@@ -98,6 +98,22 @@ export function visibleFraction(layout, viewport) {
   return Math.min(1, overlap / Math.min(layout.height, viewport.height));
 }
 
+// The web page's current card (its outline, and the card its keys act on): the
+// topmost card an impression would count as in view, so what is outlined is
+// always on screen. When none is, as a gap between two tall cards can leave
+// it, the most visible, the upper on a tie; with none on screen (scrolled
+// past the end), the last. -1 for no cards.
+export function currentIndex(layouts, viewport, threshold = VIEWABLE_THRESHOLD) {
+  let best = -1;
+  let bestFraction = 0;
+  for (let i = 0; i < layouts.length; i++) {
+    const fraction = visibleFraction(layouts[i], viewport);
+    if (fraction >= threshold) return i;
+    if (fraction > bestFraction) { best = i; bestFraction = fraction; }
+  }
+  return best === -1 && layouts.length ? layouts.length - 1 : best;
+}
+
 export class ViewabilityTracker {
   constructor(threshold = VIEWABLE_THRESHOLD) {
     this.episodes = new Map();

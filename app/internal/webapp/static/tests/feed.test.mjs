@@ -1,6 +1,6 @@
 import test, { beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { ActiveClock, EventQueue, IDLE_MS, ViewabilityTracker, applyPendingDismissals, applySave, mergeSaved, stopwatch, visibleFraction } from "../feed_log.js";
+import { ActiveClock, EventQueue, IDLE_MS, ViewabilityTracker, applyPendingDismissals, applySave, currentIndex, mergeSaved, stopwatch, visibleFraction } from "../feed_log.js";
 import { articleDocument, articleUrl, cardContext, cardLinks, cardPlayer, cardVideo, fileVideoDocument, parseArticleMessage, parseInline, parseMarkdown, picture, playerUrl, safeUrl, xPhotos } from "../feed_card.js";
 
 // Only the DOM the feed view uses. Geometry is set by hand: `y` is a card's
@@ -127,7 +127,11 @@ test("the column takes the keyboard on arrival, so PageDown scrolls before any c
 });
 
 // Three 400 px cards, one under the other, in an 800 px window.
-function layOut() { cards().forEach((card, i) => { card.y = i * 400; card.height = 400; }); }
+// Cards stacked with no gap, 400 px each unless given heights.
+function layOut(heights = []) {
+  let y = 0;
+  cards().forEach((card, i) => { card.y = y; card.height = heights[i] ?? 400; y += card.height; });
+}
 function advance(ms) { mock.timers.tick(ms); }
 // The 15 s timer may have a send in flight; let it land before sending the rest.
 async function flushed() { await settle(); await view.flushEvents(); await settle(); }
@@ -722,6 +726,52 @@ test("the current card has an outline class and nothing else moves", async () =>
   scrollTo(400);
   assert.ok(cards()[1].className.includes("fcur"));
   assert.ok(!cards()[0].className.includes("fcur"));
+});
+
+// The bug fixed on 2026-11-12: a tall card scrolled up until only its
+// buttons showed stayed outlined, and its keys acted on it, while the next card
+// filled the screen.
+test("a card scrolled almost off the top is not current: the one filling the screen is, and its keys act on it", async () => {
+  await start();
+  layOut([1200, 600, 400]);
+  scrollTo(1100); // 100 px of hn:1 left at the top, hn:2 whole below it
+  assert.ok(cards()[1].className.includes("fcur"), "the card on screen is outlined");
+  assert.ok(!cards()[0].className.includes("fcur"), "the sliver above is not");
+  press("l");
+  press("s");
+  press("v");
+  await flushed();
+  assert.deepEqual(events().filter((e) => ["like", "save", "open"].includes(e.type)).map((e) => [e.type, e.item_id, e.position]), [
+    ["like", "hn:2", 1],
+    ["save", "hn:2", 1],
+    ["open", "hn:2", 1],
+  ]);
+  press("j");
+  assert.equal(scroller().scrollTop, 1800, "j goes on from the card on screen");
+});
+
+test("a card taller than the screen stays current while it fills at least half of it", async () => {
+  await start();
+  layOut([2000, 400, 400]);
+  scrollTo(1500); // hn:1 fills 500 of 800 px
+  assert.ok(cards()[0].className.includes("fcur"));
+  scrollTo(1700); // hn:1 fills 300 px, hn:2 is whole
+  assert.ok(cards()[1].className.includes("fcur"));
+});
+
+test("the current card is the topmost one an impression would count, else the most visible", () => {
+  const at = (top) => ({ top, height: 800 });
+  const placed = (heights) => { let y = 0; return heights.map((height) => { const l = { y, height }; y += height; return l; }); };
+  assert.equal(currentIndex(placed([400, 400, 400]), at(0)), 0);
+  assert.equal(currentIndex(placed([400, 400, 400]), at(250)), 1, "hn:1 is under half on screen");
+  assert.equal(currentIndex(placed([400, 400, 400]), at(150)), 0, "hn:1 still has over half on screen");
+  assert.equal(currentIndex(placed([1200, 600, 400]), at(1100)), 1);
+  assert.equal(currentIndex(placed([2000, 2000]), at(1500)), 0, "hn:1 fills 500 px of the screen");
+  assert.equal(currentIndex(placed([2000, 2000]), at(1700)), 1);
+  // A gap between cards can leave none at half: the most visible wins, the upper on a tie.
+  assert.equal(currentIndex([{ y: 0, height: 2000 }, { y: 2100, height: 2000 }], at(1650)), 0);
+  assert.equal(currentIndex([{ y: 0, height: 2000 }, { y: 2100, height: 2000 }], at(1700)), 1);
+  assert.equal(currentIndex([], at(0)), -1);
 });
 
 test("holding a key does nothing more: no card marked seen per repeat, no card hidden per repeat, no tab per repeat", async () => {

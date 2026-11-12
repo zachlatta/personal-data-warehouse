@@ -3,7 +3,7 @@
 // paint and no re-ranking: the list on screen is what GET /api/feed just served.
 import { feed, getToken } from "./api.js";
 import { h } from "./ui.js";
-import { ActiveClock, EventQueue, FeedLog, ViewabilityTracker, applyPendingDismissals, applySave, mergeSaved, stopwatch, visibleFraction } from "./feed_log.js";
+import { ActiveClock, EventQueue, FeedLog, ViewabilityTracker, applyPendingDismissals, applySave, currentIndex, mergeSaved, stopwatch, visibleFraction } from "./feed_log.js";
 import { articleDocument, articleUrl, cardContext, cardLinks, cardPlayer, cardVideo, fileVideoDocument, parseArticleMessage, parseMarkdown, picture, playerUrl, safeUrl, shortAge, videoAspect, xPhotos } from "./feed_card.js";
 
 const OUTBOX_KEY = "pdw_feed_outbox";
@@ -19,8 +19,6 @@ const UNDO_MS = 5_000;
 const STALE_MS = 10 * 60_000;
 const PILL_GONE_Y = 120;
 const STOP_BELOW = 0.25;
-// The current card is the one under this line, in px from the top of the column.
-const CURRENT_LINE = 24;
 const OPEN_FEATURES = "noopener,noreferrer";
 
 // Outlives a mount: the first sitting since the page started is a launch.
@@ -147,10 +145,11 @@ export function mount(container, ctx) {
     recordImpressions(tracker.flush(now, clock.read(now)));
   }
 
+  // The card outlined and acted on by keys: the topmost one in view (currentIndex).
   function currentCard() {
-    const line = scroller.scrollTop + CURRENT_LINE;
     const placed = layouts();
-    return cards.find((card) => { const l = placed.get(card.id); return l.y + l.height > line; }) || cards[cards.length - 1] || null;
+    const viewport = { top: scroller.scrollTop, height: scroller.getBoundingClientRect().height };
+    return cards[currentIndex(cards.map((card) => placed.get(card.id)), viewport)] || null;
   }
 
   // An outline only, so nothing moves.
