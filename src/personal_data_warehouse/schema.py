@@ -2801,6 +2801,22 @@ SEARCH_BENCHMARK_LABEL_COLUMNS = (
     "sync_version",
 )
 
+# Contract C2: private label manifest and the latest aggregate measurement.
+PRIORITY_BENCHMARK_LABEL_COLUMNS = (
+    "label_set",
+    "payload_json",
+    "label_sha256",
+    "updated_at",
+    "sync_version",
+)
+PRIORITY_BENCHMARK_RESULT_COLUMNS = (
+    "label_set",
+    "results_json",
+    "label_sha256",
+    "collected_at",
+    "sync_version",
+)
+
 # Contract C16, the answer benchmark (answer_benchmark.py). The questions and
 # the agent's answers are Zach's private data and live in private.*; the ops
 # row is one run's counts and percentiles, with no question text, and is

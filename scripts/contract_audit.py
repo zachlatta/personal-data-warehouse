@@ -164,6 +164,13 @@ def c2_priority_tiers() -> Verdict:
         return Verdict("C2", title, RED, f"unclassified rows in the last 7 days: {[(r['source'], r['events_7d']) for r in unclassified]}")
     if unknown or not rows:
         return Verdict("C2", title, YELLOW, "priority-mix snapshot is stale or empty")
+    if set(tiers) != {"self", "direct", "cc", "noise", "background"}:
+        return Verdict("C2", title, YELLOW, f"five populated tiers required; saw {tiers}")
+    quality = pdw_sql("priority correctness", "SELECT adapter, status, accuracy, missing FROM marts_ops.timeline_priority_correctness")
+    if not quality:
+        return Verdict("C2", title, RED, "labeled priority correctness is unmeasured")
+    if any(r["status"] != "ok" for r in quality):
+        return Verdict("C2", title, RED, "labeled priority correctness below 90% (missing counts as error)")
     return Verdict("C2", title, GREEN, f"{len(rows)} (source, tier) cells over 7 days; tiers seen {tiers}")
 
 

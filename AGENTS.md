@@ -79,11 +79,13 @@ that, not from this prose.
   `marts_ops.timeline_adapter_health` judges ingest lag against the source's own interval.
 - **C2 — five priority tiers, and everything is properly categorized.** `self` (Zach did
   it), `direct` (a real person reached him), `cc` (real people, he is peripheral), `noise`
-  (bulk or automated, including his own health telemetry), `background` (machinery — the
-  warehouse's own or other people's). *Held up by* the `timeline.timeline_priority` enum,
-  required per-adapter priority SQL validated before a batch is written, and
-  `marts_ops.timeline_priority_mix`. *Gap:* which valid tier an adapter assigns is a
-  judgement no test makes. See [Timeline priority tiers](#timeline-priority-tiers).
+  (bulk/automation, health telemetry and untargeted public community chatter),
+  `background` (machinery, including automated agent prompts). *Held up by* the enum,
+  required per-adapter SQL, `marts_ops.timeline_priority_mix` and
+  `marts_ops.timeline_priority_correctness` (≥90% accuracy, self precision and recall per
+  adapter; measured daily; unpublished or missing evidence fails). Labels stay
+  private. See [the benchmark](docs/priority-benchmark.md) and
+  [Timeline priority tiers](#timeline-priority-tiers).
 - **C3 — agents start at the timeline and filter by priority.** The `search` tool or
   `timeline.events` in SQL first, then `marts_*`/`derived_*`, then `base_*`; every search entry point
   takes `priorities`, and every hit names its tier. The manual is `pdw readme` / the MCP
@@ -355,7 +357,7 @@ The following contract is generated from `warehouse_catalog.json`:
 | `self` | Zach initiated it | his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, his workouts, even WHOOP-detected ones, and his card purchases and payments |
 | `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, big group chats for the week he takes part in them, a real `<@id>` ping, and replies in a thread of his that are conversation rather than announcements |
 | `cc` | real-people activity he is peripheral to | cc'd mail, private team channels he sits in, big group chats he is not taking part in that week, replies under his channel-wide broadcasts, people talking about him in public, and others editing a file he owns |
-| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created plus deleted or declined calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member |
+| `noise` | bulk or automated traffic, including the untargeted public community firehose | newsletters, bots, CI/system notices, auto-created/deleted/declined calendar events, health telemetry, and public community chatter not aimed at him, member or not |
 | `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, contact-card churn, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change |
 
 **Scope selection guide** — use the single `priorities` mechanism; do not add a competing scope flag:
@@ -509,10 +511,10 @@ someone notices a gap in an answer).
     `(event_ts, event_id)`, `incremental_sql` oldest-first by `(ingest_ts, event_id)`, both
     returning exactly `TIMELINE_NORMALIZED_COLUMNS`, plus `max_ingest_sql`. **ENFORCED**
     (`test_adapter_sql_carries_the_pagination_contract`).
-12. **Assign a priority tier** in the adapter's SELECT. **ENFORCED for presence, SILENT for
+12. **Assign a priority tier** in the adapter's SELECT. **ENFORCED for presence, sampled for
     correctness** — an adapter with no priority expression raises at registration, and a
     NULL or unknown label fails the batch before it is written (`TimelinePriorityError`);
-    which of the five valid tiers you chose is a judgement no test makes. See
+    labeled samples measure the audited adapters, not every possible event. See
     [Timeline priority tiers](#timeline-priority-tiers).
 13. **Seed the adapter in the end-to-end timeline tests** (`_seed_sources` +
     `EXPECTED_SEEDED_EVENTS` in `tests/test_timeline.py`). **ENFORCED** —

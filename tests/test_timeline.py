@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from datetime import UTC, datetime, timedelta
@@ -372,8 +373,8 @@ def test_slack_incremental_prefilters_the_watermark_page_without_resetting_histo
 
     The join is an execution-only LIMIT barrier and therefore must be absent
     from the compatibility SQL used for adapter_signature. These hashes are
-    the deployed pre-barrier signatures; changing one would rewalk Slack's
-    47M timeline rows and generate avoidable WAL.
+    the deployed pre-barrier signatures. Changing only the barrier must not
+    reset history; the documented public-firehose rule preserves Slack SQL.
     """
 
     expected = {
@@ -2401,6 +2402,8 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     for sess, entrypoint, rows in (
         ("sdk-sess", "sdk-cli", [("user", "Reply with ONLY minified JSON")]),
         ("sdk-typed", "sdk-cli", [("user", "how did the freight break down for this?")]),
+        ("scheduled-once", "sdk-cli", [("user", 'Recurring desk task "Example". You are one run of this Paseo schedule.')]),
+        ("agent-envelope", "sdk-cli", [("user", '<paseo-system kind="agent-message">Please check the service</paseo-system>')]),
         ("cli-brief", "cli", [("user", "You are auditing the PDW repo at /tmp/x. Report findings.")]),
         ("empty-sess", "", []),
         ("desktop-conv", "", []),
@@ -2438,8 +2441,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
             """,
             (f"s{seq}", seq, _NOW, role, text, _NOW),
         )
-    # The same long opening prompt recurring across sessions = a scheduled
-    # routine, not a human typing it four days in a row.
+    # An identical opening prompt on a fixed daily clock is a schedule.
     monitor_prompt = "Monitor and debug the example service in production, checking dashboards"
     for day in range(4):
         warehouse._command(
@@ -2571,6 +2573,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
         ("sdk-typed", 1, "assistant", "The freight came to 412.10 across three carriers."),
         ("sdk-typed", 2, "user", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
         ("sdk-typed", 3, "user", "ok now split it by carrier"),
+        ("sdk-typed", 4, "user", '<paseo-system kind="agent-message">The check finished.</paseo-system>'),
         ("cli-brief", 1, "user", "continue"),
     ):
         warehouse._command(
@@ -2629,7 +2632,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("z|T1|CBIG|5000.5") == "cc", "one drive-by post does not promote a 40k channel"
     assert priority_of("z|T1|CBIG|5000.6") == "cc", "his name in public, outside his window, is people talking about him"
     assert priority_of("z|T1|CBIG|5000.10") == "direct", "a real <@id> ping is aimed at him anywhere"
-    assert priority_of("z|T1|C1|5000.11") == "noise", "member-channel chatter he is nowhere near is the public firehose"
+    assert priority_of("z|T1|C1|5000.11") == "noise", "untargeted public community chatter stays outside attention"
     assert priority_of("z|T1|CANN|6000.2") == "cc", "a reply under his <!channel> broadcast is a crowd reacting"
     assert priority_of("z|T1|CANN|6000.3") == "direct", "a reply under his broadcast that names him is aimed at him"
     assert priority_of("z|T1|G1|5000.7") == "cc", "a big group DM he is not engaged in is peripheral"
@@ -2714,6 +2717,10 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # agent turns
     assert priority_of("claude_code|sdk-typed|0") == "self", "the words he typed are his"
     assert priority_of("claude_code|sdk-typed|3") == "self", "every typed turn, not only the opener"
+    for event_id in ("claude_code|scheduled-once", "claude_code|scheduled-once|0",
+                     "claude_code|agent-envelope", "claude_code|agent-envelope|0",
+                     "claude_code|sdk-typed|4"):
+        assert priority_of(event_id) == "background", "automation is not a typed user turn"
     assert priority_of("claude_code|sdk-typed|1") == "background", "the model's reply is machinery"
     assert priority_of("claude_code|sdk-typed|2") == "background", "a harness notification on the user channel is not him"
     assert priority_of("claude_code|cli-brief|1") == "background", "typed into an orchestrated session is still machinery"
@@ -2740,6 +2747,425 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     )
 
 
+def test_gmail_person_relays_and_specific_requests_are_attention_not_bulk(warehouse):
+    _ensure_all_source_tables(warehouse)
+    for event_id, sender, subject, snippet in (
+        ('person', 'fictional123@members.ebay.com', 'Re: Example listing', 'Thank you for your reply'),
+        ('offer', 'ebay@ebay.com', 'You have a new offer: Example', 'A buyer sent a new offer'),
+        ('install', 'noreply@github.com', 'Request to install Example in example-org', 'Integration Installation Request'),
+        ('promo', 'ebay@ebay.com', 'Explore our weekly deals', 'Shop these popular picks'),
+    ):
+        warehouse._command(
+            "INSERT INTO @gmail_messages (account,message_id,thread_id,internal_date,from_address,"
+            "subject,snippet,to_addresses,synced_at) VALUES ('z@x.test',%s,%s,%s,%s,%s,%s,ARRAY['z@x.test'],%s)",
+            (event_id, event_id, _NOW, sender, subject, snippet, _NOW),
+        )
+    engine = _engine(warehouse, adapters=[adapter_by_name('gmail_email')])
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    actual = dict(warehouse._query("SELECT event_id,priority::text FROM @timeline_events"))
+    assert actual == {'z@x.test|person': 'direct', 'z@x.test|offer': 'cc',
+                      'z@x.test|install': 'cc', 'z@x.test|promo': 'noise'}
+
+
+def test_agent_harness_provenance_and_short_daily_schedules_are_background(warehouse):
+    _ensure_all_source_tables(warehouse)
+    rows = [
+        ("interactive", 0, "help me understand this code", "{}", _NOW),
+        (
+            "interactive",
+            1,
+            "Check the fictional pipeline and report when it finishes",
+            '{"isMeta":true}',
+            _NOW,
+        ),
+        (
+            "interactive",
+            2,
+            "a generated summary with arbitrary wording",
+            '{"isCompactSummary":true}',
+            _NOW,
+        ),
+        (
+            "interactive",
+            3,
+            "This session is being continued from a previous conversation. Summary follows.",
+            "{}",
+            _NOW,
+        ),
+        ("interactive", 4, "continue", "{}", _NOW),
+        # Task prose alone does not prove automation, and malformed provider
+        # JSON must not halt the whole adapter.
+        ("interactive", 5, "please inspect this build", "{broken", _NOW),
+        ("interactive", 6, "continue", "", _NOW),
+        # Metadata rows in a subagent are sometimes non-sidechain; the session
+        # namespace still proves that its first user prompt came from an agent.
+        ("agent-fictional", 0, "please inspect the build result", "{}", _NOW),
+        (
+            "broadcast-a",
+            0,
+            "Inspect this fictional service and return the exact build status.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "broadcast-a",
+            1,
+            "A later instruction does not turn an automated session into a human session.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "broadcast-b",
+            0,
+            "Inspect this fictional service and return the exact build status.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "review-envelope",
+            0,
+            "This is a LANDING REVIEW: agent 11111111-1111-4111-8111-111111111111 asks for review.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "workflow-envelope",
+            0,
+            "A new input. This is run 11111111-1111-4111-8111-111111111111 of the workflow Example.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "subagent-entrypoint",
+            0,
+            "Inspect the fictional build output for a parent agent.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "detached-sdk",
+            0,
+            "Check a disposable fictional workspace before exiting.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "unattended-envelope",
+            0,
+            "Inspect a fictional service. This is an unattended agent session, so you cannot prompt me.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "late-broadcast-a",
+            20,
+            "Inspect this later fictional delivery and return the build status.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "late-broadcast-b",
+            0,
+            "Inspect this later fictional delivery and return the build status.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "prefix-a",
+            0,
+            "A fictional prefix shared by independent prompts is not the whole request: first ending.",
+            "{}",
+            _NOW,
+        ),
+        (
+            "prefix-b",
+            0,
+            "A fictional prefix shared by independent prompts is not the whole request: second ending.",
+            "{}",
+            _NOW,
+        ),
+    ]
+    for day in range(3):
+        rows.append(
+            (
+                f"daily-{day}",
+                0,
+                "Start the pass",
+                "{}",
+                _NOW.replace(hour=15, minute=3 if day == 2 else 0, second=day + 1)
+                - timedelta(days=day),
+            )
+        )
+    for suffix in ("c", "d"):
+        rows += [
+            (
+                f"broadcast-{suffix}",
+                0,
+                "Inspect this fictional service and return the exact build status.",
+                "{}",
+                _NOW,
+            ),
+            (
+                f"late-broadcast-{suffix}",
+                0,
+                "Inspect this later fictional delivery and return the build status.",
+                "{}",
+                _NOW,
+            ),
+        ]
+    rows.append(
+        (
+            "late-broadcast-e",
+            0,
+            "Inspect this later fictional delivery and return the build status.",
+            "{}",
+            _NOW,
+        )
+    )
+    for session, seq, text, raw, occurred in rows:
+        warehouse._command(
+            "INSERT INTO @claude_code_events (source,session_id,event_uuid,seq,occurred_at,"
+            "role,text,cwd,raw_json,entrypoint,ingested_at) "
+            "VALUES ('claude_code',%s,%s,%s,%s,'user',%s,'/fictional/project',%s,'sdk-cli',%s)",
+            (session, f"event-{seq}", seq, occurred, text, raw, _NOW),
+        )
+    warehouse._command(
+        "UPDATE @claude_code_events SET entrypoint='subagent' WHERE session_id='subagent-entrypoint'"
+    )
+    warehouse._command(
+        "UPDATE @claude_code_events SET cwd='/tmp',git_branch='HEAD' WHERE session_id='detached-sdk'"
+    )
+    engine = _engine(
+        warehouse,
+        adapters=[
+            adapter_by_name("agent_session"),
+            adapter_by_name("agent_session_turn"),
+        ],
+    )
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    actual = dict(
+        warehouse._query("SELECT event_id,priority::text FROM @timeline_events")
+    )
+    assert actual["claude_code|interactive"] == "self"
+    assert actual["claude_code|interactive|0"] == "self"
+    assert actual["claude_code|interactive|4"] == "self"
+    assert actual["claude_code|interactive|5"] == "self"
+    assert actual["claude_code|interactive|6"] == "self"
+    for seq in (1, 2, 3):
+        assert actual[f"claude_code|interactive|{seq}"] == "background"
+    for session in (
+        "agent-fictional",
+        "daily-0",
+        "daily-1",
+        "daily-2",
+        "broadcast-a",
+        "broadcast-b",
+        "broadcast-c",
+        "broadcast-d",
+        "review-envelope",
+        "workflow-envelope",
+        "subagent-entrypoint",
+        "detached-sdk",
+        "unattended-envelope",
+    ):
+        assert actual[f"claude_code|{session}"] == "background"
+        assert actual[f"claude_code|{session}|0"] == "background"
+    for session in (
+        "late-broadcast-a",
+        "late-broadcast-b",
+        "late-broadcast-c",
+        "late-broadcast-d",
+        "late-broadcast-e",
+    ):
+        assert actual[f"claude_code|{session}"] == "background"
+        seq = 20 if session == "late-broadcast-a" else 0
+        assert actual[f"claude_code|{session}|{seq}"] == "background"
+    for session in ("prefix-a", "prefix-b"):
+        assert actual[f"claude_code|{session}"] == "self"
+        assert actual[f"claude_code|{session}|0"] == "self"
+    headlines = dict(
+        (event_id, (title, snippet))
+        for event_id, title, snippet in warehouse._query(
+            "SELECT event_id,title,snippet FROM @timeline_events WHERE adapter='agent_session'"
+        )
+    )
+    for session, seq, text, raw, occurred in rows:
+        if seq == min(row[1] for row in rows if row[0] == session):
+            assert headlines[f"claude_code|{session}"] == (text[:300], text[:500])
+    # Even a later user turn must have an indexed route through the union
+    # view. Small fictional tables otherwise prefer sequential scans.
+    from personal_data_warehouse.timeline import _agent_broadcast_prompt
+
+    warehouse._command("SET enable_seqscan=off")
+    try:
+        plan = warehouse._query(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT u.seq FROM @ai_conversation_events u "
+            "WHERE u.source='claude_code' AND u.session_id='late-broadcast-a' AND u.seq=20 "
+            f"AND {_agent_broadcast_prompt('u')}"
+        )[0][0][0]["Plan"]
+    finally:
+        warehouse._command("RESET enable_seqscan")
+
+    def indexed_probe(node):
+        if (
+            node.get("Index Name", "").endswith(
+                ("_broadcast_prompt_idx", "_first_prompt_idx")
+            )
+            and node.get("Actual Loops", 0) > 0
+        ):
+            return True
+        return any(indexed_probe(child) for child in node.get("Plans", []))
+
+    assert indexed_probe(plan)
+
+
+def test_human_duplicates_and_codex_subagent_copies_keep_the_human_self(warehouse):
+    _ensure_all_source_tables(warehouse)
+    typed = "Can you help me find why the fictional preview service is unavailable?"
+    for session, entrypoint in (("typed-cli", "cli"), ("typed-sdk", "sdk-cli")):
+        warehouse._command(
+            "INSERT INTO @claude_code_events (source,session_id,event_uuid,seq,occurred_at,"
+            "role,text,entrypoint,ingested_at) VALUES ('claude_code',%s,'typed',0,%s,'user',%s,%s,%s)",
+            (session, _NOW, typed, entrypoint, _NOW),
+        )
+    # Four copies must not turn the human original into dispatcher fan-out.
+    # Each child has its own first header, followed by the copied human header.
+    # Codex's copied request retains its sequence after injected setup, beyond
+    # the early rows main's repeated-opener baseline reads.
+    for session in ("human-original", "child-a", "child-b", "child-c", "child-d"):
+        subagent = session != "human-original"
+        header = {
+            "payload": {
+                "source": {
+                    "subagent": {"thread_spawn": {"parent_thread_id": "human-original"}}
+                }
+            }
+        }
+        for seq, payload in (
+            (0, header if subagent else {"payload": {"source": "vscode"}}),
+            (1, {"payload": {"source": "vscode"}}),
+        ):
+            warehouse._command(
+                "INSERT INTO @codex_events (source,session_id,event_uuid,seq,event_type,occurred_at,raw_json,ingested_at) "
+                "VALUES ('codex',%s,%s,%s,'session_meta',%s,%s,%s)",
+                (session, f"header-{seq}", seq, _NOW, json.dumps(payload), _NOW),
+            )
+        warehouse._command(
+            "INSERT INTO @codex_events (source,session_id,event_uuid,seq,occurred_at,role,text,ingested_at) "
+            "VALUES ('codex',%s,'request',8,%s,'user',%s,%s)",
+            (session, _NOW, typed, _NOW),
+        )
+    engine = _engine(
+        warehouse,
+        adapters=[
+            adapter_by_name("agent_session"),
+            adapter_by_name("agent_session_turn"),
+        ],
+    )
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    actual = dict(
+        warehouse._query("SELECT event_id,priority::text FROM @timeline_events")
+    )
+    for session in ("typed-cli", "typed-sdk"):
+        assert actual[f"claude_code|{session}"] == "self"
+        assert actual[f"claude_code|{session}|0"] == "self"
+    assert actual["codex|human-original"] == "self"
+    assert actual["codex|human-original|8"] == "self"
+    for session in ("child-a", "child-b", "child-c", "child-d"):
+        assert actual[f"codex|{session}"] == "background"
+        assert actual[f"codex|{session}|8"] == "background"
+
+
+def test_main_repeated_opener_and_weekly_schedules_are_background(warehouse):
+    _ensure_all_source_tables(warehouse)
+    prefix = "Review the fictional file service and its automated weekly health audit. "
+    rows = []
+    for i, occurred in enumerate(
+        (
+            datetime(2026, 10, 26, 8, tzinfo=UTC),
+            datetime(2026, 11, 2, 9, tzinfo=UTC),
+            datetime(2026, 11, 9, 9, tzinfo=UTC),
+        )
+    ):
+        rows.append(
+            (
+                f"weekly-{i}",
+                prefix + f"Version {i} of the instructions.",
+                occurred,
+                f"/fictional/.paseo/worktrees/project/week-{i}",
+                "background",
+            )
+        )
+    for i in range(4):
+        rows.append(
+            (
+                f"scheduled-repeat-{i}",
+                "Review the fictional service and report its current health summary. "
+                f"Instructions for run {i} differ after the opening prefix.",
+                _NOW - timedelta(days=i * 2, hours=i),
+                "/fictional/project",
+                "background",
+            )
+        )
+    for session, text, occurred, cwd, expected in rows:
+        warehouse._command(
+            "INSERT INTO @claude_code_events (source,session_id,event_uuid,seq,occurred_at,role,text,cwd,ingested_at) "
+            "VALUES ('claude_code',%s,'opener',0,%s,'user',%s,%s,%s)",
+            (session, occurred, text, cwd, _NOW),
+        )
+    engine = _engine(
+        warehouse,
+        adapters=[
+            adapter_by_name("agent_session"),
+            adapter_by_name("agent_session_turn"),
+        ],
+    )
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    actual = dict(
+        warehouse._query("SELECT event_id,priority::text FROM @timeline_events")
+    )
+    for session, text, occurred, cwd, expected in rows:
+        assert actual[f"claude_code|{session}"] == expected
+        assert actual[f"claude_code|{session}|0"] == expected
+
+
+@pytest.mark.parametrize("adapter_name", ["agent_session", "agent_session_turn"])
+def test_agent_priority_probes_are_outside_materialized_page(warehouse, adapter_name):
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    adapter = adapter_by_name(adapter_name)
+    sql = adapter.backfill_sql % dict(
+        cursor_ts="'9999-01-01'::timestamptz", cursor_id="'~'", limit=1
+    )
+    plan = warehouse._query("EXPLAIN (ANALYZE, FORMAT JSON) " + sql)[0][0][0]["Plan"]
+
+    def nodes(node):
+        yield node
+        for child in node.get("Plans", []):
+            yield from nodes(child)
+
+    cte_name = (
+        "agent_session_page" if adapter_name == "agent_session" else "agent_turn_page"
+    )
+    page = next(n for n in nodes(plan) if n.get("Subplan Name") == "CTE " + cte_name)
+    assert page["Node Type"] == "Limit" and page["Actual Rows"] == 1
+    # No first-prompt/harness/repetition subquery can execute while selecting
+    # candidates: their plans belong to the consumer of the materialized page.
+    assert not any(n.get("Parent Relationship") == "SubPlan" for n in nodes(page))
+
+
 def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     _ensure_all_source_tables(warehouse)
     now = datetime.now(tz=UTC)
@@ -2748,34 +3174,26 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     # message shells and inaccessible file stubs should not surface as self
     # activity, and stale file stubs should use the Slack message timestamp
     # rather than the sync timestamp.
-    warehouse._command(
-        """
+    warehouse._command("""
         INSERT INTO @slack_users (account, team_id, user_id, display_name)
         VALUES ('z', 'T1', 'UME', 'self'),
                ('z', 'T1', 'U1', 'Teammate One'),
                ('z', 'T1', 'U2', 'Teammate Two')
-        """
-    )
-    warehouse._command(
-        """
+        """)
+    warehouse._command("""
         INSERT INTO @slack_account_identities (account, team_id, user_id)
         VALUES ('z', 'T1', 'UME')
-        """
-    )
-    warehouse._command(
-        """
+        """)
+    warehouse._command("""
         INSERT INTO @slack_conversations (account, team_id, conversation_id, name, is_im)
         VALUES ('z', 'T1', 'D1', '', 1),
                ('z', 'T1', 'D2', 'U2', 1)
-        """
-    )
-    warehouse._command(
-        """
+        """)
+    warehouse._command("""
         INSERT INTO @slack_conversation_members (account, team_id, conversation_id, user_id)
         VALUES ('z', 'T1', 'D1', 'UME'),
                ('z', 'T1', 'D1', 'U1')
-        """
-    )
+        """)
     stale_message_ts = f"{(now - timedelta(hours=1)).timestamp():.6f}"
     warehouse._command(
         """
@@ -3056,7 +3474,7 @@ def test_refresh_window_converges_late_signals(warehouse):
     row = warehouse._query(
         "SELECT priority FROM @timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
     )
-    assert row[0][0] == "noise", "no engagement yet: public member-channel chatter is the firehose"
+    assert row[0][0] == "noise", "no engagement yet: public community chatter is the firehose"
 
     # Zach replies twice; the original message predates the watermark so only
     # the refresh re-walk can reclassify it.

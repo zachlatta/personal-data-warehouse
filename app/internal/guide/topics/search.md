@@ -53,6 +53,17 @@ than paging deeper.
 ## Reading a hit
 
 Every hit carries `priority`, `ref`, `source_table`, `source_pk` and `drill_sql`.
+
+Untargeted public community Slack chatter is `noise`, regardless of channel membership:
+the public firehose is outside the attention scope. Private channels/group DMs, public
+name mentions and replies under his broadcasts follow the `cc`/`direct` rules.
+Bots and system notices are `noise`; empty attachment shells are `background`.
+Automated agent prompts are `background`, even on the user channel.
+`marts_ops.timeline_priority_correctness` measures a labeled regression sample per audited
+adapter: at least 90% must match; missing events count as errors. It is a small blind
+hash sample with tier strata, not a corpus-wide accuracy guarantee. Labels are private;
+unpublished, unmeasured, incomplete or stale evidence fails C2.
+
 `source_table` is the catalog's logical id (`gmail_messages`, `slack_messages`), not a
 relation name, so do not build the drill-down by hand: {{if .CLI}}the `sql:` line under each hit{{else}}`drill_sql`{{end}} is
 the ready statement that reads the authoritative row (one row per column, payloads dropped,

@@ -18,6 +18,8 @@ import psycopg2
 from psycopg2 import Binary
 from psycopg2.extras import Json, execute_values
 
+from personal_data_warehouse.agent_delivery import delivery_call_predicate
+
 from personal_data_warehouse.search_benchmark_runner import (
     LATENCY_P50_TARGET_MS,
     LATENCY_P90_TARGET_MS,
@@ -44,6 +46,8 @@ from personal_data_warehouse.source_sla import (
     source_upstream_health_view_sql,
 )
 from personal_data_warehouse.schema import (
+    PRIORITY_BENCHMARK_LABEL_COLUMNS,
+    PRIORITY_BENCHMARK_RESULT_COLUMNS,
     ANSWER_BENCHMARK_QUESTION_COLUMNS,
     ANSWER_BENCHMARK_RESULT_COLUMNS,
     ANSWER_BENCHMARK_RUN_COLUMNS,
@@ -1502,6 +1506,8 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         SEARCH_BENCHMARK_HISTORY_COLUMNS, ("mode", "collected_at"), "collected_at"
     ),
     "search_benchmark_labels": TableSpec(SEARCH_BENCHMARK_LABEL_COLUMNS, ("query",)),
+    "priority_benchmark_labels": TableSpec(PRIORITY_BENCHMARK_LABEL_COLUMNS, ("label_set",)),
+    "priority_benchmark_results": TableSpec(PRIORITY_BENCHMARK_RESULT_COLUMNS, ("label_set",)),
     # C16: private questions and per-question answers, and an append-only ops
     # row of one run's counts (no question text) for marts_ops.answer_benchmark.
     "answer_benchmark_questions": TableSpec(ANSWER_BENCHMARK_QUESTION_COLUMNS, ("question_id",)),
@@ -1599,6 +1605,29 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
                 table,
                 f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_first_prompt_idx "
                 f"ON @{table} ((left(text, 64))) WHERE role = 'user' AND seq <= 5",
+            )
+        )
+        # Broadcasts can occur beyond the opening turns. Bound the index key
+        # to a text prefix and timestamp; full-text equality is a heap recheck.
+        specs.append(
+            IndexSpec(
+                f"{table}_broadcast_prompt_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_broadcast_prompt_idx "
+                f"ON @{table} ((left(text, 64)), occurred_at) "
+                "WHERE role = 'user' AND length(text) >= 40",
+            )
+        )
+        # Delivery proof probes tool calls in a short received-turn time window.
+        # Index only execution/delivery candidates, rather than detoasting every
+        # event in that interval. The adapter uses this exact shared predicate.
+        specs.append(
+            IndexSpec(
+                f"{table}_agent_delivery_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_agent_delivery_idx "
+                f"ON @{table} (occurred_at DESC) WHERE "
+                + delivery_call_predicate(""),
             )
         )
         specs.append(
@@ -6783,6 +6812,7 @@ class PostgresWarehouse:
             logger.info(
                 "widened search_benchmark_history with %s", ", ".join(added)
             )
+        self.ensure_priority_benchmark_tables()
         self._ensure_pipeline_health_mart_views()
         self.ensure_source_upstream_health_view_if_possible()
 
@@ -6801,6 +6831,22 @@ class PostgresWarehouse:
         if not all(self._relation_exists(table) for table in SOURCE_UPSTREAM_INPUT_TABLES):
             return
         self._ensure_view("marts_ops_source_upstream_health", source_upstream_health_view_sql())
+
+    def ensure_priority_benchmark_tables(self) -> None:
+        """Private labels and aggregate measurements, without timeline schema DDL."""
+        tables = ("priority_benchmark_labels", "priority_benchmark_results")
+        self._ensure_table_group(tables)
+        for table in tables:
+            self._reconcile_table_columns(table)
+        self._ensure_priority_correctness_view()
+
+    def _ensure_priority_correctness_view(self) -> None:
+        from personal_data_warehouse.priority_benchmark import mart_sql
+
+        self._ensure_view(
+            "marts_timeline_priority_correctness",
+            "CREATE OR REPLACE VIEW @marts_timeline_priority_correctness AS " + mart_sql(),
+        )
 
     def _ensure_pipeline_health_mart_views(self) -> None:
         """Publish pipeline freshness with a status computed at read time.

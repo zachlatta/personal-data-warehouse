@@ -226,6 +226,7 @@ __marimo__/
 # and result references mined from agent transcripts.  Keep the reproducible
 # harness in git, never its generated inputs or outputs.
 .search-eval/
+.priority-eval/
 
 # The iOS app keeps its client code in mobile/src/lib; the lib/ rule above is for Python build output.
 !mobile/src/lib/

@@ -50,6 +50,12 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 from personal_data_warehouse.config import normalize_postgres_url
+from personal_data_warehouse.agent_delivery import (
+    DELIVERY_WINDOW_MINUTES,
+    delivery_call_predicate,
+    delivery_text,
+    delivery_text_matches,
+)
 from personal_data_warehouse.relations import expand_relations, physical_schema_names
 from personal_data_warehouse.warehouse_catalog import CATALOG
 
@@ -489,7 +495,7 @@ _GMAIL_AUTOMATED_SENDER_PATTERN = (
     "statements?@|bank@|hcb@|dinobox@|sign@|bot@|metabase@|\\mfact\\w*@|replies\\+|info@|contact@|hello@|"
     "support@|feedback@|service@|security@|accounts?@|verify|apply@|jobs@|"
     "calendar-notification@|\\mmail@|menu@|reports?@|abuse@|coolify@|deploy@|"
-    "\\mci@|build@|@members\\.|"
+    "\\mci@|build@|@members\\.|ebay@ebay\\.com|"
     "@(email|mail|msg|notify|alert|news|marketing|info|update)[\\w-]*\\.|"
     "^(education|announce(ments)?|events?|press|community|news)@)'"
 )
@@ -503,14 +509,18 @@ _GMAIL_RELAY_SENDER_PATTERN = (
 # share to the account owner. They are still generated mail, so keep them at cc
 # instead of direct, but they are not newsletter/automation noise.
 _GMAIL_HUMAN_ACTION_RELAY = (
-    "(t.from_address ~* '(drive-shares-dm-noreply@google\\.com|"
+    "((t.from_address ~* '(drive-shares-dm-noreply@google\\.com|"
     "no-reply@email\\.figma\\.com|noreply@airtable\\.com|mail@signnow\\.com|"
     "notifications@vercel\\.com|notifications@letsjelly\\.com|"
     "notifications@mail\\.granola\\.ai|feedback@slack\\.com)' "
     " AND (t.subject || ' ' || t.snippet) ~* '(upgrade request|requested access|"
     "access request|signature request|shared (a |the )?(document|folder|form|file|meeting notes)|"
     "shared with you|invited you to (edit|comment|sign|review|join|build)|"
-    "has invited you|wants access|action required|deletion request)')"
+    "has invited you|wants access|action required|deletion request)') "
+    "OR (t.from_address ~* '(^|<)ebay@ebay\\.com>?$' "
+    "    AND (t.subject || ' ' || t.snippet) ~* '(you have a new offer|buyer sent a new offer|you.ve got an offer)') "
+    "OR (t.from_address ~* '(^|<)noreply@github\\.com>?$' "
+    "    AND t.subject ~* '^request to install '))"
 )
 _GMAIL_OTP_SUBJECT_PATTERN = (
     "'(login code|verification code|security code|confirmation code|authentication code|"
@@ -585,6 +595,18 @@ _GMAIL_MERGE_CLUSTER = (
     "  AND g2.from_address ILIKE '%%' || g2.account || '%%'"
     " LIMIT 30) merge_probe) >= 30"
 )
+# A numbered drip sequence can send a smaller personalized cohort. Require
+# ten distinct recipients, the same subject and a bounded time window; an
+# individual reply in an existing human thread still remains self below.
+_GMAIL_SEQUENCE_CLUSTER = (
+    "(t.subject ~* '\\m(week|day|lesson|part|step|episode) +[0-9]+ +(of|/) +[0-9]+\\M' "
+    "AND (SELECT count(*) FROM (SELECT DISTINCT rcpt FROM @gmail_messages g2 "
+    "CROSS JOIN LATERAL unnest(g2.to_addresses) rcpt "
+    f"WHERE {_GMAIL_MERGE_PREFIX.format(col='g2.subject')} = {_GMAIL_MERGE_PREFIX.format(col='t.subject')} "
+    "AND lower(g2.subject)=lower(t.subject) AND g2.account=t.account "
+    "AND g2.internal_date BETWEEN t.internal_date-interval '3 days' AND t.internal_date+interval '3 days' "
+    "AND g2.from_address ILIKE '%%'||g2.account||'%%' LIMIT 10) cohort)>=10)"
+)
 _GMAIL_THREAD_INBOUND_BEFORE = (
     "EXISTS (SELECT 1 FROM @gmail_messages g3 "
     "        WHERE g3.thread_id = t.thread_id "
@@ -615,6 +637,17 @@ _GMAIL_KNOWN_CORRESPONDENT = (
     "                                       t.from_address)) "
     "          AND gc.n_sent_to >= 2)"
 )
+
+
+def gmail_correspondents_sql(accounts_relation: str = '@gmail_sync_state') -> str:
+    """One aggregation for the engine cache and the read-only benchmark."""
+    return f"""SELECT lower(COALESCE(NULLIF(substring(rcpt FROM '<([^>]+)>'), ''), rcpt)) AS addr,
+                     count(*) AS n_sent_to,max(m.internal_date) AS last_sent_at
+        FROM @gmail_messages m CROSS JOIN LATERAL unnest(m.to_addresses) rcpt
+        WHERE m.from_address ILIKE '%%' || m.account || '%%'
+           OR EXISTS (SELECT 1 FROM {accounts_relation} s
+                      WHERE s.account <> '' AND m.from_address ILIKE '%%' || s.account || '%%')
+        GROUP BY 1"""
 _GMAIL_BULK_CATEGORY = (
     "('CATEGORY_PROMOTIONS' = ANY(t.label_ids) OR 'CATEGORY_UPDATES' = ANY(t.label_ids) "
     " OR 'CATEGORY_FORUMS' = ANY(t.label_ids) OR 'CATEGORY_SOCIAL' = ANY(t.label_ids))"
@@ -703,8 +736,11 @@ _GMAIL_EMAIL = _simple_adapter(
         # copy that lands in a different account (cross-account forwards) —
         # unless it is one send of a mail-merge blast nobody had replied to.
         f"WHEN {_GMAIL_FROM_SELF} THEN "
-        f"  CASE WHEN {_GMAIL_MERGE_CLUSTER} AND NOT {_GMAIL_THREAD_INBOUND_BEFORE} THEN 'noise' ELSE 'self' END "
+        f"  CASE WHEN ({_GMAIL_MERGE_CLUSTER} OR {_GMAIL_SEQUENCE_CLUSTER}) AND NOT {_GMAIL_THREAD_INBOUND_BEFORE} THEN 'noise' ELSE 'self' END "
         "WHEN 'SPAM' = ANY(t.label_ids) OR 'TRASH' = ANY(t.label_ids) THEN 'noise' "
+        # Marketplace member-address messages carry one person's words to him;
+        # product offers/access requests remain cc rather than direct.
+        "WHEN t.from_address ~* '@members\\.ebay\\.com>?$' THEN 'direct' "
         # Relay services carrying a human's activity: mention/author copies are
         # directed at me; bot-authored payloads (CI, deploy status) are noise;
         # the rest is skim-worthy cc.
@@ -936,9 +972,10 @@ _SLACK_DM_CONTEXT = (
 # him by name is plausible (private rooms, group DMs, or while he is engaged).
 # cc = real people he is peripheral to: private team channels he sits in,
 # group DMs he is not engaged in, replies piling under his broadcasts, and
-# people talking ABOUT him in public. noise = everything a public channel
-# says that is not aimed at him -- member or not; being in #lounge does not
-# make its chatter his. Two standing reversals from the 2026-07 sampling still
+# people talking ABOUT him in public. noise also includes untargeted public
+# community chatter, regardless of membership: the public firehose is not an
+# attention queue. background = attachment shells and machinery.
+# Two standing reversals from the 2026-07 sampling still
 # hold: "channels I post in a lot" must NOT promote (lounge-chatter flood), and
 # one drive-by message must not promote a busy channel's +/-6h -- participation
 # means at least two of his messages in the window. System subtypes are judged
@@ -3207,8 +3244,191 @@ _SCREEN_CAPTURE = _simple_adapter(
 # entrypoint filed 383 of 390 claude_code sessions in a fortnight as
 # background, "how did the freight break down for this?" included (measured on
 # prod 2026-08-26).
+_AGENT_AUTOMATED_PROMPT_PREFIX = (
+    "<paseo-system|recurring (desk )?task\\M|"
+    "you are one run of this paseo schedule\\M|"
+    "\\[openclaw heartbeat poll\\]|\\[cron:|\\[inter-session message\\]|"
+    "\\[subagent context\\]|this session is being continued from a previous conversation"
+    "|factory (stage handoff\\M|note:)"
+    "|pick the repository this task belongs in\\."
+    # A formal harness header carrying a sender agent identity, not a topic.
+    "|this is a [[:alpha:] -]+ review: agent [0-9a-f-]{36}"
+)
+_AGENT_DISPATCH_PROMPT_PREFIX = (
+    "you were started automatically\\M"
+    "|you (pick|choose|select) the (repo|repository)\\M[^.\\n]{0,160}agent factory board\\M"
+    "|[[:alpha:] ]{1,80} sent another email in the thread you are handling\\M"
+    "|a reviewer \\(a different agent\\) requested changes to your (plan|code) "
+    "\\(round [0-9]+ of [0-9]+\\)"
+    "|plan approved by (the|a) plan reviewer\\."
+    "|code review passed \\([[:alpha:] -]+ tier\\)\\."
+)
+_AGENT_HARNESS_ENVELOPE_PATTERN = "'^\\s*(" + _AGENT_AUTOMATED_PROMPT_PREFIX + ")'"
+# A schedule's role declaration can follow a job title, and applies to a
+# one-shot run too. Mentioning a schedule alone is not this declaration.
+_AGENT_SCHEDULE_ENVELOPE_PATTERN = (
+    "'\\myou( are|''re| represent)\\M[^.\\n]{0,80}\\mrun\\M"
+    "[^.\\n]{0,80}\\mpaseo schedule\\M'"
+)
+
+
+def _agent_codex_subagent(alias: str) -> str:
+    # Forked transcripts copy their parent's user turns and session_meta. Only
+    # the child's own first header establishes provenance; a human fork alone
+    # is not automation. The source table's (session_id, seq) index bounds this.
+    return f"""(CASE WHEN {alias}.source='codex' THEN EXISTS (
+        SELECT 1 FROM @codex_events header
+        WHERE header.session_id={alias}.session_id AND header.seq=0
+          AND header.event_type='session_meta'
+          AND CASE WHEN header.raw_json IS JSON
+              THEN jsonb_typeof(header.raw_json::jsonb #> '{{payload,source,subagent}}')='object'
+              ELSE false END
+    ) ELSE false END)"""
+
+
+def _agent_broadcast_prompt(alias: str) -> str:
+    """A dispatcher-sized fan-out, excluding copies in known subagents."""
+    return f"""(length({alias}.text)>=40 AND (
+        SELECT count(*) FROM (
+        SELECT DISTINCT delivery.source,delivery.session_id FROM (
+        SELECT rep.source,rep.session_id FROM @ai_conversation_events rep
+        WHERE rep.role='user' AND length(rep.text)>=40
+          AND left(rep.text,64)=left({alias}.text,64)
+          AND rep.text={alias}.text
+          AND rep.is_sidechain=0 AND rep.entrypoint<>'subagent'
+          AND NOT (rep.source='claude_code' AND rep.session_id LIKE 'agent-%%')
+          AND NOT {_agent_codex_subagent('rep')}
+          AND rep.occurred_at BETWEEN {alias}.occurred_at-interval '5 minutes'
+                                  AND {alias}.occurred_at+interval '5 minutes'
+        LIMIT 16) delivery LIMIT 4) fanout) >= 4)"""
+
+
+def _agent_delegated_prompt(alias: str) -> str:
+    # Provider transcripts do not retain Paseo's parent-agent labels. Restrict
+    # text evidence to opening role/ownership declarations and probe envelopes;
+    # asking an agent to *start* a subagent or consult a reviewer is human input.
+    opening = f"left({alias}.text,2048)"
+    role = (
+        r"\myou are (an? |the |that )?([[:alpha:]-]+[[:space:]]){0,5}"
+        r"(subagent|runner|reviewer)\M"
+        r"|(^|[.!?\n][[:space:]]*)(read-only (audit|reviewer)|independent read-only review)\M"
+        r"|\m(user|he) explicitly (delegates this to|asked to continue in) a (background )?subagent\M"
+        r"|^[[:alpha:] ]{1,60} explicitly requests you \([[:alnum:]. -]+\)"
+    )
+    ownership = (
+        r"(^|[.\x3b\n][[:space:]]*)(parent|root owner)\M[^.\n]{0,100}\m(owns|handles|will run|is fixing|stashed)\M"
+        r"|(^|[.\x3b\n][[:space:]]*)another (worker|agent) owns\M"
+        r"|(^|[.\x3b\n][[:space:]]*)I own this worktree and will commit/land\M"
+    )
+    probe = (
+        r"^\s*(perform|run) only (a )?read-only [^.\n]{0,60}(compatibility|smoke) (check|test)\M"
+        r"|^\s*(one-time|one bounded) read-only (check|verification)\M"
+        r"|^\s*report the (current )?(date|time) and stop\M"
+    )
+    return f"""(CASE WHEN {alias}.text ~* '^check (one|[0-9]+) contracts? and record the results'
+        THEN false ELSE (
+        {opening} ~* '{role}'
+        OR ({opening} ~* '{ownership}' AND {opening} ~* '(no (staging|commits)|do not (commit|stage)|you own|own only|another (worker|agent)|parent)')
+        OR ({opening} ~* '(research/design only|investigation and recommendation task)'
+            AND {opening} ~* '(as explicitly requested by|user explicitly requests)')
+        OR {opening} ~* '{probe}'
+        OR ({opening} ~* '^\\s*(call|list)\\M' AND {opening} ~* '\\mMCP\\M'
+            AND {opening} ~* '([0-9])\\1{{7}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-\\1{{12}}')
+        OR ({alias}.source IN ('muse','muse_code')
+            AND {alias}.text ~* '^carry out this assignment end to end[,.]')
+        OR ({alias}.text ~* '^\\s*\\[request interrupted'
+            AND {alias}.cwd ~ '/\\.paseo/worktrees/[^/]+/(email|voice)-')
+        OR {opening} ~* '^from the [[:alpha:] /-]+ agent \\(worktree\\M'
+        ) END)"""
+
+
+def _agent_harness_metadata(alias: str) -> str:
+    # Claude's user-channel loops/compactions carry provenance even when their
+    # wording is an ordinary request. parent_uuid alone is just turn threading.
+    raw = f"(CASE WHEN {alias}.raw_json IS JSON THEN {alias}.raw_json::jsonb ELSE '{{}}'::jsonb END)"
+    scalar = (
+        f"({alias}.is_sidechain = 1 OR {alias}.entrypoint = 'subagent' "
+        f"OR {_agent_codex_subagent(alias)} "
+        f"OR ({alias}.source = 'claude_code' AND {alias}.session_id LIKE 'agent-%%') "
+        # Detached helpers may have no entrypoint or branch metadata. A
+        # temporary directory root without a project branch is the provenance.
+        f"OR ({alias}.git_branch IN ('','HEAD') "
+        f"    AND {alias}.cwd IN ('/tmp','/private/tmp')) "
+        f"OR {_agent_delegated_prompt(alias)} "
+        f"OR {alias}.text ~* {_AGENT_SCHEDULE_ENVELOPE_PATTERN} "
+        # Workflow dispatcher envelope with a run identity; no task vocabulary.
+        f"OR {alias}.text ~* 'this is run [0-9a-f-]{{36}} of the workflow' "
+        f"OR {alias}.text ~* 'this is an unattended agent session\\M' "
+        f"OR {raw} "
+        "@> '{\"isMeta\":true}'::jsonb "
+        f"OR {raw} "
+        "@> '{\"isCompactSummary\":true}'::jsonb)"
+    )
+    # CASE makes the evaluation order explicit: provider flags and envelopes
+    # settle the common automated cases without any cross-session lookup.
+    return f"(CASE WHEN {scalar} THEN true ELSE {_agent_broadcast_prompt(alias)} END)"
+
+
+def _agent_workspace(alias: str) -> str:
+    """A linked worktree's project and relative path, without its run slug."""
+    return f"regexp_replace({alias}.cwd, '(/\\.paseo/worktrees/[^/]+/)[^/]+/?', '\\1')"
+
+
+def _agent_repeated_opener(alias: str) -> str:
+    # The measured baseline treats four early user rows with the same
+    # 64-character opening prefix as recurring machinery, across providers/dates.
+    return f"""(length({alias}.text)>40 AND (
+        SELECT count(*) FROM (
+            SELECT 1 FROM @ai_conversation_events rep
+            WHERE rep.role='user' AND rep.seq<=5
+              AND left(rep.text,64)=left({alias}.text,64)
+            LIMIT 4) repetitions)>=4)"""
+
+
+def _agent_scheduled_prompt(alias: str) -> str:
+    # Fixed local clock, including DST, with stable project scope across fresh
+    # Paseo worktree slugs. Prefix probes use the existing first-prompt index.
+    daily = f"""(length({alias}.text) >= 8 AND {alias}.seq <= 5 AND (
+        SELECT count(*) FROM (
+            SELECT DISTINCT (rep.occurred_at AT TIME ZONE 'America/New_York')::date
+            FROM @ai_conversation_events rep
+            WHERE rep.role = 'user' AND rep.seq <= 5
+              AND left(rep.text, 64) = left({alias}.text, 64)
+              AND rep.text = {alias}.text AND rep.source = {alias}.source
+              AND {_agent_workspace('rep')} = {_agent_workspace(alias)}
+              AND rep.occurred_at BETWEEN {alias}.occurred_at - interval '7 days'
+                                      AND {alias}.occurred_at + interval '7 days'
+              AND least(
+                  abs(extract(epoch FROM ((rep.occurred_at AT TIME ZONE 'America/New_York')::time -
+                                          ({alias}.occurred_at AT TIME ZONE 'America/New_York')::time))),
+                  86400 - abs(extract(epoch FROM ((rep.occurred_at AT TIME ZONE 'America/New_York')::time -
+                                                 ({alias}.occurred_at AT TIME ZONE 'America/New_York')::time)))
+              ) <= 300
+            LIMIT 3
+        ) scheduled_days) >= 3)"""
+    # Weekly schedules can vary their instructions and use a fresh linked
+    # worktree each run. Keep their project scope, long opening prefix and
+    # weekday/clock-time evidence; local time tolerates daylight-saving changes.
+    weekly = f"""(length({alias}.text)>=40 AND {alias}.seq<=5 AND (
+        SELECT count(*) FROM (
+            SELECT DISTINCT (rep.occurred_at AT TIME ZONE 'America/New_York')::date
+            FROM @ai_conversation_events rep
+            WHERE rep.role='user' AND rep.seq<=5 AND rep.source={alias}.source
+              AND left(rep.text,64)=left({alias}.text,64)
+              AND {_agent_workspace('rep')}={_agent_workspace(alias)}
+              AND rep.occurred_at BETWEEN {alias}.occurred_at-interval '21 days'
+                                      AND {alias}.occurred_at+interval '21 days'
+              AND extract(isodow FROM rep.occurred_at AT TIME ZONE 'America/New_York')
+                  = extract(isodow FROM {alias}.occurred_at AT TIME ZONE 'America/New_York')
+              AND abs(extract(epoch FROM (
+                  (rep.occurred_at AT TIME ZONE 'America/New_York')::time -
+                  ({alias}.occurred_at AT TIME ZONE 'America/New_York')::time)))<=300
+            LIMIT 3
+        ) scheduled_weeks)>=3)"""
+    return f"(CASE WHEN {daily} THEN true ELSE {weekly} END)"
+
 _AGENT_ORCHESTRATED_PROMPT_PATTERN = (
-    "'^\\s*(you are |you''re |your (task|job|goal|mission|role)\\M|"
+    "'^\\s*(" + _AGENT_AUTOMATED_PROMPT_PREFIX + "|" + _AGENT_DISPATCH_PROMPT_PREFIX + "|you are |you''re |your (task|job|goal|mission|role)\\M|"
     "(pure |external |live )*(public )?web research|research task|"
     "(task|goal|context|mission|objective)\\s*[:—-]|\\*\\*(task|goal|context|objective)|"
     "<command-name>|\\x7b\"|small install task|work in /|in the repo (at )?/|"
@@ -3227,13 +3447,14 @@ _AGENT_ORCHESTRATED_PROMPT_PATTERN = (
 # agent source emitted 'self'. It also made those sessions' titles read
 # "<recommended_plugins> Here is a list of plugins...". The patterns are prefix
 # matches taken from the corpus, not guesses.
-_AGENT_INJECTED_PREAMBLE = (
-    "(e2.text LIKE '<recommended_plugins>%%' "
-    " OR e2.text LIKE '<environment_context>%%' "
-    " OR e2.text LIKE '<codex_internal_context%%' "
-    " OR e2.text LIKE '<local-command-caveat>%%' "
-    " OR e2.text LIKE '# AGENTS.md instructions for %%')"
-)
+def _agent_environment_preamble(alias: str) -> str:
+    return (
+        f"({alias}.text LIKE '<recommended_plugins>%%' "
+        f" OR {alias}.text LIKE '<environment_context>%%' "
+        f" OR {alias}.text LIKE '<codex_internal_context%%' "
+        f" OR {alias}.text LIKE '<local-command-caveat>%%' "
+        f" OR {alias}.text LIKE '# AGENTS.md instructions for %%')"
+    )
 
 
 # A Muse loop session has neither title source the roll-up reads: Muse writes
@@ -3288,6 +3509,42 @@ def _agent_session_adapter() -> TimelineAdapter:
     search document carries only those headline fields — transcript content
     is indexed per turn by the agent_session_turn adapter below.
     """
+    aggregate = f"""
+        SELECT
+            e.source,
+            e.session_id,
+            COALESCE(min(e.occurred_at) FILTER (WHERE e.occurred_at > {_EPOCH_GUARD}),
+                     max(e.ingested_at)) AS event_ts,
+            COALESCE(max(e.occurred_at) FILTER (WHERE e.occurred_at > {_EPOCH_GUARD}),
+                     {_EPOCH}) AS end_ts,
+            max(NULLIF(e.device, '')) AS device,
+            max(NULLIF(e.account, '')) AS account,
+            COALESCE(min(NULLIF(e.entrypoint, '')), '') AS entrypoint,
+            count(*) AS event_count,
+            count(*) FILTER (WHERE e.role = 'user') AS user_event_count,
+            count(*) FILTER (WHERE e.role = 'assistant') AS assistant_event_count,
+            count(*) FILTER (WHERE e.is_sidechain = 0) AS non_sidechain_count,
+            sum(e.output_tokens) AS output_tokens,
+            max(e.ingested_at) AS ingest_ts
+        FROM @ai_conversation_events e
+        {{changed_join}}
+        GROUP BY e.source, e.session_id
+    """
+    priority_sql = f"""CASE
+        WHEN s.source IN ('chatgpt', 'claude_desktop') THEN {TIMELINE_PRIORITY_SELF}
+        WHEN s.source = 'claude_code' AND s.session_id LIKE 'agent-%%'
+          THEN {TIMELINE_PRIORITY_BACKGROUND}
+        WHEN s.entrypoint IN ('subagent', 'codex_exec', 'zrl-claw')
+          THEN {TIMELINE_PRIORITY_BACKGROUND}
+        WHEN s.user_event_count = 0 OR s.non_sidechain_count = 0 OR fp.text IS NULL
+          THEN {TIMELINE_PRIORITY_BACKGROUND}
+        WHEN fp.text ~* {_AGENT_ORCHESTRATED_PROMPT_PATTERN}
+          OR st.session_title ~* {_AGENT_HARNESS_ENVELOPE_PATTERN}
+          THEN {TIMELINE_PRIORITY_BACKGROUND}
+        WHEN {_agent_harness_metadata('fp')} THEN {TIMELINE_PRIORITY_BACKGROUND}
+        WHEN {_agent_scheduled_prompt('fp')} THEN {TIMELINE_PRIORITY_BACKGROUND}
+        WHEN {_agent_repeated_opener('fp')} THEN {TIMELINE_PRIORITY_BACKGROUND}
+        ELSE {TIMELINE_PRIORITY_SELF} END"""
     rollup = f"""
         SELECT
             concat_ws('|', s.source, s.session_id) AS event_id,
@@ -3322,70 +3579,20 @@ def _agent_session_adapter() -> TimelineAdapter:
                            THEN {_muse_loop_session_title_sql()} END,
                       NULLIF(cw.cwd, ''), NULLIF(gb.git_branch, ''), NULLIF(ru.repo_url, '')) AS search_text,
             s.ingest_ts AS ingest_ts,
-            -- Interactive vs background (benchmark-tuned, sampling/ 2026-07,
-            -- re-audited 2026-08-26). chatgpt/claude_desktop are always human
-            -- conversations, and some sync as a header row with zero user
-            -- events. Cron/inter-session prompts, programmatic entrypoints,
-            -- orchestrator-shaped opening prompts, zero-user-turn transcripts,
-            -- and sidechain-only subagent transcripts are machinery.
-            CASE WHEN s.source IN ('chatgpt', 'claude_desktop') THEN {TIMELINE_PRIORITY_SELF}
-                 WHEN COALESCE(NULLIF(st.session_title, ''), fp.text, '') LIKE '[cron:%%'
-                   OR COALESCE(fp.text, '') LIKE '[cron:%%'
-                   OR COALESCE(fp.text, '') LIKE '[Inter-session message]%%'
-                   OR COALESCE(NULLIF(st.session_title, ''), fp.text, '') LIKE '[Subagent Context]%%'
-                   OR COALESCE(fp.text, '') LIKE '[Subagent Context]%%'
-                   THEN {TIMELINE_PRIORITY_BACKGROUND}
-                 WHEN s.entrypoint IN ('codex_exec', 'zrl-claw')
-                   THEN {TIMELINE_PRIORITY_BACKGROUND}
-                 WHEN fp.text ~* {_AGENT_ORCHESTRATED_PROMPT_PATTERN}
-                   THEN {TIMELINE_PRIORITY_BACKGROUND}
-                 WHEN s.user_event_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
-                 WHEN s.non_sidechain_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
-                 -- fp now skips harness-injected preambles, so a NULL here
-                 -- means the transcript has user rows but nobody ever typed
-                 -- one: a programmatic run, whatever its entrypoint says.
-                 WHEN fp.text IS NULL THEN {TIMELINE_PRIORITY_BACKGROUND}
-                 -- The same long opening prompt recurring across sessions is a
-                 -- scheduled routine (daily monitor runs), not a human typing.
-                 WHEN length(COALESCE(fp.text, '')) > 40 AND (
-                      SELECT count(*) FROM (
-                          SELECT 1 FROM @ai_conversation_events rep
-                          WHERE rep.role = 'user' AND rep.seq <= 5
-                            AND left(rep.text, 64) = left(fp.text, 64)
-                          LIMIT 4) reps) >= 4
-                   THEN {TIMELINE_PRIORITY_BACKGROUND}
-                 ELSE {TIMELINE_PRIORITY_SELF} END AS priority
-        FROM (
-            SELECT
-                e.source,
-                e.session_id,
-                COALESCE(min(e.occurred_at) FILTER (WHERE e.occurred_at > {_EPOCH_GUARD}),
-                         max(e.ingested_at)) AS event_ts,
-                COALESCE(max(e.occurred_at) FILTER (WHERE e.occurred_at > {_EPOCH_GUARD}),
-                         {_EPOCH}) AS end_ts,
-                max(NULLIF(e.device, '')) AS device,
-                max(NULLIF(e.account, '')) AS account,
-                COALESCE(min(NULLIF(e.entrypoint, '')), '') AS entrypoint,
-                count(*) AS event_count,
-                count(*) FILTER (WHERE e.role = 'user') AS user_event_count,
-                count(*) FILTER (WHERE e.role = 'assistant') AS assistant_event_count,
-                count(*) FILTER (WHERE e.is_sidechain = 0) AS non_sidechain_count,
-                sum(e.output_tokens) AS output_tokens,
-                max(e.ingested_at) AS ingest_ts
-            FROM @ai_conversation_events e
-            {{changed_join}}
-            GROUP BY e.source, e.session_id
-        ) s
+            {priority_sql} AS priority
+        FROM agent_session_page s
         LEFT JOIN LATERAL (
             SELECT e2.session_title FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id AND e2.session_title != ''
             ORDER BY e2.seq LIMIT 1
         ) st ON TRUE
         LEFT JOIN LATERAL (
-            SELECT e2.text FROM @ai_conversation_events e2
+            SELECT e2.text, e2.source, e2.session_id, e2.cwd, e2.seq, e2.occurred_at,
+                   e2.is_sidechain, e2.entrypoint, e2.git_branch, e2.raw_json
+            FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id
               AND e2.role = 'user' AND e2.text != ''
-              AND NOT {_AGENT_INJECTED_PREAMBLE}
+              AND NOT {_agent_environment_preamble('e2')}
             ORDER BY e2.seq LIMIT 1
         ) fp ON TRUE
         LEFT JOIN LATERAL (
@@ -3410,11 +3617,16 @@ def _agent_session_adapter() -> TimelineAdapter:
         ) ru ON TRUE
     """
     backfill_sql = f"""
-        SELECT * FROM ({rollup.format(changed_join="")}) roll
-        WHERE roll.event_ts <= %(cursor_ts)s
-          AND (roll.event_ts, roll.event_id) < (%(cursor_ts)s, %(cursor_id)s)
-        ORDER BY roll.event_ts DESC, roll.event_id DESC
-        LIMIT %(limit)s
+        WITH agent_session_page AS MATERIALIZED (
+            SELECT * FROM ({aggregate.replace('{changed_join}', '')}) candidate
+            WHERE candidate.event_ts <= %(cursor_ts)s
+              AND (candidate.event_ts, concat_ws('|', candidate.source, candidate.session_id))
+                  < (%(cursor_ts)s, %(cursor_id)s)
+            ORDER BY candidate.event_ts DESC, concat_ws('|', candidate.source, candidate.session_id) DESC
+            LIMIT %(limit)s
+        )
+        {rollup}
+        ORDER BY 4 DESC, 1 DESC
     """
     changed_join = """
         JOIN (
@@ -3424,10 +3636,15 @@ def _agent_session_adapter() -> TimelineAdapter:
         ) changed ON changed.source = e.source AND changed.session_id = e.session_id
     """
     incremental_sql = f"""
-        SELECT * FROM ({rollup.format(changed_join=changed_join)}) roll
-        WHERE (roll.ingest_ts, roll.event_id) > (%(watermark_ts)s, %(watermark_id)s)
-        ORDER BY roll.ingest_ts ASC, roll.event_id ASC
-        LIMIT %(limit)s
+        WITH agent_session_page AS MATERIALIZED (
+            SELECT * FROM ({aggregate.replace('{changed_join}', changed_join)}) candidate
+            WHERE (candidate.ingest_ts, concat_ws('|', candidate.source, candidate.session_id))
+                  > (%(watermark_ts)s, %(watermark_id)s)
+            ORDER BY candidate.ingest_ts ASC, concat_ws('|', candidate.source, candidate.session_id) ASC
+            LIMIT %(limit)s
+        )
+        {rollup}
+        ORDER BY 13 ASC, 1 ASC
     """
     return TimelineAdapter(
         name="agent_session",
@@ -3437,19 +3654,10 @@ def _agent_session_adapter() -> TimelineAdapter:
         backfill_sql=backfill_sql,
         incremental_sql=incremental_sql,
         max_ingest_sql="SELECT max(ingested_at) FROM @ai_conversation_events",
-        # The real rule, verbatim in intent from the rollup SELECT above: a
-        # session Zach actually drove is `self`; one whose opening user turn
-        # repeats near-identically across >=4 sessions is an automated harness
-        # firing the same prompt, so it is `background`. This field is metadata
-        # (the rollup computes the value), which is exactly why it drifted into
-        # a placeholder that named no rule at all -- the registration test only
-        # checks that it is non-empty.
-        priority_expression=(
-            f"CASE WHEN <opening user turn is orchestrator-shaped "
-            f"({_AGENT_ORCHESTRATED_PROMPT_PATTERN}) or repeats across >=4 sessions> "
-            f"THEN {TIMELINE_PRIORITY_BACKGROUND} ELSE {TIMELINE_PRIORITY_SELF} END"
-        ),
-        batch_size=10000,
+        priority_expression=priority_sql,
+        # Enrichment does several indexed probes per session after pagination.
+        # Keep historical pages small enough for the fast lane to stay responsive.
+        batch_size=1000,
     )
 
 
@@ -3470,8 +3678,8 @@ _TIMELINE_JIT_OFF_SQL = "SET jit = off"
 # Prefix matches taken from the two weeks of prod user turns on 2026-08-27
 # (675 heartbeat polls, 388 task notifications, 132 plugin preambles ...).
 _AGENT_HARNESS_USER_TURN_PATTERN = (
-    "'^\\s*(<task-notification>|<system-reminder>|<command-name>|<local-command-stdout>|"
-    "<realtime_delegation>|<local-command-caveat>|\\[openclaw heartbeat poll\\]|"
+    "'^\\s*(" + _AGENT_AUTOMATED_PROMPT_PREFIX + "|" + _AGENT_DISPATCH_PROMPT_PREFIX + "|<task-notification>|<system-reminder>|<command-name>|<local-command-stdout>|"
+    "<realtime_delegation>|<local-command-caveat>|"
     "\\[request interrupted|stop hook feedback:|\\[system notification|"
     "another claude session|\\[image: |a session-scoped stop hook|"
     # Codex's approval reviewer replays the session on the user channel: 241
@@ -3488,11 +3696,23 @@ _AGENT_HARNESS_USER_TURN_PATTERN = (
 # still never crowd the browse view. Until 2026-08-27 every turn was
 # background, which hid every sentence Zach ever typed from a
 # priorities => ARRAY['self'] search: only the session title was reachable.
+_AGENT_DELIVERED_TURN = f"""(
+    left(e.text,512) ~* '\\(relayed by (an?|another) agent\\M'
+    OR EXISTS (
+        SELECT 1 FROM agent_delivery_candidates delivered
+        WHERE delivered.occurred_at BETWEEN e.occurred_at-interval '{DELIVERY_WINDOW_MINUTES} minutes' AND e.occurred_at
+          AND (delivered.source<>e.source OR delivered.session_id<>e.session_id)
+          AND {delivery_text_matches('delivered.sent_text','e.delivery_prompt')}
+    ))"""
+
 _AGENT_TURN_PRIORITY = (
-    "CASE WHEN e.role = 'user' AND sess.priority = 'self' "
-    f"      AND NOT {_AGENT_INJECTED_PREAMBLE.replace('e2.', 'e.')} "
-    f"      AND e.text !~* {_AGENT_HARNESS_USER_TURN_PATTERN} "
-    f"     THEN {TIMELINE_PRIORITY_SELF} ELSE {TIMELINE_PRIORITY_BACKGROUND} END"
+    "CASE WHEN e.role = 'user' AND e.session_priority = 'self' THEN CASE "
+    f"WHEN {_agent_environment_preamble('e')} "
+    f"  OR e.text ~* {_AGENT_HARNESS_USER_TURN_PATTERN} THEN {TIMELINE_PRIORITY_BACKGROUND} "
+    f"WHEN {_agent_harness_metadata('e')} THEN {TIMELINE_PRIORITY_BACKGROUND} "
+    f"WHEN {_agent_scheduled_prompt('e')} THEN {TIMELINE_PRIORITY_BACKGROUND} "
+    f"WHEN {_AGENT_DELIVERED_TURN} THEN {TIMELINE_PRIORITY_BACKGROUND} "
+    f"ELSE {TIMELINE_PRIORITY_SELF} END ELSE {TIMELINE_PRIORITY_BACKGROUND} END"
 )
 
 def _agent_session_turn_adapter() -> TimelineAdapter:
@@ -3507,6 +3727,38 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
     turn is 'background' so the transcript never crowds the browse/priority
     views. Their `context` is '<source>|<session_id>', so
     timeline.context(ref) pages the surrounding turns of the same session.
+    """
+    page_rows = """
+        SELECT e.source, e.session_id, e.seq, e.occurred_at, e.role, e.text,
+               e.device, e.session_title, e.event_uuid, e.ingested_at, e.cwd,
+               e.git_branch, e.entrypoint, e.is_sidechain,
+               CASE WHEN e.role = 'user' THEN e.raw_json ELSE '' END AS raw_json
+        FROM @ai_conversation_events e
+        WHERE e.role IN ('user', 'assistant') AND e.text != ''
+    """
+    # Resolve parents and scan delivery tools only after the source page LIMIT.
+    # A page with no human-session user turns has a NULL window and reads no
+    # delivery candidates. Each source has the shared partial time index.
+    context_and_deliveries = f"""
+        agent_turn_context AS MATERIALIZED (
+            SELECT e.*,sess.priority AS session_priority,
+                CASE WHEN e.role='user' THEN {delivery_text('e.text')} ELSE '' END AS delivery_prompt
+            FROM agent_turn_page e
+            LEFT JOIN @timeline_events sess
+              ON sess.adapter = 'agent_session'
+             AND sess.event_id = concat_ws('|', e.source, e.session_id)
+        ), agent_delivery_window AS MATERIALIZED (
+            SELECT min(occurred_at)-interval '{DELIVERY_WINDOW_MINUTES} minutes' AS since,
+                   max(occurred_at) AS until
+            FROM agent_turn_context WHERE role='user' AND session_priority='self'
+        ), agent_delivery_candidates AS MATERIALIZED (
+            SELECT delivery.source,delivery.session_id,delivery.occurred_at,
+                   {delivery_text('delivery.tool_input_json')} AS sent_text
+            FROM @ai_conversation_events delivery
+            WHERE {delivery_call_predicate('delivery')}
+              AND delivery.occurred_at >= (SELECT since FROM agent_delivery_window)
+              AND delivery.occurred_at <= (SELECT until FROM agent_delivery_window)
+        )
     """
     select = f"""
         SELECT
@@ -3526,27 +3778,31 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
             concat_ws(E'\n', NULLIF(e.session_title, ''), NULLIF(e.text, '')) AS search_text,
             e.ingested_at AS ingest_ts,
             {_AGENT_TURN_PRIORITY} AS priority
-        FROM @ai_conversation_events e
-        LEFT JOIN @timeline_events sess
-          ON sess.adapter = 'agent_session'
-         AND sess.event_id = concat_ws('|', e.source, e.session_id)
-        WHERE e.role IN ('user', 'assistant') AND e.text != ''
+        FROM agent_turn_context e
     """
     backfill_sql = f"""
-        {select}
+        WITH agent_turn_page AS MATERIALIZED (
+        {page_rows}
           AND e.occurred_at <= %(cursor_ts)s
           AND (e.occurred_at, concat_ws('|', e.source, e.session_id, e.seq::text))
               < (%(cursor_ts)s, %(cursor_id)s)
-        ORDER BY 4 DESC, 1 DESC
+        ORDER BY e.occurred_at DESC, concat_ws('|', e.source, e.session_id, e.seq::text) DESC
         LIMIT %(limit)s
+        ), {context_and_deliveries}
+        {select}
+        ORDER BY 4 DESC, 1 DESC
     """
     incremental_sql = f"""
-        {select}
+        WITH agent_turn_page AS MATERIALIZED (
+        {page_rows}
           AND e.ingested_at >= %(watermark_ts)s
           AND (e.ingested_at, concat_ws('|', e.source, e.session_id, e.seq::text))
               > (%(watermark_ts)s, %(watermark_id)s)
-        ORDER BY 13 ASC, 1 ASC
+        ORDER BY e.ingested_at ASC, concat_ws('|', e.source, e.session_id, e.seq::text) ASC
         LIMIT %(limit)s
+        ), {context_and_deliveries}
+        {select}
+        ORDER BY 13 ASC, 1 ASC
     """
     return TimelineAdapter(
         name="agent_session_turn",
@@ -4419,6 +4675,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "script_runs": _state("script execution telemetry, not real-world activity; daily summary in marts_ops.script_runs"),
     "search_request_timing_state": _state("the search-timing writer's ten-minute heartbeat"),
     "timeline_priority_mix": _state("per-source priority-tier counts over the last seven days (collector snapshot)"),
+    "priority_benchmark_labels": _state("private priority benchmark labels and required sample sizes"),
+    "priority_benchmark_results": _state("aggregate priority benchmark measurements for marts_ops"),
     "agent_usage": _state("how agents use PDW over a trailing window (daily collector snapshot)"),
     "agent_failure_shapes": _state("failed agent calls to PDW by shape per ISO week (daily collector snapshot)"),
     "search_benchmark_runs": _state("weekly search benchmark: latency and labeled quality per mode"),
@@ -4995,21 +5253,7 @@ class TimelineSyncEngine:
             cursor.execute("SELECT to_regclass(%s) IS NOT NULL", (gmail_messages,))
             if not cursor.fetchone()[0]:
                 return
-            cursor.execute(
-                self._source_sql(
-                    """
-                    SELECT lower(COALESCE(NULLIF(substring(rcpt FROM '<([^>]+)>'), ''), rcpt)) AS addr,
-                           count(*) AS n_sent_to,
-                           max(m.internal_date) AS last_sent_at
-                    FROM @gmail_messages m
-                    CROSS JOIN LATERAL unnest(m.to_addresses) AS rcpt
-                    WHERE m.from_address ILIKE '%%' || m.account || '%%'
-                       OR EXISTS (SELECT 1 FROM @gmail_sync_state s
-                                  WHERE s.account <> '' AND m.from_address ILIKE '%%' || s.account || '%%')
-                    GROUP BY 1
-                    """
-                )
-            )
+            cursor.execute(self._source_sql(gmail_correspondents_sql()))
             rows = cursor.fetchall()
         with self._dest_conn.cursor() as cursor:
             cursor.execute(self._dest_sql("DELETE FROM @timeline_gmail_correspondents"))

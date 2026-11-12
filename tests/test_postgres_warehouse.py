@@ -2153,6 +2153,8 @@ def test_postgres_ai_conversation_event_tables_create_read_path_indexes(
         assert f"{table}_session_seq_idx" in index_names, table
         assert f"{table}_occurred_at_idx" in index_names, table
         assert f"{table}_first_prompt_idx" in index_names, table
+        assert f"{table}_broadcast_prompt_idx" in index_names, table
+        assert f"{table}_agent_delivery_idx" in index_names, table
         assert f"{table}_ingested_at_idx" in index_names, table
 
 

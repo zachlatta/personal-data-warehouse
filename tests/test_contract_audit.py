@@ -12,6 +12,27 @@ from personal_data_warehouse.search_benchmark import SearchResult
 from scripts import contract_audit
 
 
+@pytest.mark.parametrize("missing_tier,quality,expected", [
+    (False, "ok", "green"),
+    (True, "ok", "yellow"),
+    (False, "failing", "red"),
+    (False, None, "red"),
+])
+def test_c2_requires_five_tiers_and_passing_labeled_correctness(monkeypatch, missing_tier, quality, expected):
+    tiers = ["self", "direct", "cc", "noise", "background"]
+    if missing_tier:
+        tiers.pop()
+    def query(question, sql):
+        if question == "priority mix":
+            return [dict(source="example", priority=t, status="ok", events_7d=1) for t in tiers]
+        if quality is None:
+            return None
+        return [dict(adapter=a, status=quality, accuracy=1, missing=0)
+                for a in ("slack_message", "agent_session_turn", "agent_session", "gmail_email")]
+    monkeypatch.setattr(contract_audit, "pdw_sql", query)
+    assert contract_audit.c2_priority_tiers().status == expected
+
+
 def _search_payload(**overrides: object) -> str:
     payload: dict[str, object] = {
         "mode": "hybrid",

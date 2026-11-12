@@ -263,7 +263,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # Android bucket, because the base table repeats a bucket per upload.
             # +1 marts: marts_ops.source_upstream_health, each source's own
             # newest item against base_* (C11).
-            "marts": 76,  # daily script pilot usage
+            # +1 marts: marts_ops.timeline_priority_correctness, the C2 verdict.
+            "marts": 77,  # daily script pilot usage
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -291,11 +292,12 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +2 ops: ops.search_request_timings (one row per real search, C6) and
         # ops.search_request_timing_state (its writer's heartbeat).
         # +1 ops: ops.answer_benchmark_runs, one row of counts per C16 run.
+        # +1 ops: ops.priority_benchmark_results, the daily C2 measurement.
         # +1 ops: ops.source_upstream_observations, what each source itself
         # says is its newest item (C11).
         # +4 ops: mutation auto-approval policies, their grants, every policy
         # decision, and the kill switch (app/internal/mutations/policy_store.go).
-            "ops": 54,  # outgoing feed projection and script-run telemetry
+        "ops": 55,  # outgoing feed projection and script-run telemetry
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).
@@ -303,7 +305,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # master secret and the single-use cli_authorize codes.
         # +2 private: private.answer_benchmark_questions and _results, C16's
         # real questions, gold answers and the agent's graded answers.
-        "private": 17,  # encrypted MCP connections, HN session
+        # +1 private: private.priority_benchmark_labels, the C2 label mirror.
+        "private": 18,  # encrypted MCP connections, HN session
         # +2 internal: the row-trigger functions that keep
         # derived_search.chunk_vectors in step with chunks and embeddings.
         # +2 internal: the Feed tab's card-versioning trigger and the guard
