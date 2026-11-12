@@ -8182,24 +8182,13 @@ class PostgresWarehouse:
                 rows = int(cursor.fetchone()[0] or 0)
             except psycopg2.errors.QueryCanceled:
                 cursor.execute("ROLLBACK")
-                # A partial warm still counts: the pages it read are cached,
-                # and retrying at once would keep the disk saturated.
-                self._record_heap_prewarm()
+                # A partial warm: the pages it read stay cached.
                 return {"heap_rows": None, "timed_out": True}
             except Exception:
                 cursor.execute("ROLLBACK")
                 raise
             cursor.execute("COMMIT")
-        self._record_heap_prewarm()
         return {"heap_rows": rows, "timed_out": False}
-
-    def _record_heap_prewarm(self) -> None:
-        self._ensure_search_schema_state_table()
-        self._command(
-            "INSERT INTO @search_schema_state (id, signature, heap_prewarmed_at) "
-            "VALUES (1, '', clock_timestamp()) "
-            "ON CONFLICT (id) DO UPDATE SET heap_prewarmed_at = EXCLUDED.heap_prewarmed_at"
-        )
 
     def probe_bm25_indexes(self) -> dict[str, str]:
         """Scan rows through every BM25 index in the warehouse; return errors by name.
@@ -17282,8 +17271,6 @@ class PostgresWarehouse:
             "prewarmed_index_fingerprint text NOT NULL DEFAULT '', "
             "prewarmed_at timestamptz NOT NULL "
             "DEFAULT '1970-01-01 00:00:00+00'::timestamptz, "
-            "heap_prewarmed_at timestamptz NOT NULL "
-            "DEFAULT '1970-01-01 00:00:00+00'::timestamptz, "
             "CONSTRAINT search_schema_state_single_row CHECK (id = 1))"
         )
         rel = canonical_relation(self._SEARCH_SCHEMA_MARKER_TABLE).with_namespace(
@@ -17304,10 +17291,6 @@ class PostgresWarehouse:
             ),
             "prewarmed_index_fingerprint": "text NOT NULL DEFAULT ''",
             "prewarmed_at": (
-                "timestamptz NOT NULL DEFAULT "
-                "'1970-01-01 00:00:00+00'::timestamptz"
-            ),
-            "heap_prewarmed_at": (
                 "timestamptz NOT NULL DEFAULT "
                 "'1970-01-01 00:00:00+00'::timestamptz"
             ),
@@ -17424,14 +17407,6 @@ class PostgresWarehouse:
         if rows:
             return str(rows[0][0]), rows[0][1], str(rows[0][2])
         return "", datetime.fromtimestamp(0, tz=UTC), ""
-
-    def search_heap_prewarmed_at(self) -> datetime:
-        """When the attention-tier timeline heap was last warmed (the epoch if never)."""
-        self._ensure_search_schema_state_table()
-        rows = self._query("SELECT heap_prewarmed_at FROM @search_schema_state WHERE id = 1")
-        if rows and rows[0][0] is not None:
-            return rows[0][0]
-        return datetime.fromtimestamp(0, tz=UTC)
 
     def search_prewarmed_at(self) -> datetime:
         """When the search indexes were last warmed (the epoch if never)."""

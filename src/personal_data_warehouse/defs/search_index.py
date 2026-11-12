@@ -36,7 +36,6 @@ from personal_data_warehouse.search_index import (
     record_bm25_index_bloat,
     record_search_cache_residency,
     rewarm_search_indexes_if_cold,
-    rewarm_timeline_heap_if_cold,
 )
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 
@@ -156,18 +155,6 @@ def search_chunks(context) -> MaterializeResult:
                             context.log.info("Re-warmed cold search cache: %s", warm)
                     except Exception as error:  # cache repair must not fail the builder
                         context.log.error("Could not re-warm search cache: %s", error)
-                    # The heap the lexical pool reads decays within hours and
-                    # the index guard never looks at it: its own floor, its
-                    # own hourly clock. An index warm above already warmed it
-                    # and reset that clock.
-                    try:
-                        heap_warm = rewarm_timeline_heap_if_cold(
-                            warehouse, residency.get("timeline_heap")
-                        )
-                        if heap_warm.get("warmed"):
-                            context.log.info("Re-warmed cold timeline heap: %s", heap_warm)
-                    except Exception as error:  # cache repair must not fail the builder
-                        context.log.error("Could not re-warm timeline heap: %s", error)
             except Exception as error:
                 warehouse.write_search_health("chunks", last_error=str(error)[:500])
                 raise

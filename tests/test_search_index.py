@@ -22,13 +22,9 @@ from personal_data_warehouse.search_index import (
     SearchChunkBuilder,
     SearchEmbeddingRunner,
     _EmbedBudget,
-    SEARCH_HEAP_REWARM_FLOOR,
-    SEARCH_HEAP_REWARM_MIN_INTERVAL,
     record_search_cache_residency,
     rewarm_search_indexes_if_cold,
-    rewarm_timeline_heap_if_cold,
     should_rewarm_search_indexes,
-    should_rewarm_timeline_heap,
     split_text,
     vector_literal,
     window_start,
@@ -890,6 +886,33 @@ def test_record_search_cache_residency_refreshes_the_living_health_row() -> None
     assert component == "timeline_heap_residency"
     assert facts["resident_bytes"] == 800 and facts["total_bytes"] == 8_000
     assert facts["resident_fraction"] == 0.1
+    assert facts["last_error"] == ""
+
+
+def test_a_failing_heap_gauge_is_its_own_error_and_keeps_the_index_gauge() -> None:
+    class Warehouse:
+        def __init__(self) -> None:
+            self.writes = []
+
+        def measure_search_cache_residency(self):
+            return {"target_count": 5, "resident_bytes": 2_500, "total_bytes": 10_000, "resident_fraction": 0.25}
+
+        def measure_timeline_heap_residency(self):
+            raise RuntimeError("pg_buffercache extension is not installed")
+
+        def write_search_health(self, component, **facts):
+            self.writes.append((component, facts))
+
+    warehouse = Warehouse()
+    measured = record_search_cache_residency(warehouse)
+
+    assert measured["resident_fraction"] == 0.25
+    assert [component for component, _ in warehouse.writes] == [
+        "cache_residency",
+        "timeline_heap_residency",
+    ]
+    assert warehouse.writes[0][1]["last_error"] == ""
+    assert "pg_buffercache" in warehouse.writes[1][1]["last_error"]
 
 
 def test_timeline_heap_residency_is_measured_and_shown_beside_the_indexes(
@@ -953,63 +976,28 @@ def test_a_cold_cache_is_rewarmed_within_the_working_day() -> None:
     )
 
 
-def test_a_cold_timeline_heap_is_rewarmed_on_its_own_hourly_clock() -> None:
-    """The attention heap decays within hours, and the index guard never sees it.
+def test_the_heap_warm_runs_only_inside_the_full_search_cache_warm() -> None:
+    """No separate heap re-warm: under search load it held ~10 minutes.
 
-    Measured on production 2026-11-11/12: a warm left the heap 18.1% resident
-    in shared buffers, and two hours later it read 3.2% there and 0.7% in the
-    page cache, with fresh scoped searches back at 1.3-8.0 s. The index guard
-    acts on index residency every six hours only, so the heap has its own
-    floor and a one-hour clock.
+    Production 2026-11-12: the attention heap read 16.5% of the timeline
+    heap in shared buffers right after a warm at 02:46Z, and 3.4% at
+    02:55:51Z, after an agent's ~30 scoped searches pulled the index
+    residency from 0.117 to 0.494. HNSW pages with higher usage counts
+    displaced the heap pages the warm had loaded once. An hourly heap warm
+    would buy about ten warm minutes an hour for up to 134 GB/day of reads,
+    so the heap is warmed only with the indexes (deploy, restart, REINDEX,
+    the six-hourly cold-index guard). Memory is the fix for the rest.
     """
-    now = datetime(2026, 11, 12, 3, 0, tzinfo=UTC)
-    assert SEARCH_HEAP_REWARM_FLOOR == 0.10
-    assert SEARCH_HEAP_REWARM_MIN_INTERVAL == timedelta(hours=1)
-    cold = 0.05
-    assert should_rewarm_timeline_heap(
-        resident_fraction=cold, last_warmed_at=now - timedelta(minutes=61), now=now
+    import inspect
+
+    import personal_data_warehouse.defs.search_index as search_index_defs
+    import personal_data_warehouse.search_index as search_index_module
+
+    assert "warm_attention_heap" not in inspect.getsource(search_index_defs)
+    assert "warm_attention_heap" not in inspect.getsource(search_index_module)
+    assert "self.warm_attention_heap()" in inspect.getsource(
+        PostgresWarehouse.prewarm_search_indexes_if_needed
     )
-    assert not should_rewarm_timeline_heap(
-        resident_fraction=cold, last_warmed_at=now - timedelta(minutes=30), now=now
-    )
-    assert not should_rewarm_timeline_heap(
-        resident_fraction=0.15, last_warmed_at=now - timedelta(days=1), now=now
-    )
-    assert not should_rewarm_timeline_heap(
-        resident_fraction=-1, last_warmed_at=now - timedelta(days=1), now=now
-    )
-
-
-def test_rewarm_timeline_heap_warms_only_the_heap_and_says_why() -> None:
-    class Warehouse:
-        def __init__(self, warmed_at):
-            self.warmed_at = warmed_at
-            self.heap_warms = 0
-
-        def search_heap_prewarmed_at(self):
-            return self.warmed_at
-
-        def warm_attention_heap(self):
-            self.heap_warms += 1
-            return {"heap_rows": 42, "timed_out": False}
-
-        def prewarm_search_indexes_if_needed(self, **_kwargs):
-            raise AssertionError("a heap re-warm must not re-read the indexes")
-
-    now = datetime(2026, 11, 12, 3, 0, tzinfo=UTC)
-    cold = Warehouse(now - timedelta(hours=2))
-    result = rewarm_timeline_heap_if_cold(cold, {"resident_fraction": 0.032}, now=now)
-    assert cold.heap_warms == 1
-    assert result["warmed"] is True and result["heap_rows"] == 42
-    assert "0.03" in result["reason"]
-
-    recent = Warehouse(now - timedelta(minutes=10))
-    result = rewarm_timeline_heap_if_cold(recent, {"resident_fraction": 0.032}, now=now)
-    assert recent.heap_warms == 0 and result["warmed"] is False
-
-    unmeasured = Warehouse(now - timedelta(hours=2))
-    assert rewarm_timeline_heap_if_cold(unmeasured, None, now=now)["warmed"] is False
-    assert unmeasured.heap_warms == 0
 
 
 def test_rewarm_forces_a_prewarm_when_cold_and_records_why() -> None:

@@ -456,12 +456,8 @@ def test_attention_heap_warm_reads_the_tier_heap_through_a_prefetched_bitmap_sca
     )
     warehouse._command("ANALYZE @timeline_events")
 
-    assert warehouse.search_heap_prewarmed_at() == datetime.fromtimestamp(0, tz=UTC)
     result = warehouse.warm_attention_heap()
     assert result == {"heap_rows": 90, "timed_out": False}
-    # The heap re-warm keeps its own clock, separate from the index warm's.
-    assert datetime.now(tz=UTC) - warehouse.search_heap_prewarmed_at() < timedelta(minutes=5)
-    assert warehouse.search_prewarmed_at() == datetime.fromtimestamp(0, tz=UTC)
 
     warehouse._command("BEGIN")
     try:
@@ -477,6 +473,31 @@ def test_attention_heap_warm_reads_the_tier_heap_through_a_prefetched_bitmap_sca
     # The warm runs inside the five-minute search_chunks job, after a chunk
     # build of up to 240 s: its budget must leave the tick room to finish.
     assert dict(ATTENTION_HEAP_WARM_SETTINGS)["statement_timeout"] == "180s"
+
+
+def test_a_heap_warm_cut_off_by_its_budget_is_a_partial_warm(
+    warehouse: PostgresWarehouse, monkeypatch
+) -> None:
+    """On a saturated disk the 180 s budget ends the warm: that is a partial
+    warm reported as such, never an error that fails the search_chunks pass,
+    and it leaves the session as it found it."""
+    import personal_data_warehouse.postgres as postgres_module
+
+    _ensure_all_table_groups(warehouse)
+    monkeypatch.setattr(
+        postgres_module,
+        "ATTENTION_HEAP_WARM_SETTINGS",
+        (("statement_timeout", "50ms"),),
+    )
+    monkeypatch.setattr(
+        warehouse, "_attention_heap_warm_sql", lambda: "SELECT count(*) FROM pg_sleep(5)"
+    )
+    started = time.monotonic()
+    assert warehouse.warm_attention_heap() == {"heap_rows": None, "timed_out": True}
+    assert time.monotonic() - started < 4
+    # SET LOCAL ended with the rolled-back transaction, and the connection works.
+    assert warehouse._query("SHOW statement_timeout")[0][0] != "50ms"
+    assert warehouse._query("SELECT 1") == [(1,)]
 
 
 def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(

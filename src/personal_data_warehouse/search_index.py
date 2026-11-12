@@ -112,58 +112,6 @@ SEARCH_RESIDENCY_REWARM_FLOOR = 0.20
 SEARCH_RESIDENCY_REWARM_MIN_INTERVAL = timedelta(hours=6)
 
 
-#: Shared-buffer residency of the timeline heap below which the attention-tier
-#: heap is re-warmed. The attention rows sit on ~14% of the heap's pages, so a
-#: warm reads ~18% (18.1% on production 2026-11-11) and 10% means most of it
-#: is gone again.
-SEARCH_HEAP_REWARM_FLOOR = 0.10
-#: The heap has its own, shorter clock. Production 2026-11-11/12: 18.1% right
-#: after a warm, 3.2% (and 0.7% in the page cache) two hours later, with fresh
-#: scoped searches back at 1.3-8.0 s; the six-hour index interval would leave
-#: it cold most of the day. One warm reads ~5.6 GB in about a minute.
-SEARCH_HEAP_REWARM_MIN_INTERVAL = timedelta(hours=1)
-
-
-def should_rewarm_timeline_heap(
-    *, resident_fraction: float, last_warmed_at: datetime, now: datetime
-) -> bool:
-    """Whether the attention-tier timeline heap should be re-read into the cache."""
-
-    if resident_fraction < 0:
-        return False  # unmeasured, never evidence of cold
-    if resident_fraction >= SEARCH_HEAP_REWARM_FLOOR:
-        return False
-    return now - last_warmed_at >= SEARCH_HEAP_REWARM_MIN_INTERVAL
-
-
-def rewarm_timeline_heap_if_cold(
-    warehouse: Any, heap_measured: dict[str, Any] | None, *, now: datetime | None = None
-) -> dict[str, Any]:
-    """Re-warm only the attention heap when its residency gauge reads cold.
-
-    86% of a cold scoped lexical leg's reads are these heap pages, and the
-    index re-warm, which acts on index residency, never looks at them.
-    """
-
-    now = now or datetime.now(tz=UTC)
-    if not heap_measured:
-        return {"warmed": False, "reason": "heap residency unmeasured"}
-    fraction = float(heap_measured.get("resident_fraction", -1))
-    last = warehouse.search_heap_prewarmed_at()
-    if not should_rewarm_timeline_heap(resident_fraction=fraction, last_warmed_at=last, now=now):
-        return {
-            "warmed": False,
-            "reason": f"heap residency {fraction:.2f}, last warmed {last.isoformat()}",
-        }
-    result = warehouse.warm_attention_heap()
-    return {
-        "warmed": True,
-        "heap_rows": result.get("heap_rows"),
-        "timed_out": result.get("timed_out"),
-        "reason": f"heap cold ({fraction:.2f}) and last warmed {last.isoformat()}",
-    }
-
-
 def should_rewarm_search_indexes(
     *, resident_fraction: float, last_prewarmed_at: datetime, now: datetime
 ) -> bool:
@@ -263,14 +211,11 @@ def record_search_cache_residency(warehouse: Any) -> dict[str, int | float]:
     )
     # The lexical pool's cold reads are mostly timeline heap pages, which the
     # index gauge above cannot see (86% of them on 2026-11-11).
-    measured = dict(measured)
-    measured["timeline_heap"] = None
     try:
         heap = warehouse.measure_timeline_heap_residency()
     except Exception as error:  # noqa: BLE001 - one gauge must not hide the other
         warehouse.write_search_health("timeline_heap_residency", last_error=str(error)[:500])
     else:
-        measured["timeline_heap"] = heap
         warehouse.write_search_health(
             "timeline_heap_residency",
             configured=1,
