@@ -226,8 +226,8 @@ Streaming in full is cheap precisely because the conversation is new.
 **Slack's API cannot tell PDW which conversations have new messages, so the freshness pass
 polls.** `conversations.list` returns no last-message marker — its `updated` tracks topic and
 member edits (measured 2026-10-01, it matched the newest message for 16 of 116 recently
-active DMs) — so the only way to find a message is `conversations.history` on the
-conversation. From 2026-08-24 the sync asked Slack's own `client.counts` instead, in one
+active DMs; the one exception, a DM's first message, is below) — so the only way to find
+a message is `conversations.history` on the conversation. From 2026-08-24 the sync asked Slack's own `client.counts` instead, in one
 request through Zach's pasted web session; on 2026-10-01 Slack answered
 `team_is_restricted` to a fresh, valid session (`auth.test` accepted it) and the change feed
 was removed. Polling is the design.
@@ -317,8 +317,8 @@ Nothing cheaper can tell PDW which DMs moved: on 2026-11-11 the workspace token 
 `not_allowed_token_type` from both `client.counts` and `users.counts`, and the session is
 off polling (below).
 
-**Three things kept warm DMs at fifteen minutes after that (2026-11-11, an hour after
-deploy).**
+**Never-written DMs, due times between passes, and channel intervals (2026-11-11, an
+hour after deploy).** Warm DMs were still polled about every fifteen minutes, not ten.
 
 - **A DM that never held a message was dated by Slack's `updated`.** 2,198 of ~6,800 DMs
   and group DMs had never held a message, so they had no cursor, and the scheduler fell back

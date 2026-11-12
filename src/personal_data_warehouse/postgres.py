@@ -15620,7 +15620,9 @@ class PostgresWarehouse:
                 -- team_is_restricted on 2026-10-01 and removed), so every type
                 -- is judged. DMs, group DMs and private channels: the freshness
                 -- pass's coldest interval is twelve hours on the OAuth token
-                -- (SLACK_FRESHNESS_DUE_INTERVALS), so twenty-four with margin.
+                -- (SLACK_FRESHNESS_DUE_INTERVALS, and
+                -- SLACK_FRESHNESS_CHANNEL_DUE_INTERVALS for channels), so
+                -- twenty-four with margin.
                 -- Public channels: the sweep's own rotation (~2 days) with margin.
                 --
                 -- landing_p95_seconds is judged for the two DM types only, where
@@ -15763,9 +15765,11 @@ class PostgresWarehouse:
                 -- due every ten minutes (two hours past the warm window,
                 -- twelve past the cool one), and the message landed inside
                 -- that interval plus a margin. A message into a hot DM is
-                -- always judged (the CASE is NULL). A brand-new conversation
-                -- has no anchor; discovery polls it at once, so it stays
-                -- judged too.
+                -- always judged (the CASE is NULL). A first message has no
+                -- anchor -- in a brand-new conversation, which discovery polls
+                -- at once, or in one never written in, which the freshness
+                -- pass polls once conversations.list moves its `updated` --
+                -- so it stays judged too.
                 SELECT
                     a.account,
                     a.team_id,

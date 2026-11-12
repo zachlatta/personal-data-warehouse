@@ -3834,7 +3834,7 @@ def test_freshness_polls_channels_on_their_own_slower_intervals(monkeypatch):
     for less: a private or member public channel active within two weeks is due
     every thirty minutes, not ten, and a member public channel active in the last
     two hours is no longer every pass. A hot private channel still is. Measured
-    2026-11-11, DMs and group DMs need ~210 of the ~250 polls a pass makes; on
+    2026-11-11, DMs and group DMs need ~187 of the ~250 polls a pass makes; on
     the DM intervals channels Zach is in asked for ~110 more and warm private
     channels went p50 58 / max 106 minutes between polls."""
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
