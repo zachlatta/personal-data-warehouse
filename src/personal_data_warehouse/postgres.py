@@ -6754,8 +6754,7 @@ class PostgresWarehouse:
                     NULLIF(collected_at, {epoch}) AS collected_at,
                     NULLIF(sla_detector, '') AS sla_detector,
                     NULLIF(sla_detector_status, '') AS sla_detector_status,
-                    NULLIF(sla_exemption, '') AS sla_exemption,
-                    NULLIF(sla_exemption_kind, '') AS sla_exemption_kind
+                    NULLIF(sla_exemption, '') AS sla_exemption
                 FROM @pipeline_health
             ),
             judged AS (
@@ -6883,10 +6882,7 @@ class PostgresWarehouse:
                             secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
                     ELSE sla_detector_status
                 END AS sla_detector_status,
-                sla_exemption,
-                -- structural: no comparison can exist; deferred: one can and
-                -- has not been built (C11 reads yellow while any remain).
-                sla_exemption_kind
+                sla_exemption
             FROM classified
             """,
         )

@@ -201,19 +201,12 @@ func (r *Runner) observeNewest(snapshot *Snapshot, observedAt time.Time) {
 			newest = m
 		}
 	}
-	obs := ingestclient.SourceObservation{
-		Pipeline:   "apple_messages",
-		Scope:      r.Account,
-		Detail:     fmt.Sprintf("chat.db snapshot: newest of %d messages", len(snapshot.Messages)),
-		ObservedAt: common.ISOFormat(observedAt),
+	newestAt, newestID := time.Time{}, ""
+	if newest != nil {
+		newestAt, newestID = newest.MessageAt, newest.MessageID
 	}
-	if newest != nil && !newest.MessageAt.IsZero() {
-		obs.NewestAt = common.ISOFormat(newest.MessageAt)
-		obs.NewestID = newest.MessageID
-	}
-	if _, err := r.Client.PostSourceObservation(obs); err != nil {
-		r.Logger.Warningf("Could not post the Apple Messages source observation: %v", err)
-	}
+	ingestclient.Observe(r.Client.PostSourceObservation, r.Logger, "apple_messages", r.Account, newestAt, newestID,
+		fmt.Sprintf("chat.db snapshot: newest of %d messages", len(snapshot.Messages)), observedAt)
 }
 
 func dirOf(path string) string {

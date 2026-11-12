@@ -1,6 +1,7 @@
 package applenotes
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -201,4 +202,30 @@ func TestEnsureNotesAppRunning(t *testing.T) {
 		t.Fatalf("kill switch: %+v", kick)
 	}
 	_ = os.Getenv
+}
+
+// C11: the observation is the newest note modification on the Mac, in the
+// same field each revision carries as modified_at, so a healthy source lands.
+func TestRunnerObservesTheNoteStoresNewestEdit(t *testing.T) {
+	client := &fakeClient{}
+	var observed []ingestclient.SourceObservation
+	runner := &Runner{Account: "zach@example.com", Client: client, Logger: &common.RecordingLogger{},
+		State: EmptyState("zach@example.com", "/store"),
+		Now:   func() time.Time { return time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC) },
+		Observe: func(o ingestclient.SourceObservation) (map[string]any, error) {
+			observed = append(observed, o)
+			return nil, errors.New("a failed post never fails the upload")
+		}}
+	if _, err := runner.syncNotes(syntheticNotes(t)); err != nil {
+		t.Fatal(err)
+	}
+	newest := ""
+	for _, payload := range client.revisions {
+		if at := payload["note"].(map[string]any)["modified_at"].(string); at > newest {
+			newest = at
+		}
+	}
+	if len(observed) != 1 || observed[0].Pipeline != "apple_notes" || observed[0].NewestAt != newest || observed[0].NewestID == "" {
+		t.Fatalf("observed = %+v, newest uploaded = %s", observed, newest)
+	}
 }

@@ -19,6 +19,7 @@
 package androidmessages
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +74,9 @@ type Runner struct {
 	AttachmentBytesPerRun int64
 	DryRun                bool
 	BeforeUploadCheck     func() string
+	// Observe posts the phone's own newest message (contract C11); nil
+	// disables it.
+	Observe ingestclient.ObservationPoster
 }
 
 type state struct {
@@ -129,6 +133,7 @@ func (r *Runner) Sync() (Summary, error) {
 	if err != nil {
 		return summary, err
 	}
+	r.observeNewest(db, sinceMS)
 	messages, locations, err := readMessages(db, sinceMS, st.MaxID, recentMS)
 	db.Close()
 	if err != nil {
@@ -271,4 +276,28 @@ func writeState(path string, st state) error {
 		return err
 	}
 	return common.WriteFileAtomic(path, raw, 0o600)
+}
+
+// observeNewest posts bugle_db's own newest message by received_timestamp,
+// the field the warehouse stores as message_at, before anything is sent
+// (contract C11). Only messages on or after Since are ever uploaded, so only
+// those are compared.
+func (r *Runner) observeNewest(db *sql.DB, sinceMS int64) {
+	if r.Observe == nil || r.DryRun {
+		return
+	}
+	rows, err := common.Query(db, `SELECT _id AS bugle_id, received_timestamp AS received_ms FROM messages
+		WHERE received_timestamp >= ?1 ORDER BY received_timestamp DESC LIMIT 1`, sinceMS)
+	if err != nil {
+		r.Logger.Warningf("Could not read the newest Android message for C11: %v", err)
+		return
+	}
+	var newestAt time.Time
+	newestID := ""
+	if len(rows) == 1 {
+		newestAt = time.UnixMilli(intOf(rows[0].Values["received_ms"])).UTC()
+		newestID = fmt.Sprint(intOf(rows[0].Values["bugle_id"]))
+	}
+	ingestclient.Observe(r.Observe, r.Logger, "android_messages", r.Account+"/"+r.Device, newestAt, newestID,
+		"bugle_db: the newest received_timestamp", r.Now())
 }

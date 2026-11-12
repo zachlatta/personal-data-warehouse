@@ -70,6 +70,9 @@ type Runner struct {
 	// non-empty reason defers the whole run. The CLI makes it Wi-Fi only.
 	NetworkCheck func() string
 	List         func() ([]MediaItem, error) // MediaStore; replaced in tests
+	// Observe posts the gallery's own newest arrival (contract C11); nil
+	// disables it.
+	Observe ingestclient.ObservationPoster
 }
 
 type pending struct {
@@ -123,6 +126,9 @@ func (r *Runner) Sync() (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
+	// After the Wi-Fi gate, which keeps MediaStore unread off Wi-Fi: the C11
+	// observation's interval allows for days away from Wi-Fi.
+	r.observeNewest(items)
 	sort.SliceStable(items, func(i, j int) bool { return items[i].TakenAt.After(items[j].TakenAt) })
 	summary := Summary{Seen: len(items)}
 	now := r.Now()
@@ -387,4 +393,18 @@ func androidRecord(device string, item MediaItem, facts ExifFacts) map[string]an
 		record["longitude"] = *facts.Longitude
 	}
 	return record
+}
+
+// observeNewest posts the newest gallery file by date_added (when it reached
+// the phone) with its relative path, the native id the warehouse stores as
+// source_native_id, so the detector asks whether that exact file landed.
+func (r *Runner) observeNewest(items []MediaItem) {
+	var newest MediaItem
+	for _, item := range items {
+		if item.AddedAt.After(newest.AddedAt) {
+			newest = item
+		}
+	}
+	ingestclient.Observe(r.Observe, r.Logger, "android_photos", r.Account, newest.AddedAt, newest.RelativePath,
+		fmt.Sprintf("MediaStore: the newest date_added of %d gallery files", len(items)), r.Now())
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -187,5 +188,42 @@ func TestDryRunRecordsNothing(t *testing.T) {
 	st, err := loadState(statePath)
 	if err != nil || st.EventsCursorMS != 0 {
 		t.Fatalf("dry run wrote state: %+v %v", st, err)
+	}
+}
+
+// C11: the observation is the newest usage event the phone reports, the
+// field the warehouse stores as event_at; with nothing new it is the cursor.
+func TestSyncObservesThePhonesNewestUsageEvent(t *testing.T) {
+	now := time.UnixMilli(1_792_882_000_000).UTC()
+	base := now.Add(-time.Hour).UnixMilli()
+	exp := &fakeExporter{events: []string{
+		event(base, 15, "SCREEN_INTERACTIVE", "android", ""),
+		event(base+10, 1, "ACTIVITY_RESUMED", "com.example.app", "com.example.app.Main"),
+	}}
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	var observed []ingestclient.SourceObservation
+	observe := func(o ingestclient.SourceObservation) (map[string]any, error) {
+		observed = append(observed, o)
+		return nil, errors.New("a failed post never fails the upload")
+	}
+	r := runner(t, exp, &fakeUploader{}, statePath, now)
+	r.Observe = observe
+	if summary, err := r.Sync(); err != nil || summary.EventsSent != 2 {
+		t.Fatalf("summary = %+v, err = %v", summary, err)
+	}
+	want := common.ISOFormat(time.UnixMilli(base + 10).UTC())
+	if len(observed) != 1 || observed[0].Pipeline != "android_screen_time" || observed[0].Scope != "zach@example.com/pixel" ||
+		observed[0].NewestAt != want || observed[0].NewestID == "" {
+		t.Fatalf("observed = %+v", observed)
+	}
+	// Nothing new: still a fresh look, naming the newest the phone reported.
+	r = runner(t, exp, &fakeUploader{}, statePath, now.Add(time.Minute))
+	r.Observe = observe
+	exp.events = nil
+	if _, err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if len(observed) != 2 || observed[1].NewestAt != want {
+		t.Fatalf("idle observation = %+v", observed)
 	}
 }

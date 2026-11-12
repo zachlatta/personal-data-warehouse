@@ -102,6 +102,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 
 	var client Uploader
+	var observe ingestclient.ObservationPoster // a dry run posts nothing
 	guard := func() string { return "" }
 	if *dryRun {
 		client = &dryRunUploader{out: stdout}
@@ -112,6 +113,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			return common.ExitFailure
 		}
 		client = ingest
+		observe = ingest.PostSourceObservation
 		// Not UploadGuard: this runs on the phone (see common.PreflightGuard).
 		guard = common.PreflightGuard(env, "ANDROID_SCREEN_TIME", cfg.BaseURL)
 	}
@@ -123,6 +125,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Logger:            logger,
 		DryRun:            *dryRun,
 		BeforeUploadCheck: guard,
+		Observe:           observe,
 	}).Sync()
 	fmt.Fprintf(stdout, "Android screen time upload complete: events_read=%d events=%d daily_read=%d daily=%d daily_unchanged=%d batches=%d deferred=%t dry_run=%t\n",
 		summary.EventsRead, summary.EventsSent, summary.DailyRead, summary.DailySent, summary.DailyUnchanged, summary.Batches, summary.Deferred, *dryRun)

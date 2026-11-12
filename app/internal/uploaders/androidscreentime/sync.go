@@ -107,6 +107,9 @@ type Runner struct {
 	BatchSize         int
 	DryRun            bool
 	BeforeUploadCheck func() string
+	// Observe posts the phone's own newest usage event (contract C11); nil
+	// disables it.
+	Observe ingestclient.ObservationPoster
 }
 
 type state struct {
@@ -154,10 +157,19 @@ func (r *Runner) Sync() (Summary, error) {
 	KeyEvents(events)
 	summary.EventsRead = len(events)
 	newestMS := st.EventsCursorMS
+	newestKey := ""
 	for _, e := range events {
-		if ms := int64Value(e["event_at_ms"]); ms > newestMS {
+		if ms := int64Value(e["event_at_ms"]); ms >= newestMS {
 			newestMS = ms
+			newestKey = str(e["event_key"])
 		}
+	}
+	// C11: UsageStatsManager's own newest event, the field the warehouse
+	// stores as event_at, before anything is sent. With nothing new since the
+	// cursor, the newest the phone reported is the cursor itself.
+	if !r.DryRun && newestMS > 0 {
+		ingestclient.Observe(r.Observe, r.Logger, "android_screen_time", r.Account+"/"+r.Device,
+			time.UnixMilli(newestMS).UTC(), newestKey, "UsageStatsManager: the newest usage event", now)
 	}
 
 	daily, err := r.readJSONL("daily", now.Add(-dailyLookback).UnixMilli(), endMS)

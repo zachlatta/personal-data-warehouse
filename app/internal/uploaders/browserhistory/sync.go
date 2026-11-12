@@ -96,7 +96,14 @@ type Runner struct {
 	Limit             int
 	BatchSize         int
 	BeforeUploadCheck func() string
+	// Observe posts this device's own newest visit across every profile
+	// (contract C11); nil disables it.
+	Observe ingestclient.ObservationPoster
 }
+
+// newestVisitWindow is how many of a profile's highest visit ids are read to
+// find its newest visit time (contract C11).
+const newestVisitWindow = 50
 
 // ErrProfilesFailed is returned (wrapped) when some profile could not be
 // read; the readable profiles were still uploaded.
@@ -148,6 +155,8 @@ func (r *Runner) Sync() (Summary, error) {
 			summary.Failed = append(summary.Failed, fmt.Sprintf("%s/%s: %v", profile.Browser, profile.Key, err))
 		}
 	}
+	ingestclient.Observe(r.Observe, r.Logger, "browser_history", r.Account+"/"+r.Device, run.newest.VisitedAt,
+		run.newestKey, fmt.Sprintf("History databases: the newest visit across %d profiles", len(profiles)), r.Now())
 	summary.VisitsUploaded = run.uploaded
 	summary.Searches = run.searches
 	summary.BatchesUploaded = run.batches
@@ -167,6 +176,10 @@ type profileRun struct {
 	uploaded  int
 	searches  int
 	batches   int
+	// newest is the device's own newest visit across profiles (C11), read
+	// before each profile uploads anything.
+	newest    Visit
+	newestKey string
 }
 
 func (p *profileRun) sync(profile Profile, dir string) error {
@@ -186,6 +199,17 @@ func (p *profileRun) sync(profile Profile, dir string) error {
 	maxID, err := MaxVisitID(db, profile.Engine)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", profile.HistoryPath, err)
+	}
+	// The newest visits have the highest ids; their times go through the same
+	// conversion as every uploaded visited_at, and a visit with no time (which
+	// never ships) is skipped by ScanVisits.
+	if recent, err := ScanVisits(db, profile.Engine, max(0, maxID-newestVisitWindow), newestVisitWindow); err == nil {
+		for _, visit := range recent {
+			if visit.VisitedAt.After(p.newest.VisitedAt) {
+				p.newest = visit
+				p.newestKey = fmt.Sprintf("%s/%s/%d", profile.Browser, profile.Key, visit.VisitID)
+			}
+		}
 	}
 	after := int64(0)
 	if r.Mode == "incremental" && r.State != nil {

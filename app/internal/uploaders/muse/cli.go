@@ -136,6 +136,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			Limit:             *limit,
 			BatchSize:         agentsessions.DefaultBatchSize,
 			BeforeUploadCheck: guard,
+			Observe:           client.PostSourceObservation,
 		}
 		transcripts, err = runner.Sync()
 		state.Close()

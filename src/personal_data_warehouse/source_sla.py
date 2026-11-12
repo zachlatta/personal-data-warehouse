@@ -61,6 +61,27 @@ class UpstreamCheck:
     observation_interval: timedelta
 
 
+def _agent_session_check(pipeline: str, *, observation_interval: timedelta = HOUR) -> UpstreamCheck:
+    """A device's transcripts: the newest event time and its session, read by
+    ``pdw ingest agent-sessions`` (or ``muse``) from the files themselves, and
+    the newest event PDW holds for that session (``(session_id, seq)`` index)."""
+    return UpstreamCheck(
+        pipeline=pipeline,
+        scope="account/device",
+        evidence=(
+            "the device's own transcripts: the newest event time (the field the ingest"
+            " reads as occurred_at) and its session, every uploader run"
+        ),
+        pdw_newest_sql=f"""(SELECT max(e.occurred_at) FROM @{pipeline}_events e
+            WHERE e.session_id = o.upstream_newest_id
+              AND e.account = split_part(o.scope, '/', 1)
+              AND e.device = substr(o.scope, length(split_part(o.scope, '/', 1)) + 2))""",
+        # Uploaded every five minutes, then the agent-sessions Drive reader.
+        tolerance=HOUR,
+        observation_interval=observation_interval,
+    )
+
+
 SOURCE_UPSTREAM_CHECKS: tuple[UpstreamCheck, ...] = (
     UpstreamCheck(
         pipeline="gmail",
@@ -212,6 +233,82 @@ SOURCE_UPSTREAM_CHECKS: tuple[UpstreamCheck, ...] = (
         tolerance=48 * HOUR,
         observation_interval=36 * HOUR,
     ),
+    _agent_session_check("claude_code"),
+    _agent_session_check("codex"),
+    _agent_session_check("openclaw"),
+    # pi and argon run on Macs that can sleep; the observation still comes
+    # from every uploader run, idle tool or not.
+    _agent_session_check("pi", observation_interval=6 * HOUR),
+    _agent_session_check("muse_code", observation_interval=6 * HOUR),
+    _agent_session_check("argon", observation_interval=6 * HOUR),
+    _agent_session_check("muse", observation_interval=6 * HOUR),
+    UpstreamCheck(
+        pipeline="apple_contacts",
+        scope="account",
+        evidence="the Mac's AddressBook: the newest card modification, every uploader run",
+        pdw_newest_sql="""(SELECT max(c.source_updated_at) FROM @apple_contact_cards c
+            WHERE c.source = 'apple_contacts' AND c.account = o.scope)""",
+        tolerance=HOUR,
+        observation_interval=2 * HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="apple_notes",
+        scope="account",
+        evidence=(
+            "the Mac's NoteStore: the newest note modification, every uploader run (what"
+            " iCloud delivered to the Mac; iCloud's own delivery is beyond any device)"
+        ),
+        pdw_newest_sql="""(SELECT max(n.modified_at) FROM @apple_notes n WHERE n.account = o.scope)""",
+        tolerance=HOUR,
+        observation_interval=2 * HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="browser_history",
+        scope="account/device",
+        evidence="the Mac's History databases: the newest visit across profiles, every uploader run",
+        pdw_newest_sql="""(SELECT max(v.visited_at) FROM @browser_history_visits v
+            WHERE v.account = split_part(o.scope, '/', 1)
+              AND v.device = substr(o.scope, length(split_part(o.scope, '/', 1)) + 2))""",
+        tolerance=HOUR,
+        observation_interval=2 * HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="android_photos",
+        scope="account",
+        evidence=(
+            "MediaStore on the phone: the newest gallery file by date_added and its relative"
+            " path, every uploader run on Wi-Fi"
+        ),
+        # The exact file by its native id: present means it landed, and then the
+        # observation's own time stands in for PDW's.
+        pdw_newest_sql="""(SELECT o.upstream_newest_at FROM @android_photos_files f
+            WHERE f.source = 'android_photos' AND f.account = o.scope
+              AND f.source_native_id = o.upstream_newest_id LIMIT 1)""",
+        # Uploads are Wi-Fi only and MediaStore is not read off Wi-Fi, so a day
+        # away from Wi-Fi is not a fault.
+        tolerance=24 * HOUR,
+        observation_interval=3 * 24 * HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="android_messages",
+        scope="account/device",
+        evidence="bugle_db on the phone: the newest received_timestamp, every uploader run",
+        pdw_newest_sql="""(SELECT max(m.message_at) FROM @android_messages m
+            WHERE m.account = split_part(o.scope, '/', 1)
+              AND m.device = substr(o.scope, length(split_part(o.scope, '/', 1)) + 2))""",
+        tolerance=HOUR,
+        observation_interval=2 * HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="android_screen_time",
+        scope="account/device",
+        evidence="UsageStatsManager on the phone: the newest usage event, every uploader run",
+        pdw_newest_sql="""(SELECT max(e.event_at) FROM @android_screen_time_events e
+            WHERE e.device = substr(o.scope, length(split_part(o.scope, '/', 1)) + 2)
+              AND e.account = split_part(o.scope, '/', 1))""",
+        tolerance=HOUR,
+        observation_interval=2 * HOUR,
+    ),
     UpstreamCheck(
         pipeline="apple_messages",
         scope="account",
@@ -243,6 +340,19 @@ SOURCE_UPSTREAM_INPUT_TABLES: tuple[str, ...] = (
     "chatgpt_conversation_sync",
     "claude_desktop_events",
     "alice_voice_recordings",
+    "claude_code_events",
+    "codex_events",
+    "openclaw_events",
+    "pi_events",
+    "muse_code_events",
+    "argon_events",
+    "muse_events",
+    "apple_contact_cards",
+    "apple_notes",
+    "browser_history_visits",
+    "android_photos_files",
+    "android_messages",
+    "android_screen_time_events",
 )
 
 

@@ -269,12 +269,11 @@ Every `kind="source"` entry in `PIPELINES` now carries three things, enforced by
 - `data_basis` — the stated SLA: a measurement (the gap query in `pipeline_health.py`,
   re-run 2026-11-11 for the sources that had none) or the reason there is no cadence.
 - `detector` — the catalog id of the `marts_ops` view that compares PDW with the source
-  itself; **or** `sla_exemption` with its `exemption_kind`. Exactly one, and an exemption of
-  at least a sentence (no "n/a"). A `structural` exemption says why no comparison can exist
-  (PDW is the source, nothing upstream keeps history, or every run is already the whole
-  comparison). A `deferred` one is a detector that could be built and has not been, with
-  what it needs; C11 reads yellow while any remain. Every server-side poller has a detector;
-  the 13 deferred are the device-file uploaders.
+  itself; **or** `sla_exemption`, which says why no comparison can exist: PDW is the source
+  (feed, scans, screen_timelapse, android_location, manual_finance), nothing upstream keeps
+  history (android_notifications), the source is retired (apple_photos), or every run is
+  already the whole comparison (gmail_settings, hacker_news, resideo). Exactly one; the test
+  pins which ten sources may be exempt, so "not built yet" is never an exemption.
 
 The collector reads each detector view once per collection (filtered to the pipeline by its
 `pipeline` or `source` column, `DETECTOR_SCOPE_COLUMNS`) and writes its worst row into
@@ -283,7 +282,8 @@ The collector reads each detector view once per collection (filtered to the pipe
 claim about the pipeline; C11 grades `sla_detector_status` (`scripts/contract_audit.py`).
 
 **`marts_ops.source_upstream_health`** is the detector for every source below. Each
-collector records what the provider itself says is its newest item in
+collector, or device uploader through `POST /ingest/source-observation`, records what the
+provider or the device's own store says is its newest item in
 `ops.source_upstream_observations` (one row per pipeline and scope), before writing what it
 fetched:
 
@@ -301,6 +301,11 @@ fetched:
 | `claude_desktop` | the first conversation of claude.ai's newest-updated list | that conversation's header row (`seq = 0`) `updated_at` in `base_claude_desktop.events` |
 | `comma` | the newest route in the retained `routes_segments` window | `base_comma.routes.start_at` |
 | `alice_voice_recordings` | the newest `created_at` in the daily listing | `base_alice_voice_recordings.recordings.recorded_at` |
+| `claude_code`, `codex`, `openclaw`, `pi`, `muse_code`, `argon`, `muse` | `pdw ingest agent-sessions` / `muse` read the end of every transcript modified within a day of the tool's newest (and the OpenClaw store): the newest event time, in the field the ingest reads as `occurred_at`, and its session | the newest `occurred_at` PDW holds for that session (`(session_id, seq)` index) |
+| `apple_contacts` / `apple_notes` | the Mac's AddressBook / NoteStore: the newest modification | `base_apple_contacts.cards.source_updated_at` / `base_apple_notes.notes.modified_at` |
+| `browser_history` | the Mac's History databases: the newest visit across profiles | `base_browser_history.visits.visited_at` per device |
+| `android_photos` | MediaStore: the newest gallery file by `date_added`, with its relative path | that exact file by `source_native_id` in `base_android_photos.files` |
+| `android_messages` / `android_screen_time` | bugle_db's newest `received_timestamp` / UsageStatsManager's newest event | `base_android_messages.messages.message_at` / `base_android_screen_time.events.event_at` per device |
 
 The view is live: a row is `ok` once PDW's newest is at least the source's newest (1 s
 slack), `late` when the **oldest** item PDW has not caught up with has been missing for

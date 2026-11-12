@@ -778,7 +778,7 @@ def test_c11_grades_failing_derived_or_enrichment_pipelines(monkeypatch: pytest.
     rows = {
         "source slas": [
             {"pipeline": "gmail", "data_basis": "measured", "sla_detector": "marts_ops.source_upstream_health",
-             "sla_detector_status": "ok", "sla_exemption": None, "sla_exemption_kind": None},
+             "sla_detector_status": "ok", "sla_exemption": None},
         ],
         "source pipeline health": [
             {"pipeline": "finance_ledger", "status": "failing"},

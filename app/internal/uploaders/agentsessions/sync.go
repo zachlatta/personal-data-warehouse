@@ -57,8 +57,11 @@ type Runner struct {
 	// a read, and idle passes log nothing. A pass every two seconds over
 	// thousands of transcripts then costs one directory walk.
 	SkipUnchanged bool
+	// Observe posts each tool's newest event (contract C11); nil disables it.
+	Observe ingestclient.ObservationPoster
 
 	checkedNetwork bool
+	lastObserved   time.Time
 	// shipped is each source's signature as of the last pass that left it
 	// fully uploaded; pass holds this pass's candidates until it succeeds.
 	shipped map[string]fileSignature
@@ -158,6 +161,7 @@ func (r *Runner) Sync() (Summary, error) {
 	}
 	r.pass = map[string]fileSignature{}
 	files := Discover(r.Dirs)
+	r.observeNewest(files)
 	if !r.SkipUnchanged {
 		r.Logger.Infof("Discovered %d agent session transcript file(s)", len(files))
 	}

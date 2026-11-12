@@ -441,13 +441,11 @@ class Pipeline:
     #: yet and what it would take (``sla_exemption``). Never both, never
     #: neither: ``tests/test_source_sla.py``.
     detector: str = ""
+    #: An exemption is structural: no comparison with the source can exist
+    #: (PDW is the source, nothing upstream keeps history, the source is
+    #: retired, or every run already is the whole comparison).
+    #: tests/test_source_sla.py pins which sources may claim one.
     sla_exemption: str = ""
-    #: Every exemption is one of two kinds. ``structural``: no comparison with
-    #: the source can exist (PDW is the source, nothing upstream keeps history,
-    #: or every run already is the full comparison). ``deferred``: one can be
-    #: built and has not been; C11 grades yellow while any remain, and AGENTS.md
-    #: names them as the gap.
-    sla_exemption_kind: str = ""
 
     @property
     def event_interval(self) -> timedelta | None:
@@ -539,7 +537,6 @@ def _source(
     freshness_escalates: bool = True,
     detector: str = "",
     exemption: str = "",
-    exemption_kind: str = "",
 ) -> Pipeline:
     return Pipeline(
         id=id,
@@ -556,7 +553,6 @@ def _source(
         freshness_escalates=freshness_escalates,
         detector=detector,
         sla_exemption=exemption,
-        sla_exemption_kind=exemption_kind,
     )
 
 
@@ -661,7 +657,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "users.settings.filters.list, so a successful run already is the comparison "
             "with Gmail; the run heartbeat is the detector"
         ),
-        exemption_kind="structural",
     ),
     _source(
         "google_calendar",
@@ -722,12 +717,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/apple-contacts-upload-launchd",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("apple_contacts"),
-        exemption=(
-            "the Mac's AddressBook is read only by the uploader; a detector needs it to "
-            "post the store's newest modification date to /ingest/source-observation, "
-            "as apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "browser_history",
@@ -744,12 +734,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/browser-history-upload-launchd",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("browser_history"),
-        exemption=(
-            "History.db is on the Mac and read only by the uploader; a detector needs "
-            "it to post the newest visit time to /ingest/source-observation, as "
-            "apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "screen_timelapse",
@@ -781,7 +766,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "device frame age against the phone's usage events is already judged on "
             "this row"
         ),
-        exemption_kind="structural",
     ),
     _source(
         "feed",
@@ -798,7 +782,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "PDW is the source: agents and the app write the feed directly, so there is "
             "nothing upstream to compare with"
         ),
-        exemption_kind="structural",
     ),
     _source(
         "google_drive",
@@ -893,15 +876,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("apple_notes"),
         basis=(
             "measured 2026-11-11: p95 1.65d, max 23.75d -- notes are edited "
-            "most days, so 3d (late at 6d) is a real silence"
+            "most days, so 3d (late at 6d) is a real silence. The detector compares the "
+            "Mac's NoteStore with PDW; a note iCloud never delivered to the Mac is "
+            "beyond what any device-side check can see"
         ),
-        exemption=(
-            "a Mac-side probe would see only what iCloud delivered to the Mac, which is "
-            "the usual failure; a detector needs the uploader to post NoteStore's "
-            "newest modification date to /ingest/source-observation, as apple_messages "
-            "does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "apple_voice_memos",
@@ -965,12 +944,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/android-photos-upload-android on the phone",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_photos"),
-        exemption=(
-            "MediaStore is on the phone and read only by the uploader; a detector needs "
-            "it to post the newest DATE_ADDED to /ingest/source-observation, as "
-            "apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "android_notifications",
@@ -996,7 +970,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "nothing upstream exists to compare with; the listener's spool is PDW's own "
             "buffer, not a source"
         ),
-        exemption_kind="structural",
     ),
     _source(
         "android_messages",
@@ -1016,12 +989,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/android-messages-upload-android on the phone",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_messages"),
-        exemption=(
-            "bugle_db is on the phone and read only by the uploader; a detector needs "
-            "it to post the newest message timestamp to /ingest/source-observation, as "
-            "apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "android_location", "Android approximate location",
@@ -1036,7 +1004,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "PDW's own helper makes the samples, so there is no upstream; the "
             "measurement age in data_basis already catches stale fixes"
         ),
-        exemption_kind="structural",
     ),
     _source(
         "android_screen_time",
@@ -1055,12 +1022,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/android-screen-time-upload-android on each device",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_screen_time"),
-        exemption=(
-            "UsageStatsManager is read only by PDW's exporter on the phone; a detector "
-            "needs it to post the newest usage event time to /ingest/source-"
-            "observation, as apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "scans",
@@ -1084,7 +1046,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "a scan that never reached the service exists nowhere else; PDW is the end "
             "of the scanner's Scan to PC"
         ),
-        exemption_kind="structural",
     ),
     _source(
         "alice_voice_recordings",
@@ -1140,7 +1101,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "2026-10-23; new photos arrive through android_photos, so there is no live "
             "upstream left to compare with"
         ),
-        exemption_kind="structural",
     ),
     _source(
         "claude_code",
@@ -1154,12 +1114,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "measured 2026-11-11: p95 0.02d, max 1.96d -- 2d covers the "
             "longest pause on record"
         ),
-        exemption=(
-            "session files are on the device and tailed only by the uploader; a "
-            "detector needs it to post the newest session file mtime to /ingest/source-"
-            "observation, as apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "codex",
@@ -1170,12 +1125,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         basis="measured: 2,479 gaps, p95 0.06d, max 3.94d — 7d leaves ample headroom",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("codex"),
-        exemption=(
-            "session files are on the device and tailed only by the uploader; a "
-            "detector needs it to post the newest session file mtime to /ingest/source-"
-            "observation, as apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "openclaw",
@@ -1186,12 +1136,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         basis="measured: 5,558 gaps, p95 0.02d, max 1.14d — 7d leaves ample headroom",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("openclaw"),
-        exemption=(
-            "session files are on the VM and tailed only by its timer; a detector needs "
-            "it to post the newest session file mtime to /ingest/source-observation, as "
-            "apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "pi",
@@ -1219,12 +1164,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "quiet means Zach is not using pi, so data age is shown but never"
             " colours status; the run heartbeat says the uploader is alive"
         ),
-        exemption=(
-            "usage-driven; session files are on the Mac and tailed only by the "
-            "uploader; a detector needs it to post the newest session file mtime to "
-            "/ingest/source-observation, as apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "muse_code",
@@ -1249,12 +1189,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             " so data age never colours status, and the run heartbeat says the"
             " uploader is alive"
         ),
-        exemption=(
-            "usage-driven; session files are on the Mac and tailed only by the "
-            "uploader; a detector needs it to post the newest session file mtime to "
-            "/ingest/source-observation, as apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "argon",
@@ -1279,12 +1214,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             " quiet means Zach is not using it, so data age never colours"
             " status, and the run heartbeat says the uploader is alive"
         ),
-        exemption=(
-            "usage-driven; session files are on the Mac and tailed only by the "
-            "uploader; a detector needs it to post the newest session file mtime to "
-            "/ingest/source-observation, as apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "muse",
@@ -1308,12 +1238,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
         run=12 * HOUR,
         state=_uploader_heartbeat("muse"),
-        exemption=(
-            "transcripts are on the Muse VM and read only by its hook; a detector needs "
-            "the hook to post the newest transcript time to /ingest/source-observation, "
-            "as apple_messages does"
-        ),
-        exemption_kind="deferred",
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "claude_desktop",
@@ -1411,7 +1336,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "run already compares with the last reading; there is no upstream history "
             "to diff"
         ),
-        exemption_kind="structural",
     ),
     _source(
         "whoop",
@@ -1522,7 +1446,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "every run re-lists the newest page of each list, so a successful run "
             "already is the comparison with the source"
         ),
-        exemption_kind="structural",
     ),
     _source(
         "plaid",
@@ -1590,7 +1513,6 @@ PIPELINES: tuple[Pipeline, ...] = (
             "manual: a document exists only when one is uploaded, so nothing upstream "
             "exists to compare with"
         ),
-        exemption_kind="structural",
     ),
     Pipeline(
         id="attachment_enrichment",
@@ -2505,7 +2427,6 @@ class PipelineSnapshot:
     sla_detector: str = ""
     sla_detector_status: str = ""
     sla_exemption: str = ""
-    sla_exemption_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -3155,7 +3076,6 @@ class PipelineHealthCollector:
             sla_detector=_detector_relation(entry.detector),
             sla_detector_status=self._detector_status(entry),
             sla_exemption=entry.sla_exemption,
-            sla_exemption_kind=entry.sla_exemption_kind,
         )
         if entry.id == "screen_timelapse":
             self._apply_screen_timelapse_device_freshness(snapshot)

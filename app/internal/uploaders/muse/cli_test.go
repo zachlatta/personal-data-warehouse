@@ -75,14 +75,15 @@ func TestRunShipsTranscriptsAndWorkspaceThroughTheApp(t *testing.T) {
 		t.Fatalf("code=%d stderr=%q out=%q", code, errOut, out)
 	}
 	paths := strings.Join(app.Paths(), ",")
-	if paths != "/ingest/agent-sessions/batch,/ingest/muse/file,/ingest/agent-sessions/batch" {
+	// C11: the transcripts' newest event is posted before anything uploads.
+	if paths != "/ingest/source-observation,/ingest/agent-sessions/batch,/ingest/muse/file,/ingest/agent-sessions/batch" {
 		t.Fatalf("app calls = %s", paths)
 	}
-	transcript := testfixtures.DecodeGzipJSONL(app.Calls()[0].Body)
+	transcript := testfixtures.DecodeGzipJSONL(app.Calls()[1].Body)
 	if len(transcript) != 2 || transcript[0]["record_type"] != "muse_event" || transcript[0]["device"] != "muse" || transcript[0]["account"] != "zach@example.com" {
 		t.Fatalf("transcript batch = %v", transcript)
 	}
-	files := testfixtures.DecodeGzipJSONL(app.Calls()[2].Body)
+	files := testfixtures.DecodeGzipJSONL(app.Calls()[3].Body)
 	var shipped []string
 	for _, record := range files {
 		shipped = append(shipped, record["record"].(map[string]any)["path"].(string))
@@ -98,9 +99,10 @@ func TestRunShipsTranscriptsAndWorkspaceThroughTheApp(t *testing.T) {
 		t.Fatalf("summary missing: %q", out)
 	}
 
-	// A second run with nothing new uploads nothing.
+	// A second run with nothing new uploads nothing; it still reports the
+	// device's newest event, which is what keeps the detector from `unknown`.
 	code, _, errOut = runMuse(t, []string{"--home", home}, museEnv(home), cfg)
-	if code != 0 || len(app.Calls()) != 3 {
+	if code != 0 || len(app.Calls()) != 5 || app.Paths()[4] != "/ingest/source-observation" {
 		t.Fatalf("idle run code=%d calls=%d stderr=%q", code, len(app.Calls()), errOut)
 	}
 }
@@ -112,7 +114,7 @@ func TestRunCanShipOnlyOneHalf(t *testing.T) {
 	if code, _, errOut := runMuse(t, []string{"--home", home, "--no-files"}, museEnv(home), cfg); code != 0 {
 		t.Fatalf("stderr=%q", errOut)
 	}
-	if paths := strings.Join(app.Paths(), ","); paths != "/ingest/agent-sessions/batch" {
+	if paths := strings.Join(app.Paths(), ","); paths != "/ingest/source-observation,/ingest/agent-sessions/batch" {
 		t.Fatalf("--no-files calls = %s", paths)
 	}
 }

@@ -77,31 +77,29 @@ def test_an_exemption_is_a_reason_not_a_placeholder(entry):
     assert not any(word in entry.sla_exemption.lower() for word in ("todo", "tbd", "n/a")), entry.id
 
 
-#: The exemptions accepted as structural: PDW is the source, nothing upstream
-#: keeps history, or every run already is the whole comparison. Anything else
-#: without a detector is deferred work, and C11 reads yellow while it remains.
+#: The only sources that may hold an exemption: PDW is the source, nothing
+#: upstream keeps history, the source is retired, or every run already is the
+#: whole comparison. Every other source, server poller or device uploader,
+#: compares itself with the source.
 STRUCTURAL_EXEMPTIONS = {
     "feed", "scans", "screen_timelapse", "android_location", "manual_finance",
     "gmail_settings", "hacker_news", "resideo", "apple_photos", "android_notifications",
 }
 
 
-@pytest.mark.parametrize("entry", SOURCES, ids=[entry.id for entry in SOURCES])
-def test_an_exemption_says_whether_it_is_structural_or_deferred(entry):
-    if entry.detector:
-        assert entry.sla_exemption_kind == "", entry.id
-    elif entry.id in STRUCTURAL_EXEMPTIONS:
-        assert entry.sla_exemption_kind == "structural", entry.id
-    else:
-        # "Not built yet" is never structural: it is the stated C11 gap.
-        assert entry.sla_exemption_kind == "deferred", entry.id
+def test_only_a_source_no_comparison_can_exist_for_is_exempt():
+    assert {entry.id for entry in SOURCES if not entry.detector} == STRUCTURAL_EXEMPTIONS
 
 
-def test_the_server_side_pollers_compare_with_the_source_not_their_own_heartbeat():
-    """A Python poller that already talks to the provider has no excuse for an exemption."""
+def test_pollers_and_device_uploaders_compare_with_the_source_not_their_own_heartbeat():
+    """A collector that already reads the provider, or the device's own store, has no
+    excuse for an exemption."""
     for pipeline in (
         "google_contacts", "whoop", "whoop_private", "github", "chatgpt",
         "claude_desktop", "comma", "alice_voice_recordings",
+        "claude_code", "codex", "openclaw", "pi", "muse_code", "argon", "muse",
+        "apple_contacts", "apple_notes", "browser_history",
+        "android_photos", "android_messages", "android_screen_time",
     ):
         assert PIPELINES_BY_ID[pipeline].detector == SOURCE_UPSTREAM_HEALTH_VIEW, pipeline
 
@@ -323,6 +321,47 @@ def test_the_server_side_pollers_lookups_read_what_landed(warehouse):
     assert rows[("whoop", "a@x.test")]["status"] == "late"
 
 
+def test_the_device_uploaders_lookups_read_what_landed(warehouse):
+    """Each device check's PDW-side lookup, against a real row: landed reads ok."""
+    _provision_everything(warehouse)
+    now = datetime.now(tz=UTC)
+    at = now - timedelta(hours=1)
+    warehouse._command(
+        "INSERT INTO @claude_code_events (source, session_id, event_uuid, account, device, seq, occurred_at)"
+        " VALUES ('claude_code', 's1', 'u1', 'a@x.test', 'mew-dev', 0, %s)",
+        (at,),
+    )
+    warehouse._command(
+        "INSERT INTO @android_photos_files (source, account, source_native_id, content_sha256)"
+        " VALUES ('android_photos', 'a@x.test', 'DCIM/Camera/PXL_1.jpg', 'sha')"
+    )
+    warehouse._command(
+        "INSERT INTO @apple_contact_cards (source, account, source_kind, address_book_id, card_id, source_updated_at)"
+        " VALUES ('apple_contacts', 'a@x.test', 'apple_contacts', 'local', 'c1', %s)",
+        (at,),
+    )
+    warehouse._command(
+        "INSERT INTO @android_screen_time_events (account, device, event_key, event_at)"
+        " VALUES ('a@x.test', 'pichu', 'k1', %s)",
+        (at,),
+    )
+    for pipeline, scope, newest_id in (
+        ("claude_code", "a@x.test/mew-dev", "s1"),
+        ("android_photos", "a@x.test", "DCIM/Camera/PXL_1.jpg"),
+        ("apple_contacts", "a@x.test", "c1"),
+        ("android_screen_time", "a@x.test/pichu", "k1"),
+    ):
+        _observe(warehouse, pipeline, scope, newest_at=at, newest_id=newest_id, observed_at=now)
+    # The device holds a session PDW has none of, two hours old: late.
+    _observe(warehouse, "codex", "a@x.test/mew-dev", newest_at=now - timedelta(hours=2), newest_id="s9",
+             observed_at=now)
+    rows = _health(warehouse)
+    for key in (("claude_code", "a@x.test/mew-dev"), ("android_photos", "a@x.test"),
+                ("apple_contacts", "a@x.test"), ("android_screen_time", "a@x.test/pichu")):
+        assert (rows[key]["status"], rows[key]["landed"]) == ("ok", 1), key
+    assert rows[("codex", "a@x.test/mew-dev")]["status"] == "late"
+
+
 def test_an_older_observation_never_overwrites_a_newer_one(warehouse):
     _provision_everything(warehouse)
     now = datetime.now(tz=UTC)
@@ -341,8 +380,8 @@ def test_the_collector_writes_each_sources_detector_verdict_or_exemption(warehou
     rows = {
         row["pipeline"]: row
         for row in warehouse._query_dicts(
-            "SELECT pipeline, kind, data_basis, sla_detector, sla_detector_status, sla_exemption,"
-            " sla_exemption_kind FROM @marts_pipeline_health"
+            "SELECT pipeline, kind, data_basis, sla_detector, sla_detector_status, sla_exemption"
+            " FROM @marts_pipeline_health"
         )
     }
     calendar = rows["google_calendar"]
@@ -354,9 +393,7 @@ def test_the_collector_writes_each_sources_detector_verdict_or_exemption(warehou
     assert rows["hacker_news"]["sla_detector"] is None
     assert rows["hacker_news"]["sla_detector_status"] is None
     assert "re-lists" in rows["hacker_news"]["sla_exemption"]
-    assert rows["hacker_news"]["sla_exemption_kind"] == "structural"
-    assert rows["codex"]["sla_exemption_kind"] == "deferred"
-    assert rows["gmail"]["sla_exemption_kind"] is None
+    assert rows["codex"]["sla_detector"] == "marts_ops.source_upstream_health"
     for row in rows.values():
         if row["kind"] == "source":
             assert row["data_basis"], row["pipeline"]

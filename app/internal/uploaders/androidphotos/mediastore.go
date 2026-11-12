@@ -52,6 +52,7 @@ type MediaItem struct {
 	TakenAt            time.Time // datetaken (UTC); falls back to date_added
 	TakenAtFromAdded   bool      // true when MediaStore had no datetaken
 	ModifiedAt         time.Time // date_modified (whole seconds)
+	AddedAt            time.Time // date_added (whole seconds): when it reached the phone
 }
 
 // queryMediaStore runs Android's `content query` against MediaStore and
@@ -158,6 +159,7 @@ func parseMediaRow(line string) (MediaItem, bool, error) {
 		OwnerPackage:       fields["owner_package_name"],
 		GenerationModified: atoi(fields["generation_modified"]),
 		ModifiedAt:         time.Unix(atoi(fields["date_modified"]), 0).UTC(),
+		AddedAt:            time.Unix(atoi(fields["date_added"]), 0).UTC(),
 	}
 	if taken := atoi(fields["datetaken"]); taken > 0 {
 		item.TakenAt = time.UnixMilli(taken).UTC()

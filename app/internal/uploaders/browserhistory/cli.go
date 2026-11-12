@@ -96,6 +96,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 
 	var state *State
 	var client Uploader
+	var observe ingestclient.ObservationPoster // a dry run posts nothing
 	guard := func() string { return "" }
 	if *dryRun {
 		// No state: a dry run reads every profile from the start.
@@ -113,6 +114,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			return common.ExitFailure
 		}
 		client = ingest
+		observe = ingest.PostSourceObservation
 		guard = common.UploadGuard(env, "BROWSER_HISTORY", cfg.BaseURL)
 	}
 	summary, err := (&Runner{
@@ -126,6 +128,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Mode:              *mode,
 		Limit:             *limit,
 		BeforeUploadCheck: guard,
+		Observe:           observe,
 	}).Sync()
 	fmt.Fprintf(stdout, "Browser history upload complete: profiles=%d visits=%d searches=%d batches=%d deferred=%t failed=%d\n",
 		summary.Profiles, summary.VisitsUploaded, summary.Searches, summary.BatchesUploaded, summary.Deferred, len(summary.Failed))

@@ -702,3 +702,27 @@ func TestSyncSendsTheStillWhenTheMotionVideoIsUnreadable(t *testing.T) {
 		t.Fatalf("summary=%+v files=%d", summary, len(client.files))
 	}
 }
+
+// C11: the observation names the newest arrival by its relative path, the
+// native id the warehouse stores, so the detector asks whether that file landed.
+func TestSyncObservesTheGallerysNewestArrival(t *testing.T) {
+	lib := newLibrary(t)
+	lib.add("DCIM/Camera/PXL_1.jpg", "image/jpeg", lib.now.Add(-2*time.Hour), []byte("a"))
+	lib.add("Pictures/Screenshots/Screenshot_2.png", "image/png", lib.now.Add(-3*time.Hour), []byte("b"))
+	lib.items[0].AddedAt = lib.now.Add(-2 * time.Hour)
+	lib.items[1].AddedAt = lib.now.Add(-time.Hour) // added last, though taken earlier
+	runner := lib.runner(t, &fakeUploader{}, openState(t))
+	var observed []ingestclient.SourceObservation
+	runner.Observe = func(o ingestclient.SourceObservation) (map[string]any, error) {
+		observed = append(observed, o)
+		return nil, errors.New("a failed post never fails the upload")
+	}
+	if _, err := runner.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if len(observed) != 1 || observed[0].Pipeline != "android_photos" || observed[0].Scope != "zach@example.com" ||
+		observed[0].NewestID != "Pictures/Screenshots/Screenshot_2.png" ||
+		observed[0].NewestAt != common.ISOFormat(lib.now.Add(-time.Hour)) {
+		t.Fatalf("observed = %+v", observed)
+	}
+}

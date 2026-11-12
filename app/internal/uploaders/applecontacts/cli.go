@@ -123,6 +123,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Mode:              *mode,
 		Limit:             *limit,
 		BeforeUploadCheck: common.UploadGuard(env, "APPLE_CONTACTS", cfg.BaseURL),
+		Observe:           client.PostSourceObservation,
 	}).Sync()
 	if err != nil {
 		fmt.Fprintf(stderr, "pdw ingest apple-contacts: %v\n", err)

@@ -155,14 +155,12 @@ that, not from this prose.
 - **C11 — a source's own SLA is stated and detected, not inferred from the pipeline being
   green.** Each source row of `marts_ops.pipeline_health` states its SLA (`data_basis`) and
   names its detector (`sla_detector`, verdict in `sla_detector_status`):
-  `marts_ops.source_upstream_health` compares the provider's own newest item with `base_*`,
-  judged on the oldest item PDW has not caught up with, for Gmail, Calendar, Drive,
-  Contacts, WhatsApp, Apple Messages, both WHOOP feeds, GitHub, ChatGPT, Claude Desktop,
-  comma and Alice; Slack, Plaid, SimpleFIN and voice landing have their own views. *Held up
-  by* `tests/test_source_sla.py`; a `structural` `sla_exemption` says why no comparison can
-  exist. *Gap:* the device-file uploaders (agent-session CLIs, Apple Contacts and Notes,
-  browser history, the Pixel's photos, texts and screen time) are `deferred`, so C11 reads
-  yellow until each posts its own newest item.
+  `marts_ops.source_upstream_health` compares what the provider or the device's own store
+  reports as newest with `base_*`, judged on the oldest item PDW has not caught up with, for
+  every server poller and device uploader; Slack, Plaid, SimpleFIN and voice landing have
+  their own views. *Held up by* `tests/test_source_sla.py`. *Exceptions:* ten sources no
+  comparison can exist for (PDW is the source, nothing upstream keeps history, the source is
+  retired, or each run is the whole comparison), each naming why in `sla_exemption`.
 - **C12 — future developers understand these contracts and honor them.** This file is
   loaded into every session in this repository, so it holds only the contracts and the
   rules every change needs; per-source and incident detail lives in `docs/agents/` and is

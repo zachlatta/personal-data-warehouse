@@ -116,6 +116,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 
 	statePath := *stateFile
 	var client Uploader
+	var observe ingestclient.ObservationPoster // a dry run posts nothing
 	guard := func() string { return "" }
 	// Photos go over Wi-Fi only (Zach, 2026-11-08), and a phone that cannot
 	// tell which network it is on defers rather than risk cellular data.
@@ -137,6 +138,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			return common.ExitFailure
 		}
 		client = ingest
+		observe = ingest.PostSourceObservation
 		// Not UploadGuard: its tethering policy is about a Mac on a phone's
 		// hotspot, and this runs on the phone (see common.PreflightGuard).
 		guard = common.PreflightGuard(env, "ANDROID_PHOTOS", cfg.BaseURL)
@@ -156,6 +158,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Logger:            logger,
 		Limit:             *limit,
 		BeforeUploadCheck: guard,
+		Observe:           observe,
 		NetworkCheck:      network,
 	}).Sync()
 	fmt.Fprintf(stdout, "Android photo upload complete: seen=%d uploaded=%d motion=%d motion_unreadable=%d already_landed=%d unsettled=%d missing=%d remaining=%d deferred=%t dry_run=%t\n",

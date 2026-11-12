@@ -512,3 +512,32 @@ func TestFileExtension(t *testing.T) {
 		}
 	}
 }
+
+// C11: the observation is bugle_db's newest received_timestamp, the field the
+// warehouse reads as message_at, so a healthy phone lands.
+func TestSyncObservesThePhonesNewestMessage(t *testing.T) {
+	path, db := bugleDB(t)
+	addMessage(t, db, 1, 10, 5, switchedAt.Add(-48*time.Hour), 100, "content://mms/1", "before the switch")
+	addMessage(t, db, 3, 10, 5, switchedAt.Add(time.Hour), 100, "content://sms/1", "lunch?")
+	addMessage(t, db, 4, 11, 2, switchedAt.Add(2*time.Hour), 2, "content://mms/40", "sure")
+	client := &fakeUploader{}
+	r := runner(path, client)
+	var observed []ingestclient.SourceObservation
+	r.Observe = func(o ingestclient.SourceObservation) (map[string]any, error) {
+		observed = append(observed, o)
+		return nil, errors.New("a failed post never fails the upload")
+	}
+	if summary, err := r.Sync(); err != nil || summary.Uploaded != 2 {
+		t.Fatalf("summary = %+v, err = %v", summary, err)
+	}
+	newest := int64(0)
+	for _, message := range client.sent() {
+		if ms := int64(message["received_timestamp_ms"].(float64)); ms > newest {
+			newest = ms
+		}
+	}
+	if len(observed) != 1 || observed[0].Pipeline != "android_messages" || observed[0].Scope != "zach@example.test/pichu" ||
+		observed[0].NewestID != "4" || observed[0].NewestAt != common.ISOFormat(time.UnixMilli(newest).UTC()) {
+		t.Fatalf("observed = %+v, newest sent = %d", observed, newest)
+	}
+}
