@@ -669,6 +669,23 @@ guest saw as idle. Two plan faults, both fixed in the functions themselves:
   ~14% of the heap, so ~15-20% there means they are warm. An unscoped search pools from
   the whole heap, which does not fit in memory; it still pays the disk read latency
   below.
+- *The heap warm decays within hours, so it has its own clock.* Two hours after that warm
+  the heap read 3.2% in shared buffers and 0.7% (0.3 of 41.3 GB) in the page cache, and
+  fresh scoped searches were back at 1.3-8.0 s. `shared_buffers` (20 GB) is smaller than
+  the index set plus this heap (~21.9 + 5.6 GB), so the sync workload and the indexes
+  push it out. The page cache is no fallback: the bitmap scan fills both layers (16.5% in
+  shared buffers and 16.4% in the page cache right after a second warm, 02:46Z on
+  2026-11-12), and both empty at the same pace, so `pg_prewarm` into the page cache
+  would decay the same way. The five-minute `search_chunks` pass therefore re-reads the
+  attention heap when `timeline_heap_residency` is below `SEARCH_HEAP_REWARM_FLOOR`
+  (10%), at most every `SEARCH_HEAP_REWARM_MIN_INTERVAL` (1 h), and keeps that clock in
+  `heap_prewarmed_at`, apart from the index warm's 6 h one. An hour keeps the heap warm
+  for most of each hour at ~5.6 GB and ~1 minute of disk per warm (at most ~134 GB a
+  day). A smaller warm set does not trade better: on six scoped queries only 3-41% of the
+  5,000 pooled rows were from the last 12 months (attention rows overall: ~31%), so a
+  recent-months warm would miss most of the reads. The warm's statement budget is 180 s,
+  inside the five-minute tick after a chunk build of up to 240 s, and `search_chunks_job`
+  carries a 30-minute `dagster/max_runtime`.
 
 What it did not fix is the read wait itself. Cold reads ran 0.5-0.7 ms each because the
 guest's disk is a qcow2 on mew's `md0` RAID1 (a Samsung 970 EVO Plus and a Viper VPN100),
