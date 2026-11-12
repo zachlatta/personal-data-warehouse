@@ -4,6 +4,8 @@
 // from viewability.ts, EventQueue from event-queue.ts, FeedLog from engagement.ts,
 // the taps' rules from refresh.ts and saved-queue.ts.
 // Change the rule in both places; the tests reuse the phone's numbers.
+// currentIndex alone is the page's own (the phone has no outlined card or keys);
+// it is here to judge "on screen" with the same visibleFraction and threshold.
 
 // Active time: the part of wall time Zach is actually using the page. Time
 // counts while the tab is visible and he touched it in the last IDLE_MS, or
