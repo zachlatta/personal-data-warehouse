@@ -116,7 +116,7 @@ const pipelinesPageHTML = `<!doctype html>
     backfilling: "still working through its historical backlog",
     unmeasured: "we did not look — the probe was too expensive to afford, which is not the same claim as no data",
     unmonitored: "nothing declares an expectation here, so there is nothing to be late against",
-    exempt: "no detector compares this source with the source itself yet; the row says why and what one would need"
+    exempt: "no comparison with the source itself can exist (PDW is the source, nothing upstream keeps history, the source is retired, or each run is the whole comparison); the row says why"
   };
   // The four levels this dashboard covers, worst first inside each. They are
   // deliberately separate surfaces rather than one flat list: a pipeline, a

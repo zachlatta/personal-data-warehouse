@@ -437,8 +437,8 @@ class Pipeline:
     #: C11. A source's own SLA is detected by asking the source, not inferred
     #: from this row being green. Every ``kind="source"`` pipeline names either
     #: the catalog id of the ``marts_ops`` view that compares PDW with the
-    #: source itself (``detector``), or says why no such comparison is possible
-    #: yet and what it would take (``sla_exemption``). Never both, never
+    #: source itself (``detector``), or says why no such comparison can exist
+    #: (``sla_exemption``). Never both, never
     #: neither: ``tests/test_source_sla.py``.
     detector: str = ""
     #: An exemption is structural: no comparison with the source can exist

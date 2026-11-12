@@ -2650,7 +2650,7 @@ PIPELINE_HEALTH_COLUMNS = (
     "collected_at",
     # C11: the catalog id of the marts_ops view that compares this source with
     # the source itself, its worst status at collection, or (for a source with
-    # no such comparison) the stated reason and what one would need.
+    # no such comparison can exist) the stated reason why.
     "sla_detector",
     "sla_detector_status",
     "sla_exemption",
@@ -2952,11 +2952,6 @@ TIMELINE_PRIORITY_MIX_COLUMNS = (
     "collected_at",
 )
 
-# One row per (pipeline, device) from the machines that push data through the
-# app's /ingest/* endpoints: the run's own verdict, posted by the upload
-# wrapper after the uploader exits. It is the only in-warehouse heartbeat a
-# laptop uploader has; without it a run that fires every five minutes and
-# fails every time is indistinguishable from a quiet source.
 # What a source itself says is its newest item, recorded by the collector that
 # talks to it (C11): Gmail's newest message, a calendar's last modification,
 # Drive's newest modified file, the WhatsApp linked device's newest message,
@@ -2978,6 +2973,11 @@ SOURCE_UPSTREAM_OBSERVATION_COLUMNS = (
     "sync_version",
 )
 
+# One row per (pipeline, device) from the machines that push data through the
+# app's /ingest/* endpoints: the run's own verdict, posted by the upload
+# wrapper after the uploader exits. It is the only in-warehouse heartbeat a
+# laptop uploader has; without it a run that fires every five minutes and
+# fails every time is indistinguishable from a quiet source.
 UPLOADER_HEARTBEAT_COLUMNS = (
     "pipeline",
     "device",

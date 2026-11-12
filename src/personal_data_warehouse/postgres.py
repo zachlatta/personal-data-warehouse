@@ -6691,10 +6691,11 @@ class PostgresWarehouse:
     def ensure_source_upstream_health_view_if_possible(self) -> None:
         """C11's detector view, once every base table it compares against exists.
 
-        It reads five sources' base tables, provisioned by five ensure paths
-        that run in any order; each of those calls this too, so whichever runs
-        last creates it, and the ten-minute pipeline_health ensure keeps it
-        current in production.
+        It reads every detected source's base table
+        (``SOURCE_UPSTREAM_INPUT_TABLES``), provisioned by ensure paths that
+        run in any order, so it is built by the ten-minute pipeline_health
+        ensure once all of them exist; until then the collector reads the
+        detector as ``unknown``.
         """
         # The ChatGPT poller creates its sync table on first use; the view reads
         # it, so make sure it exists rather than leave the detector unbuilt.
