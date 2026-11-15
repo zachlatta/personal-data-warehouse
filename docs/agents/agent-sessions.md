@@ -442,21 +442,24 @@ spaced, dashed and JSON-escaped forms) become `[card ****1234]`; labelled securi
 codes in the same event become `[redacted]`. This is an intentional exception to
 raw fidelity, including `raw_json`. Original host transcripts are separate copies.
 
-Discovery evaluates every digit-run start, including overlapping starts. Groups
-may be separated by any mixture of 1–3 spaces/dashes; layout never hides a
-Luhn-valid 13–19 digit reading. Contiguous runs are never split. After length
-and Luhn checks, recognized phone/date/time/identifier tokens exclude readings
-that consume their fragments. Complete cards immediately before numeric fields
-or expiry delimiters retain precedence over interpreting their final group as a
-new token. Earlier confirmed cards preserve independent following numeric fields.
-Overlapping valid readings are masked together; possible adjacent codes are
-suppressed separately so their digits never become a retained card suffix.
+Discovery evaluates every complete digit-run start, including overlaps. A
+candidate is one contiguous 13–19 digit run or an explicit grouped layout:
+`4-4-4-4`, `4-4-4-4-(1..3)`, `4-6-5`, `4-6-4`, `4-4-4-(1..3)`, `4-4-5`,
+or `5-5-(5..6)`. Groups may use any mixture of 1–3 spaces/dashes. Runs are
+never split; independent identifiers such as `16+2` or `12+4+2` are not joined
+by length/checksum alone. A layout-conformant Luhn-valid card wins over any
+overlapping interpretation of neighbouring digits as phones, dates or times.
+Overlapping valid card readings are masked together. After a confirmed card,
+labelled security codes are masked; bare 3–4 digit codes must be standalone
+tokens so following date/time/phone prefixes are preserved. Possible codes never
+become a retained card suffix.
 The shared fixture and fixed-seed corpus in `tests/fixtures/card_redaction_cases.json`
 exercise identical generated corpora in Python and Go. The exact-preservation
 insertion corpus uses an independent checksum oracle to construct unambiguous
 ground truth across formatting and preceding/following numeric contexts;
 ambiguous readings have explicit conservative fixtures. Separate checks cover
-unfiltered numeric prose, writer storage and existing-row repair.
+unfiltered numeric prose, including valid checksums in non-layout groups,
+writer storage and existing-row repair.
 
 Explicit maintenance modules (dry-run unless `--apply` is passed):
 `personal_data_warehouse.scrub_conversation_cards` reports source/month counts

@@ -84,7 +84,7 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 			formats = append(formats, format{group, sep})
 		}
 	}
-	if config.Iterations < 8000 {
+	if config.Iterations < 20000 {
 		t.Fatal("property corpus must include thousands of cases")
 	}
 	for i := 0; i < config.Iterations; i++ {
@@ -105,7 +105,25 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 		}
 		order := number(16)
 		order = order[:15] + string(rune('0'+(int(order[15]-'0')+1)%10))
-		tokens := []string{phone, "+1-" + phone, phone2, date + "T" + clock + "Z", strings.ReplaceAll(date, "-", "/"), clock, strings.Join(uuidParts, "-"), order, strings.Repeat("9", 40+rand(40)), digits(3) + "." + digits(2)}
+		quantity := ""
+		for n := 10; n < 100; n++ {
+			if valid(order + fmt.Sprint(n)) {
+				quantity = fmt.Sprint(n)
+				break
+			}
+		}
+		aggregate := number(18)
+		aggregateBad := aggregate[:17] + string(rune('0'+(int(aggregate[17]-'0')+1)%10))
+		nonLayoutGroups := []int{4, 4, 4, 5 + i%3}
+		if i%3 == 0 {
+			nonLayoutGroups = []int{6, 6, 6}
+		}
+		nonLayoutLength := 0
+		for _, n := range nonLayoutGroups {
+			nonLayoutLength += n
+		}
+		nonLayout := propertyRenderGroups(number(nonLayoutLength), nonLayoutGroups, config.SeparatorVariants[i%6])
+		tokens := []string{phone, "+1-" + phone, phone2, date + "T" + clock + "Z", strings.ReplaceAll(date, "-", "/"), clock, strings.Join(uuidParts, "-"), order, strings.Repeat("9", 40+rand(40)), digits(3) + "." + digits(2), order + " " + quantity, aggregate[:12] + " " + aggregate[12:16] + " " + aggregate[16:], aggregateBad[:12] + " " + aggregateBad[12:16] + " " + aggregateBad[16:], "id=" + nonLayout + ";"}
 		for j := len(tokens) - 1; j > 0; j-- {
 			k := rand(j + 1)
 			tokens[j], tokens[k] = tokens[k], tokens[j]
@@ -118,6 +136,14 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 		}
 		f := formats[i%len(formats)]
 		context := config.PrecedingContexts[(i/len(formats))%len(config.PrecedingContexts)]
+		contextLine := line
+		for valid(contextLine) || valid(contextLine+"0") {
+			contextLine = contextLine[:3] + string(rune('0'+(int(contextLine[3]-'0')+1)%10))
+		}
+		contextPhone := area + "-" + exchange + "-" + contextLine
+		if replacement, ok := map[string]string{"$four_digits ": contextLine + " ", "$phone ": contextPhone + " ", "$phone_prefix ": area + " " + exchange + " ", "$date ": date + " ", "$order ": order + " "}[context]; ok {
+			context = replacement
+		}
 		following := config.FollowingContexts[(i/(len(formats)*len(config.PrecedingContexts)))%len(config.FollowingContexts)]
 		length := 0
 		for _, n := range f.groups {
@@ -127,7 +153,7 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 		for attempt := 0; attempt < 1000; attempt++ {
 			pan = number(length)
 			grouped = propertyRenderGroups(pan, f.groups, f.variant)
-			if propertyUnambiguousInsertion(context, grouped, valid) {
+			if propertyUnambiguousInsertion(context, grouped, following.Input, config.Groupings, valid) {
 				break
 			}
 			if attempt == 999 {
@@ -186,8 +212,8 @@ func propertyRenderGroups(number string, group []int, variant string) string {
 
 // Independent exhaustive checksum oracle, not a call into the redactor. Exact
 // insertion ground truth has one valid reading; ambiguity has separate fixtures.
-func propertyUnambiguousInsertion(context, pan string, checksum func(string) bool) bool {
-	value := context + pan
+func propertyUnambiguousInsertion(context, pan, following string, layouts [][]int, checksum func(string) bool) bool {
+	value := context + pan + following
 	atoms := [][2]int{}
 	for i := 0; i < len(value); {
 		if value[i] < '0' || value[i] > '9' {
@@ -204,6 +230,7 @@ func propertyUnambiguousInsertion(context, pan string, checksum func(string) boo
 	correct := false
 	for i, a := range atoms {
 		digits := ""
+		groups := []int{}
 		for j := i; j < len(atoms); j++ {
 			if j > i {
 				sep := value[atoms[j-1][1]:atoms[j][0]]
@@ -218,12 +245,30 @@ func propertyUnambiguousInsertion(context, pan string, checksum func(string) boo
 				}
 			}
 			digits += value[atoms[j][0]:atoms[j][1]]
+			groups = append(groups, atoms[j][1]-atoms[j][0])
 			if len(digits) > 19 {
 				break
 			}
-			if len(digits) >= 13 && checksum(digits) {
+			layout := false
+			for _, expected := range layouts {
+				if len(groups) != len(expected) {
+					continue
+				}
+				equal := true
+				for k, n := range groups {
+					if n != expected[k] {
+						equal = false
+						break
+					}
+				}
+				if equal {
+					layout = true
+					break
+				}
+			}
+			if layout && checksum(digits) {
 				count++
-				correct = a[0] == len(context) && atoms[j][1] == len(value)
+				correct = a[0] == len(context) && atoms[j][1] == len(context)+len(pan)
 			}
 		}
 	}

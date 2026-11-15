@@ -13,19 +13,15 @@ _ESCAPE = re.compile(r'\\+u(003[0-9]|0020|002[dD])')
 _DIGITS = re.compile(r'[0-9]+')
 _SEPARATOR = re.compile(r'[ -]{1,3}')
 _ADJACENT_CODE = re.compile(r'(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})(?![0-9])')
-_EXPIRY_SUFFIX = re.compile(r'/[0-9]{2}/(?:[0-9]{4}|[0-9]{2})(?![0-9/])')
-_PROTECTED = [
-    ('phone', re.compile(r'(?:\+[0-9]{1,3}[ -]{1,3})?[0-9]{3}[ -]{1,3}[0-9]{3}[ -]{1,3}[0-9]{4}')),
-    ('phone', re.compile(r'\([0-9]{3}\) {0,3}[0-9]{3}[ -]{1,3}[0-9]{4}')),
-    ('date', re.compile(r'[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])')),
-    ('date', re.compile(r'[0-9]{4}/(?:0[1-9]|1[0-2])/(?:0[1-9]|[12][0-9]|3[01])')),
-    ('date', re.compile(r'[0-9]{1,2}/[0-9]{2,4}')),
-    ('time', re.compile(r'[0-9]{1,3}:[0-9]{2}(?::[0-9]{2})?(?:\.[0-9]+)?')),
-    ('uuid', re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')),
-    ('id', re.compile(r'[0-9]{1,4}\.[0-9]+')),
-    ('id', re.compile(r'[0-9]{1,4}/[0-9]{2,4}')),
-    ('id', re.compile(r'[0-9]{1,4}[a-zA-Z_][a-zA-Z_0-9]*')),
-]
+# Explicit storage policy, mirrored in Go and pinned by shared fixtures.
+# A contiguous PAN is one whole run; grouped PANs must match one of these
+# layouts. Independent identifiers are never joined by length/Luhn alone.
+_CARD_LAYOUTS = frozenset(
+    [(n,) for n in range(13, 20)] +
+    [(4,4,4,4), (4,6,5), (4,6,4), (4,4,5), (5,5,5), (5,5,6)] +
+    [(4,4,4,n) for n in range(1,4)] +
+    [(4,4,4,4,n) for n in range(1,4)]
+)
 
 
 def standalone_end(value: str, end: int) -> bool:
@@ -37,62 +33,27 @@ def standalone_end(value: str, end: int) -> bool:
 
 
 def card_spans(value: str):
-    """Enumerate every overlapping digit-run reading, then apply exclusions.
+    """Enumerate complete runs/layouts at every start, then check Luhn.
 
-    A reading has 13–19 digits, never splits a contiguous run, and may join
-    groups across any 1–3 spaces/dashes. Layout and separator uniformity cannot
-    hide a card. Recognized non-card tokens, rather than candidate shape, keep
-    readings from consuming phone/date/time/identifier fragments.
+    Separators may mix 1–3 spaces/dashes. A complete valid layout wins over
+    neighbouring phone/date/time interpretations. No speculative token veto
+    may suppress it, and no layout-free concatenation may invent a card.
     """
     atoms = list(_DIGITS.finditer(value))
     readings = set()
     for i,atom in enumerate(atoms):
         digits = ''
+        groups = ()
         for j in range(i,len(atoms)):
             if j>i and not _SEPARATOR.fullmatch(value[atoms[j-1].end():atoms[j].start()]):
                 break
             digits += atoms[j][0]
+            groups += (len(atoms[j][0]),)
             if len(digits)>19:
                 break
-            if is_card(digits):
+            if groups in _CARD_LAYOUTS and is_card(digits):
                 readings.add((atom.start(),atoms[j].end()))
-    if not readings:
-        return
-    protected = []
-    token_starts = sorted({m.start() for m in atoms} | {m.start()-1 for m in atoms if m.start() and value[m.start()-1] in '+('})
-    for kind,pattern in _PROTECTED:
-        positions = [m.start() for m in pattern.finditer(value)] if kind=='uuid' else token_starts
-        for position in positions:
-            match = pattern.match(value,position)
-            if match is None:
-                continue
-            if match.start() and value[match.start()-1].isdigit():
-                continue
-            if match.end()<len(value) and value[match.end()].isdigit():
-                continue
-            first = _DIGITS.search(value,match.start(),match.end())
-            protected.append((kind,match.start(),match.end(),first.end()))
-    valid = []
-    for start,end in sorted(readings):
-        blocked = False
-        for kind,a,b,first_end in protected:
-            if start>=b or end<=a:
-                continue
-            # A confirmed PAN immediately before a numeric field/expiry has
-            # precedence over interpreting its final group as a new token.
-            # An earlier complete PAN instead makes that token a separate field.
-            groups = [len(m[0]) for m in _DIGITS.finditer(value,start,end)]
-            card_layout = (len(groups)==4 and groups[:3]==[4,4,4] and 1<=groups[3]<=7 or
-                           len(groups)==5 and groups[:4]==[4,4,4,4] and 1<=groups[4]<=3 or groups==[4,6,5])
-            numeric_field = card_layout and kind in ('date','time','id') and start<a and end==first_end
-            earlier_pan = any(s<a and start<e<=a for s,e in readings)
-            external_pan = any(s<start and start<e<=a for s,e in readings)
-            if numeric_field and (not earlier_pan or _EXPIRY_SUFFIX.match(value,end) and not external_pan):
-                continue
-            blocked = True
-            break
-        if not blocked:
-            valid.append((start,end))
+    valid = sorted(readings)
     codes = []
     for start,end in valid:
         code = _ADJACENT_CODE.match(value,end)
@@ -106,7 +67,7 @@ def card_spans(value: str):
         codes.append((code.start(1),code.end()))
     valid = [(a,b) for a,b in valid if not any(a<d and b>c for c,d in codes)]
     # Mask the union of overlapping valid readings: ambiguity never exposes a
-    # complete alternative PAN. Recognized safe tokens were excluded above.
+    # complete alternative PAN. Only explicit layouts reached this point.
     merged = []
     for start,end in valid:
         if merged and start<merged[-1][1]:

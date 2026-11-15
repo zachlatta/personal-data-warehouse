@@ -21,7 +21,7 @@ def render_groups(number,grouping,variant):
     return result
 
 
-def unambiguous_insertion(context,pan):
+def unambiguous_insertion(context, pan, following, layouts):
     """Independent exhaustive checksum oracle for known insertion ground truth.
 
     Prefix numbers can accidentally form a SECOND valid PAN with inserted
@@ -29,19 +29,21 @@ def unambiguous_insertion(context,pan):
     exact-preservation properties construct one valid reading, without consulting
     the redactor or filtering the safe prose through it.
     """
-    value=context+pan;atoms=list(re.finditer(r'[0-9]+',value))
+    value=context+pan+following;atoms=list(re.finditer(r'[0-9]+',value))
     readings=[]
     for i,atom in enumerate(atoms):
         digits=''
+        groups=[]
         for j in range(i,len(atoms)):
             if j>i and not re.fullmatch(r'[ -]{1,3}',value[atoms[j-1].end():atoms[j].start()]):
                 break
             digits+=atoms[j][0]
+            groups.append(len(atoms[j][0]))
             if len(digits)>19:
                 break
-            if 13<=len(digits) and checksum_valid(digits):
+            if groups in layouts and checksum_valid(digits):
                 readings.append((atom.start(),atoms[j].end()))
-    return readings==[(len(context),len(value))]
+    return readings==[(len(context),len(context)+len(pan))]
 
 
 def property_cases():
@@ -66,8 +68,18 @@ def property_cases():
         uuid = '-'.join(''.join('0123456789abcdef'[rand(16)] for _ in range(n)) for n in (8,4,4,4,12))
         valid_order = valid_number(16)
         order = valid_order[:-1] + str((int(valid_order[-1])+1)%10)
+        # Layout-free joining would corrupt these independent identifiers.
+        # Exercise both valid and invalid aggregate checksums, never filtering
+        # preservation cases through the production redactor.
+        quantity=next(str(n) for n in range(10,100) if checksum_valid(order+str(n)))
+        aggregate=valid_number(18)
+        aggregate_bad=aggregate[:-1]+str((int(aggregate[-1])+1)%10)
+        non_layout_groups = [6,6,6] if i%3==0 else [4,4,4,5+i%3]
+        non_layout=render_groups(valid_number(sum(non_layout_groups)), non_layout_groups, config['separator_variants'][i%6])
         tokens = [phone, '+1-'+phone, phone2, date+'T'+time+'Z', date.replace('-','/'), time,
-                  uuid, order, '9'*(40+rand(40)), digits(3)+'.'+digits(2)]
+                  uuid, order, '9'*(40+rand(40)), digits(3)+'.'+digits(2),
+                  order+' '+quantity, ' '.join((aggregate[:12],aggregate[12:16],aggregate[16:])),
+                  ' '.join((aggregate_bad[:12],aggregate_bad[12:16],aggregate_bad[16:])), 'id='+non_layout+';']
         # Fisher-Yates uses the same unsigned LCG in both language tests.
         for j in range(len(tokens)-1,0,-1):
             k=rand(j+1);tokens[j],tokens[k]=tokens[k],tokens[j]
@@ -76,14 +88,23 @@ def property_cases():
         yield f'preserve-{i}', safe, safe
         grouping, variant = formats[i%len(formats)]
         context = config['preceding_contexts'][(i//len(formats))%len(config['preceding_contexts'])]
+        # A checksum-valid four-digit line plus a 13-digit PAN is invariably
+        # another valid 17-digit layout. Construct unambiguous phone context
+        # independently; the unfiltered safe prose above keeps the original.
+        context_line = line
+        while checksum_valid(context_line) or checksum_valid(context_line+'0'):
+            context_line = context_line[:-1]+str((int(context_line[-1])+1)%10)
+        context_phone = area+'-'+exchange+'-'+context_line
+        context = {'$four_digits ': context_line+' ', '$phone ': context_phone+' ', '$phone_prefix ': area+' '+exchange+' ',
+                   '$date ': date+' ', '$order ': order+' '}.get(context, context)
         following = config['following_contexts'][(i//(len(formats)*len(config['preceding_contexts'])))%len(config['following_contexts'])]
         for attempt in range(1000):
             number=valid_number(sum(grouping))
             pan=render_groups(number,grouping,variant)
-            if unambiguous_insertion(context,pan):
+            if unambiguous_insertion(context,pan,following['input'],config['groupings']):
                 break
         else:
-            raise AssertionError('could not construct unambiguous synthetic PAN')
+            raise AssertionError(f'could not construct unambiguous synthetic PAN at {i}, layout {grouping}, variant {variant}')
         replacement='[card ****'+number[-4:]+']'
         at=rand(len(tokens)+1)
         prefix=joiner.join(tokens[:at])+' | '+context

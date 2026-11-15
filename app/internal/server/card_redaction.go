@@ -25,26 +25,6 @@ var cardEscape = regexp.MustCompile(`\\+u(003[0-9]|0020|002[dD])`)
 var cardDigits = regexp.MustCompile(`[0-9]+`)
 var cardSeparator = regexp.MustCompile(`^[ -]{1,3}$`)
 var adjacentCardCode = regexp.MustCompile(`^(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})`)
-var cardExpirySuffix = regexp.MustCompile(`^/[0-9]{2}/(?:[0-9]{4}|[0-9]{2})(?:[^0-9/]|$)`)
-var protectedUUID = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
-
-type protectedPattern struct {
-	kind    string
-	pattern *regexp.Regexp
-}
-
-var protectedPatterns = []protectedPattern{
-	{"phone", regexp.MustCompile(`^(?:\+[0-9]{1,3}[ -]{1,3})?[0-9]{3}[ -]{1,3}[0-9]{3}[ -]{1,3}[0-9]{4}`)},
-	{"phone", regexp.MustCompile(`^\([0-9]{3}\) {0,3}[0-9]{3}[ -]{1,3}[0-9]{4}`)},
-	{"date", regexp.MustCompile(`^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])`)},
-	{"date", regexp.MustCompile(`^[0-9]{4}/(?:0[1-9]|1[0-2])/(?:0[1-9]|[12][0-9]|3[01])`)},
-	{"date", regexp.MustCompile(`^[0-9]{1,2}/[0-9]{2,4}`)},
-	{"time", regexp.MustCompile(`^[0-9]{1,3}:[0-9]{2}(?::[0-9]{2})?(?:\.[0-9]+)?`)},
-	{"uuid", regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)},
-	{"id", regexp.MustCompile(`^[0-9]{1,4}\.[0-9]+`)},
-	{"id", regexp.MustCompile(`^[0-9]{1,4}/[0-9]{2,4}`)},
-	{"id", regexp.MustCompile(`^[0-9]{1,4}[a-zA-Z_][a-zA-Z_0-9]*`)},
-}
 
 func standaloneCardTokenEnd(s string, end int) bool {
 	if end == len(s) {
@@ -64,72 +44,42 @@ func digitCount(s string) int {
 	}
 	return n
 }
-func cardLayout(s string) bool {
-	atoms := cardDigits.FindAllStringIndex(s, -1)
-	g := []int{}
-	for _, a := range atoms {
-		g = append(g, a[1]-a[0])
+
+// Explicit policy mirrored in Python and pinned by the shared fixture corpus.
+func cardLayout(g []int) bool {
+	switch len(g) {
+	case 1:
+		return g[0] >= 13 && g[0] <= 19
+	case 3:
+		return g[0] == 4 && (g[1] == 6 && (g[2] == 4 || g[2] == 5) || g[1] == 4 && g[2] == 5) || g[0] == 5 && g[1] == 5 && (g[2] == 5 || g[2] == 6)
+	case 4:
+		return g[0] == 4 && g[1] == 4 && g[2] == 4 && g[3] >= 1 && g[3] <= 4
+	case 5:
+		return g[0] == 4 && g[1] == 4 && g[2] == 4 && g[3] == 4 && g[4] >= 1 && g[4] <= 3
 	}
-	return (len(g) == 4 && g[0] == 4 && g[1] == 4 && g[2] == 4 && g[3] >= 1 && g[3] <= 7) || (len(g) == 5 && g[0] == 4 && g[1] == 4 && g[2] == 4 && g[3] == 4 && g[4] >= 1 && g[4] <= 3) || (len(g) == 3 && g[0] == 4 && g[1] == 6 && g[2] == 5)
+	return false
 }
 
-// Every digit-run start is evaluated, including overlaps. Candidate formatting
-// never excludes a reading: only length, Luhn and recognized non-card tokens do.
+// Every complete run/layout is evaluated at every start, including overlaps.
+// A valid card wins over neighbouring phone/date/time interpretations.
 func cardTokens(s string) [][2]int {
 	atoms := cardDigits.FindAllStringIndex(s, -1)
 	readings := [][2]int{}
 	for i, a := range atoms {
 		digits := ""
+		groups := []int{}
 		for j := i; j < len(atoms); j++ {
 			if j > i && !cardSeparator.MatchString(s[atoms[j-1][1]:atoms[j][0]]) {
 				break
 			}
 			digits += s[atoms[j][0]:atoms[j][1]]
+			groups = append(groups, atoms[j][1]-atoms[j][0])
 			if len(digits) > 19 {
 				break
 			}
-			if validCard(digits) {
+			if cardLayout(groups) && validCard(digits) {
 				readings = append(readings, [2]int{a[0], atoms[j][1]})
 			}
-		}
-	}
-	if len(readings) == 0 {
-		return nil
-	}
-	tokenStarts := []int{}
-	for _, a := range atoms {
-		tokenStarts = append(tokenStarts, a[0])
-		if a[0] > 0 && (s[a[0]-1] == '+' || s[a[0]-1] == '(') {
-			tokenStarts = append(tokenStarts, a[0]-1)
-		}
-	}
-	type token struct {
-		kind                 string
-		start, end, firstEnd int
-	}
-	protected := []token{}
-	for _, p := range protectedPatterns {
-		positions := tokenStarts
-		if p.kind == "uuid" {
-			positions = nil
-			for _, m := range protectedUUID.FindAllStringIndex(s, -1) {
-				positions = append(positions, m[0])
-			}
-		}
-		for _, start := range positions {
-			if asciiDigit(s, start-1) {
-				continue
-			}
-			m := p.pattern.FindStringIndex(s[start:])
-			if m == nil {
-				continue
-			}
-			end := start + m[1]
-			if asciiDigit(s, end) {
-				continue
-			}
-			first := cardDigits.FindStringIndex(s[start:end])
-			protected = append(protected, token{p.kind, start, end, start + first[1]})
 		}
 	}
 	sort.Slice(readings, func(i, j int) bool {
@@ -138,35 +88,7 @@ func cardTokens(s string) [][2]int {
 		}
 		return readings[i][1] < readings[j][1]
 	})
-	valid := [][2]int{}
-	for _, r := range readings {
-		start, end := r[0], r[1]
-		blocked := false
-		for _, p := range protected {
-			if start >= p.end || end <= p.start {
-				continue
-			}
-			numericField := cardLayout(s[start:end]) && (p.kind == "date" || p.kind == "time" || p.kind == "id") && start < p.start && end == p.firstEnd
-			earlier := false
-			external := false
-			for _, other := range readings {
-				if other[0] < p.start && start < other[1] && other[1] <= p.start {
-					earlier = true
-					if other[0] < start {
-						external = true
-					}
-				}
-			}
-			if numericField && (!earlier || cardExpirySuffix.MatchString(s[end:]) && !external) {
-				continue
-			}
-			blocked = true
-			break
-		}
-		if !blocked {
-			valid = append(valid, r)
-		}
-	}
+	valid := readings
 	codes := [][2]int{}
 	for _, r := range valid {
 		start, end := r[0], r[1]

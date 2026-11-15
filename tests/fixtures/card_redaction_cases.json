@@ -843,6 +843,22 @@
       "expected": "prefix[card ****1111]suffix"
     },
     {
+      "name": "review6_phone_prefix",
+      "input": "212 555 4111 1111 1111 1111 CVV2: 987",
+      "expected": "212 555 [card ****1111] CVV2: [redacted]"
+    },
+    {
+      "name": "review6_independent_order_ids",
+      "input": "Order IDs: 4111111111111112 17",
+      "expected": "Order IDs: 4111111111111112 17",
+      "synthetic_provenance": {
+        "recipe": "canonical_invalid_id_plus_luhn_quantity",
+        "description": "Increment the published Visa test PAN final digit modulo ten to make an invalid identifier. Append the first two-digit integer starting at ten making their aggregate pass Luhn; the independent identifiers must remain unchanged.",
+        "base_test_pan": "4111111111111111",
+        "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+      }
+    },
+    {
       "name": "review5_numeric_prefix",
       "input": "1234 4111 1111 1111 1111 CVV2: 987",
       "expected": "1234 [card ****1111] CVV2: [redacted]"
@@ -920,7 +936,7 @@
   ],
   "property": {
     "seed": 12345678,
-    "iterations": 8000,
+    "iterations": 20000,
     "groupings": [
       [
         13
@@ -947,43 +963,50 @@
         4,
         4,
         4,
-        1
+        4
       ],
       [
         4,
-        4,
-        4,
-        2
+        6,
+        5
       ],
       [
         4,
-        4,
-        4,
-        3
-      ],
-      [
-        4,
-        4,
-        4,
+        6,
         4
       ],
       [
         4,
         4,
-        4,
         5
       ],
       [
-        4,
-        4,
-        4,
+        5,
+        5,
+        5
+      ],
+      [
+        5,
+        5,
         6
       ],
       [
         4,
         4,
         4,
-        7
+        1
+      ],
+      [
+        4,
+        4,
+        4,
+        2
+      ],
+      [
+        4,
+        4,
+        4,
+        3
       ],
       [
         4,
@@ -1005,11 +1028,6 @@
         4,
         4,
         3
-      ],
-      [
-        4,
-        6,
-        5
       ]
     ],
     "delimiters": [
@@ -1040,8 +1058,12 @@
     ],
     "preceding_contexts": [
       "word ",
-      "1234 ",
-      "12345678 "
+      "$four_digits ",
+      "12345678 ",
+      "$phone ",
+      "$phone_prefix ",
+      "$date ",
+      "$order "
     ],
     "following_contexts": [
       {
@@ -1167,9 +1189,21 @@
       {
         "input": " 123/45",
         "expected": " 123/45"
+      },
+      {
+        "input": " CVV2: 987",
+        "expected": " CVV2: [redacted]"
+      },
+      {
+        "input": " CVC: 987",
+        "expected": " CVC: [redacted]"
+      },
+      {
+        "input": " CVC2: 1234",
+        "expected": " CVC2: [redacted]"
       }
     ],
-    "corpus_sha256": "031c4b1718ce9c7f264c28e66110c03566424436ba5b58457eb810a59ee5f1ac",
+    "corpus_sha256": "0423e2f5f4a7b01c3cc288ab8251952c72050e70bb3e6f4706ee6f31d08cb4eb",
     "permutation_tokens": [
       "2026-11-15T09:12:13Z",
       "+1-202-555-0198",

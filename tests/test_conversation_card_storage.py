@@ -279,6 +279,29 @@ def test_missing_canonical_turn_refuses_to_delete_derived_row(warehouse):
     assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0] == 1
 
 
+@pytest.mark.parametrize('name', ['review6_phone_prefix', 'review6_independent_order_ids'])
+@pytest.mark.parametrize('operation', ['writer', 'scan', 'repair'])
+def test_card_layout_boundaries_at_storage(warehouse, name, operation):
+    from pathlib import Path
+    cases = json.loads((Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['cases']
+    case = next(c for c in cases if c['name'] == name)
+    row = dict(event(), text=case['input'], **{
+        key: json.dumps({'text': case['input']})
+        for key in ('tool_input_json', 'tool_result_json', 'raw_json')})
+    if operation == 'writer':
+        warehouse.insert_agent_session_events([row])
+    else:
+        warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+        if operation == 'scan':
+            assert bool(scrub(warehouse)) == (case['input'] != case['expected'])
+            return
+        scrub(warehouse, apply=True)
+    stored = warehouse._query_dicts('SELECT text,tool_input_json,tool_result_json,raw_json FROM @claude_code_events')[0]
+    assert stored['text'] == case['expected']
+    for key in ('tool_input_json', 'tool_result_json', 'raw_json'):
+        assert json.loads(stored[key])['text'] == case['expected']
+
+
 def test_chunk_only_match_rebuilds_without_losing_timeline_rows(warehouse):
     from personal_data_warehouse.search_index import SearchChunkBuilder
     from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
