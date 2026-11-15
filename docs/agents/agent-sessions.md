@@ -545,8 +545,12 @@ are pending, never assumed zero.
 Reports contain counts only; repeat each dry-run afterward and require zero.
 Historical backups and WAL are not erased by these commands.
 
-The scrub SQL prefilter is a proven superset of decoded card detection: after
-backslash/Unicode-unit normalization, 13 digits fit within a 49-character window.
+The scrub SQL/archive prefilters bound both literal and decoded digit readings:
+remove backslashes, replace every possible Unicode unit by **four** digit
+sentinels, then select 13 digits within a 49-character normalized window.
+Four preserves up to four literal digits after an ordinary word ending in `u`
+as well as the possible decoded character; this deliberately permits false
+positives and never makes a checksum decision. Nested escaping only adds digits.
 Only prefiltered IDs are fetched and confirmed in bounded memory batches by
 spawned processes. The CLI defaults `--workers` to available CPUs. Large heaps
 use disjoint block ranges under one exported read-only snapshot so live tuple

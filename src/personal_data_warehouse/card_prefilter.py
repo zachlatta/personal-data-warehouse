@@ -9,6 +9,7 @@ import threading
 from personal_data_warehouse.card_redaction import card_count, redact_row
 
 UNICODE_UNIT = r'u[0-9a-fA-F]{4}'
+UNIT_DIGITS = '0000'
 DIGIT_WINDOW = r'[0-9]([ -]{0,3}[0-9]){12}'
 _UNIT = re.compile(UNICODE_UNIT)
 _WINDOW = re.compile(DIGIT_WINDOW)
@@ -17,20 +18,24 @@ _WINDOW = re.compile(DIGIT_WINDOW)
 def sql_prefilter(expression):
     """Parallel-safe SQL expression, requiring no installed function or DDL.
 
-    Remove all literal backslashes; replace EVERY Unicode unit by a digit
-    sentinel (not only escaped digits). Each decoded PAN digit contributes at
-    least one literal/sentinel digit. Escaped separators/backslashes contribute
-    extra digits; remaining separators are at most three spaces/dashes. Thus a
-    PAN implies 13 normalized digits within 49 normalized characters, whatever
-    the raw escaping depth. False positives are always confirmed in Python.
+    Remove backslashes; replace each possible Unicode unit by FOUR digits.
+    A bare 'u' can introduce ordinary prose digits, so one sentinel would lose
+    up to four literal PAN digits. Four preserves BOTH possible readings: at
+    most four literal digits or one decoded character. No possible PAN digit
+    is lost; escape syntax introduces only extra digits, including when the
+    backslashes or the escape's own 'u' are encoded at further JSON levels.
+    Every remaining PAN separator is at most three spaces/dashes. Thus a PAN
+    implies 13 digits within 49 normalized characters at any escaping depth.
+    This is an upper bound, not an escape decoder or a card decision.
+    False positives are always confirmed in Python.
     The expression is supplied by code, never by CLI input.
     """
     return (f"regexp_replace(translate(COALESCE(({expression})::text, ''), chr(92), ''), "
-            f"'{UNICODE_UNIT}', '0', 'g') ~ '{DIGIT_WINDOW}'")
+            f"'{UNICODE_UNIT}', '{UNIT_DIGITS}', 'g') ~ '{DIGIT_WINDOW}'")
 
 
 def might_contain_card(value):
-    return bool(_WINDOW.search(_UNIT.sub('0',value.replace('\\',''))))
+    return bool(_WINDOW.search(_UNIT.sub(UNIT_DIGITS,value.replace('\\',''))))
 
 
 def available_cpus():
