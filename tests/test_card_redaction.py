@@ -3,6 +3,18 @@ import json
 import pytest
 
 from personal_data_warehouse.card_redaction import redact, redact_row
+from pathlib import Path
+
+
+@pytest.mark.parametrize('case', json.loads((Path(__file__).parent / 'fixtures/card_redaction_cases.json').read_text()), ids=lambda c: c['name'])
+def test_shared_adversarial_cases(case):
+    assert redact(case['input']) == case['expected']
+
+
+@pytest.mark.parametrize('label', ['CVV2', 'CVC2', 'CID', 'CSC', 'security code', 'card code'])
+def test_security_code_json_keys(label):
+    result = json.loads(redact(json.dumps({'number': '4111111111111111', label: 987})))
+    assert result[label] == '[redacted]'
 
 
 @pytest.mark.parametrize('separator', ['', ' ', '-'])
@@ -38,6 +50,9 @@ def test_all_supported_lengths(length):
     prefix = '4' + '1' * (length - 2)
     number = next(prefix + str(n) for n in range(10) if is_card(prefix + str(n)))
     assert redact(number).startswith('[card ****')
+    grouped = ' '.join(number[i:i+4] for i in range(0,len(number),4))
+    masked = redact(grouped + ' 987')
+    assert masked.startswith('[card ****') and masked.endswith('] [redacted]') and '987' not in masked
 
 
 def test_nested_escaped_json_in_tool_output():

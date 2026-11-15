@@ -1,0 +1,84 @@
+[
+  {
+    "name": "expiry_adjacent",
+    "input": "4111111111111111 12/27 CVV: 987",
+    "expected": "[card ****1111] 12/27 CVV: [redacted]"
+  },
+  {
+    "name": "bare_code",
+    "input": "4111111111111111 987",
+    "expected": "[card ****1111] [redacted]",
+    "synthetic_provenance": {
+      "recipe": "canonical_pan_with_descending_test_code",
+      "description": "Append the three descending test digits starting at nine to the contiguous published Visa test PAN. The aggregate also passes Luhn.",
+      "base_test_pan": "4111111111111111",
+      "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+    }
+  },
+  {
+    "name": "spaced_bare_code",
+    "input": "4111 1111 1111 1111 987",
+    "expected": "[card ****1111] [redacted]",
+    "synthetic_provenance": {
+      "recipe": "canonical_pan_with_descending_test_code",
+      "description": "Append the three descending test digits starting at nine to the published Visa test PAN grouped in fours with spaces. The aggregate also passes Luhn.",
+      "base_test_pan": "4111111111111111",
+      "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+    }
+  },
+  {
+    "name": "cvv2",
+    "input": "4111111111111111 CVV2: 987",
+    "expected": "[card ****1111] CVV2: [redacted]"
+  },
+  {
+    "name": "cvc2",
+    "input": "4111111111111111 CVC2: 987",
+    "expected": "[card ****1111] CVC2: [redacted]"
+  },
+  {
+    "name": "cid",
+    "input": "4111111111111111 CID: 987",
+    "expected": "[card ****1111] CID: [redacted]"
+  },
+  {
+    "name": "csc",
+    "input": "4111111111111111 CSC: 987",
+    "expected": "[card ****1111] CSC: [redacted]"
+  },
+  {
+    "name": "card_code",
+    "input": "4111111111111111 card code: 987",
+    "expected": "[card ****1111] card code: [redacted]"
+  },
+  {
+    "name": "json_suffix",
+    "input": "{\"ok\":true} diagnostic follows; card 4111111111111111",
+    "expected": "{\"ok\":true} diagnostic follows; card [card ****1111]"
+  },
+  {
+    "name": "invalid",
+    "input": "4111111111111112",
+    "expected": "4111111111111112"
+  },
+  {
+    "name": "long",
+    "input": "9941111111111111119999",
+    "expected": "9941111111111111119999"
+  },
+  {
+    "name": "phone",
+    "input": "+1-212-555-0198",
+    "expected": "+1-212-555-0198"
+  },
+  {
+    "name": "timestamp",
+    "input": "2026-11-15T09:12:13Z",
+    "expected": "2026-11-15T09:12:13Z"
+  },
+  {
+    "name": "uuid",
+    "input": "e83fa2c9-9814-4a3b-b8ae-827560198234",
+    "expected": "e83fa2c9-9814-4a3b-b8ae-827560198234"
+  }
+]

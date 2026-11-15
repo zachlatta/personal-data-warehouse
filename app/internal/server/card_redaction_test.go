@@ -7,9 +7,79 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestSharedAdversarialCardCases(t *testing.T) {
+	data, err := os.ReadFile("../../../tests/fixtures/card_redaction_cases.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		Name     string
+		Input    string
+		Expected string
+	}
+	if json.Unmarshal(data, &cases) != nil {
+		t.Fatal("invalid shared fixture")
+	}
+	for _, c := range cases {
+		t.Run(c.Name, func(t *testing.T) {
+			if redactCardText(c.Input, true) != c.Expected {
+				t.Fatal("redaction contract failed")
+			}
+			line, _ := json.Marshal(map[string]string{"text": c.Input})
+			cleaned, err := redactConversationBatch(conversationTestBatch(string(line)), 100000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, _ := gzip.NewReader(bytes.NewReader(cleaned))
+			raw, _ := io.ReadAll(r)
+			r.Close()
+			var result map[string]string
+			if json.Unmarshal(raw, &result) != nil || result["text"] != c.Expected {
+				t.Fatal("batch contract failed")
+			}
+		})
+	}
+}
+
+func TestSecurityCodeJSONKeys(t *testing.T) {
+	for _, label := range []string{"CVV2", "CVC2", "CID", "CSC", "security code", "card code"} {
+		result := redactCardJSON(map[string]any{"number": "4111111111111111", label: json.Number("987")}, true).(map[string]any)
+		if result[label] != "[redacted]" {
+			t.Fatal("code not masked")
+		}
+	}
+}
+
+func TestAllCardLengthsWithAdjacentCode(t *testing.T) {
+	for length := 13; length <= 19; length++ {
+		prefix := "4" + strings.Repeat("1", length-2)
+		number := ""
+		for n := 0; n < 10; n++ {
+			candidate := prefix + string(rune('0'+n))
+			if validCard(candidate) {
+				number = candidate
+				break
+			}
+		}
+		var groups []string
+		for i := 0; i < len(number); i += 4 {
+			end := i + 4
+			if end > len(number) {
+				end = len(number)
+			}
+			groups = append(groups, number[i:end])
+		}
+		result := redactCardText(strings.Join(groups, " ")+" 987", true)
+		if !strings.HasPrefix(result, "[card ****") || !strings.HasSuffix(result, "] [redacted]") || strings.Contains(result, "987") {
+			t.Fatal("adjacent code or card suffix survived")
+		}
+	}
+}
 
 func conversationTestBatch(s string) []byte {
 	var out bytes.Buffer

@@ -50,7 +50,7 @@ def test_legacy_scrub_cleans_timeline_chunks_and_is_idempotent(warehouse):
     assert scrub(warehouse, page_size=1) == []
     assert warehouse._query('SELECT count(*) FROM @search_chunks')[0][0] == 0
     assert warehouse._query('SELECT count(*) FROM @search_chunk_embeddings')[0][0] == 0
-    assert warehouse._query('SELECT snippet FROM @timeline_events')[0][0] == 'CVV: [redacted]'
+    assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0] == 0
 
 
 def test_local_jsonl_scrub(tmp_path):
@@ -94,3 +94,73 @@ def test_object_scrub_verifies_replacement_before_deleting(tmp_path, monkeypatch
     assert store.deleted == ['old']
     assert scrub_objects(store)['matches'] == 0
     assert list(tmp_path.iterdir()) == []
+
+
+def test_session_rollup_context_is_not_a_session_key(warehouse):
+    row = event()
+    warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+    warehouse._command("""INSERT INTO @timeline_events
+      (adapter,event_id,source,context,source_pk,snippet,search_text)
+      VALUES ('agent_session','claude_code|test-session','claude_code','/workspace',%s,%s,%s)""",
+      (json.dumps(dict(source='claude_code',session_id='test-session')), 'CVV: 987', 'CVV: 987'))
+    warehouse._command("""INSERT INTO @search_chunks
+      (chunk_id,adapter,event_id,source,context,text,text_sha256)
+      VALUES ('rollup-chunk','agent_session','claude_code|test-session','claude_code','/workspace',%s,'rollup-sha')""", ('CVV: 987',))
+    warehouse._command("INSERT INTO @search_chunk_embeddings (text_sha256,model) VALUES ('rollup-sha','test')")
+    scrub(warehouse,apply=True)
+    # Verify the bad outcome without returning any candidate content.
+    assert scrub(warehouse) == []
+    assert warehouse._query("SELECT count(*) FROM @timeline_events WHERE snippet LIKE 'CVV: %' AND snippet NOT LIKE '%redacted%'")[0][0] == 0
+    assert warehouse._query('SELECT count(*) FROM @search_chunk_embeddings')[0][0] == 0
+
+def test_partial_pan_in_turn_snippet_is_regenerated(warehouse):
+    row = event()
+    warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+    warehouse._command("""INSERT INTO @timeline_events
+      (adapter,event_id,source,context,snippet,search_text)
+      VALUES ('agent_session_turn','test-event','claude_code','claude_code|test-session',%s,%s)""",
+      ('card ' + row['text'][:12], row['text']))
+    scrub(warehouse,apply=True)
+    assert scrub(warehouse) == []
+    assert warehouse._query("SELECT count(*) FROM @timeline_events WHERE snippet LIKE 'card 4%'")[0][0] == 0
+
+
+def test_month_source_report_retains_zero_after_groups():
+    from personal_data_warehouse.scrub_conversation_cards import month_source_report, report_html
+    baseline = [dict(table='claude_code_events', month='2026-01', source='claude_code', measure='rows', count=2),
+                dict(table='claude_code_events', month='2026-01', source='claude_code', measure='matches', count=5),
+                dict(table='timeline_events', month='2026-01', source='claude_code', measure='matches', count=3)]
+    report = month_source_report(baseline, [])
+    assert report == [dict(month='2026-01', source='claude_code', rows_before=2, matches_before=5, rows_after=0, matches_after=0)]
+    assert '<td>2026-01</td><td>claude_code</td><td>2</td><td>5</td><td>0</td><td>0</td>' in report_html(report)
+    assert month_source_report(baseline)[0]['matches_after'] is None
+    assert 'pending' in report_html(month_source_report(baseline))
+
+
+def test_real_adapters_rebuild_rollups_and_truncated_copies(warehouse):
+    from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
+    row = event()
+    row['occurred_at'] = datetime.now(UTC)
+    row['cwd'] = '/workspace'
+    text = 'x' * 292 + '4111111111111111'
+    text += 'y' * (492 - len(text)) + '4111111111111111 CVV2: 987'
+    row['text'] = text
+    row['raw_json'] = json.dumps({'text': text})
+    safe = dict(row, event_uuid='safe-event', seq=2, text='safe following turn', raw_json='{}')
+    warehouse._insert_rows('claude_code_events', [row, safe], AGENT_SESSION_EVENT_COLUMNS)
+    engine = TimelineSyncEngine(source_url=os.environ['POSTGRES_DATABASE_URL'], source_schema=warehouse._schema,
+                                dest_schema=warehouse._schema, adapters=[adapter_by_name(n) for n in ('agent_session','agent_session_turn')])
+    try:
+        engine.run()
+        assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0] == 3
+        assert warehouse._query("SELECT count(*) FROM @timeline_events WHERE right(title,8) = '41111111'")[0][0] == 2
+        scrub(warehouse, apply=True)
+        assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0] == 0
+        engine.run_incremental(adapter_names=['agent_session', 'agent_session_turn'])
+        rebuilt = warehouse._query_dicts('SELECT title,snippet,search_text FROM @timeline_events')
+        assert len(rebuilt) == 3
+        for copy in rebuilt:
+            assert all('41111111' not in value and '987' not in value for value in copy.values())
+        assert scrub(warehouse) == []
+    finally:
+        engine.close()

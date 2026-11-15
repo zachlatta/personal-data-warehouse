@@ -6,9 +6,65 @@ import re
 from typing import Any
 
 _RUN = re.compile(r'(?<![0-9])[0-9](?:[ -]*[0-9])*(?![0-9])')
-_CODE = re.compile(r'(?i)((?:cvv|cvc|security[ _-]*code)\b(?:\s+is)?[\s\\\x22\x27:=,-]{0,24})([0-9]{3,4})(?![0-9])')
-_CODE_KEY = re.compile(r'(?i)^(?:cvv|cvc|security[ _-]*code)$')
+_LABEL = r'(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*code)'
+_CODE = re.compile(r'(?i)(\b' + _LABEL + r'\b(?:\s+is)?[\s\\\x22\x27:=,-]{0,24})([0-9]{3,4})(?![0-9])')
+_CODE_KEY = re.compile(r'(?i)^' + _LABEL + '$')
 _ESCAPE = re.compile(r'\\+u(003[0-9]|0020|002[dD])')
+_DIGITS = re.compile(r'[0-9]+')
+_BARE_CODE = re.compile(r'[ -]+([0-9]{3,4})(?![0-9])')
+
+
+def card_spans(value: str):
+    """Token-aligned Luhn windows; never split a long contiguous identifier.
+
+    Prefer a complete contiguous PAN or standard 4/4/4/4 and 4/6/5
+    groupings over a longer window that accidentally includes an adjacent code.
+    """
+    for run in _RUN.finditer(value):
+        tokens = list(_DIGITS.finditer(run[0]))
+        i = 0
+        while i < len(tokens):
+            candidates = []
+            digits = ''
+            for j in range(i, len(tokens)):
+                digits += tokens[j][0]
+                if len(digits) > 19:
+                    break
+                if not is_card(digits):
+                    continue
+                groups = [len(t[0]) for t in tokens[i:j+1]]
+                rank = 0 if len(groups) == 1 else 1 if groups in ([4,4,4,4], [4,6,5]) else 2
+                candidates.append((rank, len(digits), j))
+            if not candidates:
+                i += 1
+                continue
+            _, _, j = min(candidates)
+            furthest = max(c[2] for c in candidates)
+            # Ambiguous valid windows are all covered, but retain digits only
+            # from the preferred PAN, never an adjacent code in a longer window.
+            yield run.start() + tokens[i].start(), run.start() + tokens[furthest].end(), run.start() + tokens[j].end()
+            i = furthest + 1
+
+
+def _mask_cards(value: str) -> str:
+    output = []
+    cursor = 0
+    for start, end, retained_end in card_spans(value):
+        if start < cursor:
+            continue
+        digits = value[start:retained_end].replace(' ', '').replace('-', '')
+        output.extend((value[cursor:start], '[card ****' + digits[-4:] + ']'))
+        if end > retained_end:
+            output.append(' [redacted]')
+        # Bare adjacent security codes have no label to match later. Consume
+        # them separately, so they never become part of the retained last four.
+        code = _BARE_CODE.match(value, end)
+        if code:
+            output.extend((value[end:code.start(1)], '[redacted]'))
+            end = code.end()
+        cursor = end
+    output.append(value[cursor:])
+    return ''.join(output)
 
 
 def is_card(value: str) -> bool:
@@ -24,7 +80,7 @@ def is_card(value: str) -> bool:
 
 def card_count(value: str) -> int:
     decoded = _ESCAPE.sub(lambda m: chr(int(m[1], 16)), value)
-    return sum(is_card(m[0]) for m in _RUN.finditer(decoded))
+    return sum(1 for _ in card_spans(decoded))
 
 
 def redact(value: str, *, card_context: bool = False) -> str:
@@ -57,7 +113,7 @@ def redact(value: str, *, card_context: bool = False) -> str:
         cleaned = walk(parsed)
         return json.dumps(cleaned, ensure_ascii=False) if cleaned != parsed else value
     decoded = _ESCAPE.sub(lambda m: chr(int(m[1], 16)), value)
-    cleaned = _RUN.sub(lambda m: '[card ****' + m[0].replace(' ', '').replace('-', '')[-4:] + ']' if is_card(m[0]) else m[0], decoded)
+    cleaned = _mask_cards(decoded)
     cleaned = _CODE.sub(lambda m: m[1] + '[redacted]', cleaned)
     return cleaned if cleaned != decoded else value
 
