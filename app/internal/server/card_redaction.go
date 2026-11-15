@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 var cardRun = regexp.MustCompile(`[0-9](?:[ -]*[0-9])*`)
@@ -21,7 +23,15 @@ var codeValue = regexp.MustCompile(`(?i)(\b` + cardCodeLabel + `\b(?:\s+is)?[\s\
 var codeKey = regexp.MustCompile(`(?i)^` + cardCodeLabel + `$`)
 var cardEscape = regexp.MustCompile(`\\+u(003[0-9]|0020|002[dD])`)
 var cardDigits = regexp.MustCompile(`[0-9]+`)
-var bareCardCode = regexp.MustCompile(`^[ -]+([0-9]{3,4})(?:[^0-9]|$)`)
+var bareCardCode = regexp.MustCompile(`^[ -]+([0-9]{3,4})`)
+
+func standaloneCardTokenEnd(s string, end int) bool {
+	if end == len(s) {
+		return true
+	}
+	next, _ := utf8.DecodeRuneInString(s[end:])
+	return !unicode.IsLetter(next) && !unicode.IsDigit(next) && !strings.ContainsRune("_-/:", next) && !(next == '.' && end+1 < len(s) && s[end+1] >= '0' && s[end+1] <= '9')
+}
 
 // Only token-aligned windows are candidates. A long contiguous identifier is
 // never split. Prefer contiguous PANs and standard groupings over a window that
@@ -40,6 +50,9 @@ func cardWindows(s string) [][3]int {
 					break
 				}
 				if !validCard(digits) {
+					continue
+				}
+				if j > i && !standaloneCardTokenEnd(s, run[0]+tokens[j][1]) {
 					continue
 				}
 				furthest = j
@@ -84,7 +97,7 @@ func maskCardWindows(s string) string {
 		if end > span[2] {
 			out.WriteString(" [redacted]")
 		}
-		if code := bareCardCode.FindStringSubmatchIndex(s[end:]); code != nil {
+		if code := bareCardCode.FindStringSubmatchIndex(s[end:]); code != nil && standaloneCardTokenEnd(s, end+code[3]) {
 			out.WriteString(s[end : end+code[2]])
 			out.WriteString("[redacted]")
 			end += code[3]

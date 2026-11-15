@@ -448,11 +448,14 @@ and cleans source rows, timeline text and search chunks/embeddings;
 `personal_data_warehouse.scrub_conversation_objects` replaces inbox/library
 batches after verifying sanitized uploads; `personal_data_warehouse.scrub_conversation_jsonl`
 accepts `--root` and `--session` to clean host JSONL copies. Pause writers,
-timeline sync and search workers during maintenance. The database scrub removes
-affected session/turn rows by source session identity (a rollup's context is a
-directory/account, not its session id), removes their chunks and embeddings, and
-stamps every source event in those sessions for incremental adapter regeneration.
-This also removes partial card numbers in truncated titles and snippets. The
+timeline sync and search workers during maintenance. The database scrub discovers
+affected sessions in sources AND derived copies by source session identity (a
+rollup's context is a directory/account, not its session id). In one transaction
+it sanitizes sources, runs the canonical timeline adapters, rewrites current keys
+in place, and only then removes stale keys, chunks and embeddings. Missing source
+data or failed regeneration rolls back all repairs. Fresh sequence numbers
+enqueue chunk regeneration even when only a chunk was dirty. This also replaces
+partial card numbers in truncated titles and snippets without losing timeline rows. The
 `--report-html` option writes a source/month before-and-after counts table for
 delivery; baseline groups retain explicit zero-after rows. Dry-run after counts
 are pending, never assumed zero.

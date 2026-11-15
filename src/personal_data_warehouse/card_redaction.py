@@ -14,6 +14,14 @@ _DIGITS = re.compile(r'[0-9]+')
 _BARE_CODE = re.compile(r'[ -]+([0-9]{3,4})(?![0-9])')
 
 
+def standalone_end(value: str, end: int) -> bool:
+    if end == len(value):
+        return True
+    next_char = value[end]
+    return not (next_char.isalnum() or next_char in '_-/:' or
+                (next_char == '.' and end + 1 < len(value) and value[end + 1].isdigit()))
+
+
 def card_spans(value: str):
     """Token-aligned Luhn windows; never split a long contiguous identifier.
 
@@ -31,6 +39,8 @@ def card_spans(value: str):
                 if len(digits) > 19:
                     break
                 if not is_card(digits):
+                    continue
+                if j > i and not standalone_end(value, run.start() + tokens[j].end()):
                     continue
                 groups = [len(t[0]) for t in tokens[i:j+1]]
                 rank = 0 if len(groups) == 1 else 1 if groups in ([4,4,4,4], [4,6,5]) else 2
@@ -59,7 +69,7 @@ def _mask_cards(value: str) -> str:
         # Bare adjacent security codes have no label to match later. Consume
         # them separately, so they never become part of the retained last four.
         code = _BARE_CODE.match(value, end)
-        if code:
+        if code and standalone_end(value, code.end()):
             output.extend((value[end:code.start(1)], '[redacted]'))
             end = code.end()
         cursor = end
