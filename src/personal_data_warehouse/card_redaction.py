@@ -5,13 +5,18 @@ import json
 import re
 from typing import Any
 
-_RUN = re.compile(r'(?<![0-9])[0-9](?:[ -]*[0-9])*(?![0-9])')
 _LABEL = r'(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*code)'
 _CODE = re.compile(r'(?i)(\b' + _LABEL + r'\b(?:\s+is)?[\s\\\x22\x27:=,-]{0,24})([0-9]{3,4})(?![0-9])')
 _CODE_KEY = re.compile(r'(?i)^' + _LABEL + '$')
 _ESCAPE = re.compile(r'\\+u(003[0-9]|0020|002[dD])')
-_DIGITS = re.compile(r'[0-9]+')
 _BARE_CODE = re.compile(r'[ -]+([0-9]{3,4})(?![0-9])')
+_CARD_TOKENS = [re.compile(r'[0-9]{13,19}')] + [
+    re.compile(re.escape(sep).join(grouping))
+    for sep in (' ', '-') for grouping in (
+        (r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{1,7}'),
+        (r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{1,3}'),
+        (r'[0-9]{4}',r'[0-9]{6}',r'[0-9]{5}'))]
+_EXPIRY_SUFFIX = re.compile(r'/[0-9]{2}/(?:[0-9]{4}|[0-9]{2})(?![0-9/])')
 
 
 def standalone_end(value: str, end: int) -> bool:
@@ -22,63 +27,75 @@ def standalone_end(value: str, end: int) -> bool:
                 (next_char == '.' and end + 1 < len(value) and value[end + 1].isdigit()))
 
 
-def card_spans(value: str):
-    """Token-aligned Luhn windows; never split a long contiguous identifier.
+def pan_token_end(value: str, end: int, *, contiguous=False) -> bool:
+    """A PAN ends at punctuation, not inside a numeric/identifier token.
 
-    Prefer a complete contiguous PAN or standard 4/4/4/4 and 4/6/5
-    groupings over a longer window that accidentally includes an adjacent code.
+    The one numeric suffix belonging to card syntax is /MM/YY (or /MM/YYYY).
+    It remains outside the PAN. No arbitrary numeric window is considered.
     """
-    for run in _RUN.finditer(value):
-        tokens = list(_DIGITS.finditer(run[0]))
-        i = 0
-        while i < len(tokens):
-            candidates = []
-            digits = ''
-            for j in range(i, len(tokens)):
-                digits += tokens[j][0]
-                if len(digits) > 19:
-                    break
-                if not is_card(digits):
-                    continue
-                # The first complete PAN accepts punctuation as a delimiter.
-                # Only a LONGER, ambiguous window might have swallowed a date,
-                # phone prefix or code appended after that already-valid PAN.
-                if candidates and not standalone_end(value, run.start() + tokens[j].end()):
-                    continue
-                groups = [len(t[0]) for t in tokens[i:j+1]]
-                rank = 0 if len(groups) == 1 else 1 if groups in ([4,4,4,4], [4,6,5]) else 2
-                candidates.append((rank, len(digits), j))
-            if not candidates:
-                i += 1
+    if end==len(value):
+        return True
+    char=value[end]
+    if char.isdigit():
+        return False
+    if char.isalnum() or char=='_':
+        # A whole 13–19 digit run remains sensitive inside prose/identifiers.
+        # A short grouped tail attached to a word (123abc) is not a card group.
+        return contiguous
+    if char in '-/:.' and end+1<len(value) and value[end+1].isdigit():
+        return char=='/' and _EXPIRY_SUFFIX.match(value,end) is not None
+    return True
+
+
+def card_spans(value: str):
+    """One card token: contiguous digits or one recognized consistent grouping.
+
+    Never join arbitrary neighboring numbers, mix separators, split a longer
+    digit run, or cross a numeric continuation. Luhn runs AFTER
+    lexical recognition. Bare codes are handled only after confirming a PAN.
+    """
+    candidates = {}
+    for index,pattern in enumerate(_CARD_TOKENS):
+        for match in pattern.finditer(value):
+            start,end = match.span()
+            if start and (value[start-1].isdigit() or (value[start-1]=='-' and start>1 and value[start-2].isdigit())):
                 continue
-            _, _, j = min(candidates)
-            furthest = max(c[2] for c in candidates)
-            # Ambiguous valid windows are all covered, but retain digits only
-            # from the preferred PAN, never an adjacent code in a longer window.
-            yield run.start() + tokens[i].start(), run.start() + tokens[furthest].end(), run.start() + tokens[j].end()
-            i = furthest + 1
+            if not pan_token_end(value,end,contiguous=index==0):
+                continue
+            if is_card(match[0]):
+                candidates.setdefault(start,set()).add(end)
+    cursor = 0
+    for start in sorted(candidates):
+        if start < cursor:
+            continue
+        ends = sorted(candidates[start])
+        end = max(ends)
+        # A complete shorter PAN followed by an isolated 3–4 digit token is
+        # ambiguous with a longer grouping. Prefer the confirmed shorter PAN
+        # and suppress the entire code separately, never retaining code digits.
+        for short in ends:
+            code = _BARE_CODE.match(value,short)
+            if short<end and code and code.end()==end and standalone_end(value,end):
+                end=short
+                break
+        yield start,end
+        cursor=end
 
 
 def _mask_cards(value: str) -> str:
     output = []
     cursor = 0
-    for start, end, retained_end in card_spans(value):
+    for start,end in card_spans(value):
         if start < cursor:
             continue
-        digits = value[start:retained_end].replace(' ', '').replace('-', '')
-        output.extend((value[cursor:start], '[card ****' + digits[-4:] + ']'))
-        if end > retained_end:
-            output.append(' [redacted]')
-        # Bare adjacent security codes have no label to match later. Consume
-        # them separately, so they never become part of the retained last four.
-        code = _BARE_CODE.match(value, end)
-        if code and standalone_end(value, code.end()):
+        digits = value[start:end].replace(' ', '').replace('-', '')
+        output.extend((value[cursor:start], '[card ****'+digits[-4:]+']'))
+        while (code := _BARE_CODE.match(value,end)) and standalone_end(value,code.end()):
             output.extend((value[end:code.start(1)], '[redacted]'))
-            end = code.end()
-        cursor = end
+            end=code.end()
+        cursor=end
     output.append(value[cursor:])
     return ''.join(output)
-
 
 def is_card(value: str) -> bool:
     digits = value.replace(' ', '').replace('-', '')

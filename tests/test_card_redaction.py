@@ -6,9 +6,27 @@ from personal_data_warehouse.card_redaction import redact, redact_row
 from pathlib import Path
 
 
-@pytest.mark.parametrize('case', json.loads((Path(__file__).parent / 'fixtures/card_redaction_cases.json').read_text()), ids=lambda c: c['name'])
+@pytest.mark.parametrize('case', json.loads((Path(__file__).parent / 'fixtures/card_redaction_cases.json').read_text())['cases'], ids=lambda c: c['name'])
 def test_shared_adversarial_cases(case):
-    assert redact(case['input']) == case['expected']
+    actual = redact(case['input'])
+    if case.get('json_result'):
+        assert json.loads(actual) == json.loads(case['expected'])
+    else:
+        assert actual == case['expected']
+
+
+def test_generated_numeric_prose_and_inserted_card_properties():
+    import hashlib
+    from tests.card_redaction_properties import property_cases
+    digest = hashlib.sha256()
+    count = 0
+    for name,value,expected in property_cases():
+        assert redact(value) == expected, name
+        digest.update((name+'\0'+value+'\0'+expected+'\n').encode())
+        count += 1
+    config = json.loads((Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['property']
+    assert count >= 6000
+    assert digest.hexdigest() == config['corpus_sha256']
 
 
 @pytest.mark.parametrize('label', ['CVV2', 'CVC2', 'CID', 'CSC', 'security code', 'card code'])

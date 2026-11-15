@@ -41,7 +41,7 @@ def test_every_source_writer_masks_all_content(warehouse):
 def test_delimited_cards_are_masked_by_writer_and_found_by_scan(warehouse):
     from pathlib import Path
     from personal_data_warehouse.card_redaction import card_count
-    cases = [c for c in json.loads((Path(__file__).parent / 'fixtures/card_redaction_cases.json').read_text()) if c['name'].startswith('delimiter_')]
+    cases = [c for c in json.loads((Path(__file__).parent / 'fixtures/card_redaction_cases.json').read_text())['cases'] if c['name'].startswith('delimiter_')]
     for index, case in enumerate(cases):
         row = dict(event(), event_uuid=f'writer-{index}', seq=index + 1, text=case['input'],
                    tool_input_json=json.dumps({'text': case['input']}), tool_result_json=json.dumps({'text': case['input']}),
@@ -57,6 +57,37 @@ def test_delimited_cards_are_masked_by_writer_and_found_by_scan(warehouse):
     scrub(warehouse, apply=True, page_size=1)
     assert scrub(warehouse, page_size=1) == []
     assert warehouse._query('SELECT count(*) FROM @claude_code_events')[0][0] == 2 * len(cases)
+
+
+def test_writer_and_scrub_preserve_numeric_prose(warehouse):
+    from pathlib import Path
+    from tests.card_redaction_properties import property_cases
+    fixture = json.loads((Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())
+    values = [c['input'] for c in fixture['cases'] if c['name'].startswith('review4_safe_')]
+    values += [value for name,value,_ in property_cases() if name.startswith('preserve-')][:20]
+    for index,value in enumerate(values):
+        row = dict(event(), event_uuid=f'numeric-{index}', seq=index+1, text=value, raw_json=json.dumps({'text':value}),
+                   tool_input_json=json.dumps({'text':value}), tool_result_json=json.dumps({'text':value}))
+        warehouse.insert_agent_session_events([row])
+        stored = warehouse._query_dicts('SELECT text,raw_json,tool_input_json,tool_result_json FROM @claude_code_events WHERE event_uuid = %s', (row['event_uuid'],))[0]
+        assert all(stored[k]==row[k] for k in stored)
+        legacy = dict(row, event_uuid=f'legacy-numeric-{index}', seq=index+len(values)+1)
+        warehouse._insert_rows('claude_code_events', [legacy], AGENT_SESSION_EVENT_COLUMNS)
+    assert scrub(warehouse) == []
+    scrub(warehouse, apply=True)
+    assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0] == 0
+    before = warehouse._query_dicts('SELECT * FROM @claude_code_events ORDER BY event_uuid')
+    legacy = dict(event(), event_uuid='sensitive-event', seq=2*len(values)+1)
+    warehouse._insert_rows('claude_code_events', [legacy], AGENT_SESSION_EVENT_COLUMNS)
+    scrub(warehouse, apply=True, page_size=1)
+    after = warehouse._query_dicts("SELECT * FROM @claude_code_events WHERE event_uuid != 'sensitive-event' ORDER BY event_uuid")
+    assert [{k:v for k,v in r.items() if k!='ingested_at'} for r in before] == [{k:v for k,v in r.items() if k!='ingested_at'} for r in after]
+    assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0] == 2*len(values)+2
+    assert scrub(warehouse) == []
+    for row in after:
+        index=(row['seq']-1)%len(values)
+        assert row['text']==values[index]
+        assert all(json.loads(row[k])=={'text':values[index]} for k in ('raw_json','tool_input_json','tool_result_json'))
 
 
 def test_legacy_scrub_cleans_timeline_chunks_and_is_idempotent(warehouse):

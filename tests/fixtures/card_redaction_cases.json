@@ -1,289 +1,960 @@
-[
-  {
-    "name": "expiry_adjacent",
-    "input": "4111111111111111 12/27 CVV: 987",
-    "expected": "[card ****1111] 12/27 CVV: [redacted]"
-  },
-  {
-    "name": "bare_code",
-    "input": "4111111111111111 987",
-    "expected": "[card ****1111] [redacted]",
-    "synthetic_provenance": {
-      "recipe": "canonical_pan_with_descending_test_code",
-      "description": "Append the three descending test digits starting at nine to the contiguous published Visa test PAN. The aggregate also passes Luhn.",
-      "base_test_pan": "4111111111111111",
-      "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+{
+  "cases": [
+    {
+      "name": "expiry_adjacent",
+      "input": "4111111111111111 12/27 CVV: 987",
+      "expected": "[card ****1111] 12/27 CVV: [redacted]"
+    },
+    {
+      "name": "bare_code",
+      "input": "4111111111111111 987",
+      "expected": "[card ****1111] [redacted]",
+      "synthetic_provenance": {
+        "recipe": "canonical_pan_with_descending_test_code",
+        "description": "Append the three descending test digits starting at nine to the contiguous published Visa test PAN. The aggregate also passes Luhn.",
+        "base_test_pan": "4111111111111111",
+        "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+      }
+    },
+    {
+      "name": "spaced_bare_code",
+      "input": "4111 1111 1111 1111 987",
+      "expected": "[card ****1111] [redacted]",
+      "synthetic_provenance": {
+        "recipe": "canonical_pan_with_descending_test_code",
+        "description": "Append the three descending test digits starting at nine to the published Visa test PAN grouped in fours with spaces. The aggregate also passes Luhn.",
+        "base_test_pan": "4111111111111111",
+        "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+      }
+    },
+    {
+      "name": "cvv2",
+      "input": "4111111111111111 CVV2: 987",
+      "expected": "[card ****1111] CVV2: [redacted]"
+    },
+    {
+      "name": "cvc2",
+      "input": "4111111111111111 CVC2: 987",
+      "expected": "[card ****1111] CVC2: [redacted]"
+    },
+    {
+      "name": "cid",
+      "input": "4111111111111111 CID: 987",
+      "expected": "[card ****1111] CID: [redacted]"
+    },
+    {
+      "name": "csc",
+      "input": "4111111111111111 CSC: 987",
+      "expected": "[card ****1111] CSC: [redacted]"
+    },
+    {
+      "name": "card_code",
+      "input": "4111111111111111 card code: 987",
+      "expected": "[card ****1111] card code: [redacted]"
+    },
+    {
+      "name": "json_suffix",
+      "input": "{\"ok\":true} diagnostic follows; card 4111111111111111",
+      "expected": "{\"ok\":true} diagnostic follows; card [card ****1111]"
+    },
+    {
+      "name": "invalid",
+      "input": "4111111111111112",
+      "expected": "4111111111111112"
+    },
+    {
+      "name": "long",
+      "input": "9941111111111111119999",
+      "expected": "9941111111111111119999"
+    },
+    {
+      "name": "phone",
+      "input": "+1-212-555-0198",
+      "expected": "+1-212-555-0198"
+    },
+    {
+      "name": "timestamp",
+      "input": "2026-11-15T09:12:13Z",
+      "expected": "2026-11-15T09:12:13Z"
+    },
+    {
+      "name": "uuid",
+      "input": "e83fa2c9-9814-4a3b-b8ae-827560198234",
+      "expected": "e83fa2c9-9814-4a3b-b8ae-827560198234"
+    },
+    {
+      "name": "suffix_0",
+      "input": "4111111111111111 2026-11-15T09:12:13Z",
+      "expected": "[card ****1111] 2026-11-15T09:12:13Z"
+    },
+    {
+      "name": "suffix_1",
+      "input": "4111111111111111 212-555-0198",
+      "expected": "[card ****1111] 212-555-0198"
+    },
+    {
+      "name": "suffix_2",
+      "input": "4111111111111111 2026-11-15",
+      "expected": "[card ****1111] 2026-11-15"
+    },
+    {
+      "name": "suffix_3",
+      "input": "4111111111111111 123/45",
+      "expected": "[card ****1111] 123/45"
+    },
+    {
+      "name": "suffix_4",
+      "input": "4111111111111111 123:45",
+      "expected": "[card ****1111] 123:45"
+    },
+    {
+      "name": "suffix_5",
+      "input": "4111111111111111 123.45",
+      "expected": "[card ****1111] 123.45"
+    },
+    {
+      "name": "suffix_6",
+      "input": "4111111111111111 1234T09:12",
+      "expected": "[card ****1111] 1234T09:12"
+    },
+    {
+      "name": "suffix_7",
+      "input": "4111111111111111 1234-word",
+      "expected": "[card ****1111] 1234-word"
+    },
+    {
+      "name": "delimiter_0_0",
+      "input": "4111111111111111: CVV: 987",
+      "expected": "[card ****1111]: CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_0_1",
+      "input": "4111111111111111/12/27 CVV: 987",
+      "expected": "[card ****1111]/12/27 CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_0_2",
+      "input": "4111111111111111-end CVC2: 987",
+      "expected": "[card ****1111]-end CVC2: [redacted]"
+    },
+    {
+      "name": "delimiter_0_3",
+      "input": "4111111111111111, CVV: 987",
+      "expected": "[card ****1111], CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_0_4",
+      "input": "4111111111111111; CVV: 987",
+      "expected": "[card ****1111]; CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_0_5",
+      "input": "4111111111111111. CVV: 987",
+      "expected": "[card ****1111]. CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_0_6",
+      "input": "4111111111111111) CVV: 987",
+      "expected": "[card ****1111]) CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_0_7",
+      "input": "4111111111111111\" CVV: 987",
+      "expected": "[card ****1111]\" CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_0_8",
+      "input": "4111111111111111] CVV: 987",
+      "expected": "[card ****1111]] CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_0_9",
+      "input": "4111111111111111\nCVV: 987",
+      "expected": "[card ****1111]\nCVV: [redacted]"
+    },
+    {
+      "name": "delimiter_0_10",
+      "input": "4111111111111111| CVV: 987",
+      "expected": "[card ****1111]| CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_0",
+      "input": "4111 1111 1111 1111: CVV: 987",
+      "expected": "[card ****1111]: CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_1",
+      "input": "4111 1111 1111 1111/12/27 CVV: 987",
+      "expected": "[card ****1111]/12/27 CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_2",
+      "input": "4111 1111 1111 1111-end CVC2: 987",
+      "expected": "[card ****1111]-end CVC2: [redacted]"
+    },
+    {
+      "name": "delimiter_1_3",
+      "input": "4111 1111 1111 1111, CVV: 987",
+      "expected": "[card ****1111], CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_4",
+      "input": "4111 1111 1111 1111; CVV: 987",
+      "expected": "[card ****1111]; CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_5",
+      "input": "4111 1111 1111 1111. CVV: 987",
+      "expected": "[card ****1111]. CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_6",
+      "input": "4111 1111 1111 1111) CVV: 987",
+      "expected": "[card ****1111]) CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_7",
+      "input": "4111 1111 1111 1111\" CVV: 987",
+      "expected": "[card ****1111]\" CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_8",
+      "input": "4111 1111 1111 1111] CVV: 987",
+      "expected": "[card ****1111]] CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_9",
+      "input": "4111 1111 1111 1111\nCVV: 987",
+      "expected": "[card ****1111]\nCVV: [redacted]"
+    },
+    {
+      "name": "delimiter_1_10",
+      "input": "4111 1111 1111 1111| CVV: 987",
+      "expected": "[card ****1111]| CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_0",
+      "input": "4111-1111-1111-1111: CVV: 987",
+      "expected": "[card ****1111]: CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_1",
+      "input": "4111-1111-1111-1111/12/27 CVV: 987",
+      "expected": "[card ****1111]/12/27 CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_2",
+      "input": "4111-1111-1111-1111-end CVC2: 987",
+      "expected": "[card ****1111]-end CVC2: [redacted]"
+    },
+    {
+      "name": "delimiter_2_3",
+      "input": "4111-1111-1111-1111, CVV: 987",
+      "expected": "[card ****1111], CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_4",
+      "input": "4111-1111-1111-1111; CVV: 987",
+      "expected": "[card ****1111]; CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_5",
+      "input": "4111-1111-1111-1111. CVV: 987",
+      "expected": "[card ****1111]. CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_6",
+      "input": "4111-1111-1111-1111) CVV: 987",
+      "expected": "[card ****1111]) CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_7",
+      "input": "4111-1111-1111-1111\" CVV: 987",
+      "expected": "[card ****1111]\" CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_8",
+      "input": "4111-1111-1111-1111] CVV: 987",
+      "expected": "[card ****1111]] CVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_9",
+      "input": "4111-1111-1111-1111\nCVV: 987",
+      "expected": "[card ****1111]\nCVV: [redacted]"
+    },
+    {
+      "name": "delimiter_2_10",
+      "input": "4111-1111-1111-1111| CVV: 987",
+      "expected": "[card ****1111]| CVV: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_0",
+      "input": "4111111111111111: CVC2: 987",
+      "expected": "[card ****1111]: CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_1",
+      "input": "4111111111111111/12/27 CVC2: 987",
+      "expected": "[card ****1111]/12/27 CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_2",
+      "input": "4111111111111111-end CVC2: 987",
+      "expected": "[card ****1111]-end CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_3",
+      "input": "4111111111111111, CVC2: 987",
+      "expected": "[card ****1111], CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_4",
+      "input": "4111111111111111; CVC2: 987",
+      "expected": "[card ****1111]; CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_5",
+      "input": "4111111111111111. CVC2: 987",
+      "expected": "[card ****1111]. CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_6",
+      "input": "4111111111111111) CVC2: 987",
+      "expected": "[card ****1111]) CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_7",
+      "input": "4111111111111111\" CVC2: 987",
+      "expected": "[card ****1111]\" CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_8",
+      "input": "4111111111111111] CVC2: 987",
+      "expected": "[card ****1111]] CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_9",
+      "input": "4111111111111111\n CVC2: 987",
+      "expected": "[card ****1111]\n CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_10",
+      "input": "4111111111111111| CVC2: 987",
+      "expected": "[card ****1111]| CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_11",
+      "input": "4111111111111111! CVC2: 987",
+      "expected": "[card ****1111]! CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_12",
+      "input": "4111111111111111? CVC2: 987",
+      "expected": "[card ****1111]? CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_13",
+      "input": "4111111111111111} CVC2: 987",
+      "expected": "[card ****1111]} CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_14",
+      "input": "4111111111111111\t CVC2: 987",
+      "expected": "[card ****1111]\t CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_0_15",
+      "input": "4111111111111111 \u2014 prose CVC2: 987",
+      "expected": "[card ****1111] \u2014 prose CVC2: [redacted]"
+    },
+    {
+      "name": "review4_suffix_0_0",
+      "input": "4111111111111111 2026-11-15T09:12:13Z",
+      "expected": "[card ****1111] 2026-11-15T09:12:13Z"
+    },
+    {
+      "name": "review4_suffix_0_1",
+      "input": "4111111111111111 +1-212-555-0198",
+      "expected": "[card ****1111] +1-212-555-0198"
+    },
+    {
+      "name": "review4_suffix_0_2",
+      "input": "4111111111111111 212-555-0198",
+      "expected": "[card ****1111] 212-555-0198"
+    },
+    {
+      "name": "review4_suffix_0_3",
+      "input": "4111111111111111 2026/11/15",
+      "expected": "[card ****1111] 2026/11/15"
+    },
+    {
+      "name": "review4_suffix_0_4",
+      "input": "4111111111111111 123:45",
+      "expected": "[card ****1111] 123:45"
+    },
+    {
+      "name": "review4_suffix_0_5",
+      "input": "4111111111111111 123.45",
+      "expected": "[card ****1111] 123.45"
+    },
+    {
+      "name": "review4_suffix_0_6",
+      "input": "4111111111111111 123_abc",
+      "expected": "[card ****1111] 123_abc"
+    },
+    {
+      "name": "review4_suffix_0_7",
+      "input": "4111111111111111 123abc",
+      "expected": "[card ****1111] 123abc"
+    },
+    {
+      "name": "review4_suffix_0_8",
+      "input": "4111111111111111 99999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "expected": "[card ****1111] 99999999999999999999999999999999999999999999999999999999999999999999999999999999"
+    },
+    {
+      "name": "review4_delimiter_1_0",
+      "input": "4111 1111 1111 1111: CVC2: 987",
+      "expected": "[card ****1111]: CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_1",
+      "input": "4111 1111 1111 1111/12/27 CVC2: 987",
+      "expected": "[card ****1111]/12/27 CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_2",
+      "input": "4111 1111 1111 1111-end CVC2: 987",
+      "expected": "[card ****1111]-end CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_3",
+      "input": "4111 1111 1111 1111, CVC2: 987",
+      "expected": "[card ****1111], CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_4",
+      "input": "4111 1111 1111 1111; CVC2: 987",
+      "expected": "[card ****1111]; CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_5",
+      "input": "4111 1111 1111 1111. CVC2: 987",
+      "expected": "[card ****1111]. CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_6",
+      "input": "4111 1111 1111 1111) CVC2: 987",
+      "expected": "[card ****1111]) CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_7",
+      "input": "4111 1111 1111 1111\" CVC2: 987",
+      "expected": "[card ****1111]\" CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_8",
+      "input": "4111 1111 1111 1111] CVC2: 987",
+      "expected": "[card ****1111]] CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_9",
+      "input": "4111 1111 1111 1111\n CVC2: 987",
+      "expected": "[card ****1111]\n CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_10",
+      "input": "4111 1111 1111 1111| CVC2: 987",
+      "expected": "[card ****1111]| CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_11",
+      "input": "4111 1111 1111 1111! CVC2: 987",
+      "expected": "[card ****1111]! CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_12",
+      "input": "4111 1111 1111 1111? CVC2: 987",
+      "expected": "[card ****1111]? CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_13",
+      "input": "4111 1111 1111 1111} CVC2: 987",
+      "expected": "[card ****1111]} CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_14",
+      "input": "4111 1111 1111 1111\t CVC2: 987",
+      "expected": "[card ****1111]\t CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_1_15",
+      "input": "4111 1111 1111 1111 \u2014 prose CVC2: 987",
+      "expected": "[card ****1111] \u2014 prose CVC2: [redacted]"
+    },
+    {
+      "name": "review4_suffix_1_0",
+      "input": "4111 1111 1111 1111 2026-11-15T09:12:13Z",
+      "expected": "[card ****1111] 2026-11-15T09:12:13Z"
+    },
+    {
+      "name": "review4_suffix_1_1",
+      "input": "4111 1111 1111 1111 +1-212-555-0198",
+      "expected": "[card ****1111] +1-212-555-0198"
+    },
+    {
+      "name": "review4_suffix_1_2",
+      "input": "4111 1111 1111 1111 212-555-0198",
+      "expected": "[card ****1111] 212-555-0198",
+      "synthetic_provenance": {
+        "recipe": "canonical_pan_with_example_phone",
+        "description": "Append a fictional phone token to the published Visa test PAN grouped in fours with spaces. Phone area is 200+12, exchange 500+55, line 100+98 padded to four digits; no phone data was collected.",
+        "base_test_pan": "4111111111111111",
+        "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+      }
+    },
+    {
+      "name": "review4_suffix_1_3",
+      "input": "4111 1111 1111 1111 2026/11/15",
+      "expected": "[card ****1111] 2026/11/15"
+    },
+    {
+      "name": "review4_suffix_1_4",
+      "input": "4111 1111 1111 1111 123:45",
+      "expected": "[card ****1111] 123:45"
+    },
+    {
+      "name": "review4_suffix_1_5",
+      "input": "4111 1111 1111 1111 123.45",
+      "expected": "[card ****1111] 123.45"
+    },
+    {
+      "name": "review4_suffix_1_6",
+      "input": "4111 1111 1111 1111 123_abc",
+      "expected": "[card ****1111] 123_abc"
+    },
+    {
+      "name": "review4_suffix_1_7",
+      "input": "4111 1111 1111 1111 123abc",
+      "expected": "[card ****1111] 123abc"
+    },
+    {
+      "name": "review4_suffix_1_8",
+      "input": "4111 1111 1111 1111 99999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "expected": "[card ****1111] 99999999999999999999999999999999999999999999999999999999999999999999999999999999"
+    },
+    {
+      "name": "review4_delimiter_2_0",
+      "input": "4111-1111-1111-1111: CVC2: 987",
+      "expected": "[card ****1111]: CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_1",
+      "input": "4111-1111-1111-1111/12/27 CVC2: 987",
+      "expected": "[card ****1111]/12/27 CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_2",
+      "input": "4111-1111-1111-1111-end CVC2: 987",
+      "expected": "[card ****1111]-end CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_3",
+      "input": "4111-1111-1111-1111, CVC2: 987",
+      "expected": "[card ****1111], CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_4",
+      "input": "4111-1111-1111-1111; CVC2: 987",
+      "expected": "[card ****1111]; CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_5",
+      "input": "4111-1111-1111-1111. CVC2: 987",
+      "expected": "[card ****1111]. CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_6",
+      "input": "4111-1111-1111-1111) CVC2: 987",
+      "expected": "[card ****1111]) CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_7",
+      "input": "4111-1111-1111-1111\" CVC2: 987",
+      "expected": "[card ****1111]\" CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_8",
+      "input": "4111-1111-1111-1111] CVC2: 987",
+      "expected": "[card ****1111]] CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_9",
+      "input": "4111-1111-1111-1111\n CVC2: 987",
+      "expected": "[card ****1111]\n CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_10",
+      "input": "4111-1111-1111-1111| CVC2: 987",
+      "expected": "[card ****1111]| CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_11",
+      "input": "4111-1111-1111-1111! CVC2: 987",
+      "expected": "[card ****1111]! CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_12",
+      "input": "4111-1111-1111-1111? CVC2: 987",
+      "expected": "[card ****1111]? CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_13",
+      "input": "4111-1111-1111-1111} CVC2: 987",
+      "expected": "[card ****1111]} CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_14",
+      "input": "4111-1111-1111-1111\t CVC2: 987",
+      "expected": "[card ****1111]\t CVC2: [redacted]"
+    },
+    {
+      "name": "review4_delimiter_2_15",
+      "input": "4111-1111-1111-1111 \u2014 prose CVC2: 987",
+      "expected": "[card ****1111] \u2014 prose CVC2: [redacted]"
+    },
+    {
+      "name": "review4_suffix_2_0",
+      "input": "4111-1111-1111-1111 2026-11-15T09:12:13Z",
+      "expected": "[card ****1111] 2026-11-15T09:12:13Z"
+    },
+    {
+      "name": "review4_suffix_2_1",
+      "input": "4111-1111-1111-1111 +1-212-555-0198",
+      "expected": "[card ****1111] +1-212-555-0198"
+    },
+    {
+      "name": "review4_suffix_2_2",
+      "input": "4111-1111-1111-1111 212-555-0198",
+      "expected": "[card ****1111] 212-555-0198",
+      "synthetic_provenance": {
+        "recipe": "canonical_pan_with_example_phone",
+        "description": "Append the same constructed example phone token to the published Visa test PAN grouped in fours with dashes. Area is 200+12, exchange 500+55, line 100+98 padded to four digits.",
+        "base_test_pan": "4111111111111111",
+        "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+      }
+    },
+    {
+      "name": "review4_suffix_2_3",
+      "input": "4111-1111-1111-1111 2026/11/15",
+      "expected": "[card ****1111] 2026/11/15"
+    },
+    {
+      "name": "review4_suffix_2_4",
+      "input": "4111-1111-1111-1111 123:45",
+      "expected": "[card ****1111] 123:45"
+    },
+    {
+      "name": "review4_suffix_2_5",
+      "input": "4111-1111-1111-1111 123.45",
+      "expected": "[card ****1111] 123.45"
+    },
+    {
+      "name": "review4_suffix_2_6",
+      "input": "4111-1111-1111-1111 123_abc",
+      "expected": "[card ****1111] 123_abc"
+    },
+    {
+      "name": "review4_suffix_2_7",
+      "input": "4111-1111-1111-1111 123abc",
+      "expected": "[card ****1111] 123abc"
+    },
+    {
+      "name": "review4_suffix_2_8",
+      "input": "4111-1111-1111-1111 99999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "expected": "[card ****1111] 99999999999999999999999999999999999999999999999999999999999999999999999999999999"
+    },
+    {
+      "name": "review4_safe_0",
+      "input": "2026-11-15T09:12:13Z",
+      "expected": "2026-11-15T09:12:13Z"
+    },
+    {
+      "name": "review4_safe_1",
+      "input": "+1-212-555-0198",
+      "expected": "+1-212-555-0198"
+    },
+    {
+      "name": "review4_safe_2",
+      "input": "212-555-0198",
+      "expected": "212-555-0198"
+    },
+    {
+      "name": "review4_safe_3",
+      "input": "2026/11/15",
+      "expected": "2026/11/15"
+    },
+    {
+      "name": "review4_safe_4",
+      "input": "123:45",
+      "expected": "123:45"
+    },
+    {
+      "name": "review4_safe_5",
+      "input": "123.45",
+      "expected": "123.45"
+    },
+    {
+      "name": "review4_safe_6",
+      "input": "123_abc",
+      "expected": "123_abc"
+    },
+    {
+      "name": "review4_safe_7",
+      "input": "123abc",
+      "expected": "123abc"
+    },
+    {
+      "name": "review4_safe_8",
+      "input": "99999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "expected": "99999999999999999999999999999999999999999999999999999999999999999999999999999999"
+    },
+    {
+      "name": "review4_safe_9",
+      "input": "2026-11-15T09:12:13Z +1-212-555-0198 212-555-0198 2026/11/15 123:45 123.45 123_abc 123abc 99999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "expected": "2026-11-15T09:12:13Z +1-212-555-0198 212-555-0198 2026/11/15 123:45 123.45 123_abc 123abc 99999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "synthetic_provenance": {
+        "recipe": "constructed_numeric_prose",
+        "description": "Join fixed example date/time, constructed example phones, short numeric identifier fragments and eighty repeated nines. Date/time is November 15 of year 2026 at 09:12:13 UTC; phone components are 200+12, 500+55 and 100+98. Identifier fragments are the first three positive digits and the next two digits. No source data was used; checksum-valid cross-token readings are incidental."
+      }
+    },
+    {
+      "name": "review4_safe_10",
+      "input": "2026-11-15T09:12:13Z; +1-212-555-0198; 212-555-0198; 2026/11/15; 123:45; 123.45; 123_abc; 123abc; 99999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "expected": "2026-11-15T09:12:13Z; +1-212-555-0198; 212-555-0198; 2026/11/15; 123:45; 123.45; 123_abc; 123abc; 99999999999999999999999999999999999999999999999999999999999999999999999999999999"
+    },
+    {
+      "name": "invalid_grouped_0",
+      "input": "4111 1111 1111 1112",
+      "expected": "4111 1111 1111 1112"
+    },
+    {
+      "name": "invalid_grouped_1",
+      "input": "4111-1111-1111-1112",
+      "expected": "4111-1111-1111-1112"
+    },
+    {
+      "name": "not_one_card_token_0",
+      "input": "4111-1111 1111-1111",
+      "expected": "4111-1111 1111-1111"
+    },
+    {
+      "name": "not_one_card_token_1",
+      "input": "4111 1111-1111 1111",
+      "expected": "4111 1111-1111 1111"
+    },
+    {
+      "name": "not_one_card_token_2",
+      "input": "4111  1111 1111 1111",
+      "expected": "4111  1111 1111 1111"
+    },
+    {
+      "name": "escaped_digits",
+      "input": "\\u0034\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031 CVV: 987",
+      "expected": "[card ****1111] CVV: [redacted]"
+    },
+    {
+      "name": "double_escaped_digits",
+      "input": "\\\\u0034\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031 CVV: 987",
+      "expected": "[card ****1111] CVV: [redacted]"
+    },
+    {
+      "name": "json_CVV",
+      "input": "{\"number\": \"4111111111111111\", \"CVV\": 987}",
+      "expected": "{\"number\": \"[card ****1111]\", \"CVV\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "json_CVC",
+      "input": "{\"number\": \"4111111111111111\", \"CVC\": 987}",
+      "expected": "{\"number\": \"[card ****1111]\", \"CVC\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "json_CVV2",
+      "input": "{\"number\": \"4111111111111111\", \"CVV2\": 987}",
+      "expected": "{\"number\": \"[card ****1111]\", \"CVV2\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "json_CVC2",
+      "input": "{\"number\": \"4111111111111111\", \"CVC2\": 987}",
+      "expected": "{\"number\": \"[card ****1111]\", \"CVC2\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "json_CID",
+      "input": "{\"number\": \"4111111111111111\", \"CID\": 987}",
+      "expected": "{\"number\": \"[card ****1111]\", \"CID\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "json_CSC",
+      "input": "{\"number\": \"4111111111111111\", \"CSC\": 987}",
+      "expected": "{\"number\": \"[card ****1111]\", \"CSC\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "json_security code",
+      "input": "{\"number\": \"4111111111111111\", \"security code\": 987}",
+      "expected": "{\"number\": \"[card ****1111]\", \"security code\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "json_card code",
+      "input": "{\"number\": \"4111111111111111\", \"card code\": 987}",
+      "expected": "{\"number\": \"[card ****1111]\", \"card code\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "json_numeric_pan",
+      "input": "{\"card\":4111111111111111,\"cvc\":987}",
+      "expected": "{\"card\":\"[card ****1111]\",\"cvc\":\"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "cvc_prose",
+      "input": "4111111111111111 CVC = 987",
+      "expected": "[card ****1111] CVC = [redacted]"
+    },
+    {
+      "name": "security_code_prose",
+      "input": "4111111111111111 security-code is 987",
+      "expected": "[card ****1111] security-code is [redacted]"
+    },
+    {
+      "name": "json_pan_with_suffix",
+      "input": "{\"card\": \"4111111111111111\"} CVV: 987",
+      "expected": "{\"card\": \"[card ****1111]\"} CVV: [redacted]"
+    },
+    {
+      "name": "contiguous_card_inside_prose",
+      "input": "prefix4111111111111111suffix",
+      "expected": "prefix[card ****1111]suffix"
     }
-  },
-  {
-    "name": "spaced_bare_code",
-    "input": "4111 1111 1111 1111 987",
-    "expected": "[card ****1111] [redacted]",
-    "synthetic_provenance": {
-      "recipe": "canonical_pan_with_descending_test_code",
-      "description": "Append the three descending test digits starting at nine to the published Visa test PAN grouped in fours with spaces. The aggregate also passes Luhn.",
-      "base_test_pan": "4111111111111111",
-      "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
-    }
-  },
-  {
-    "name": "cvv2",
-    "input": "4111111111111111 CVV2: 987",
-    "expected": "[card ****1111] CVV2: [redacted]"
-  },
-  {
-    "name": "cvc2",
-    "input": "4111111111111111 CVC2: 987",
-    "expected": "[card ****1111] CVC2: [redacted]"
-  },
-  {
-    "name": "cid",
-    "input": "4111111111111111 CID: 987",
-    "expected": "[card ****1111] CID: [redacted]"
-  },
-  {
-    "name": "csc",
-    "input": "4111111111111111 CSC: 987",
-    "expected": "[card ****1111] CSC: [redacted]"
-  },
-  {
-    "name": "card_code",
-    "input": "4111111111111111 card code: 987",
-    "expected": "[card ****1111] card code: [redacted]"
-  },
-  {
-    "name": "json_suffix",
-    "input": "{\"ok\":true} diagnostic follows; card 4111111111111111",
-    "expected": "{\"ok\":true} diagnostic follows; card [card ****1111]"
-  },
-  {
-    "name": "invalid",
-    "input": "4111111111111112",
-    "expected": "4111111111111112"
-  },
-  {
-    "name": "long",
-    "input": "9941111111111111119999",
-    "expected": "9941111111111111119999"
-  },
-  {
-    "name": "phone",
-    "input": "+1-212-555-0198",
-    "expected": "+1-212-555-0198"
-  },
-  {
-    "name": "timestamp",
-    "input": "2026-11-15T09:12:13Z",
-    "expected": "2026-11-15T09:12:13Z"
-  },
-  {
-    "name": "uuid",
-    "input": "e83fa2c9-9814-4a3b-b8ae-827560198234",
-    "expected": "e83fa2c9-9814-4a3b-b8ae-827560198234"
-  },
-  {
-    "name": "suffix_0",
-    "input": "4111111111111111 2026-11-15T09:12:13Z",
-    "expected": "[card ****1111] 2026-11-15T09:12:13Z"
-  },
-  {
-    "name": "suffix_1",
-    "input": "4111111111111111 212-555-0198",
-    "expected": "[card ****1111] 212-555-0198"
-  },
-  {
-    "name": "suffix_2",
-    "input": "4111111111111111 2026-11-15",
-    "expected": "[card ****1111] 2026-11-15"
-  },
-  {
-    "name": "suffix_3",
-    "input": "4111111111111111 123/45",
-    "expected": "[card ****1111] 123/45"
-  },
-  {
-    "name": "suffix_4",
-    "input": "4111111111111111 123:45",
-    "expected": "[card ****1111] 123:45"
-  },
-  {
-    "name": "suffix_5",
-    "input": "4111111111111111 123.45",
-    "expected": "[card ****1111] 123.45"
-  },
-  {
-    "name": "suffix_6",
-    "input": "4111111111111111 1234T09:12",
-    "expected": "[card ****1111] 1234T09:12"
-  },
-  {
-    "name": "suffix_7",
-    "input": "4111111111111111 1234-word",
-    "expected": "[card ****1111] 1234-word"
-  },
-  {
-    "name": "delimiter_0_0",
-    "input": "4111111111111111: CVV: 987",
-    "expected": "[card ****1111]: CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_0_1",
-    "input": "4111111111111111/12/27 CVV: 987",
-    "expected": "[card ****1111]/12/27 CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_0_2",
-    "input": "4111111111111111-end CVC2: 987",
-    "expected": "[card ****1111]-end CVC2: [redacted]"
-  },
-  {
-    "name": "delimiter_0_3",
-    "input": "4111111111111111, CVV: 987",
-    "expected": "[card ****1111], CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_0_4",
-    "input": "4111111111111111; CVV: 987",
-    "expected": "[card ****1111]; CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_0_5",
-    "input": "4111111111111111. CVV: 987",
-    "expected": "[card ****1111]. CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_0_6",
-    "input": "4111111111111111) CVV: 987",
-    "expected": "[card ****1111]) CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_0_7",
-    "input": "4111111111111111\" CVV: 987",
-    "expected": "[card ****1111]\" CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_0_8",
-    "input": "4111111111111111] CVV: 987",
-    "expected": "[card ****1111]] CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_0_9",
-    "input": "4111111111111111\nCVV: 987",
-    "expected": "[card ****1111]\nCVV: [redacted]"
-  },
-  {
-    "name": "delimiter_0_10",
-    "input": "4111111111111111| CVV: 987",
-    "expected": "[card ****1111]| CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_0",
-    "input": "4111 1111 1111 1111: CVV: 987",
-    "expected": "[card ****1111]: CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_1",
-    "input": "4111 1111 1111 1111/12/27 CVV: 987",
-    "expected": "[card ****1111]/12/27 CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_2",
-    "input": "4111 1111 1111 1111-end CVC2: 987",
-    "expected": "[card ****1111]-end CVC2: [redacted]"
-  },
-  {
-    "name": "delimiter_1_3",
-    "input": "4111 1111 1111 1111, CVV: 987",
-    "expected": "[card ****1111], CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_4",
-    "input": "4111 1111 1111 1111; CVV: 987",
-    "expected": "[card ****1111]; CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_5",
-    "input": "4111 1111 1111 1111. CVV: 987",
-    "expected": "[card ****1111]. CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_6",
-    "input": "4111 1111 1111 1111) CVV: 987",
-    "expected": "[card ****1111]) CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_7",
-    "input": "4111 1111 1111 1111\" CVV: 987",
-    "expected": "[card ****1111]\" CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_8",
-    "input": "4111 1111 1111 1111] CVV: 987",
-    "expected": "[card ****1111]] CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_9",
-    "input": "4111 1111 1111 1111\nCVV: 987",
-    "expected": "[card ****1111]\nCVV: [redacted]"
-  },
-  {
-    "name": "delimiter_1_10",
-    "input": "4111 1111 1111 1111| CVV: 987",
-    "expected": "[card ****1111]| CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_0",
-    "input": "4111-1111-1111-1111: CVV: 987",
-    "expected": "[card ****1111]: CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_1",
-    "input": "4111-1111-1111-1111/12/27 CVV: 987",
-    "expected": "[card ****1111]/12/27 CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_2",
-    "input": "4111-1111-1111-1111-end CVC2: 987",
-    "expected": "[card ****1111]-end CVC2: [redacted]"
-  },
-  {
-    "name": "delimiter_2_3",
-    "input": "4111-1111-1111-1111, CVV: 987",
-    "expected": "[card ****1111], CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_4",
-    "input": "4111-1111-1111-1111; CVV: 987",
-    "expected": "[card ****1111]; CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_5",
-    "input": "4111-1111-1111-1111. CVV: 987",
-    "expected": "[card ****1111]. CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_6",
-    "input": "4111-1111-1111-1111) CVV: 987",
-    "expected": "[card ****1111]) CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_7",
-    "input": "4111-1111-1111-1111\" CVV: 987",
-    "expected": "[card ****1111]\" CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_8",
-    "input": "4111-1111-1111-1111] CVV: 987",
-    "expected": "[card ****1111]] CVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_9",
-    "input": "4111-1111-1111-1111\nCVV: 987",
-    "expected": "[card ****1111]\nCVV: [redacted]"
-  },
-  {
-    "name": "delimiter_2_10",
-    "input": "4111-1111-1111-1111| CVV: 987",
-    "expected": "[card ****1111]| CVV: [redacted]"
+  ],
+  "property": {
+    "seed": 12345678,
+    "iterations": 3000,
+    "groupings": [
+      [
+        13
+      ],
+      [
+        14
+      ],
+      [
+        15
+      ],
+      [
+        16
+      ],
+      [
+        17
+      ],
+      [
+        18
+      ],
+      [
+        19
+      ],
+      [
+        4,
+        4,
+        4,
+        1
+      ],
+      [
+        4,
+        4,
+        4,
+        2
+      ],
+      [
+        4,
+        4,
+        4,
+        3
+      ],
+      [
+        4,
+        4,
+        4,
+        4
+      ],
+      [
+        4,
+        4,
+        4,
+        5
+      ],
+      [
+        4,
+        4,
+        4,
+        6
+      ],
+      [
+        4,
+        4,
+        4,
+        7
+      ],
+      [
+        4,
+        4,
+        4,
+        4,
+        1
+      ],
+      [
+        4,
+        4,
+        4,
+        4,
+        2
+      ],
+      [
+        4,
+        4,
+        4,
+        4,
+        3
+      ],
+      [
+        4,
+        6,
+        5
+      ]
+    ],
+    "delimiters": [
+      ":",
+      "/12/27",
+      "-end",
+      ",",
+      ";",
+      ".",
+      ")",
+      "\"",
+      "]",
+      "\n",
+      "|",
+      "!",
+      "?",
+      "}",
+      "\t",
+      " \u2014 prose"
+    ],
+    "corpus_sha256": "6968514723dc11b65ef59cf0f6d2dc56848f110e06e4bfb8999572555cda89f3"
   }
-]
+}

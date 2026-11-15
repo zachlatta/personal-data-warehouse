@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -18,17 +19,26 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 		t.Fatal(err)
 	}
 	var cases []struct {
-		Name     string
-		Input    string
-		Expected string
+		Name       string
+		Input      string
+		Expected   string
+		JSONResult bool `json:"json_result"`
 	}
-	if json.Unmarshal(data, &cases) != nil {
+	var fixture struct{ Cases json.RawMessage }
+	if json.Unmarshal(data, &fixture) != nil || json.Unmarshal(fixture.Cases, &cases) != nil {
 		t.Fatal("invalid shared fixture")
 	}
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
+			equal := func(actual string) bool {
+				if !c.JSONResult {
+					return actual == c.Expected
+				}
+				var got, want any
+				return json.Unmarshal([]byte(actual), &got) == nil && json.Unmarshal([]byte(c.Expected), &want) == nil && reflect.DeepEqual(got, want)
+			}
 			for _, context := range []bool{false, true} {
-				if redactCardText(c.Input, context) != c.Expected {
+				if !equal(redactCardText(c.Input, context)) {
 					t.Fatal("redaction contract failed")
 				}
 			}
@@ -41,7 +51,7 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 			raw, _ := io.ReadAll(r)
 			r.Close()
 			var result map[string]string
-			if json.Unmarshal(raw, &result) != nil || result["text"] != c.Expected {
+			if json.Unmarshal(raw, &result) != nil || !equal(result["text"]) {
 				t.Fatal("batch contract failed")
 			}
 		})

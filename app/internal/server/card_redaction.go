@@ -9,21 +9,21 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 )
 
-var cardRun = regexp.MustCompile(`[0-9](?:[ -]*[0-9])*`)
-
 const cardCodeLabel = `(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*code)`
 
 var codeValue = regexp.MustCompile(`(?i)(\b` + cardCodeLabel + `\b(?:\s+is)?[\s\\"':=,-]{0,24})([0-9]{3,4})(?:\b)`)
 var codeKey = regexp.MustCompile(`(?i)^` + cardCodeLabel + `$`)
 var cardEscape = regexp.MustCompile(`\\+u(003[0-9]|0020|002[dD])`)
-var cardDigits = regexp.MustCompile(`[0-9]+`)
 var bareCardCode = regexp.MustCompile(`^[ -]+([0-9]{3,4})`)
+var cardTokenPatterns = makeCardTokenPatterns()
+var cardExpirySuffix = regexp.MustCompile(`^/[0-9]{2}/(?:[0-9]{4}|[0-9]{2})(?:[^0-9/]|$)`)
 
 func standaloneCardTokenEnd(s string, end int) bool {
 	if end == len(s) {
@@ -33,74 +33,114 @@ func standaloneCardTokenEnd(s string, end int) bool {
 	return !unicode.IsLetter(next) && !unicode.IsDigit(next) && !strings.ContainsRune("_-/:", next) && !(next == '.' && end+1 < len(s) && s[end+1] >= '0' && s[end+1] <= '9')
 }
 
-// Only token-aligned windows are candidates. A long contiguous identifier is
-// never split. Prefer contiguous PANs and standard groupings over a window that
-// accidentally incorporates an expiry or security code.
-func cardWindows(s string) [][3]int {
-	var spans [][3]int
-	for _, run := range cardRun.FindAllStringIndex(s, -1) {
-		text := s[run[0]:run[1]]
-		tokens := cardDigits.FindAllStringIndex(text, -1)
-		for i := 0; i < len(tokens); {
-			best, rank, bestLength, furthest := -1, 3, 20, -1
-			digits := ""
-			for j := i; j < len(tokens); j++ {
-				digits += text[tokens[j][0]:tokens[j][1]]
-				if len(digits) > 19 {
-					break
-				}
-				if !validCard(digits) {
-					continue
-				}
-				// Punctuation never disqualifies the first complete PAN. The
-				// stricter numeric-token boundary applies only to an ambiguous
-				// extension after a shorter valid PAN (date/phone/code prefix).
-				if best >= 0 && !standaloneCardTokenEnd(s, run[0]+tokens[j][1]) {
-					continue
-				}
-				furthest = j
-				score := 2
-				if j == i {
-					score = 0
-				} else if j-i == 3 && tokens[i][1]-tokens[i][0] == 4 && tokens[i+1][1]-tokens[i+1][0] == 4 && tokens[i+2][1]-tokens[i+2][0] == 4 && tokens[j][1]-tokens[j][0] == 4 {
-					score = 1
-				} else if j-i == 2 && tokens[i][1]-tokens[i][0] == 4 && tokens[i+1][1]-tokens[i+1][0] == 6 && tokens[j][1]-tokens[j][0] == 5 {
-					score = 1
-				}
-				if score < rank || (score == rank && len(digits) < bestLength) {
-					best = j
-					rank = score
-					bestLength = len(digits)
-				}
-			}
-			if best < 0 {
-				i++
-				continue
-			}
-			// Cover every ambiguous valid window, retaining digits only from
-			// the preferred PAN rather than a suffix that might be its code.
-			spans = append(spans, [3]int{run[0] + tokens[i][0], run[0] + tokens[furthest][1], run[0] + tokens[best][1]})
-			i = furthest + 1
-		}
+func panTokenEnd(s string, end int, contiguous bool) bool {
+	if end == len(s) {
+		return true
 	}
-	return spans
+	next, _ := utf8.DecodeRuneInString(s[end:])
+	if unicode.IsNumber(next) {
+		return false
+	}
+	if unicode.IsLetter(next) || next == '_' {
+		return contiguous
+	}
+	if strings.ContainsRune("-/:.", next) && asciiDigit(s, end+1) {
+		return next == '/' && cardExpirySuffix.MatchString(s[end:])
+	}
+	return true
 }
 
-func maskCardWindows(s string) string {
+func makeCardTokenPatterns() []*regexp.Regexp {
+	patterns := []*regexp.Regexp{regexp.MustCompile(`[0-9]{13,19}`)}
+	groups := [][]string{
+		{`[0-9]{4}`, `[0-9]{4}`, `[0-9]{4}`, `[0-9]{1,7}`},
+		{`[0-9]{4}`, `[0-9]{4}`, `[0-9]{4}`, `[0-9]{4}`, `[0-9]{1,3}`},
+		{`[0-9]{4}`, `[0-9]{6}`, `[0-9]{5}`},
+	}
+	for _, sep := range []string{" ", "-"} {
+		for _, group := range groups {
+			patterns = append(patterns, regexp.MustCompile(strings.Join(group, sep)))
+		}
+	}
+	return patterns
+}
+
+func asciiDigit(s string, i int) bool { return i >= 0 && i < len(s) && s[i] >= '0' && s[i] <= '9' }
+
+// A candidate is ONE recognized token, never a window across arbitrary numeric
+// prose. Separators are single and consistent. Phone/date/UUID groupings are
+// outside this grammar, and numeric continuations cannot end a candidate.
+// Only then apply length and Luhn.
+func cardTokens(s string) [][2]int {
+	candidates := map[[2]int]bool{}
+	for index, pattern := range cardTokenPatterns {
+		for _, m := range pattern.FindAllStringIndex(s, -1) {
+			start, end := m[0], m[1]
+			if asciiDigit(s, start-1) || (start > 0 && s[start-1] == '-' && asciiDigit(s, start-2)) {
+				continue
+			}
+			if !panTokenEnd(s, end, index == 0) {
+				continue
+			}
+			if validCard(s[start:end]) {
+				candidates[[2]int{start, end}] = true
+			}
+		}
+	}
+	ordered := [][2]int{}
+	for c := range candidates {
+		ordered = append(ordered, c)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i][0] != ordered[j][0] {
+			return ordered[i][0] < ordered[j][0]
+		}
+		return ordered[i][1] < ordered[j][1]
+	})
+	result := [][2]int{}
+	cursor := 0
+	for i := 0; i < len(ordered); {
+		start := ordered[i][0]
+		j := i
+		for j < len(ordered) && ordered[j][0] == start {
+			j++
+		}
+		if start >= cursor {
+			end := ordered[j-1][1]
+			// An isolated appended 3–4 digit code is suppressed separately, so
+			// its digits can never become the PAN mask's retained suffix.
+			for _, c := range ordered[i:j] {
+				short := c[1]
+				code := bareCardCode.FindStringSubmatchIndex(s[short:])
+				if short < end && code != nil && short+code[3] == end && standaloneCardTokenEnd(s, end) {
+					end = short
+					break
+				}
+			}
+			result = append(result, [2]int{start, end})
+			cursor = end
+		}
+		i = j
+	}
+	return result
+}
+
+func maskCardTokens(s string) string {
 	var out strings.Builder
 	cursor := 0
-	for _, span := range cardWindows(s) {
+	for _, span := range cardTokens(s) {
 		start, end := span[0], span[1]
 		if start < cursor {
 			continue
 		}
-		d := strings.NewReplacer(" ", "", "-", "").Replace(s[start:span[2]])
+		digits := strings.NewReplacer(" ", "", "-", "").Replace(s[start:end])
 		out.WriteString(s[cursor:start])
-		out.WriteString("[card ****" + d[len(d)-4:] + "]")
-		if end > span[2] {
-			out.WriteString(" [redacted]")
-		}
-		if code := bareCardCode.FindStringSubmatchIndex(s[end:]); code != nil && standaloneCardTokenEnd(s, end+code[3]) {
+		out.WriteString("[card ****" + digits[len(digits)-4:] + "]")
+		for {
+			code := bareCardCode.FindStringSubmatchIndex(s[end:])
+			if code == nil || !standaloneCardTokenEnd(s, end+code[3]) {
+				break
+			}
 			out.WriteString(s[end : end+code[2]])
 			out.WriteString("[redacted]")
 			end += code[3]
@@ -139,7 +179,7 @@ func validCard(s string) bool {
 
 func redactCardText(s string, context bool) string {
 	if !context {
-		context = len(cardWindows(decodeCardEscapes(s))) > 0
+		context = len(cardTokens(decodeCardEscapes(s))) > 0
 	}
 	var parsed any
 	dec := json.NewDecoder(strings.NewReader(s))
@@ -153,7 +193,7 @@ func redactCardText(s string, context bool) string {
 			return string(b)
 		}
 	}
-	s = maskCardWindows(decodeCardEscapes(s))
+	s = maskCardTokens(decodeCardEscapes(s))
 	if context {
 		s = codeValue.ReplaceAllString(s, "${1}[redacted]")
 	}
@@ -221,7 +261,7 @@ func redactConversationBatch(body []byte, maxBytes int64) ([]byte, error) {
 		}
 		// Marshal decoded JSON so unicode-escaped digits participate in detection.
 		decoded, _ := json.Marshal(v)
-		context := len(cardWindows(decodeCardEscapes(string(decoded)))) > 0
+		context := len(cardTokens(decodeCardEscapes(string(decoded)))) > 0
 		if !context {
 			continue
 		}
