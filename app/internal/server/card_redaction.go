@@ -26,6 +26,10 @@ var cardEscape = regexp.MustCompile(`\\+u(003[0-9]|0020|002[dD])`)
 var cardDigits = regexp.MustCompile(`[0-9]+`)
 var cardSeparator = regexp.MustCompile(`^[ -]{1,3}$`)
 var adjacentCardCode = regexp.MustCompile(`^(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})`)
+var paymentCardLabels = `(?:` + strings.Join(cardpolicy.Rules.AttachedLabels, "|") + `|` + cardpolicy.Rules.PaymentLabelPattern + `)`
+var paymentCardContext = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_])` + paymentCardLabels + `(?:$|[^A-Za-z0-9_])`)
+var paymentCardAfter = regexp.MustCompile(`(?i)^[\s/|;#=&+:\-]{1,24}` + paymentCardLabels + `(?:$|[^A-Za-z0-9_])`)
+var paymentCardBefore = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_])` + paymentCardLabels + `[\s/|;#=&+:\-]{1,24}$`)
 
 func cardBrand(s string) bool {
 	for _, issuer := range cardpolicy.Rules.Issuers {
@@ -70,21 +74,32 @@ func cardTokenBoundary(s string, start, end int) bool {
 	if !(left == start || allowed(s[left:start])) || !(right == end || allowed(s[end:right])) {
 		return false
 	}
+	if digitCount(s[start:end]) != end-start {
+		return true
+	}
+	before, after := start-96, end+96
+	if before < 0 {
+		before = 0
+	}
+	if after > len(s) {
+		after = len(s)
+	}
+	if paymentCardBefore.MatchString(s[before:start]) || paymentCardAfter.MatchString(s[end:after]) {
+		return true
+	}
 	left, right = start, end
-	for left > 0 && (cardWordByte(s[left-1]) || s[left-1] == '+' || s[left-1] == '/') {
+	for left > 0 && (cardWordByte(s[left-1]) || strings.ContainsRune("+/=-", rune(s[left-1]))) {
 		left--
 	}
-	for right < len(s) && (cardWordByte(s[right]) || s[right] == '+' || s[right] == '/') {
+	for right < len(s) && (cardWordByte(s[right]) || strings.ContainsRune("+/=-", rune(s[right]))) {
 		right++
 	}
-	for _, side := range []string{s[left:start], s[end:right]} {
-		letters := false
-		for _, c := range []byte(side) {
-			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' {
-				letters = true
-			}
-		}
-		if letters && !allowed(strings.Trim(side, "+/")) {
+	token := s[left:right]
+	if len(token) < cardpolicy.Rules.EncodedTokenMinLength || paymentCardContext.MatchString(token) {
+		return true
+	}
+	for _, c := range []byte(token) {
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' {
 			return false
 		}
 	}

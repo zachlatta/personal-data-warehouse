@@ -9,6 +9,10 @@ from typing import Any
 
 CARD_POLICY = json.loads(Path(__file__).with_name('card_policy.json').read_text())
 _ATTACHED_LABELS = frozenset(CARD_POLICY['attached_labels'])
+_PAYMENT_LABELS = '(?:' + '|'.join(re.escape(label) for label in CARD_POLICY['attached_labels']) + '|' + CARD_POLICY['payment_label_pattern'] + ')'
+_PAYMENT_CONTEXT = re.compile(r'(?i)(?:^|[^A-Za-z0-9_])'+_PAYMENT_LABELS+r'(?:$|[^A-Za-z0-9_])')
+_PAYMENT_AFTER = re.compile(r'(?i)^[\s/|;#=&+:\-]{1,24}'+_PAYMENT_LABELS+r'(?:$|[^A-Za-z0-9_])')
+_PAYMENT_BEFORE = re.compile(r'(?i)(?:^|[^A-Za-z0-9_])'+_PAYMENT_LABELS+r'[\s/|;#=&+:\-]{1,24}$')
 
 
 def card_brands(digits):
@@ -28,15 +32,17 @@ def card_token_boundary(value,start,end):
     if not ((left==start or value[left:start].lower() in _ATTACHED_LABELS) and
             (right==end or value[end:right].lower() in _ATTACHED_LABELS)):
         return False
-    # Base64's '+' and '/' can separate a digit run from its letters. Numeric
-    # slash suffixes remain valid expiry context; arbitrary encoded words do not.
+    # A formatted card wins over speculative encodings. For a contiguous PAN,
+    # only a long, mixed letter/digit encoding token WITHOUT payment labels can
+    # veto punctuation context. Labels such as /CVV= are ordinary card fields.
+    if not value[start:end].isdigit():return True
+    if _PAYMENT_AFTER.search(value[end:end+96]) or _PAYMENT_BEFORE.search(value[max(0,start-96):start]):return True
     left=start;right=end
-    while left and (_word_char(value[left-1]) or value[left-1] in '+/'):left-=1
-    while right<len(value) and (_word_char(value[right]) or value[right] in '+/'):right+=1
-    for side in (value[left:start],value[end:right]):
-        if any(c.isalpha() or c=='_' for c in side) and side.strip('+/').lower() not in _ATTACHED_LABELS:
-            return False
-    return True
+    while left and (_word_char(value[left-1]) or value[left-1] in '+/=-'):left-=1
+    while right<len(value) and (_word_char(value[right]) or value[right] in '+/=-'):right+=1
+    token=value[left:right]
+    return (len(token)<CARD_POLICY['encoded_token_min_length'] or
+            not any(c.isalpha() for c in token) or bool(_PAYMENT_CONTEXT.search(token)))
 
 _LABEL = r'(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*code)'
 _CODE = re.compile(r'(?i)(\b' + _LABEL + r'\b(?:\s+is)?[\s\\\x22\x27:=,-]{0,24})([0-9]{3,4})(?![0-9])')

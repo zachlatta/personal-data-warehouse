@@ -9,8 +9,10 @@ type Issuer struct {
 	Ranges  [][2]string
 }
 type Policy struct {
-	AttachedLabels []string `json:"attached_labels"`
-	Issuers        []Issuer
+	AttachedLabels        []string `json:"attached_labels"`
+	PaymentLabelPattern   string   `json:"payment_label_pattern"`
+	EncodedTokenMinLength int      `json:"encoded_token_min_length"`
+	Issuers               []Issuer
 }
 
 var Rules = func() Policy {

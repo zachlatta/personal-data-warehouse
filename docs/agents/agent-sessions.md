@@ -553,6 +553,16 @@ labels `card`, `pan`, `cc`, `number`, `num`, and `menu` remain supported; `menu`
 retains the historical input shape without admitting arbitrary identifier words.
 Non-brand numbers stay unchanged even near a CVV/expiry label. Group layouts,
 overlapping starts and adjacent-code handling are otherwise unchanged.
+The policy records its network/acquirer source URLs and conservatively includes
+their supported formats, including DGN's additional JCB allocations, Diners
+3095, UnionPay 81, and provider-supported Visa/Mir/Maestro lengths. Historical
+JCB formats remain covered for stored conversations. Network routing summaries
+are subsets, so a routing range does not narrow a network's general prefix rule.
+Payment-label words across punctuation take precedence over encoded-token
+checks. A formatted card is not vetoed as an encoding; a contiguous PAN is
+excluded as base64 only inside a mixed letter/digit token of at least 24
+characters without a payment label. Direct identifier word boundaries still
+apply, and expiry/phone suffix protection remains unchanged.
 
 The scrub SQL/archive prefilters use the policy's minimum card length and bound
 both literal and decoded digit readings. They deliberately defer issuer and

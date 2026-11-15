@@ -118,6 +118,49 @@ func TestSharedIssuerAndIdentifierCases(t *testing.T) {
 	}
 }
 
+func TestPaymentLabelsAcrossPunctuation(t *testing.T) {
+	for _, spec := range []struct {
+		prefix string
+		length int
+	}{{"4", 13}, {"4", 16}, {"4", 19}, {"3095", 16}, {"3095", 19}} {
+		stem := (spec.prefix + strings.Repeat("1", spec.length))[:spec.length-1]
+		pan := ""
+		for i := 0; i < 10; i++ {
+			v := stem + string(rune('0'+i))
+			if validCard(v) {
+				pan = v
+				break
+			}
+		}
+		forms := []string{pan}
+		if spec.length == 16 {
+			for _, variant := range []string{"space", "dash", "mixed_runs"} {
+				forms = append(forms, propertyRenderGroups(pan, []int{4, 4, 4, 4}, variant))
+			}
+		}
+		for _, form := range forms {
+			for _, delimiter := range []string{"/", "|", ";", "#", "=", "&"} {
+				for _, label := range []string{"CVV", "CVC", "CVC2", "CVV2", "CID", "CSC", "security code", "card code", "exp", "expiry"} {
+					code := "[redacted]"
+					if label == "exp" || label == "expiry" {
+						code = "987"
+					}
+					value := "pan=" + form + delimiter + label + "=987"
+					want := "pan=[card ****" + pan[len(pan)-4:] + "]" + delimiter + label + "=" + code
+					if redactCardText(value, false) != want || cardCount(value) != 1 {
+						t.Fatalf("label/delimiter %s/%s failed", label, delimiter)
+					}
+					value = label + delimiter + form
+					want = label + delimiter + "[card ****" + pan[len(pan)-4:] + "]"
+					if redactCardText(value, false) != want || cardCount(value) != 1 {
+						t.Fatalf("preceding label %s/%s failed", label, delimiter)
+					}
+				}
+			}
+		}
+	}
+}
+
 func TestSecurityCodeJSONKeys(t *testing.T) {
 	for _, label := range []string{"CVV2", "CVC2", "CID", "CSC", "security code", "card code"} {
 		raw, _ := json.Marshal(map[string]any{"number": "4111111111111111", label: json.Number("987")})
