@@ -442,17 +442,21 @@ spaced, dashed and JSON-escaped forms) become `[card ****1234]`; labelled securi
 codes in the same event become `[redacted]`. This is an intentional exception to
 raw fidelity, including `raw_json`. Original host transcripts are separate copies.
 
-Candidate recognition is a token grammar, not a sliding digit window. Contiguous
-13–19 digit runs and these groupings are supported: `4-4-4-(1..7)`,
-`4-4-4-4-(1..3)` and `4-6-5`, using either single spaces throughout or dashes
-throughout. Mixed separators, phone/date groupings and fragments of longer runs
-are not combined. Length and Luhn are checked after recognition; expiry and codes
-are handled separately after a confirmed PAN. When `4-4-4-4` plus an isolated
-three-digit token is also a valid longer grouping, the shorter confirmed PAN and
-the entire possible code are masked separately, retaining no code digits.
+Discovery evaluates every digit-run start, including overlapping starts. Groups
+may be separated by any mixture of 1–3 spaces/dashes; layout never hides a
+Luhn-valid 13–19 digit reading. Contiguous runs are never split. After length
+and Luhn checks, recognized phone/date/time/identifier tokens exclude readings
+that consume their fragments. Complete cards immediately before numeric fields
+or expiry delimiters retain precedence over interpreting their final group as a
+new token. Earlier confirmed cards preserve independent following numeric fields.
+Overlapping valid readings are masked together; possible adjacent codes are
+suppressed separately so their digits never become a retained card suffix.
 The shared fixture and fixed-seed corpus in `tests/fixtures/card_redaction_cases.json`
-exercise the same grammar in Python and Go, including exact preservation of
-surrounding numeric prose, writer storage and existing-row repair.
+exercise identical generated corpora in Python and Go. The exact-preservation
+insertion corpus uses an independent checksum oracle to construct unambiguous
+ground truth across formatting and preceding/following numeric contexts;
+ambiguous readings have explicit conservative fixtures. Separate checks cover
+unfiltered numeric prose, writer storage and existing-row repair.
 
 Explicit maintenance modules (dry-run unless `--apply` is passed):
 `personal_data_warehouse.scrub_conversation_cards` reports source/month counts

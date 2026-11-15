@@ -8,15 +8,24 @@ from typing import Any
 _LABEL = r'(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*code)'
 _CODE = re.compile(r'(?i)(\b' + _LABEL + r'\b(?:\s+is)?[\s\\\x22\x27:=,-]{0,24})([0-9]{3,4})(?![0-9])')
 _CODE_KEY = re.compile(r'(?i)^' + _LABEL + '$')
+_CODE_SCALAR = re.compile(r'[0-9]{3,4}(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
 _ESCAPE = re.compile(r'\\+u(003[0-9]|0020|002[dD])')
-_BARE_CODE = re.compile(r'[ -]+([0-9]{3,4})(?![0-9])')
-_CARD_TOKENS = [re.compile(r'[0-9]{13,19}')] + [
-    re.compile(re.escape(sep).join(grouping))
-    for sep in (' ', '-') for grouping in (
-        (r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{1,7}'),
-        (r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{4}',r'[0-9]{1,3}'),
-        (r'[0-9]{4}',r'[0-9]{6}',r'[0-9]{5}'))]
+_DIGITS = re.compile(r'[0-9]+')
+_SEPARATOR = re.compile(r'[ -]{1,3}')
+_ADJACENT_CODE = re.compile(r'(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})(?![0-9])')
 _EXPIRY_SUFFIX = re.compile(r'/[0-9]{2}/(?:[0-9]{4}|[0-9]{2})(?![0-9/])')
+_PROTECTED = [
+    ('phone', re.compile(r'(?:\+[0-9]{1,3}[ -]{1,3})?[0-9]{3}[ -]{1,3}[0-9]{3}[ -]{1,3}[0-9]{4}')),
+    ('phone', re.compile(r'\([0-9]{3}\) {0,3}[0-9]{3}[ -]{1,3}[0-9]{4}')),
+    ('date', re.compile(r'[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])')),
+    ('date', re.compile(r'[0-9]{4}/(?:0[1-9]|1[0-2])/(?:0[1-9]|[12][0-9]|3[01])')),
+    ('date', re.compile(r'[0-9]{1,2}/[0-9]{2,4}')),
+    ('time', re.compile(r'[0-9]{1,3}:[0-9]{2}(?::[0-9]{2})?(?:\.[0-9]+)?')),
+    ('uuid', re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')),
+    ('id', re.compile(r'[0-9]{1,4}\.[0-9]+')),
+    ('id', re.compile(r'[0-9]{1,4}/[0-9]{2,4}')),
+    ('id', re.compile(r'[0-9]{1,4}[a-zA-Z_][a-zA-Z_0-9]*')),
+]
 
 
 def standalone_end(value: str, end: int) -> bool:
@@ -27,60 +36,84 @@ def standalone_end(value: str, end: int) -> bool:
                 (next_char == '.' and end + 1 < len(value) and value[end + 1].isdigit()))
 
 
-def pan_token_end(value: str, end: int, *, contiguous=False) -> bool:
-    """A PAN ends at punctuation, not inside a numeric/identifier token.
-
-    The one numeric suffix belonging to card syntax is /MM/YY (or /MM/YYYY).
-    It remains outside the PAN. No arbitrary numeric window is considered.
-    """
-    if end==len(value):
-        return True
-    char=value[end]
-    if char.isdigit():
-        return False
-    if char.isalnum() or char=='_':
-        # A whole 13–19 digit run remains sensitive inside prose/identifiers.
-        # A short grouped tail attached to a word (123abc) is not a card group.
-        return contiguous
-    if char in '-/:.' and end+1<len(value) and value[end+1].isdigit():
-        return char=='/' and _EXPIRY_SUFFIX.match(value,end) is not None
-    return True
-
-
 def card_spans(value: str):
-    """One card token: contiguous digits or one recognized consistent grouping.
+    """Enumerate every overlapping digit-run reading, then apply exclusions.
 
-    Never join arbitrary neighboring numbers, mix separators, split a longer
-    digit run, or cross a numeric continuation. Luhn runs AFTER
-    lexical recognition. Bare codes are handled only after confirming a PAN.
+    A reading has 13–19 digits, never splits a contiguous run, and may join
+    groups across any 1–3 spaces/dashes. Layout and separator uniformity cannot
+    hide a card. Recognized non-card tokens, rather than candidate shape, keep
+    readings from consuming phone/date/time/identifier fragments.
     """
-    candidates = {}
-    for index,pattern in enumerate(_CARD_TOKENS):
-        for match in pattern.finditer(value):
-            start,end = match.span()
-            if start and (value[start-1].isdigit() or (value[start-1]=='-' and start>1 and value[start-2].isdigit())):
-                continue
-            if not pan_token_end(value,end,contiguous=index==0):
-                continue
-            if is_card(match[0]):
-                candidates.setdefault(start,set()).add(end)
-    cursor = 0
-    for start in sorted(candidates):
-        if start < cursor:
-            continue
-        ends = sorted(candidates[start])
-        end = max(ends)
-        # A complete shorter PAN followed by an isolated 3–4 digit token is
-        # ambiguous with a longer grouping. Prefer the confirmed shorter PAN
-        # and suppress the entire code separately, never retaining code digits.
-        for short in ends:
-            code = _BARE_CODE.match(value,short)
-            if short<end and code and code.end()==end and standalone_end(value,end):
-                end=short
+    atoms = list(_DIGITS.finditer(value))
+    readings = set()
+    for i,atom in enumerate(atoms):
+        digits = ''
+        for j in range(i,len(atoms)):
+            if j>i and not _SEPARATOR.fullmatch(value[atoms[j-1].end():atoms[j].start()]):
                 break
-        yield start,end
-        cursor=end
-
+            digits += atoms[j][0]
+            if len(digits)>19:
+                break
+            if is_card(digits):
+                readings.add((atom.start(),atoms[j].end()))
+    if not readings:
+        return
+    protected = []
+    token_starts = sorted({m.start() for m in atoms} | {m.start()-1 for m in atoms if m.start() and value[m.start()-1] in '+('})
+    for kind,pattern in _PROTECTED:
+        positions = [m.start() for m in pattern.finditer(value)] if kind=='uuid' else token_starts
+        for position in positions:
+            match = pattern.match(value,position)
+            if match is None:
+                continue
+            if match.start() and value[match.start()-1].isdigit():
+                continue
+            if match.end()<len(value) and value[match.end()].isdigit():
+                continue
+            first = _DIGITS.search(value,match.start(),match.end())
+            protected.append((kind,match.start(),match.end(),first.end()))
+    valid = []
+    for start,end in sorted(readings):
+        blocked = False
+        for kind,a,b,first_end in protected:
+            if start>=b or end<=a:
+                continue
+            # A confirmed PAN immediately before a numeric field/expiry has
+            # precedence over interpreting its final group as a new token.
+            # An earlier complete PAN instead makes that token a separate field.
+            groups = [len(m[0]) for m in _DIGITS.finditer(value,start,end)]
+            card_layout = (len(groups)==4 and groups[:3]==[4,4,4] and 1<=groups[3]<=7 or
+                           len(groups)==5 and groups[:4]==[4,4,4,4] and 1<=groups[4]<=3 or groups==[4,6,5])
+            numeric_field = card_layout and kind in ('date','time','id') and start<a and end==first_end
+            earlier_pan = any(s<a and start<e<=a for s,e in readings)
+            external_pan = any(s<start and start<e<=a for s,e in readings)
+            if numeric_field and (not earlier_pan or _EXPIRY_SUFFIX.match(value,end) and not external_pan):
+                continue
+            blocked = True
+            break
+        if not blocked:
+            valid.append((start,end))
+    codes = []
+    for start,end in valid:
+        code = _ADJACENT_CODE.match(value,end)
+        if not code or not standalone_end(value,code.end()):
+            continue
+        size = sum(c.isdigit() for c in value[start:end])
+        # Do not mistake the end of another, equally complete overlapping PAN
+        # for this reading's bare code (e.g. a preceding four-digit token).
+        if any(s>start and e==code.end() and sum(c.isdigit() for c in value[s:e])>=size for s,e in valid):
+            continue
+        codes.append((code.start(1),code.end()))
+    valid = [(a,b) for a,b in valid if not any(a<d and b>c for c,d in codes)]
+    # Mask the union of overlapping valid readings: ambiguity never exposes a
+    # complete alternative PAN. Recognized safe tokens were excluded above.
+    merged = []
+    for start,end in valid:
+        if merged and start<merged[-1][1]:
+            merged[-1] = (merged[-1][0],max(end,merged[-1][1]))
+        else:
+            merged.append((start,end))
+    yield from merged
 
 def _mask_cards(value: str) -> str:
     output = []
@@ -90,7 +123,7 @@ def _mask_cards(value: str) -> str:
             continue
         digits = value[start:end].replace(' ', '').replace('-', '')
         output.extend((value[cursor:start], '[card ****'+digits[-4:]+']'))
-        while (code := _BARE_CODE.match(value,end)) and standalone_end(value,code.end()):
+        while (code := _ADJACENT_CODE.match(value,end)) and standalone_end(value,code.end()):
             output.extend((value[end:code.start(1)], '[redacted]'))
             end=code.end()
         cursor=end
@@ -122,15 +155,27 @@ def redact(value: str, *, card_context: bool = False) -> str:
     context = card_context or card_count(value) > 0
     if not context:
         return value
+    numeric_changed = False
+    def parse_number(literal):
+        # Preserve the exact numeric lexeme until after redaction; converting
+        # a 19-digit PAN to a binary float first can round away its last digits.
+        nonlocal numeric_changed
+        cleaned = _mask_cards(literal)
+        if cleaned != literal:
+            numeric_changed = True
+            return cleaned
+        return float(literal)
     try:
-        parsed = json.loads(value)
+        parsed = json.loads(value, parse_float=parse_number)
     except (ValueError, TypeError):
         parsed = None
     if isinstance(parsed, (dict, list)):
         def walk(item: Any) -> Any:
             if isinstance(item, dict):
                 return {redact(k, card_context=True): (
-                    '[redacted]' if _CODE_KEY.fullmatch(k) and re.fullmatch(r'[0-9]{3,4}', str(v))
+                    '[redacted]' if _CODE_KEY.fullmatch(k) and (
+                        _CODE_SCALAR.fullmatch(str(v).strip()) or
+                        isinstance(v,(int,float)) and not isinstance(v,bool) and 0<=v<=9999 and int(v)==v)
                     else walk(v)
                 ) for k, v in item.items()}
             if isinstance(item, list):
@@ -141,7 +186,7 @@ def redact(value: str, *, card_context: bool = False) -> str:
                 return '[card ****' + str(item)[-4:] + ']'
             return item
         cleaned = walk(parsed)
-        return json.dumps(cleaned, ensure_ascii=False) if cleaned != parsed else value
+        return json.dumps(cleaned, ensure_ascii=False) if numeric_changed or cleaned != parsed else value
     decoded = _ESCAPE.sub(lambda m: chr(int(m[1], 16)), value)
     cleaned = _mask_cards(decoded)
     cleaned = _CODE.sub(lambda m: m[1] + '[redacted]', cleaned)

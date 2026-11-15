@@ -1,11 +1,47 @@
 """Independent fixed-seed corpus generator, mirrored in Go, configured by JSON."""
 import json
+import re
 from pathlib import Path
 
 
 def checksum_valid(value):
     return sum((int(c)*2-9 if int(c)>4 else int(c)*2) if i%2 else int(c)
                for i,c in enumerate(reversed(value))) % 10 == 0
+
+
+def render_groups(number,grouping,variant):
+    separators = {'plain':[''], 'space':[' '], 'dash':['-'], 'double':['  '], 'triple':['   '],
+                  'mixed':['-',' '], 'mixed_runs':[' -','- ',' - ']}
+    result='';pos=0
+    for i,n in enumerate(grouping):
+        if i:
+            options=separators[variant]
+            result+=options[(i-1)%len(options)]
+        result+=number[pos:pos+n];pos+=n
+    return result
+
+
+def unambiguous_insertion(context,pan):
+    """Independent exhaustive checksum oracle for known insertion ground truth.
+
+    Prefix numbers can accidentally form a SECOND valid PAN with inserted
+    digits. Such inherently ambiguous cases have explicit conservative fixtures;
+    exact-preservation properties construct one valid reading, without consulting
+    the redactor or filtering the safe prose through it.
+    """
+    value=context+pan;atoms=list(re.finditer(r'[0-9]+',value))
+    readings=[]
+    for i,atom in enumerate(atoms):
+        digits=''
+        for j in range(i,len(atoms)):
+            if j>i and not re.fullmatch(r'[ -]{1,3}',value[atoms[j-1].end():atoms[j].start()]):
+                break
+            digits+=atoms[j][0]
+            if len(digits)>19:
+                break
+            if 13<=len(digits) and checksum_valid(digits):
+                readings.append((atom.start(),atoms[j].end()))
+    return readings==[(len(context),len(value))]
 
 
 def property_cases():
@@ -20,12 +56,12 @@ def property_cases():
     def valid_number(n):
         prefix = '4' + digits(n-2)
         return next(prefix+str(i) for i in range(10) if checksum_valid(prefix+str(i)))
-    formats = [(g,s) for g in config['groupings'] for s in ([''] if len(g)==1 else [' ','-'])]
+    formats = [(g,s) for g in config['groupings'] for s in (['plain'] if len(g)==1 else config['separator_variants'])]
     for i in range(config['iterations']):
         area = str(200+rand(700)); exchange=str(200+rand(700)); line=digits(4)
         phone = area+'-'+exchange+'-'+line
         phone2 = '(202) '+str(200+rand(700))+'-'+digits(4)
-        date = f'{2000+rand(40):04}-{1+rand(12):02}-{1+rand(28):02}'
+        date = f'{1000+rand(2000):04}-{1+rand(12):02}-{1+rand(28):02}'
         time = f'{rand(24):02}:{rand(60):02}:{rand(60):02}'
         uuid = '-'.join(''.join('0123456789abcdef'[rand(16)] for _ in range(n)) for n in (8,4,4,4,12))
         valid_order = valid_number(16)
@@ -38,21 +74,28 @@ def property_cases():
         joiner = [' ','; ','\n',' | ','\t'][rand(5)]
         safe = joiner.join(tokens)
         yield f'preserve-{i}', safe, safe
-        grouping, sep = formats[i%len(formats)]
-        delimiter = config['delimiters'][(i//len(formats))%len(config['delimiters'])]
-        number = valid_number(sum(grouping))
-        parts=[];pos=0
-        for n in grouping:
-            parts.append(number[pos:pos+n]);pos+=n
-        pan=sep.join(parts)
+        grouping, variant = formats[i%len(formats)]
+        context = config['preceding_contexts'][(i//len(formats))%len(config['preceding_contexts'])]
+        following = config['following_contexts'][(i//(len(formats)*len(config['preceding_contexts'])))%len(config['following_contexts'])]
+        for attempt in range(1000):
+            number=valid_number(sum(grouping))
+            pan=render_groups(number,grouping,variant)
+            if unambiguous_insertion(context,pan):
+                break
+        else:
+            raise AssertionError('could not construct unambiguous synthetic PAN')
         replacement='[card ****'+number[-4:]+']'
-        # Explicit ambiguity policy: 4/4/4/4 + isolated 3 can be PAN+CVV.
-        # Both are suppressed, retaining digits only from the confirmed PAN.
-        bare_end = not (delimiter[0].isalnum() or delimiter[0] in '_-/:' or
-                        (delimiter[0]=='.' and len(delimiter)>1 and delimiter[1].isdigit()))
-        if sep==' ' and grouping==[4,4,4,4,3] and checksum_valid(number[:16]) and bare_end:
-            replacement='[card ****'+number[12:16]+'] [redacted]'
         at=rand(len(tokens)+1)
-        prefix=joiner.join(tokens[:at])+' | '
-        suffix=delimiter+' | '+joiner.join(tokens[at:])
-        yield f'insert-{i}', prefix+pan+suffix, prefix+replacement+suffix
+        prefix=joiner.join(tokens[:at])+' | '+context
+        suffix=' | '+joiner.join(tokens[at:])
+        yield f'insert-{i}', prefix+pan+following['input']+suffix, prefix+replacement+following['expected']+suffix
+    tokens = config['permutation_tokens']
+    for i,a in enumerate(tokens):
+        for j,b in enumerate(tokens):
+            for k,c in enumerate(tokens):
+                if len({i,j,k})!=3:
+                    continue
+                for n,joiner in enumerate(config['permutation_joiners']):
+                    value=joiner.join((a,b,c))
+                    yield f'permutation-preserve-{i}-{j}-{k}-{n}', value, value
+                    yield f'permutation-insert-{i}-{j}-{k}-{n}', '4111111111111111 | '+value, '[card ****1111] | '+value

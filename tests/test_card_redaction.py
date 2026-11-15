@@ -25,7 +25,7 @@ def test_generated_numeric_prose_and_inserted_card_properties():
         digest.update((name+'\0'+value+'\0'+expected+'\n').encode())
         count += 1
     config = json.loads((Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['property']
-    assert count >= 6000
+    assert count >= 17680
     assert digest.hexdigest() == config['corpus_sha256']
 
 

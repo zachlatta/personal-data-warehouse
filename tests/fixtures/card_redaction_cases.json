@@ -746,17 +746,17 @@
     {
       "name": "not_one_card_token_0",
       "input": "4111-1111 1111-1111",
-      "expected": "4111-1111 1111-1111"
+      "expected": "[card ****1111]"
     },
     {
       "name": "not_one_card_token_1",
       "input": "4111 1111-1111 1111",
-      "expected": "4111 1111-1111 1111"
+      "expected": "[card ****1111]"
     },
     {
       "name": "not_one_card_token_2",
       "input": "4111  1111 1111 1111",
-      "expected": "4111  1111 1111 1111"
+      "expected": "[card ****1111]"
     },
     {
       "name": "escaped_digits",
@@ -841,11 +841,86 @@
       "name": "contiguous_card_inside_prose",
       "input": "prefix4111111111111111suffix",
       "expected": "prefix[card ****1111]suffix"
+    },
+    {
+      "name": "review5_numeric_prefix",
+      "input": "1234 4111 1111 1111 1111 CVV2: 987",
+      "expected": "1234 [card ****1111] CVV2: [redacted]"
+    },
+    {
+      "name": "review5_double_spaces",
+      "input": "4111  1111  1111  1111 CVV2: 987",
+      "expected": "[card ****1111] CVV2: [redacted]"
+    },
+    {
+      "name": "review5_mixed",
+      "input": "4111-1111 1111 1111 CVV2: 987",
+      "expected": "[card ****1111] CVV2: [redacted]"
+    },
+    {
+      "name": "review5_numeric_colon",
+      "input": "4111 1111 1111 1111:987 CVV2: 987",
+      "expected": "[card ****1111]:[redacted] CVV2: [redacted]"
+    },
+    {
+      "name": "ambiguous_grouped_pan_or_code",
+      "input": "4111-1111-1111-1111-102|",
+      "expected": "[card ****1111]-[redacted]|",
+      "synthetic_provenance": {
+        "recipe": "canonical_pan_plus_luhn_code",
+        "description": "Append the first three-digit integer starting at 100 for which the published Visa test PAN plus that integer passes Luhn. Group the base in fours with dashes. Both the base and the longer reading are valid; the trailing token is a possible code.",
+        "base_test_pan": "4111111111111111",
+        "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+      }
+    },
+    {
+      "name": "ambiguous_numeric_prefix_readings",
+      "input": "1004 4111 1111 1111 1111",
+      "expected": "[card ****1111]",
+      "synthetic_provenance": {
+        "recipe": "canonical_pan_with_overlapping_prefix",
+        "description": "Prepend the first four-digit integer starting at 1000 for which that integer plus the first twelve digits of the published Visa test PAN passes Luhn. Keep the entire test PAN after the prefix; the two sixteen-digit readings overlap.",
+        "base_test_pan": "4111111111111111",
+        "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
+      }
+    },
+    {
+      "name": "json_code_surrounding_whitespace",
+      "input": "{\"number\": \"4111111111111111\", \"CVV2\": \" 987 \"}",
+      "expected": "{\"number\": \"[card ****1111]\", \"CVV2\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "review5_future_date_tokens",
+      "input": "2100-11-15 2101-11-15 2102-11-15",
+      "expected": "2100-11-15 2101-11-15 2102-11-15",
+      "synthetic_provenance": {
+        "recipe": "consecutive_future_dates",
+        "description": "Join November 15 dates for the three consecutive years starting at 2100. Any checksum-valid reading across these date tokens is incidental to the constructed calendar examples."
+      }
+    },
+    {
+      "name": "json_numeric_fractional_pan",
+      "input": "{\"card\":4111111111111111.0,\"CVV2\":987.0,\"measurement\":1.5}",
+      "expected": "{\"card\": \"[card ****1111].0\", \"CVV2\": \"[redacted]\", \"measurement\": 1.5}",
+      "json_result": true
+    },
+    {
+      "name": "json_numeric_exponent_pan",
+      "input": "{\"card\":4111111111111111e0,\"CVV\":9.87e2}",
+      "expected": "{\"card\": \"[card ****1111]e0\", \"CVV\": \"[redacted]\"}",
+      "json_result": true
+    },
+    {
+      "name": "json_numeric_fractional_pan_only",
+      "input": "{\"card\":4111111111111111.0,\"measurement\":1.5}",
+      "expected": "{\"card\": \"[card ****1111].0\", \"measurement\": 1.5}",
+      "json_result": true
     }
   ],
   "property": {
     "seed": 12345678,
-    "iterations": 3000,
+    "iterations": 8000,
     "groupings": [
       [
         13
@@ -955,6 +1030,160 @@
       "\t",
       " \u2014 prose"
     ],
-    "corpus_sha256": "6968514723dc11b65ef59cf0f6d2dc56848f110e06e4bfb8999572555cda89f3"
+    "separator_variants": [
+      "space",
+      "dash",
+      "double",
+      "triple",
+      "mixed",
+      "mixed_runs"
+    ],
+    "preceding_contexts": [
+      "word ",
+      "1234 ",
+      "12345678 "
+    ],
+    "following_contexts": [
+      {
+        "input": ":",
+        "expected": ":"
+      },
+      {
+        "input": "/12/27",
+        "expected": "/12/27"
+      },
+      {
+        "input": "-end",
+        "expected": "-end"
+      },
+      {
+        "input": ",",
+        "expected": ","
+      },
+      {
+        "input": ";",
+        "expected": ";"
+      },
+      {
+        "input": ".",
+        "expected": "."
+      },
+      {
+        "input": ")",
+        "expected": ")"
+      },
+      {
+        "input": "\"",
+        "expected": "\""
+      },
+      {
+        "input": "]",
+        "expected": "]"
+      },
+      {
+        "input": "\n",
+        "expected": "\n"
+      },
+      {
+        "input": "|",
+        "expected": "|"
+      },
+      {
+        "input": "!",
+        "expected": "!"
+      },
+      {
+        "input": "?",
+        "expected": "?"
+      },
+      {
+        "input": "}",
+        "expected": "}"
+      },
+      {
+        "input": "\t",
+        "expected": "\t"
+      },
+      {
+        "input": " \u2014 prose",
+        "expected": " \u2014 prose"
+      },
+      {
+        "input": ":987",
+        "expected": ":[redacted]"
+      },
+      {
+        "input": ":1234",
+        "expected": ":[redacted]"
+      },
+      {
+        "input": ":42",
+        "expected": ":42"
+      },
+      {
+        "input": ".42",
+        "expected": ".42"
+      },
+      {
+        "input": ",42",
+        "expected": ",42"
+      },
+      {
+        "input": " 2026-11-15T09:12:13Z",
+        "expected": " 2026-11-15T09:12:13Z"
+      },
+      {
+        "input": " +1-212-555-0198",
+        "expected": " +1-212-555-0198"
+      },
+      {
+        "input": " 212-555-0198",
+        "expected": " 212-555-0198"
+      },
+      {
+        "input": " 2026/11/15",
+        "expected": " 2026/11/15"
+      },
+      {
+        "input": " 123:45",
+        "expected": " 123:45"
+      },
+      {
+        "input": " 123.45",
+        "expected": " 123.45"
+      },
+      {
+        "input": " 123_abc",
+        "expected": " 123_abc"
+      },
+      {
+        "input": " 123abc",
+        "expected": " 123abc"
+      },
+      {
+        "input": " 99999999999999999999999999999999999999999999999999999999999999999999999999999999",
+        "expected": " 99999999999999999999999999999999999999999999999999999999999999999999999999999999"
+      },
+      {
+        "input": " 123/45",
+        "expected": " 123/45"
+      }
+    ],
+    "corpus_sha256": "031c4b1718ce9c7f264c28e66110c03566424436ba5b58457eb810a59ee5f1ac",
+    "permutation_tokens": [
+      "2026-11-15T09:12:13Z",
+      "+1-202-555-0198",
+      "(202) 555-0198",
+      "2026/11/15",
+      "123.45",
+      "999999999999999999999999999999999999999999999999999999999999",
+      "4111111111111112"
+    ],
+    "permutation_joiners": [
+      " ",
+      "; ",
+      "\n",
+      " | "
+    ]
   }
 }

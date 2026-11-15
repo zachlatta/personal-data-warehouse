@@ -41,7 +41,7 @@ def test_every_source_writer_masks_all_content(warehouse):
 def test_delimited_cards_are_masked_by_writer_and_found_by_scan(warehouse):
     from pathlib import Path
     from personal_data_warehouse.card_redaction import card_count
-    cases = [c for c in json.loads((Path(__file__).parent / 'fixtures/card_redaction_cases.json').read_text())['cases'] if c['name'].startswith('delimiter_')]
+    cases = [c for c in json.loads((Path(__file__).parent / 'fixtures/card_redaction_cases.json').read_text())['cases'] if c['name'].startswith(('delimiter_', 'review5_', 'not_one_card_token_')) and c['input']!=c['expected']]
     for index, case in enumerate(cases):
         row = dict(event(), event_uuid=f'writer-{index}', seq=index + 1, text=case['input'],
                    tool_input_json=json.dumps({'text': case['input']}), tool_result_json=json.dumps({'text': case['input']}),
@@ -63,7 +63,7 @@ def test_writer_and_scrub_preserve_numeric_prose(warehouse):
     from pathlib import Path
     from tests.card_redaction_properties import property_cases
     fixture = json.loads((Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())
-    values = [c['input'] for c in fixture['cases'] if c['name'].startswith('review4_safe_')]
+    values = [c['input'] for c in fixture['cases'] if c['name'].startswith('review4_safe_') or c['name']=='review5_future_date_tokens']
     values += [value for name,value,_ in property_cases() if name.startswith('preserve-')][:20]
     for index,value in enumerate(values):
         row = dict(event(), event_uuid=f'numeric-{index}', seq=index+1, text=value, raw_json=json.dumps({'text':value}),

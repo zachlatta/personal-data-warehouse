@@ -20,10 +20,31 @@ const cardCodeLabel = `(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*cod
 
 var codeValue = regexp.MustCompile(`(?i)(\b` + cardCodeLabel + `\b(?:\s+is)?[\s\\"':=,-]{0,24})([0-9]{3,4})(?:\b)`)
 var codeKey = regexp.MustCompile(`(?i)^` + cardCodeLabel + `$`)
+var codeScalar = regexp.MustCompile(`^[0-9]{3,4}(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$`)
 var cardEscape = regexp.MustCompile(`\\+u(003[0-9]|0020|002[dD])`)
-var bareCardCode = regexp.MustCompile(`^[ -]+([0-9]{3,4})`)
-var cardTokenPatterns = makeCardTokenPatterns()
+var cardDigits = regexp.MustCompile(`[0-9]+`)
+var cardSeparator = regexp.MustCompile(`^[ -]{1,3}$`)
+var adjacentCardCode = regexp.MustCompile(`^(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})`)
 var cardExpirySuffix = regexp.MustCompile(`^/[0-9]{2}/(?:[0-9]{4}|[0-9]{2})(?:[^0-9/]|$)`)
+var protectedUUID = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+
+type protectedPattern struct {
+	kind    string
+	pattern *regexp.Regexp
+}
+
+var protectedPatterns = []protectedPattern{
+	{"phone", regexp.MustCompile(`^(?:\+[0-9]{1,3}[ -]{1,3})?[0-9]{3}[ -]{1,3}[0-9]{3}[ -]{1,3}[0-9]{4}`)},
+	{"phone", regexp.MustCompile(`^\([0-9]{3}\) {0,3}[0-9]{3}[ -]{1,3}[0-9]{4}`)},
+	{"date", regexp.MustCompile(`^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])`)},
+	{"date", regexp.MustCompile(`^[0-9]{4}/(?:0[1-9]|1[0-2])/(?:0[1-9]|[12][0-9]|3[01])`)},
+	{"date", regexp.MustCompile(`^[0-9]{1,2}/[0-9]{2,4}`)},
+	{"time", regexp.MustCompile(`^[0-9]{1,3}:[0-9]{2}(?::[0-9]{2})?(?:\.[0-9]+)?`)},
+	{"uuid", regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)},
+	{"id", regexp.MustCompile(`^[0-9]{1,4}\.[0-9]+`)},
+	{"id", regexp.MustCompile(`^[0-9]{1,4}/[0-9]{2,4}`)},
+	{"id", regexp.MustCompile(`^[0-9]{1,4}[a-zA-Z_][a-zA-Z_0-9]*`)},
+}
 
 func standaloneCardTokenEnd(s string, end int) bool {
 	if end == len(s) {
@@ -33,94 +54,156 @@ func standaloneCardTokenEnd(s string, end int) bool {
 	return !unicode.IsLetter(next) && !unicode.IsDigit(next) && !strings.ContainsRune("_-/:", next) && !(next == '.' && end+1 < len(s) && s[end+1] >= '0' && s[end+1] <= '9')
 }
 
-func panTokenEnd(s string, end int, contiguous bool) bool {
-	if end == len(s) {
-		return true
-	}
-	next, _ := utf8.DecodeRuneInString(s[end:])
-	if unicode.IsNumber(next) {
-		return false
-	}
-	if unicode.IsLetter(next) || next == '_' {
-		return contiguous
-	}
-	if strings.ContainsRune("-/:.", next) && asciiDigit(s, end+1) {
-		return next == '/' && cardExpirySuffix.MatchString(s[end:])
-	}
-	return true
-}
-
-func makeCardTokenPatterns() []*regexp.Regexp {
-	patterns := []*regexp.Regexp{regexp.MustCompile(`[0-9]{13,19}`)}
-	groups := [][]string{
-		{`[0-9]{4}`, `[0-9]{4}`, `[0-9]{4}`, `[0-9]{1,7}`},
-		{`[0-9]{4}`, `[0-9]{4}`, `[0-9]{4}`, `[0-9]{4}`, `[0-9]{1,3}`},
-		{`[0-9]{4}`, `[0-9]{6}`, `[0-9]{5}`},
-	}
-	for _, sep := range []string{" ", "-"} {
-		for _, group := range groups {
-			patterns = append(patterns, regexp.MustCompile(strings.Join(group, sep)))
-		}
-	}
-	return patterns
-}
-
 func asciiDigit(s string, i int) bool { return i >= 0 && i < len(s) && s[i] >= '0' && s[i] <= '9' }
+func digitCount(s string) int {
+	n := 0
+	for i := range s {
+		if asciiDigit(s, i) {
+			n++
+		}
+	}
+	return n
+}
+func cardLayout(s string) bool {
+	atoms := cardDigits.FindAllStringIndex(s, -1)
+	g := []int{}
+	for _, a := range atoms {
+		g = append(g, a[1]-a[0])
+	}
+	return (len(g) == 4 && g[0] == 4 && g[1] == 4 && g[2] == 4 && g[3] >= 1 && g[3] <= 7) || (len(g) == 5 && g[0] == 4 && g[1] == 4 && g[2] == 4 && g[3] == 4 && g[4] >= 1 && g[4] <= 3) || (len(g) == 3 && g[0] == 4 && g[1] == 6 && g[2] == 5)
+}
 
-// A candidate is ONE recognized token, never a window across arbitrary numeric
-// prose. Separators are single and consistent. Phone/date/UUID groupings are
-// outside this grammar, and numeric continuations cannot end a candidate.
-// Only then apply length and Luhn.
+// Every digit-run start is evaluated, including overlaps. Candidate formatting
+// never excludes a reading: only length, Luhn and recognized non-card tokens do.
 func cardTokens(s string) [][2]int {
-	candidates := map[[2]int]bool{}
-	for index, pattern := range cardTokenPatterns {
-		for _, m := range pattern.FindAllStringIndex(s, -1) {
-			start, end := m[0], m[1]
-			if asciiDigit(s, start-1) || (start > 0 && s[start-1] == '-' && asciiDigit(s, start-2)) {
-				continue
+	atoms := cardDigits.FindAllStringIndex(s, -1)
+	readings := [][2]int{}
+	for i, a := range atoms {
+		digits := ""
+		for j := i; j < len(atoms); j++ {
+			if j > i && !cardSeparator.MatchString(s[atoms[j-1][1]:atoms[j][0]]) {
+				break
 			}
-			if !panTokenEnd(s, end, index == 0) {
-				continue
+			digits += s[atoms[j][0]:atoms[j][1]]
+			if len(digits) > 19 {
+				break
 			}
-			if validCard(s[start:end]) {
-				candidates[[2]int{start, end}] = true
+			if validCard(digits) {
+				readings = append(readings, [2]int{a[0], atoms[j][1]})
 			}
 		}
 	}
-	ordered := [][2]int{}
-	for c := range candidates {
-		ordered = append(ordered, c)
+	if len(readings) == 0 {
+		return nil
 	}
-	sort.Slice(ordered, func(i, j int) bool {
-		if ordered[i][0] != ordered[j][0] {
-			return ordered[i][0] < ordered[j][0]
+	tokenStarts := []int{}
+	for _, a := range atoms {
+		tokenStarts = append(tokenStarts, a[0])
+		if a[0] > 0 && (s[a[0]-1] == '+' || s[a[0]-1] == '(') {
+			tokenStarts = append(tokenStarts, a[0]-1)
 		}
-		return ordered[i][1] < ordered[j][1]
+	}
+	type token struct {
+		kind                 string
+		start, end, firstEnd int
+	}
+	protected := []token{}
+	for _, p := range protectedPatterns {
+		positions := tokenStarts
+		if p.kind == "uuid" {
+			positions = nil
+			for _, m := range protectedUUID.FindAllStringIndex(s, -1) {
+				positions = append(positions, m[0])
+			}
+		}
+		for _, start := range positions {
+			if asciiDigit(s, start-1) {
+				continue
+			}
+			m := p.pattern.FindStringIndex(s[start:])
+			if m == nil {
+				continue
+			}
+			end := start + m[1]
+			if asciiDigit(s, end) {
+				continue
+			}
+			first := cardDigits.FindStringIndex(s[start:end])
+			protected = append(protected, token{p.kind, start, end, start + first[1]})
+		}
+	}
+	sort.Slice(readings, func(i, j int) bool {
+		if readings[i][0] != readings[j][0] {
+			return readings[i][0] < readings[j][0]
+		}
+		return readings[i][1] < readings[j][1]
 	})
-	result := [][2]int{}
-	cursor := 0
-	for i := 0; i < len(ordered); {
-		start := ordered[i][0]
-		j := i
-		for j < len(ordered) && ordered[j][0] == start {
-			j++
-		}
-		if start >= cursor {
-			end := ordered[j-1][1]
-			// An isolated appended 3–4 digit code is suppressed separately, so
-			// its digits can never become the PAN mask's retained suffix.
-			for _, c := range ordered[i:j] {
-				short := c[1]
-				code := bareCardCode.FindStringSubmatchIndex(s[short:])
-				if short < end && code != nil && short+code[3] == end && standaloneCardTokenEnd(s, end) {
-					end = short
-					break
+	valid := [][2]int{}
+	for _, r := range readings {
+		start, end := r[0], r[1]
+		blocked := false
+		for _, p := range protected {
+			if start >= p.end || end <= p.start {
+				continue
+			}
+			numericField := cardLayout(s[start:end]) && (p.kind == "date" || p.kind == "time" || p.kind == "id") && start < p.start && end == p.firstEnd
+			earlier := false
+			external := false
+			for _, other := range readings {
+				if other[0] < p.start && start < other[1] && other[1] <= p.start {
+					earlier = true
+					if other[0] < start {
+						external = true
+					}
 				}
 			}
-			result = append(result, [2]int{start, end})
-			cursor = end
+			if numericField && (!earlier || cardExpirySuffix.MatchString(s[end:]) && !external) {
+				continue
+			}
+			blocked = true
+			break
 		}
-		i = j
+		if !blocked {
+			valid = append(valid, r)
+		}
+	}
+	codes := [][2]int{}
+	for _, r := range valid {
+		start, end := r[0], r[1]
+		code := adjacentCardCode.FindStringSubmatchIndex(s[end:])
+		if code == nil || !standaloneCardTokenEnd(s, end+code[3]) {
+			continue
+		}
+		alternative := false
+		for _, other := range valid {
+			if other[0] > start && other[1] == end+code[3] && digitCount(s[other[0]:other[1]]) >= digitCount(s[start:end]) {
+				alternative = true
+				break
+			}
+		}
+		if !alternative {
+			codes = append(codes, [2]int{end + code[2], end + code[3]})
+		}
+	}
+	result := [][2]int{}
+	for _, r := range valid {
+		blocked := false
+		for _, code := range codes {
+			if r[0] < code[1] && r[1] > code[0] {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		if len(result) > 0 && r[0] < result[len(result)-1][1] {
+			if r[1] > result[len(result)-1][1] {
+				result[len(result)-1][1] = r[1]
+			}
+		} else {
+			result = append(result, r)
+		}
 	}
 	return result
 }
@@ -137,7 +220,7 @@ func maskCardTokens(s string) string {
 		out.WriteString(s[cursor:start])
 		out.WriteString("[card ****" + digits[len(digits)-4:] + "]")
 		for {
-			code := bareCardCode.FindStringSubmatchIndex(s[end:])
+			code := adjacentCardCode.FindStringSubmatchIndex(s[end:])
 			if code == nil || !standaloneCardTokenEnd(s, end+code[3]) {
 				break
 			}
@@ -207,12 +290,16 @@ func redactCardJSON(v any, context bool) any {
 		for k, item := range x {
 			key := redactCardText(k, context)
 			if codeKey.MatchString(k) && context {
-				s := fmt.Sprint(item)
-				if len(s) == 3 || len(s) == 4 {
-					if _, err := strconv.Atoi(s); err == nil {
-						cleaned[key] = "[redacted]"
-						continue
+				s := strings.TrimSpace(fmt.Sprint(item))
+				numericCode := false
+				if number, ok := item.(json.Number); ok {
+					if n, err := strconv.ParseFloat(string(number), 64); err == nil && n >= 0 && n <= 9999 && n == float64(int64(n)) {
+						numericCode = true
 					}
+				}
+				if codeScalar.MatchString(s) || numericCode {
+					cleaned[key] = "[redacted]"
+					continue
 				}
 			}
 			cleaned[key] = redactCardJSON(item, context)
@@ -226,8 +313,8 @@ func redactCardJSON(v any, context bool) any {
 	case string:
 		return redactCardText(x, context)
 	case json.Number:
-		if validCard(string(x)) {
-			return redactCardText(string(x), context)
+		if cleaned := redactCardText(string(x), context); cleaned != string(x) {
+			return cleaned
 		}
 	}
 	return v

@@ -18,11 +18,18 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 	}
 	var fixture struct {
 		Property struct {
-			Seed         uint32
-			Iterations   int
-			Groupings    [][]int
-			Delimiters   []string
-			CorpusSHA256 string `json:"corpus_sha256"`
+			Seed              uint32
+			Iterations        int
+			Groupings         [][]int
+			SeparatorVariants []string `json:"separator_variants"`
+			PrecedingContexts []string `json:"preceding_contexts"`
+			FollowingContexts []struct {
+				Input    string
+				Expected string
+			} `json:"following_contexts"`
+			PermutationTokens  []string `json:"permutation_tokens"`
+			PermutationJoiners []string `json:"permutation_joiners"`
+			CorpusSHA256       string   `json:"corpus_sha256"`
 		}
 	}
 	if json.Unmarshal(data, &fixture) != nil {
@@ -64,20 +71,20 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 		panic("missing checksum digit")
 	}
 	type format struct {
-		groups    []int
-		separator string
+		groups  []int
+		variant string
 	}
 	formats := []format{}
 	for _, group := range config.Groupings {
-		seps := []string{" ", "-"}
+		seps := config.SeparatorVariants
 		if len(group) == 1 {
-			seps = []string{""}
+			seps = []string{"plain"}
 		}
 		for _, sep := range seps {
 			formats = append(formats, format{group, sep})
 		}
 	}
-	if config.Iterations < 3000 {
+	if config.Iterations < 8000 {
 		t.Fatal("property corpus must include thousands of cases")
 	}
 	for i := 0; i < config.Iterations; i++ {
@@ -86,7 +93,7 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 		line := digits(4)
 		phone := area + "-" + exchange + "-" + line
 		phone2 := "(202) " + fmt.Sprint(200+rand(700)) + "-" + digits(4)
-		date := fmt.Sprintf("%04d-%02d-%02d", 2000+rand(40), 1+rand(12), 1+rand(28))
+		date := fmt.Sprintf("%04d-%02d-%02d", 1000+rand(2000), 1+rand(12), 1+rand(28))
 		clock := fmt.Sprintf("%02d:%02d:%02d", rand(24), rand(60), rand(60))
 		uuidParts := []string{}
 		for _, n := range []int{8, 4, 4, 4, 12} {
@@ -110,34 +117,115 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 			t.Fatalf("numeric prose changed at case %d", i)
 		}
 		f := formats[i%len(formats)]
-		delimiter := config.Delimiters[(i/len(formats))%len(config.Delimiters)]
+		context := config.PrecedingContexts[(i/len(formats))%len(config.PrecedingContexts)]
+		following := config.FollowingContexts[(i/(len(formats)*len(config.PrecedingContexts)))%len(config.FollowingContexts)]
 		length := 0
 		for _, n := range f.groups {
 			length += n
 		}
-		pan := number(length)
-		parts := []string{}
-		pos := 0
-		for _, n := range f.groups {
-			parts = append(parts, pan[pos:pos+n])
-			pos += n
+		pan, grouped := "", ""
+		for attempt := 0; attempt < 1000; attempt++ {
+			pan = number(length)
+			grouped = propertyRenderGroups(pan, f.groups, f.variant)
+			if propertyUnambiguousInsertion(context, grouped, valid) {
+				break
+			}
+			if attempt == 999 {
+				t.Fatal("could not construct unambiguous synthetic PAN")
+			}
 		}
-		grouped := strings.Join(parts, f.separator)
 		replacement := "[card ****" + pan[len(pan)-4:] + "]"
-		bareEnd := !strings.ContainsRune("_-/:", rune(delimiter[0])) // all configured delimiters begin with punctuation/space
-		if f.separator == " " && fmt.Sprint(f.groups) == "[4 4 4 4 3]" && valid(pan[:16]) && bareEnd {
-			replacement = "[card ****" + pan[12:16] + "] [redacted]"
-		}
 		at := rand(len(tokens) + 1)
-		prefix := strings.Join(tokens[:at], joiner) + " | "
-		suffix := delimiter + " | " + strings.Join(tokens[at:], joiner)
-		value, want := prefix+grouped+suffix, prefix+replacement+suffix
+		prefix := strings.Join(tokens[:at], joiner) + " | " + context
+		suffix := " | " + strings.Join(tokens[at:], joiner)
+		value, want := prefix+grouped+following.Input+suffix, prefix+replacement+following.Expected+suffix
 		fmt.Fprintf(digest, "insert-%d\x00%s\x00%s\n", i, value, want)
 		if redactCardText(value, false) != want {
-			t.Fatalf("inserted card or surrounding prose changed at case %d, grouping %v, delimiter %d", i, f.groups, (i/len(formats))%len(config.Delimiters))
+			t.Fatalf("inserted card or surrounding prose changed at case %d, grouping %v, variant %s", i, f.groups, f.variant)
+		}
+	}
+	for i, a := range config.PermutationTokens {
+		for j, b := range config.PermutationTokens {
+			for k, c := range config.PermutationTokens {
+				if i == j || j == k || i == k {
+					continue
+				}
+				for n, sep := range config.PermutationJoiners {
+					value := strings.Join([]string{a, b, c}, sep)
+					fmt.Fprintf(digest, "permutation-preserve-%d-%d-%d-%d\x00%s\x00%s\n", i, j, k, n, value, value)
+					if redactCardText(value, false) != value {
+						t.Fatal("numeric permutation changed")
+					}
+					input, want := "4111111111111111 | "+value, "[card ****1111] | "+value
+					fmt.Fprintf(digest, "permutation-insert-%d-%d-%d-%d\x00%s\x00%s\n", i, j, k, n, input, want)
+					if redactCardText(input, false) != want {
+						t.Fatal("PAN-adjacent numeric permutation changed")
+					}
+				}
+			}
 		}
 	}
 	if fmt.Sprintf("%x", digest.Sum(nil)) != config.CorpusSHA256 {
 		t.Fatal("property corpus differs from the shared fixed-seed corpus")
 	}
+}
+
+func propertyRenderGroups(number string, group []int, variant string) string {
+	options := map[string][]string{"plain": {""}, "space": {" "}, "dash": {"-"}, "double": {"  "}, "triple": {"   "}, "mixed": {"-", " "}, "mixed_runs": {" -", "- ", " - "}}[variant]
+	var result strings.Builder
+	pos := 0
+	for i, n := range group {
+		if i > 0 {
+			result.WriteString(options[(i-1)%len(options)])
+		}
+		result.WriteString(number[pos : pos+n])
+		pos += n
+	}
+	return result.String()
+}
+
+// Independent exhaustive checksum oracle, not a call into the redactor. Exact
+// insertion ground truth has one valid reading; ambiguity has separate fixtures.
+func propertyUnambiguousInsertion(context, pan string, checksum func(string) bool) bool {
+	value := context + pan
+	atoms := [][2]int{}
+	for i := 0; i < len(value); {
+		if value[i] < '0' || value[i] > '9' {
+			i++
+			continue
+		}
+		start := i
+		for i < len(value) && value[i] >= '0' && value[i] <= '9' {
+			i++
+		}
+		atoms = append(atoms, [2]int{start, i})
+	}
+	count := 0
+	correct := false
+	for i, a := range atoms {
+		digits := ""
+		for j := i; j < len(atoms); j++ {
+			if j > i {
+				sep := value[atoms[j-1][1]:atoms[j][0]]
+				ok := len(sep) >= 1 && len(sep) <= 3
+				for _, c := range sep {
+					if c != ' ' && c != '-' {
+						ok = false
+					}
+				}
+				if !ok {
+					break
+				}
+			}
+			digits += value[atoms[j][0]:atoms[j][1]]
+			if len(digits) > 19 {
+				break
+			}
+			if len(digits) >= 13 && checksum(digits) {
+				count++
+				correct = a[0] == len(context) && atoms[j][1] == len(value)
+			}
+		}
+	}
+	return count == 1 && correct
 }
