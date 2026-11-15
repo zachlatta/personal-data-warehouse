@@ -239,7 +239,7 @@ type e2eCase struct {
 
 func e2eCases() []e2eCase {
 	sha := func(b []byte) string { return sha256Hex(b) }
-	batchBody := []byte("gzipped-batch")
+	batchBody := conversationTestBatch(`{"text":"hello"}`)
 	var locationBuffer bytes.Buffer
 	locationGzip := gzip.NewWriter(&locationBuffer)
 	locationGzip.Write([]byte(`{"source":"android_location","record_type":"location","record":{"sample_id":"fake"}}`))

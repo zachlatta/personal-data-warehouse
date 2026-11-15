@@ -14368,6 +14368,9 @@ class PostgresWarehouse:
         self._insert_rows("whatsapp_media_items", rows, WHATSAPP_MEDIA_ITEM_COLUMNS)
 
     def insert_agent_session_events(self, rows: list[dict[str, Any]]) -> None:
+        from personal_data_warehouse.card_redaction import redact_row
+
+        rows = [redact_row(row) for row in rows]
         rows_by_table: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             source = str(row.get("source") or "")

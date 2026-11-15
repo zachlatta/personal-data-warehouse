@@ -433,6 +433,26 @@ is reachable only through the agent's own read-only `muse.db` tool, not from a s
 its phone data (contacts, calendar, health, media library) was empty for this account on
 2026-09-28. Its connectors read other systems PDW already syncs.
 
+## Payment data in conversations
+
+The conversation batch HTTP endpoint redacts payment card data before object
+storage. The shared database writer applies the same policy for every AI event
+source, including direct backend polls: Luhn-valid 13–19 digit numbers (including
+spaced, dashed and JSON-escaped forms) become `[card ****1234]`; labelled security
+codes in the same event become `[redacted]`. This is an intentional exception to
+raw fidelity, including `raw_json`. Original host transcripts are separate copies.
+
+Explicit maintenance modules (dry-run unless `--apply` is passed):
+`personal_data_warehouse.scrub_conversation_cards` reports source/month counts
+and cleans source rows, timeline text and search chunks/embeddings;
+`personal_data_warehouse.scrub_conversation_objects` replaces inbox/library
+batches after verifying sanitized uploads; `personal_data_warehouse.scrub_conversation_jsonl`
+accepts `--root` and `--session` to clean host JSONL copies. Pause writers,
+timeline sync and search workers during maintenance. The database scrub bumps
+timeline sequence numbers so normal search workers regenerate sanitized chunks.
+Reports contain counts only; repeat each dry-run afterward and require zero.
+Historical backups and WAL are not erased by these commands.
+
 ## Claude Desktop Sessions (claude.ai)
 
 Captures normal Claude conversations from the Claude Desktop app so they're queryable in

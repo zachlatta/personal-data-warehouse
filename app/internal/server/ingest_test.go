@@ -161,7 +161,7 @@ func (s *sliceReader) Read(p []byte) (int, error) {
 
 func TestIngestAgentSessionsBatchStoresExpectedObject(t *testing.T) {
 	svc, stores := ingestTestService()
-	body := []byte("gzipped-batch-bytes")
+	body := conversationTestBatch(`{"text":"hello"}`)
 	exportedAt := "2026-06-19T12:34:56+00:00"
 	target := signedIngestTarget("/ingest/agent-sessions/batch", body, url.Values{"exported_at": {exportedAt}})
 
@@ -457,7 +457,7 @@ func TestIngestAgentSessionsBatchEndToEndDriveTags(t *testing.T) {
 	svc, _ := ingestTestService()
 	svc.stores["agent_sessions"] = store
 
-	body := []byte("gzipped-batch-bytes")
+	body := conversationTestBatch(`{"text":"hello"}`)
 	exportedAt := "2026-06-19T12:34:56+00:00"
 	target := signedIngestTarget("/ingest/agent-sessions/batch", body, url.Values{"exported_at": {exportedAt}})
 	rec := postIngest(t, svc, target, body)
@@ -476,7 +476,7 @@ func TestIngestAgentSessionsBatchEndToEndDriveTags(t *testing.T) {
 		`"batch_sha256":"` + sha256Hex(body) + `"`,
 		`"exported_at":"2026-06-19T12:34:56+00:00"`,
 		`"name":"20260619T123456Z-` + sha256Hex(body) + `.jsonl.gz"`,
-		"gzipped-batch-bytes",
+		string(body),
 	} {
 		if !contains(fake.uploadBody, want) {
 			t.Errorf("upload body missing %q", want)
@@ -962,7 +962,7 @@ func TestAgentSessionsBatchNotifiesTheLandingWorker(t *testing.T) {
 		notified = append(notified, channel+"|"+payload)
 		return nil
 	}
-	body := []byte("batch-bytes")
+	body := conversationTestBatch(`{"text":"hello"}`)
 	target := signedIngestTarget("/ingest/agent-sessions/batch", body, url.Values{
 		"exported_at": {"2026-11-08T16:00:00+00:00"},
 	})

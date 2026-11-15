@@ -139,6 +139,11 @@ word "error", which appears constantly in ordinary content.
 
 ## What search can and cannot find
 
+Payment card numbers and labelled security codes are masked before conversation
+storage, including raw JSON and uploaded transcript batches. Do not put secrets in
+tool calls or outputs: original host transcripts are separate copies, and warehouse
+redaction does not mean a leaked value was never saved.
+
 The search document for a session is its title, first prompt, working directory and the
 user/assistant turns — **tool calls and tool results are not in it**. A path, command or
 error that only appeared in tool output is found in `marts_ai_conversations.events`, not
