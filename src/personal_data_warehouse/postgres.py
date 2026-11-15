@@ -4323,7 +4323,7 @@ def _bridge_balance_is_behind_plaid_sql(account_id_expr: str, day_expr: str) -> 
     return f"COALESCE({plaid} > COALESCE({bridge}, {floor}), FALSE)"
 
 class PostgresWarehouse:
-    def __init__(self, postgres_database_url: str, *, schema: str = "public") -> None:
+    def __init__(self, postgres_database_url: str, *, schema: str = "public", initialize: bool = True) -> None:
         normalized = normalize_postgres_url(postgres_database_url)
         if not normalized:
             raise ValueError("POSTGRES_DATABASE_URL must be set")
@@ -4354,10 +4354,12 @@ class PostgresWarehouse:
         self._pg_textsearch_update_checked = False
         self._mutation_obsolete_indexes_checked = False
         self._pgvector_ensured = False
-        self._ensure_canonical_schemas()
-        self._set_search_path()
-        self._ensure_query_role()
-        self._ensure_schema_comments()
+        if initialize:
+            self._ensure_canonical_schemas()
+        self._set_search_path() # Session configuration is safe without provisioning.
+        if initialize:
+            self._ensure_query_role()
+            self._ensure_schema_comments()
 
     @property
     def schema_namespace(self) -> str:

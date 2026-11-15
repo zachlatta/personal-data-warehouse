@@ -523,8 +523,15 @@ Explicit maintenance modules (dry-run unless `--apply` is passed):
 and cleans source rows, timeline text and search chunks/embeddings;
 `personal_data_warehouse.scrub_conversation_objects` replaces inbox/library
 batches after verifying sanitized uploads; `personal_data_warehouse.scrub_conversation_jsonl`
-accepts `--root` and `--session` to clean host JSONL copies. Pause writers,
-timeline sync and search workers during maintenance. The database scrub discovers
+accepts `--root` and `--session` to clean host JSONL copies. First run DB/archive
+discovery with `--plan <private-new-file>` while workers remain live. Plans hold
+IDs, cursors and counts only, are created exclusively with mode 0600, and are
+reused with `--apply --plan <file>`; apply never repeats baseline discovery.
+Only apply requires pausing writers, timeline sync and search workers. Archive
+discovery can be network-bound, so finish it before taking the fresh DB plan.
+After resume, use `--verify` for read-only DB/archive checks; the DB check may
+also take `--plan` to retain the baseline groups in `--report-html` output.
+The database scrub discovers
 affected sessions in sources AND derived copies by source session identity (a
 rollup's context is a directory/account, not its session id). In one transaction
 it sanitizes sources, runs the canonical timeline adapters, rewrites current keys
@@ -537,6 +544,16 @@ delivery; baseline groups retain explicit zero-after rows. Dry-run after counts
 are pending, never assumed zero.
 Reports contain counts only; repeat each dry-run afterward and require zero.
 Historical backups and WAL are not erased by these commands.
+
+The scrub SQL prefilter is a proven superset of decoded card detection: after
+backslash/Unicode-unit normalization, 13 digits fit within a 49-character window.
+Only prefiltered IDs are fetched and confirmed in bounded memory batches by
+spawned processes. The CLI defaults `--workers` to available CPUs. Large heaps
+use disjoint block ranges under one exported read-only snapshot so live tuple
+updates cannot escape discovery; ordinary scans allow parallel PostgreSQL plans.
+Apply rechecks saved identities, checks indexed timeline/chunk changes since the
+discovery cursors, and verifies the repaired transaction with the fast filter.
+New candidates outside its plan roll back the repair and require fresh discovery.
 
 ## Claude Desktop Sessions (claude.ai)
 
