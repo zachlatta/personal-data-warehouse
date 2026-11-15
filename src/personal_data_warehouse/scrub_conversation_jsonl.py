@@ -13,7 +13,8 @@ def scrub_jsonl(root: Path, session: str, *, apply=False):
     for path in root.rglob('*.jsonl'):
         if path.is_symlink():
             continue
-        original = path.read_text()
+        # Preserve line endings as well as JSON lexemes during replacement.
+        original = path.read_bytes().decode('utf-8')
         output = []
         changed = 0
         for line in original.splitlines(keepends=True):

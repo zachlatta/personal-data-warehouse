@@ -2,6 +2,7 @@
 from datetime import UTC, datetime
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -118,10 +119,12 @@ def test_object_scrub_verifies_replacement_before_deleting(tmp_path, monkeypatch
     import gzip
     from types import SimpleNamespace
     monkeypatch.chdir(tmp_path)
+    original = b'{ "text":"4111111111111111", "cvv":987, "precision":0.123456789012345678901234567890, "huge":1e400, "duplicate":1,"duplicate":2 }\r\n'
+    expected = original.replace(b'4111111111111111', b'[card ****1111]').replace(b'"cvv":987', b'"cvv":"[redacted]"')
 
     class Store:
         def __init__(self):
-            self.objects = {'old': gzip.compress(json.dumps({'text': '4111111111111111', 'cvv': 987}).encode())}
+            self.objects = {'old': gzip.compress(original)}
             self.deleted = []
 
         def list_objects(self, **kwargs):
@@ -133,6 +136,7 @@ def test_object_scrub_verifies_replacement_before_deleting(tmp_path, monkeypatch
         def put_file(self, **kwargs):
             self.objects['new'] = kwargs['path'].read_bytes()
             assert b'4111111111111111' not in gzip.decompress(self.objects['new'])
+            assert gzip.decompress(self.objects['new']) == expected
             return {'storage_file_id': 'new', 'storage_key': 'batch'}
 
         def delete_object(self, ref):
@@ -300,6 +304,32 @@ def test_card_layout_boundaries_at_storage(warehouse, name, operation):
     assert stored['text'] == case['expected']
     for key in ('tool_input_json', 'tool_result_json', 'raw_json'):
         assert json.loads(stored[key])['text'] == case['expected']
+
+
+@pytest.mark.parametrize('operation', ['writer', 'repair'])
+@pytest.mark.parametrize('case', [c for c in json.loads(
+    (Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['cases']
+    if c['name'].startswith('json_preserve')], ids=lambda c: c['name'])
+def test_json_fidelity_at_storage(warehouse, operation, case):
+    fields = ('text', 'tool_input_json', 'tool_result_json', 'raw_json')
+    row = dict(event(), **{field: case['input'] for field in fields})
+    if operation == 'writer':
+        warehouse.insert_agent_session_events([row])
+    else:
+        warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+        scrub(warehouse, apply=True)
+    stored = warehouse._query_dicts('SELECT text,tool_input_json,tool_result_json,raw_json FROM @claude_code_events')[0]
+    assert all(stored[field] == case['expected'] for field in fields)
+
+
+@pytest.mark.parametrize('case', [c for c in json.loads(
+    (Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['cases']
+    if c['name'].startswith('json_preserve')], ids=lambda c: c['name'])
+def test_jsonl_scrub_preserves_json_bytes(tmp_path, case):
+    path = tmp_path/'test-session.jsonl'
+    path.write_bytes(case['input'].encode())
+    scrub_jsonl(tmp_path, 'test-session', apply=True)
+    assert path.read_bytes() == case['expected'].encode()
 
 
 def test_chunk_only_match_rebuilds_without_losing_timeline_rows(warehouse):

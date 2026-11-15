@@ -60,10 +60,67 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 
 func TestSecurityCodeJSONKeys(t *testing.T) {
 	for _, label := range []string{"CVV2", "CVC2", "CID", "CSC", "security code", "card code"} {
-		result := redactCardJSON(map[string]any{"number": "4111111111111111", label: json.Number("987")}, true).(map[string]any)
+		raw, _ := json.Marshal(map[string]any{"number": "4111111111111111", label: json.Number("987")})
+		var result map[string]any
+		if json.Unmarshal([]byte(redactCardText(string(raw), true)), &result) != nil {
+			t.Fatal("invalid redacted JSON")
+		}
 		if result[label] != "[redacted]" {
 			t.Fatal("code not masked")
 		}
+	}
+}
+
+func TestJSONFidelityThroughConversationBatch(t *testing.T) {
+	data, err := os.ReadFile("../../../tests/fixtures/card_redaction_cases.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Cases []struct{ Name, Input, Expected string }
+	}
+	if json.Unmarshal(data, &fixture) != nil {
+		t.Fatal("invalid shared fixture")
+	}
+	for _, c := range fixture.Cases {
+		if !strings.HasPrefix(c.Name, "json_preserve") {
+			continue
+		}
+		t.Run(c.Name, func(t *testing.T) {
+			body := conversationTestBatch(c.Input)
+			cleaned, err := redactConversationBatch(body, 100000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := gzip.NewReader(bytes.NewReader(cleaned))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := io.ReadAll(r)
+			_ = r.Close()
+			if err != nil || string(raw) != c.Expected {
+				t.Fatal("batch changed unmasked JSON bytes")
+			}
+			if c.Input == c.Expected && !bytes.Equal(body, cleaned) {
+				t.Fatal("unchanged batch was recompressed")
+			}
+		})
+	}
+}
+
+func TestJSONScalarConversationBatchRemainsValid(t *testing.T) {
+	body, err := redactConversationBatch(conversationTestBatch("4111111111111111\n"), 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(r)
+	_ = r.Close()
+	if err != nil || string(raw) != "\"[card ****1111]\"\n" {
+		t.Fatal("scalar mask must remain valid JSON")
 	}
 }
 

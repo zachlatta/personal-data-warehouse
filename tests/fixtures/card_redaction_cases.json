@@ -843,6 +843,46 @@
       "expected": "prefix[card ****1111]suffix"
     },
     {
+      "name": "json_preserve_crlf_whitespace",
+      "input": "\t{ \"amount\" : 1e400, \"card\":\"4111111111111111\" }\r\n",
+      "expected": "\t{ \"amount\" : 1e400, \"card\":\"[card ****1111]\" }\r\n"
+    },
+    {
+      "name": "json_preserve_precision",
+      "input": "{\"amount\":0.123456789012345678901234567890, \"card\":\"4111111111111111\"}",
+      "expected": "{\"amount\":0.123456789012345678901234567890, \"card\":\"[card ****1111]\"}"
+    },
+    {
+      "name": "json_preserve_large_exponents",
+      "input": "{\"positive\":1e400,\"negative\":-1E+400,\"tiny\":1e-400,\"card\":4111111111111111}",
+      "expected": "{\"positive\":1e400,\"negative\":-1E+400,\"tiny\":1e-400,\"card\":\"[card ****1111]\"}"
+    },
+    {
+      "name": "json_preserve_big_integers_and_unicode",
+      "input": "{\"z\":123456789012345678901234567890, \"escaped\":\"\\u00e9\\ud83d\\ude80\\/\", \"literal\":\"\u00e9\ud83d\ude80<>&\", \"a\":\"4111111111111111\"}",
+      "expected": "{\"z\":123456789012345678901234567890, \"escaped\":\"\\u00e9\\ud83d\\ude80\\/\", \"literal\":\"\u00e9\ud83d\ude80<>&\", \"a\":\"[card ****1111]\"}"
+    },
+    {
+      "name": "json_preserve_duplicate_keys_and_whitespace",
+      "input": " { \"card\" : \"4111111111111111\", \"card\":\"keep\", \"CVV\":987, \"CVV\":1234 }\n",
+      "expected": " { \"card\" : \"[card ****1111]\", \"card\":\"keep\", \"CVV\":\"[redacted]\", \"CVV\":\"[redacted]\" }\n"
+    },
+    {
+      "name": "json_preserve_without_card",
+      "input": " \n{ \"z\":1e400, \"a\":0.123456789012345678901234567890, \"a\":123456789012345678901234567890, \"u\":\"\\u00e9 \u00e9 \\/ <>&\" }\t",
+      "expected": " \n{ \"z\":1e400, \"a\":0.123456789012345678901234567890, \"a\":123456789012345678901234567890, \"u\":\"\\u00e9 \u00e9 \\/ <>&\" }\t"
+    },
+    {
+      "name": "json_preserve_escapes_in_changed_string",
+      "input": "{\"text\":\"\\u00e9 \ud83d\ude80 4111111111111111 \\u00e9 CVV: 987 \\ud83d\\ude80\"}",
+      "expected": "{\"text\":\"\\u00e9 \ud83d\ude80 [card ****1111] \\u00e9 CVV: [redacted] \\ud83d\\ude80\"}"
+    },
+    {
+      "name": "json_preserve_escaped_key_and_card",
+      "input": "{\"card\":\"\\u0034111111111111111\", \"\\u0043VV2\":\"\\u0039\\u0038\\u0037\", \"keep\":\"\\u0031\\u00e9\"}",
+      "expected": "{\"card\":\"[card ****1111]\", \"\\u0043VV2\":\"[redacted]\", \"keep\":\"\\u0031\\u00e9\"}"
+    },
+    {
       "name": "review6_phone_prefix",
       "input": "212 555 4111 1111 1111 1111 CVV2: 987",
       "expected": "212 555 [card ****1111] CVV2: [redacted]"
@@ -932,6 +972,16 @@
       "input": "{\"card\":4111111111111111.0,\"measurement\":1.5}",
       "expected": "{\"card\": \"[card ****1111].0\", \"measurement\": 1.5}",
       "json_result": true
+    },
+    {
+      "name": "json_preserve_nested_lexemes",
+      "input": "{\"outer\": \"{ \\\"amount\\\":1e400, \\\"card\\\":\\\"4111111111111111\\\", \\\"u\\\":\\\"\\\\u00e9\\\" }\"}",
+      "expected": "{\"outer\": \"{ \\\"amount\\\":1e400, \\\"card\\\":\\\"[card ****1111]\\\", \\\"u\\\":\\\"\\\\u00e9\\\" }\"}"
+    },
+    {
+      "name": "json_preserve_surrogates_and_escapes",
+      "input": "{\"text\":\"\\ud800 \\n \\t \\\" 4111111111111111 \\\\ \\udc00\"}",
+      "expected": "{\"text\":\"\\ud800 \\n \\t \\\" [card ****1111] \\\\ \\udc00\"}"
     }
   ],
   "property": {
@@ -1029,24 +1079,6 @@
         4,
         3
       ]
-    ],
-    "delimiters": [
-      ":",
-      "/12/27",
-      "-end",
-      ",",
-      ";",
-      ".",
-      ")",
-      "\"",
-      "]",
-      "\n",
-      "|",
-      "!",
-      "?",
-      "}",
-      "\t",
-      " \u2014 prose"
     ],
     "separator_variants": [
       "space",

@@ -461,6 +461,12 @@ ambiguous readings have explicit conservative fixtures. Separate checks cover
 unfiltered numeric prose, including valid checksums in non-layout groups,
 writer storage and existing-row repair.
 
+JSON redaction validates the input and edits sensitive token spans directly.
+Untouched numeric lexemes (including large exponents), key order, duplicate
+keys, whitespace and Unicode escapes survive byte-for-byte, including nested
+JSON strings. Numeric card/code tokens become quoted masks. Unchanged batches
+retain their original compressed bytes, and local JSONL scrubs retain line endings.
+
 Explicit maintenance modules (dry-run unless `--apply` is passed):
 `personal_data_warehouse.scrub_conversation_cards` reports source/month counts
 and cleans source rows, timeline text and search chunks/embeddings;

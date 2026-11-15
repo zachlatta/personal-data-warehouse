@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 _LABEL = r'(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*code)'
@@ -13,6 +14,7 @@ _ESCAPE = re.compile(r'\\+u(003[0-9]|0020|002[dD])')
 _DIGITS = re.compile(r'[0-9]+')
 _SEPARATOR = re.compile(r'[ -]{1,3}')
 _ADJACENT_CODE = re.compile(r'(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})(?![0-9])')
+_JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|[{}\[\]:,]|true|false|null')
 # Explicit storage policy, mirrored in Go and pinned by shared fixtures.
 # A contiguous PAN is one whole run; grouped PANs must match one of these
 # layouts. Independent identifiers are never joined by length/Luhn alone.
@@ -76,20 +78,106 @@ def card_spans(value: str):
             merged.append((start,end))
     yield from merged
 
-def _mask_cards(value: str) -> str:
+def _apply_edits(value, edits):
     output = []
     cursor = 0
-    for start,end in card_spans(value):
-        if start < cursor:
-            continue
-        digits = value[start:end].replace(' ', '').replace('-', '')
-        output.extend((value[cursor:start], '[card ****'+digits[-4:]+']'))
-        while (code := _ADJACENT_CODE.match(value,end)) and standalone_end(value,code.end()):
-            output.extend((value[end:code.start(1)], '[redacted]'))
-            end=code.end()
-        cursor=end
+    for start, end, replacement in edits:
+        output.extend((value[cursor:start], replacement))
+        cursor = end
     output.append(value[cursor:])
     return ''.join(output)
+
+
+def _text_edits(value):
+    # Keep offsets through escaped-digit decoding: unmasked escapes must survive.
+    chars = []; bounds = [0]; pos = 0
+    while pos < len(value):
+        match = _ESCAPE.match(value, pos) if value[pos] == '\\' else None
+        chars.append(chr(int(match[1], 16)) if match else value[pos])
+        pos = match.end() if match else pos + 1
+        bounds.append(pos)
+    decoded = ''.join(chars)
+    edits = []
+    for start, end in card_spans(decoded):
+        digits = decoded[start:end].replace(' ', '').replace('-', '')
+        edits.append((start, end, '[card ****'+digits[-4:]+']'))
+        while (code := _ADJACENT_CODE.match(decoded, end)) and standalone_end(decoded, code.end()):
+            edits.append((code.start(1), code.end(), '[redacted]'))
+            end = code.end()
+    for match in _CODE.finditer(decoded):
+        start, end = match.span(2)
+        if not any(start < b and end > a for a, b, _ in edits):
+            edits.append((start, end, '[redacted]'))
+    return [(bounds[a], bounds[b], replacement) for a, b, replacement in sorted(edits)]
+
+
+def _json_string_bounds(token):
+    """Map decoded character boundaries to offsets in an original JSON string."""
+    bounds = [1]; pos = 1
+    while pos < len(token)-1:
+        if token[pos] != '\\':
+            pos += 1
+        elif token[pos+1] != 'u':
+            pos += 2
+        else:
+            high = int(token[pos+2:pos+6], 16)
+            pos += 6
+            if (0xD800 <= high <= 0xDBFF and token[pos:pos+2] == '\\u' and
+                    0xDC00 <= int(token[pos+2:pos+6], 16) <= 0xDFFF):
+                pos += 6
+        bounds.append(pos)
+    return bounds
+
+
+def _code_token(token):
+    if token.startswith('"'):
+        return bool(_CODE_SCALAR.fullmatch(json.loads(token).strip()))
+    try:
+        number = Decimal(token)
+        return number.is_finite() and 0 <= number <= 9999 and number == number.to_integral_value()
+    except InvalidOperation:
+        return False
+
+
+def _reject_constant(_):
+    raise ValueError('non-JSON constant')
+
+
+def _redaction_edits(value, context):
+    if not context and not card_count(value):
+        return []
+    if value.lstrip().startswith(('{', '[')):
+        try:
+            # Validate only; these objects are never serialized or stored.
+            # Callbacks avoid binary floats and Python's integer digit limit.
+            json.loads(value, parse_float=str, parse_int=str, parse_constant=_reject_constant)
+        except (ValueError, RecursionError):
+            pass
+        else:
+            tokens = list(_JSON_TOKEN.finditer(value))
+            codes = set()
+            for index, token in enumerate(tokens[:-2]):
+                if (token[0].startswith('"') and tokens[index+1][0] == ':' and
+                        _CODE_KEY.fullmatch(json.loads(token[0])) and _code_token(tokens[index+2][0])):
+                    codes.add(index+2)
+            edits = []
+            for index, token in enumerate(tokens):
+                raw = token[0]
+                if index in codes:
+                    edits.append((token.start(), token.end(), '"[redacted]"'))
+                elif raw.startswith('"'):
+                    inner = _redaction_edits(json.loads(raw), True)
+                    if inner:
+                        bounds = _json_string_bounds(raw)
+                        edits.extend((token.start()+bounds[a], token.start()+bounds[b],
+                                      json.dumps(replacement, ensure_ascii=True)[1:-1])
+                                     for a, b, replacement in inner)
+                elif raw[0] in '-0123456789':
+                    inner = _text_edits(raw)
+                    if inner:
+                        edits.append((token.start(), token.end(), json.dumps(_apply_edits(raw, inner))))
+            return edits
+    return _text_edits(value)
 
 def is_card(value: str) -> bool:
     digits = value.replace(' ', '').replace('-', '')
@@ -108,50 +196,12 @@ def card_count(value: str) -> int:
 
 
 def redact(value: str, *, card_context: bool = False) -> str:
-    """Preserve unchanged strings byte-for-byte; decode nested JSON before masking.
+    """Replace only sensitive spans, preserving every other JSON/text byte.
 
     JSON numeric card/code fields become strings, so the result stays valid JSON.
     A code is masked only when this value (or its containing row) holds a card.
     """
-    context = card_context or card_count(value) > 0
-    if not context:
-        return value
-    numeric_changed = False
-    def parse_number(literal):
-        # Preserve the exact numeric lexeme until after redaction; converting
-        # a 19-digit PAN to a binary float first can round away its last digits.
-        nonlocal numeric_changed
-        cleaned = _mask_cards(literal)
-        if cleaned != literal:
-            numeric_changed = True
-            return cleaned
-        return float(literal)
-    try:
-        parsed = json.loads(value, parse_float=parse_number)
-    except (ValueError, TypeError):
-        parsed = None
-    if isinstance(parsed, (dict, list)):
-        def walk(item: Any) -> Any:
-            if isinstance(item, dict):
-                return {redact(k, card_context=True): (
-                    '[redacted]' if _CODE_KEY.fullmatch(k) and (
-                        _CODE_SCALAR.fullmatch(str(v).strip()) or
-                        isinstance(v,(int,float)) and not isinstance(v,bool) and 0<=v<=9999 and int(v)==v)
-                    else walk(v)
-                ) for k, v in item.items()}
-            if isinstance(item, list):
-                return [walk(v) for v in item]
-            if isinstance(item, str):
-                return redact(item, card_context=True)
-            if isinstance(item, int) and is_card(str(item)):
-                return '[card ****' + str(item)[-4:] + ']'
-            return item
-        cleaned = walk(parsed)
-        return json.dumps(cleaned, ensure_ascii=False) if numeric_changed or cleaned != parsed else value
-    decoded = _ESCAPE.sub(lambda m: chr(int(m[1], 16)), value)
-    cleaned = _mask_cards(decoded)
-    cleaned = _CODE.sub(lambda m: m[1] + '[redacted]', cleaned)
-    return cleaned if cleaned != decoded else value
+    return _apply_edits(value, _redaction_edits(value, card_context))
 
 
 def redact_row(row: dict[str, Any]) -> dict[str, Any]:

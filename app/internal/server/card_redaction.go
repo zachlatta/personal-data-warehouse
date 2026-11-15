@@ -130,32 +130,6 @@ func cardTokens(s string) [][2]int {
 	return result
 }
 
-func maskCardTokens(s string) string {
-	var out strings.Builder
-	cursor := 0
-	for _, span := range cardTokens(s) {
-		start, end := span[0], span[1]
-		if start < cursor {
-			continue
-		}
-		digits := strings.NewReplacer(" ", "", "-", "").Replace(s[start:end])
-		out.WriteString(s[cursor:start])
-		out.WriteString("[card ****" + digits[len(digits)-4:] + "]")
-		for {
-			code := adjacentCardCode.FindStringSubmatchIndex(s[end:])
-			if code == nil || !standaloneCardTokenEnd(s, end+code[3]) {
-				break
-			}
-			out.WriteString(s[end : end+code[2]])
-			out.WriteString("[redacted]")
-			end += code[3]
-		}
-		cursor = end
-	}
-	out.WriteString(s[cursor:])
-	return out.String()
-}
-
 func decodeCardEscapes(s string) string {
 	return cardEscape.ReplaceAllStringFunc(s, func(v string) string { n, _ := strconv.ParseInt(v[len(v)-4:], 16, 32); return string(rune(n)) })
 }
@@ -183,63 +157,7 @@ func validCard(s string) bool {
 }
 
 func redactCardText(s string, context bool) string {
-	if !context {
-		context = len(cardTokens(decodeCardEscapes(s))) > 0
-	}
-	var parsed any
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.UseNumber()
-	first := dec.Decode(&parsed)
-	var trailing any
-	if first == nil && dec.Decode(&trailing) == io.EOF && (strings.HasPrefix(strings.TrimSpace(s), "{") || strings.HasPrefix(strings.TrimSpace(s), "[")) {
-		cleaned := redactCardJSON(parsed, context)
-		b, err := json.Marshal(cleaned)
-		if err == nil {
-			return string(b)
-		}
-	}
-	s = maskCardTokens(decodeCardEscapes(s))
-	if context {
-		s = codeValue.ReplaceAllString(s, "${1}[redacted]")
-	}
-	return s
-}
-
-func redactCardJSON(v any, context bool) any {
-	switch x := v.(type) {
-	case map[string]any:
-		cleaned := make(map[string]any, len(x))
-		for k, item := range x {
-			key := redactCardText(k, context)
-			if codeKey.MatchString(k) && context {
-				s := strings.TrimSpace(fmt.Sprint(item))
-				numericCode := false
-				if number, ok := item.(json.Number); ok {
-					if n, err := strconv.ParseFloat(string(number), 64); err == nil && n >= 0 && n <= 9999 && n == float64(int64(n)) {
-						numericCode = true
-					}
-				}
-				if codeScalar.MatchString(s) || numericCode {
-					cleaned[key] = "[redacted]"
-					continue
-				}
-			}
-			cleaned[key] = redactCardJSON(item, context)
-		}
-		return cleaned
-	case []any:
-		for i, item := range x {
-			x[i] = redactCardJSON(item, context)
-		}
-		return x
-	case string:
-		return redactCardText(x, context)
-	case json.Number:
-		if cleaned := redactCardText(string(x), context); cleaned != string(x) {
-			return cleaned
-		}
-	}
-	return v
+	return applyCardEdits(s, cardRedactionEdits(s, context))
 }
 
 func redactConversationBatch(body []byte, maxBytes int64) ([]byte, error) {
@@ -258,27 +176,17 @@ func redactConversationBatch(body []byte, maxBytes int64) ([]byte, error) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
-		var v any
-		dec := json.NewDecoder(bytes.NewReader(line))
-		dec.UseNumber()
-		if dec.Decode(&v) != nil {
+		if !json.Valid(line) {
 			return nil, fmt.Errorf("invalid conversation JSON")
 		}
-		var extra any
-		if dec.Decode(&extra) != io.EOF {
-			return nil, fmt.Errorf("invalid conversation JSON suffix")
-		}
-		// Marshal decoded JSON so unicode-escaped digits participate in detection.
-		decoded, _ := json.Marshal(v)
-		context := len(cardTokens(decodeCardEscapes(string(decoded)))) > 0
-		if !context {
+		if len(cardTokens(decodeCardEscapes(string(line)))) == 0 {
 			continue
 		}
-		cleaned, err := json.Marshal(redactCardJSON(v, true))
-		if err != nil {
-			return nil, fmt.Errorf("cannot scrub conversation JSON")
+		cleaned := applyCardEdits(string(line), cardJSONEdits(string(line)))
+		if cleaned == string(line) {
+			continue
 		}
-		lines[i] = cleaned
+		lines[i] = []byte(cleaned)
 		changed = true
 	}
 	if !changed {
