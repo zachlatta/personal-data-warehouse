@@ -38,6 +38,27 @@ def test_every_source_writer_masks_all_content(warehouse):
     assert scrub(warehouse) == []
 
 
+def test_delimited_cards_are_masked_by_writer_and_found_by_scan(warehouse):
+    from pathlib import Path
+    from personal_data_warehouse.card_redaction import card_count
+    cases = [c for c in json.loads((Path(__file__).parent / 'fixtures/card_redaction_cases.json').read_text()) if c['name'].startswith('delimiter_')]
+    for index, case in enumerate(cases):
+        row = dict(event(), event_uuid=f'writer-{index}', seq=index + 1, text=case['input'],
+                   tool_input_json=json.dumps({'text': case['input']}), tool_result_json=json.dumps({'text': case['input']}),
+                   raw_json=json.dumps({'text': case['input']}))
+        warehouse.insert_agent_session_events([row])
+        stored = warehouse._query_dicts('SELECT text,tool_input_json,tool_result_json,raw_json FROM @claude_code_events WHERE event_uuid = %s', (row['event_uuid'],))[0]
+        assert stored['text'] == case['expected']
+        assert all(card_count(value) == 0 and '987' not in value for value in stored.values())
+        legacy = dict(row, event_uuid=f'legacy-{index}', seq=index + len(cases) + 1)
+        warehouse._insert_rows('claude_code_events', [legacy], AGENT_SESSION_EVENT_COLUMNS)
+    before = scrub(warehouse, page_size=1)
+    assert next(r['count'] for r in before if r['table']=='claude_code_events' and r['measure']=='rows') == len(cases)
+    scrub(warehouse, apply=True, page_size=1)
+    assert scrub(warehouse, page_size=1) == []
+    assert warehouse._query('SELECT count(*) FROM @claude_code_events')[0][0] == 2 * len(cases)
+
+
 def test_legacy_scrub_cleans_timeline_chunks_and_is_idempotent(warehouse):
     row = event()
     warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)

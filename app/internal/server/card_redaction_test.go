@@ -27,8 +27,10 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
-			if redactCardText(c.Input, true) != c.Expected {
-				t.Fatal("redaction contract failed")
+			for _, context := range []bool{false, true} {
+				if redactCardText(c.Input, context) != c.Expected {
+					t.Fatal("redaction contract failed")
+				}
 			}
 			line, _ := json.Marshal(map[string]string{"text": c.Input})
 			cleaned, err := redactConversationBatch(conversationTestBatch(string(line)), 100000)

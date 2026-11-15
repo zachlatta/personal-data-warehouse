@@ -40,7 +40,10 @@ def card_spans(value: str):
                     break
                 if not is_card(digits):
                     continue
-                if j > i and not standalone_end(value, run.start() + tokens[j].end()):
+                # The first complete PAN accepts punctuation as a delimiter.
+                # Only a LONGER, ambiguous window might have swallowed a date,
+                # phone prefix or code appended after that already-valid PAN.
+                if candidates and not standalone_end(value, run.start() + tokens[j].end()):
                     continue
                 groups = [len(t[0]) for t in tokens[i:j+1]]
                 rank = 0 if len(groups) == 1 else 1 if groups in ([4,4,4,4], [4,6,5]) else 2

@@ -52,7 +52,10 @@ func cardWindows(s string) [][3]int {
 				if !validCard(digits) {
 					continue
 				}
-				if j > i && !standaloneCardTokenEnd(s, run[0]+tokens[j][1]) {
+				// Punctuation never disqualifies the first complete PAN. The
+				// stricter numeric-token boundary applies only to an ambiguous
+				// extension after a shorter valid PAN (date/phone/code prefix).
+				if best >= 0 && !standaloneCardTokenEnd(s, run[0]+tokens[j][1]) {
 					continue
 				}
 				furthest = j
@@ -135,6 +138,9 @@ func validCard(s string) bool {
 }
 
 func redactCardText(s string, context bool) string {
+	if !context {
+		context = len(cardWindows(decodeCardEscapes(s))) > 0
+	}
 	var parsed any
 	dec := json.NewDecoder(strings.NewReader(s))
 	dec.UseNumber()

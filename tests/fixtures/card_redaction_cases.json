@@ -120,5 +120,170 @@
     "name": "suffix_7",
     "input": "4111111111111111 1234-word",
     "expected": "[card ****1111] 1234-word"
+  },
+  {
+    "name": "delimiter_0_0",
+    "input": "4111111111111111: CVV: 987",
+    "expected": "[card ****1111]: CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_0_1",
+    "input": "4111111111111111/12/27 CVV: 987",
+    "expected": "[card ****1111]/12/27 CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_0_2",
+    "input": "4111111111111111-end CVC2: 987",
+    "expected": "[card ****1111]-end CVC2: [redacted]"
+  },
+  {
+    "name": "delimiter_0_3",
+    "input": "4111111111111111, CVV: 987",
+    "expected": "[card ****1111], CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_0_4",
+    "input": "4111111111111111; CVV: 987",
+    "expected": "[card ****1111]; CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_0_5",
+    "input": "4111111111111111. CVV: 987",
+    "expected": "[card ****1111]. CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_0_6",
+    "input": "4111111111111111) CVV: 987",
+    "expected": "[card ****1111]) CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_0_7",
+    "input": "4111111111111111\" CVV: 987",
+    "expected": "[card ****1111]\" CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_0_8",
+    "input": "4111111111111111] CVV: 987",
+    "expected": "[card ****1111]] CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_0_9",
+    "input": "4111111111111111\nCVV: 987",
+    "expected": "[card ****1111]\nCVV: [redacted]"
+  },
+  {
+    "name": "delimiter_0_10",
+    "input": "4111111111111111| CVV: 987",
+    "expected": "[card ****1111]| CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_0",
+    "input": "4111 1111 1111 1111: CVV: 987",
+    "expected": "[card ****1111]: CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_1",
+    "input": "4111 1111 1111 1111/12/27 CVV: 987",
+    "expected": "[card ****1111]/12/27 CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_2",
+    "input": "4111 1111 1111 1111-end CVC2: 987",
+    "expected": "[card ****1111]-end CVC2: [redacted]"
+  },
+  {
+    "name": "delimiter_1_3",
+    "input": "4111 1111 1111 1111, CVV: 987",
+    "expected": "[card ****1111], CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_4",
+    "input": "4111 1111 1111 1111; CVV: 987",
+    "expected": "[card ****1111]; CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_5",
+    "input": "4111 1111 1111 1111. CVV: 987",
+    "expected": "[card ****1111]. CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_6",
+    "input": "4111 1111 1111 1111) CVV: 987",
+    "expected": "[card ****1111]) CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_7",
+    "input": "4111 1111 1111 1111\" CVV: 987",
+    "expected": "[card ****1111]\" CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_8",
+    "input": "4111 1111 1111 1111] CVV: 987",
+    "expected": "[card ****1111]] CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_9",
+    "input": "4111 1111 1111 1111\nCVV: 987",
+    "expected": "[card ****1111]\nCVV: [redacted]"
+  },
+  {
+    "name": "delimiter_1_10",
+    "input": "4111 1111 1111 1111| CVV: 987",
+    "expected": "[card ****1111]| CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_0",
+    "input": "4111-1111-1111-1111: CVV: 987",
+    "expected": "[card ****1111]: CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_1",
+    "input": "4111-1111-1111-1111/12/27 CVV: 987",
+    "expected": "[card ****1111]/12/27 CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_2",
+    "input": "4111-1111-1111-1111-end CVC2: 987",
+    "expected": "[card ****1111]-end CVC2: [redacted]"
+  },
+  {
+    "name": "delimiter_2_3",
+    "input": "4111-1111-1111-1111, CVV: 987",
+    "expected": "[card ****1111], CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_4",
+    "input": "4111-1111-1111-1111; CVV: 987",
+    "expected": "[card ****1111]; CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_5",
+    "input": "4111-1111-1111-1111. CVV: 987",
+    "expected": "[card ****1111]. CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_6",
+    "input": "4111-1111-1111-1111) CVV: 987",
+    "expected": "[card ****1111]) CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_7",
+    "input": "4111-1111-1111-1111\" CVV: 987",
+    "expected": "[card ****1111]\" CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_8",
+    "input": "4111-1111-1111-1111] CVV: 987",
+    "expected": "[card ****1111]] CVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_9",
+    "input": "4111-1111-1111-1111\nCVV: 987",
+    "expected": "[card ****1111]\nCVV: [redacted]"
+  },
+  {
+    "name": "delimiter_2_10",
+    "input": "4111-1111-1111-1111| CVV: 987",
+    "expected": "[card ****1111]| CVV: [redacted]"
   }
 ]
