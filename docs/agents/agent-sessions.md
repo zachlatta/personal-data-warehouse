@@ -466,6 +466,9 @@ Untouched numeric lexemes (including large exponents), key order, duplicate
 keys, whitespace and Unicode escapes survive byte-for-byte, including nested
 JSON strings. Numeric card/code tokens become quoted masks. Unchanged batches
 retain their original compressed bytes, and local JSONL scrubs retain line endings.
+Discovery and scan counts traverse decoded JSON string tokens at every nesting
+level, including Unicode-encoded backslashes. Counting and masking share the
+same token traversal; a raw-byte negative filter must never suppress it.
 
 Explicit maintenance modules (dry-run unless `--apply` is passed):
 `personal_data_warehouse.scrub_conversation_cards` reports source/month counts

@@ -18,12 +18,13 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 	}
 	var fixture struct {
 		Property struct {
-			Seed              uint32
-			Iterations        int
-			Groupings         [][]int
-			SeparatorVariants []string `json:"separator_variants"`
-			PrecedingContexts []string `json:"preceding_contexts"`
-			FollowingContexts []struct {
+			Seed               uint32
+			Iterations         int
+			EncodingIterations int `json:"encoding_iterations"`
+			Groupings          [][]int
+			SeparatorVariants  []string `json:"separator_variants"`
+			PrecedingContexts  []string `json:"preceding_contexts"`
+			FollowingContexts  []struct {
 				Input    string
 				Expected string
 			} `json:"following_contexts"`
@@ -191,9 +192,72 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 			}
 		}
 	}
+	if config.EncodingIterations < 3000 {
+		t.Fatal("encoded corpus must include thousands of cases")
+	}
+	for i := 0; i < config.EncodingIterations; i++ {
+		f := formats[i%len(formats)]
+		length := 0
+		for _, n := range f.groups {
+			length += n
+		}
+		pan, grouped := "", ""
+		for attempt := 0; attempt < 1000; attempt++ {
+			pan = number(length)
+			grouped = propertyRenderGroups(pan, f.groups, f.variant)
+			if propertyUnambiguousInsertion("", grouped, " CVV2: 987", config.Groupings, valid) {
+				break
+			}
+			if attempt == 999 {
+				t.Fatal("could not construct unambiguous encoded PAN")
+			}
+		}
+		depth, mixed, slash := 1+i%3, (i/6)%2 == 1, (i/3)%2 == 1
+		value, want := propertyEncodedDocument(grouped, "[card ****"+pan[len(pan)-4:]+"]", depth, mixed, slash)
+		fmt.Fprintf(digest, "encoded-insert-%d\x00%s\x00%s\n", i, value, want)
+		got := redactCardText(value, false)
+		if got != want || cardCount(value) != 1 || cardCount(got) != 0 {
+			t.Fatalf("encoded card failed at case %d", i)
+		}
+		value, want = propertyEncodedDocument("4111111111111112", "", depth, mixed, slash)
+		fmt.Fprintf(digest, "encoded-preserve-%d\x00%s\x00%s\n", i, value, want)
+		if redactCardText(value, false) != want || cardCount(value) != 0 {
+			t.Fatalf("encoded non-card changed at case %d", i)
+		}
+	}
 	if fmt.Sprintf("%x", digest.Sum(nil)) != config.CorpusSHA256 {
 		t.Fatal("property corpus differs from the shared fixed-seed corpus")
 	}
+}
+
+func propertyEncodedDocument(pan, replacement string, depth int, mixed, slash bool) (string, string) {
+	var encoded strings.Builder
+	for i, c := range pan {
+		if c >= '0' && c <= '9' && (!mixed || i%2 == 0) {
+			fmt.Fprintf(&encoded, `\u%04x`, c)
+		} else {
+			encoded.WriteRune(c)
+		}
+	}
+	value := `{ "text":"` + encoded.String() + ` CVV2: 987", "keep":1e400, "dup":1,"dup":2, "u":"\u00e9" }`
+	want := value
+	if replacement != "" {
+		want = strings.ReplaceAll(strings.ReplaceAll(value, encoded.String(), replacement), " CVV2: 987", " CVV2: [redacted]")
+	}
+	if slash {
+		value = strings.ReplaceAll(value, `\`, `\u005c`)
+		want = strings.ReplaceAll(want, `\`, `\u005c`)
+	}
+	for j := 0; j < depth-1; j++ {
+		v, _ := json.Marshal(map[string]string{"payload": value})
+		w, _ := json.Marshal(map[string]string{"payload": want})
+		value, want = string(v), string(w)
+		if slash {
+			value = strings.ReplaceAll(value, `\\`, `\u005c`)
+			want = strings.ReplaceAll(want, `\\`, `\u005c`)
+		}
+	}
+	return value, want
 }
 
 func propertyRenderGroups(number string, group []int, variant string) string {

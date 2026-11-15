@@ -143,10 +143,8 @@ def _reject_constant(_):
     raise ValueError('non-JSON constant')
 
 
-def _redaction_edits(value, context):
-    if not context and not card_count(value):
-        return []
-    if value.lstrip().startswith(('{', '[')):
+def _json_tokens(value):
+    if value.lstrip().startswith(('{', '[', '"')):
         try:
             # Validate only; these objects are never serialized or stored.
             # Callbacks avoid binary floats and Python's integer digit limit.
@@ -154,29 +152,37 @@ def _redaction_edits(value, context):
         except (ValueError, RecursionError):
             pass
         else:
-            tokens = list(_JSON_TOKEN.finditer(value))
-            codes = set()
-            for index, token in enumerate(tokens[:-2]):
-                if (token[0].startswith('"') and tokens[index+1][0] == ':' and
-                        _CODE_KEY.fullmatch(json.loads(token[0])) and _code_token(tokens[index+2][0])):
-                    codes.add(index+2)
-            edits = []
-            for index, token in enumerate(tokens):
-                raw = token[0]
-                if index in codes:
-                    edits.append((token.start(), token.end(), '"[redacted]"'))
-                elif raw.startswith('"'):
-                    inner = _redaction_edits(json.loads(raw), True)
-                    if inner:
-                        bounds = _json_string_bounds(raw)
-                        edits.extend((token.start()+bounds[a], token.start()+bounds[b],
-                                      json.dumps(replacement, ensure_ascii=True)[1:-1])
-                                     for a, b, replacement in inner)
-                elif raw[0] in '-0123456789':
-                    inner = _text_edits(raw)
-                    if inner:
-                        edits.append((token.start(), token.end(), json.dumps(_apply_edits(raw, inner))))
-            return edits
+            return list(_JSON_TOKEN.finditer(value))
+    return None
+
+
+def _redaction_edits(value, context):
+    if not context and not card_count(value):
+        return []
+    tokens = _json_tokens(value)
+    if tokens is not None:
+        codes = set()
+        for index, token in enumerate(tokens[:-2]):
+            if (token[0].startswith('"') and tokens[index+1][0] == ':' and
+                    _CODE_KEY.fullmatch(json.loads(token[0])) and _code_token(tokens[index+2][0])):
+                codes.add(index+2)
+        edits = []
+        for index, token in enumerate(tokens):
+            raw = token[0]
+            if index in codes:
+                edits.append((token.start(), token.end(), '"[redacted]"'))
+            elif raw.startswith('"'):
+                inner = _redaction_edits(json.loads(raw), True)
+                if inner:
+                    bounds = _json_string_bounds(raw)
+                    edits.extend((token.start()+bounds[a], token.start()+bounds[b],
+                                  json.dumps(replacement, ensure_ascii=True)[1:-1])
+                                 for a, b, replacement in inner)
+            elif raw[0] in '-0123456789':
+                inner = _text_edits(raw)
+                if inner:
+                    edits.append((token.start(), token.end(), json.dumps(_apply_edits(raw, inner))))
+        return edits
     return _text_edits(value)
 
 def is_card(value: str) -> bool:
@@ -191,6 +197,15 @@ def is_card(value: str) -> bool:
 
 
 def card_count(value: str) -> int:
+    """Count leaf readings using the same decoded JSON traversal as masking.
+
+    A raw escape regex is not a safe negative filter: Unicode can encode the
+    escape backslashes themselves. Count leaves once, not at every wrapper.
+    """
+    tokens = _json_tokens(value)
+    if tokens is not None:
+        return sum(card_count(json.loads(raw)) if raw.startswith('"') else card_count(raw)
+                   for token in tokens if (raw := token[0])[0] in '"-0123456789')
     decoded = _ESCAPE.sub(lambda m: chr(int(m[1], 16)), value)
     return sum(1 for _ in card_spans(decoded))
 

@@ -283,7 +283,9 @@ def test_missing_canonical_turn_refuses_to_delete_derived_row(warehouse):
     assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0] == 1
 
 
-@pytest.mark.parametrize('name', ['review6_phone_prefix', 'review6_independent_order_ids'])
+@pytest.mark.parametrize('name', ['review6_phone_prefix', 'review6_independent_order_ids'] + [
+    c['name'] for c in json.loads((Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['cases']
+    if c['name'].startswith('encoded_nested_')])
 @pytest.mark.parametrize('operation', ['writer', 'scan', 'repair'])
 def test_card_layout_boundaries_at_storage(warehouse, name, operation):
     from pathlib import Path
@@ -324,7 +326,7 @@ def test_json_fidelity_at_storage(warehouse, operation, case):
 
 @pytest.mark.parametrize('case', [c for c in json.loads(
     (Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['cases']
-    if c['name'].startswith('json_preserve')], ids=lambda c: c['name'])
+    if c['name'].startswith(('json_preserve','encoded_nested_'))], ids=lambda c: c['name'])
 def test_jsonl_scrub_preserves_json_bytes(tmp_path, case):
     path = tmp_path/'test-session.jsonl'
     path.write_bytes(case['input'].encode())

@@ -179,7 +179,7 @@ func redactConversationBatch(body []byte, maxBytes int64) ([]byte, error) {
 		if !json.Valid(line) {
 			return nil, fmt.Errorf("invalid conversation JSON")
 		}
-		if len(cardTokens(decodeCardEscapes(string(line)))) == 0 {
+		if cardCount(string(line)) == 0 {
 			continue
 		}
 		cleaned := applyCardEdits(string(line), cardJSONEdits(string(line)))

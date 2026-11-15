@@ -23,6 +23,7 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 		Input      string
 		Expected   string
 		JSONResult bool `json:"json_result"`
+		CardCount  *int `json:"card_count"`
 	}
 	var fixture struct{ Cases json.RawMessage }
 	if json.Unmarshal(data, &fixture) != nil || json.Unmarshal(fixture.Cases, &cases) != nil {
@@ -30,6 +31,9 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
+			if c.CardCount != nil && cardCount(c.Input) != *c.CardCount {
+				t.Fatal("decoded card count differs")
+			}
 			equal := func(actual string) bool {
 				if !c.JSONResult {
 					return actual == c.Expected
@@ -40,6 +44,9 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 			for _, context := range []bool{false, true} {
 				if !equal(redactCardText(c.Input, context)) {
 					t.Fatal("redaction contract failed")
+				}
+				if c.CardCount != nil && cardCount(redactCardText(c.Input, context)) != 0 {
+					t.Fatal("card survived decoded scan")
 				}
 			}
 			line, _ := json.Marshal(map[string]string{"text": c.Input})
@@ -83,7 +90,7 @@ func TestJSONFidelityThroughConversationBatch(t *testing.T) {
 		t.Fatal("invalid shared fixture")
 	}
 	for _, c := range fixture.Cases {
-		if !strings.HasPrefix(c.Name, "json_preserve") {
+		if !strings.HasPrefix(c.Name, "json_preserve") && !strings.HasPrefix(c.Name, "encoded_nested_") {
 			continue
 		}
 		t.Run(c.Name, func(t *testing.T) {

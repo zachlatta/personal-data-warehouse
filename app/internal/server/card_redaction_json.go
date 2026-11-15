@@ -161,14 +161,41 @@ func cardCodeToken(raw string) bool {
 }
 
 func cardRedactionEdits(s string, context bool) []cardEdit {
-	if !context && len(cardTokens(decodeCardEscapes(s))) == 0 {
+	if !context && cardCount(s) == 0 {
 		return nil
 	}
-	trimmed := strings.TrimSpace(s)
-	if (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) && json.Valid([]byte(s)) {
+	if _, valid := cardJSONTokens(s); valid {
 		return cardJSONEdits(s)
 	}
 	return cardTextEdits(s)
+}
+
+func cardJSONTokens(s string) ([][]int, bool) {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) > 0 && strings.ContainsRune("{[\"", rune(trimmed[0])) && json.Valid([]byte(s)) {
+		return cardJSONToken.FindAllStringIndex(s, -1), true
+	}
+	return nil, false
+}
+
+// Counting and editing discover the same decoded leaves. Do not use raw-byte
+// detection as a negative filter: Unicode may encode escape backslashes too.
+func cardCount(s string) int {
+	if tokens, valid := cardJSONTokens(s); valid {
+		count := 0
+		for _, token := range tokens {
+			raw := s[token[0]:token[1]]
+			if raw[0] == '"' {
+				var decoded string
+				_ = json.Unmarshal([]byte(raw), &decoded)
+				count += cardCount(decoded)
+			} else if raw[0] == '-' || raw[0] >= '0' && raw[0] <= '9' {
+				count += cardCount(raw)
+			}
+		}
+		return count
+	}
+	return len(cardTokens(decodeCardEscapes(s)))
 }
 
 // The caller validates JSON and establishes card context. Unlike the text

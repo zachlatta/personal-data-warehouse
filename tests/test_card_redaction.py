@@ -2,17 +2,21 @@ import json
 
 import pytest
 
-from personal_data_warehouse.card_redaction import redact, redact_row
+from personal_data_warehouse.card_redaction import card_count, redact, redact_row
 from pathlib import Path
 
 
 @pytest.mark.parametrize('case', json.loads((Path(__file__).parent / 'fixtures/card_redaction_cases.json').read_text())['cases'], ids=lambda c: c['name'])
 def test_shared_adversarial_cases(case):
+    if 'card_count' in case:
+        assert card_count(case['input']) == case['card_count']
     actual = redact(case['input'])
     if case.get('json_result'):
         assert json.loads(actual) == json.loads(case['expected'])
     else:
         assert actual == case['expected']
+    if 'card_count' in case:
+        assert card_count(actual) == 0
 
 
 def test_generated_numeric_prose_and_inserted_card_properties():
@@ -21,11 +25,15 @@ def test_generated_numeric_prose_and_inserted_card_properties():
     digest = hashlib.sha256()
     count = 0
     for name,value,expected in property_cases():
-        assert redact(value) == expected, name
+        actual = redact(value)
+        assert actual == expected, name
+        if name.startswith('encoded-'):
+            assert card_count(value) == int(name.startswith('encoded-insert-')), name
+            assert card_count(actual) == 0, name
         digest.update((name+'\0'+value+'\0'+expected+'\n').encode())
         count += 1
     config = json.loads((Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['property']
-    assert count >= 41680
+    assert count >= 47680
     assert digest.hexdigest() == config['corpus_sha256']
 
 

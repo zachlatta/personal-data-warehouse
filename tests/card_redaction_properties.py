@@ -46,6 +46,21 @@ def unambiguous_insertion(context, pan, following, layouts):
     return readings==[(len(context),len(context)+len(pan))]
 
 
+def encoded_document(pan, replacement, depth, mixed, encoded_slash):
+    encoded = ''.join('\\u%04x'%ord(c) if c.isdigit() and (not mixed or i%2==0) else c
+                      for i,c in enumerate(pan))
+    value = '{ "text":"'+encoded+' CVV2: 987", "keep":1e400, "dup":1,"dup":2, "u":"\\u00e9" }'
+    expected = value.replace(encoded,replacement).replace(' CVV2: 987',' CVV2: [redacted]') if replacement else value
+    if encoded_slash:
+        value=value.replace('\\',r'\u005c');expected=expected.replace('\\',r'\u005c')
+    for _ in range(depth-1):
+        value=json.dumps({'payload':value},separators=(',',':'))
+        expected=json.dumps({'payload':expected},separators=(',',':'))
+        if encoded_slash:
+            value=value.replace('\\\\',r'\u005c');expected=expected.replace('\\\\',r'\u005c')
+    return value,expected
+
+
 def property_cases():
     config = json.loads((Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['property']
     state = config['seed']
@@ -120,3 +135,16 @@ def property_cases():
                     value=joiner.join((a,b,c))
                     yield f'permutation-preserve-{i}-{j}-{k}-{n}', value, value
                     yield f'permutation-insert-{i}-{j}-{k}-{n}', '4111111111111111 | '+value, '[card ****1111] | '+value
+    for i in range(config['encoding_iterations']):
+        grouping,variant=formats[i%len(formats)]
+        for attempt in range(1000):
+            number=valid_number(sum(grouping));pan=render_groups(number,grouping,variant)
+            if unambiguous_insertion('',pan,' CVV2: 987',config['groupings']):
+                break
+        else:
+            raise AssertionError('could not construct unambiguous encoded PAN')
+        options=(1+i%3, bool((i//6)%2), bool((i//3)%2))
+        value,expected=encoded_document(pan,'[card ****'+number[-4:]+']',*options)
+        yield f'encoded-insert-{i}',value,expected
+        value,expected=encoded_document('4111111111111112',None,*options)
+        yield f'encoded-preserve-{i}',value,expected

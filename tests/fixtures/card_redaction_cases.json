@@ -982,6 +982,78 @@
       "name": "json_preserve_surrogates_and_escapes",
       "input": "{\"text\":\"\\ud800 \\n \\t \\\" 4111111111111111 \\\\ \\udc00\"}",
       "expected": "{\"text\":\"\\ud800 \\n \\t \\\" [card ****1111] \\\\ \\udc00\"}"
+    },
+    {
+      "name": "encoded_nested_depth_1_mixed_0_slash_0",
+      "input": "{ \"text\":\"\\u0034\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031\\u0031 CVV2: 987\", \"keep\":1e400, \"u\":\"\\u00e9\" }",
+      "expected": "{ \"text\":\"[card ****1111] CVV2: [redacted]\", \"keep\":1e400, \"u\":\"\\u00e9\" }",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_1_mixed_0_slash_1",
+      "input": "{ \"text\":\"\\u005cu0034\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031\\u005cu0031 CVV2: 987\", \"keep\":1e400, \"u\":\"\\u005cu00e9\" }",
+      "expected": "{ \"text\":\"[card ****1111] CVV2: [redacted]\", \"keep\":1e400, \"u\":\"\\u005cu00e9\" }",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_1_mixed_1_slash_0",
+      "input": "{ \"text\":\"\\u00341\\u00311\\u00311\\u00311\\u00311\\u00311\\u00311\\u00311 CVV2: 987\", \"keep\":1e400, \"u\":\"\\u00e9\" }",
+      "expected": "{ \"text\":\"[card ****1111] CVV2: [redacted]\", \"keep\":1e400, \"u\":\"\\u00e9\" }",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_1_mixed_1_slash_1",
+      "input": "{ \"text\":\"\\u005cu00341\\u005cu00311\\u005cu00311\\u005cu00311\\u005cu00311\\u005cu00311\\u005cu00311\\u005cu00311 CVV2: 987\", \"keep\":1e400, \"u\":\"\\u005cu00e9\" }",
+      "expected": "{ \"text\":\"[card ****1111] CVV2: [redacted]\", \"keep\":1e400, \"u\":\"\\u005cu00e9\" }",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_2_mixed_0_slash_0",
+      "input": "{\"payload\":\"{ \\\"text\\\":\\\"\\\\u0034\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031\\\\u0031 CVV2: 987\\\", \\\"keep\\\":1e400, \\\"u\\\":\\\"\\\\u00e9\\\" }\"}",
+      "expected": "{\"payload\":\"{ \\\"text\\\":\\\"[card ****1111] CVV2: [redacted]\\\", \\\"keep\\\":1e400, \\\"u\\\":\\\"\\\\u00e9\\\" }\"}",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_2_mixed_0_slash_1",
+      "input": "{\"payload\":\"{ \\\"text\\\":\\\"\\u005cu005cu0034\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031\\u005cu005cu0031 CVV2: 987\\\", \\\"keep\\\":1e400, \\\"u\\\":\\\"\\u005cu005cu00e9\\\" }\"}",
+      "expected": "{\"payload\":\"{ \\\"text\\\":\\\"[card ****1111] CVV2: [redacted]\\\", \\\"keep\\\":1e400, \\\"u\\\":\\\"\\u005cu005cu00e9\\\" }\"}",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_2_mixed_1_slash_0",
+      "input": "{\"payload\":\"{ \\\"text\\\":\\\"\\\\u00341\\\\u00311\\\\u00311\\\\u00311\\\\u00311\\\\u00311\\\\u00311\\\\u00311 CVV2: 987\\\", \\\"keep\\\":1e400, \\\"u\\\":\\\"\\\\u00e9\\\" }\"}",
+      "expected": "{\"payload\":\"{ \\\"text\\\":\\\"[card ****1111] CVV2: [redacted]\\\", \\\"keep\\\":1e400, \\\"u\\\":\\\"\\\\u00e9\\\" }\"}",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_2_mixed_1_slash_1",
+      "input": "{\"payload\":\"{ \\\"text\\\":\\\"\\u005cu005cu00341\\u005cu005cu00311\\u005cu005cu00311\\u005cu005cu00311\\u005cu005cu00311\\u005cu005cu00311\\u005cu005cu00311\\u005cu005cu00311 CVV2: 987\\\", \\\"keep\\\":1e400, \\\"u\\\":\\\"\\u005cu005cu00e9\\\" }\"}",
+      "expected": "{\"payload\":\"{ \\\"text\\\":\\\"[card ****1111] CVV2: [redacted]\\\", \\\"keep\\\":1e400, \\\"u\\\":\\\"\\u005cu005cu00e9\\\" }\"}",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_3_mixed_0_slash_0",
+      "input": "{\"payload\":\"{\\\"payload\\\":\\\"{ \\\\\\\"text\\\\\\\":\\\\\\\"\\\\\\\\u0034\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031\\\\\\\\u0031 CVV2: 987\\\\\\\", \\\\\\\"keep\\\\\\\":1e400, \\\\\\\"u\\\\\\\":\\\\\\\"\\\\\\\\u00e9\\\\\\\" }\\\"}\"}",
+      "expected": "{\"payload\":\"{\\\"payload\\\":\\\"{ \\\\\\\"text\\\\\\\":\\\\\\\"[card ****1111] CVV2: [redacted]\\\\\\\", \\\\\\\"keep\\\\\\\":1e400, \\\\\\\"u\\\\\\\":\\\\\\\"\\\\\\\\u00e9\\\\\\\" }\\\"}\"}",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_3_mixed_0_slash_1",
+      "input": "{\"payload\":\"{\\\"payload\\\":\\\"{ \\u005c\\\"text\\u005c\\\":\\u005c\\\"\\u005cu005cu005cu0034\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031\\u005cu005cu005cu0031 CVV2: 987\\u005c\\\", \\u005c\\\"keep\\u005c\\\":1e400, \\u005c\\\"u\\u005c\\\":\\u005c\\\"\\u005cu005cu005cu00e9\\u005c\\\" }\\\"}\"}",
+      "expected": "{\"payload\":\"{\\\"payload\\\":\\\"{ \\u005c\\\"text\\u005c\\\":\\u005c\\\"[card ****1111] CVV2: [redacted]\\u005c\\\", \\u005c\\\"keep\\u005c\\\":1e400, \\u005c\\\"u\\u005c\\\":\\u005c\\\"\\u005cu005cu005cu00e9\\u005c\\\" }\\\"}\"}",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_3_mixed_1_slash_0",
+      "input": "{\"payload\":\"{\\\"payload\\\":\\\"{ \\\\\\\"text\\\\\\\":\\\\\\\"\\\\\\\\u00341\\\\\\\\u00311\\\\\\\\u00311\\\\\\\\u00311\\\\\\\\u00311\\\\\\\\u00311\\\\\\\\u00311\\\\\\\\u00311 CVV2: 987\\\\\\\", \\\\\\\"keep\\\\\\\":1e400, \\\\\\\"u\\\\\\\":\\\\\\\"\\\\\\\\u00e9\\\\\\\" }\\\"}\"}",
+      "expected": "{\"payload\":\"{\\\"payload\\\":\\\"{ \\\\\\\"text\\\\\\\":\\\\\\\"[card ****1111] CVV2: [redacted]\\\\\\\", \\\\\\\"keep\\\\\\\":1e400, \\\\\\\"u\\\\\\\":\\\\\\\"\\\\\\\\u00e9\\\\\\\" }\\\"}\"}",
+      "card_count": 1
+    },
+    {
+      "name": "encoded_nested_depth_3_mixed_1_slash_1",
+      "input": "{\"payload\":\"{\\\"payload\\\":\\\"{ \\u005c\\\"text\\u005c\\\":\\u005c\\\"\\u005cu005cu005cu00341\\u005cu005cu005cu00311\\u005cu005cu005cu00311\\u005cu005cu005cu00311\\u005cu005cu005cu00311\\u005cu005cu005cu00311\\u005cu005cu005cu00311\\u005cu005cu005cu00311 CVV2: 987\\u005c\\\", \\u005c\\\"keep\\u005c\\\":1e400, \\u005c\\\"u\\u005c\\\":\\u005c\\\"\\u005cu005cu005cu00e9\\u005c\\\" }\\\"}\"}",
+      "expected": "{\"payload\":\"{\\\"payload\\\":\\\"{ \\u005c\\\"text\\u005c\\\":\\u005c\\\"[card ****1111] CVV2: [redacted]\\u005c\\\", \\u005c\\\"keep\\u005c\\\":1e400, \\u005c\\\"u\\u005c\\\":\\u005c\\\"\\u005cu005cu005cu00e9\\u005c\\\" }\\\"}\"}",
+      "card_count": 1
     }
   ],
   "property": {
@@ -1235,7 +1307,7 @@
         "expected": " CVC2: [redacted]"
       }
     ],
-    "corpus_sha256": "0423e2f5f4a7b01c3cc288ab8251952c72050e70bb3e6f4706ee6f31d08cb4eb",
+    "corpus_sha256": "c6eedcbb9de9f20fa8c0be803520f28c48e6b342ffc26c1060af309fead66c55",
     "permutation_tokens": [
       "2026-11-15T09:12:13Z",
       "+1-202-555-0198",
@@ -1250,6 +1322,7 @@
       "; ",
       "\n",
       " | "
-    ]
+    ],
+    "encoding_iterations": 3000
   }
 }
