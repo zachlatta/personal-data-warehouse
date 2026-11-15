@@ -514,6 +514,9 @@ retain their original compressed bytes, and local JSONL scrubs retain line endin
 Discovery and scan counts traverse decoded JSON string tokens at every nesting
 level, including Unicode-encoded backslashes. Counting and masking share the
 same token traversal; a raw-byte negative filter must never suppress it.
+Committed constructed examples declare a reproducible `synthetic_provenance`
+recipe checked by `tests/test_card_fixture_provenance.py`. Use published sandbox
+numbers or generate additional examples at test time; never copy live credentials.
 
 Explicit maintenance modules (dry-run unless `--apply` is passed):
 `personal_data_warehouse.scrub_conversation_cards` reports source/month counts
