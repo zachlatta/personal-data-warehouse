@@ -73,7 +73,7 @@ def test_row_context_masks_code_in_another_field_and_is_idempotent():
 @pytest.mark.parametrize('length', range(13, 20))
 def test_all_supported_lengths(length):
     from personal_data_warehouse.card_redaction import is_card
-    prefix = '4' + '1' * (length - 2)
+    prefix = ('4' if length in (13,16,19) else '6') + '1' * (length - 2)
     number = next(prefix + str(n) for n in range(10) if is_card(prefix + str(n)))
     assert redact(number).startswith('[card ****')
     grouped = ' '.join(number[i:i+4] for i in range(0,len(number),4))

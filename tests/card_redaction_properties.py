@@ -71,7 +71,7 @@ def property_cases():
     def digits(n):
         return ''.join(str(rand(10)) for _ in range(n))
     def valid_number(n):
-        prefix = '4' + digits(n-2)
+        prefix = ('4' if n in (13,16,19) else '6') + digits(n-2)
         return next(prefix+str(i) for i in range(10) if checksum_valid(prefix+str(i)))
     formats = [(g,s) for g in config['groupings'] for s in (['plain'] if len(g)==1 else config['separator_variants'])]
     for i in range(config['iterations']):

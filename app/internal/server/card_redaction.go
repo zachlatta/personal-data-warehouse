@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/cardpolicy"
 	"io"
 	"regexp"
 	"sort"
@@ -25,6 +26,70 @@ var cardEscape = regexp.MustCompile(`\\+u(003[0-9]|0020|002[dD])`)
 var cardDigits = regexp.MustCompile(`[0-9]+`)
 var cardSeparator = regexp.MustCompile(`^[ -]{1,3}$`)
 var adjacentCardCode = regexp.MustCompile(`^(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})`)
+
+func cardBrand(s string) bool {
+	for _, issuer := range cardpolicy.Rules.Issuers {
+		length := false
+		for _, n := range issuer.Lengths {
+			if n == len(s) {
+				length = true
+				break
+			}
+		}
+		if !length {
+			continue
+		}
+		for _, r := range issuer.Ranges {
+			if len(s) >= len(r[0]) && s[:len(r[0])] >= r[0] && s[:len(r[0])] <= r[1] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cardWordByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+func cardTokenBoundary(s string, start, end int) bool {
+	left, right := start, end
+	for left > 0 && cardWordByte(s[left-1]) {
+		left--
+	}
+	for right < len(s) && cardWordByte(s[right]) {
+		right++
+	}
+	allowed := func(word string) bool {
+		for _, label := range cardpolicy.Rules.AttachedLabels {
+			if strings.EqualFold(word, label) {
+				return true
+			}
+		}
+		return false
+	}
+	if !(left == start || allowed(s[left:start])) || !(right == end || allowed(s[end:right])) {
+		return false
+	}
+	left, right = start, end
+	for left > 0 && (cardWordByte(s[left-1]) || s[left-1] == '+' || s[left-1] == '/') {
+		left--
+	}
+	for right < len(s) && (cardWordByte(s[right]) || s[right] == '+' || s[right] == '/') {
+		right++
+	}
+	for _, side := range []string{s[left:start], s[end:right]} {
+		letters := false
+		for _, c := range []byte(side) {
+			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' {
+				letters = true
+			}
+		}
+		if letters && !allowed(strings.Trim(side, "+/")) {
+			return false
+		}
+	}
+	return true
+}
 
 func standaloneCardTokenEnd(s string, end int) bool {
 	if end == len(s) {
@@ -77,7 +142,7 @@ func cardTokens(s string) [][2]int {
 			if len(digits) > 19 {
 				break
 			}
-			if cardLayout(groups) && validCard(digits) {
+			if cardLayout(groups) && validCard(digits) && cardBrand(digits) && cardTokenBoundary(s, a[0], atoms[j][1]) {
 				readings = append(readings, [2]int{a[0], atoms[j][1]})
 			}
 		}

@@ -62,7 +62,11 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 		return sum%10 == 0
 	}
 	number := func(n int) string {
-		prefix := "4" + digits(n-2)
+		issuer := "6"
+		if n == 13 || n == 16 || n == 19 {
+			issuer = "4"
+		}
+		prefix := issuer + digits(n-2)
 		for j := 0; j < 10; j++ {
 			s := prefix + string(rune('0'+j))
 			if valid(s) {

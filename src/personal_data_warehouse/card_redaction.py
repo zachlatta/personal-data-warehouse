@@ -3,8 +3,40 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from typing import Any
+
+CARD_POLICY = json.loads(Path(__file__).with_name('card_policy.json').read_text())
+_ATTACHED_LABELS = frozenset(CARD_POLICY['attached_labels'])
+
+
+def card_brands(digits):
+    return {rule['name'] for rule in CARD_POLICY['issuers'] if len(digits) in rule['lengths']
+            and any(low <= digits[:len(low)] <= high for low,high in rule['ranges'])}
+
+
+def _word_char(char):
+    return char.isascii() and (char.isalnum() or char == '_')
+
+
+def card_token_boundary(value,start,end):
+    left=start
+    while left and _word_char(value[left-1]):left-=1
+    right=end
+    while right<len(value) and _word_char(value[right]):right+=1
+    if not ((left==start or value[left:start].lower() in _ATTACHED_LABELS) and
+            (right==end or value[end:right].lower() in _ATTACHED_LABELS)):
+        return False
+    # Base64's '+' and '/' can separate a digit run from its letters. Numeric
+    # slash suffixes remain valid expiry context; arbitrary encoded words do not.
+    left=start;right=end
+    while left and (_word_char(value[left-1]) or value[left-1] in '+/'):left-=1
+    while right<len(value) and (_word_char(value[right]) or value[right] in '+/'):right+=1
+    for side in (value[left:start],value[end:right]):
+        if any(c.isalpha() or c=='_' for c in side) and side.strip('+/').lower() not in _ATTACHED_LABELS:
+            return False
+    return True
 
 _LABEL = r'(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*code)'
 _CODE = re.compile(r'(?i)(\b' + _LABEL + r'\b(?:\s+is)?[\s\\\x22\x27:=,-]{0,24})([0-9]{3,4})(?![0-9])')
@@ -53,7 +85,8 @@ def card_spans(value: str):
             groups += (len(atoms[j][0]),)
             if len(digits)>19:
                 break
-            if groups in _CARD_LAYOUTS and is_card(digits):
+            if (groups in _CARD_LAYOUTS and is_card(digits) and card_brands(digits)
+                    and card_token_boundary(value,atom.start(),atoms[j].end())):
                 readings.add((atom.start(),atoms[j].end()))
     valid = sorted(readings)
     codes = []

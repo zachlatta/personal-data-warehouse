@@ -42,6 +42,11 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 				return json.Unmarshal([]byte(actual), &got) == nil && json.Unmarshal([]byte(c.Expected), &want) == nil && reflect.DeepEqual(got, want)
 			}
 			for _, context := range []bool{false, true} {
+				// A forced row context asserts a card exists elsewhere; it is
+				// intentionally inapplicable to standalone non-card fixtures.
+				if context && c.CardCount != nil && *c.CardCount == 0 {
+					continue
+				}
 				if !equal(redactCardText(c.Input, context)) {
 					t.Fatal("redaction contract failed")
 				}
@@ -60,6 +65,54 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 			var result map[string]string
 			if json.Unmarshal(raw, &result) != nil || !equal(result["text"]) {
 				t.Fatal("batch contract failed")
+			}
+		})
+	}
+}
+
+func TestSharedIssuerAndIdentifierCases(t *testing.T) {
+	data, err := os.ReadFile("../../../tests/fixtures/card_issuer_cases.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		Name, Prefix, Before, After string
+		Length                      int
+		Mask                        bool
+	}
+	if json.Unmarshal(data, &cases) != nil {
+		t.Fatal("invalid issuer fixtures")
+	}
+	for _, c := range cases {
+		t.Run(c.Name, func(t *testing.T) {
+			stem := (c.Prefix + strings.Repeat("1", c.Length))[:c.Length-1]
+			pan := ""
+			for i := 0; i < 10; i++ {
+				v := stem + string(rune('0'+i))
+				if validCard(v) {
+					pan = v
+					break
+				}
+			}
+			value := c.Before + pan + c.After
+			want := value
+			if c.Mask {
+				want = c.Before + "[card ****" + pan[len(pan)-4:] + "]" + c.After
+			}
+			if redactCardText(value, false) != want || (cardCount(value) > 0) != c.Mask {
+				t.Fatal("issuer or token boundary differs")
+			}
+			body, _ := json.Marshal(map[string]string{"text": value})
+			cleaned, err := redactConversationBatch(conversationTestBatch(string(body)), 100000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, _ := gzip.NewReader(bytes.NewReader(cleaned))
+			raw, _ := io.ReadAll(r)
+			r.Close()
+			var got map[string]string
+			if json.Unmarshal(raw, &got) != nil || got["text"] != want {
+				t.Fatal("batch issuer boundary differs")
 			}
 		})
 	}
@@ -133,7 +186,11 @@ func TestJSONScalarConversationBatchRemainsValid(t *testing.T) {
 
 func TestAllCardLengthsWithAdjacentCode(t *testing.T) {
 	for length := 13; length <= 19; length++ {
-		prefix := "4" + strings.Repeat("1", length-2)
+		issuer := "6"
+		if length == 13 || length == 16 || length == 19 {
+			issuer = "4"
+		}
+		prefix := issuer + strings.Repeat("1", length-2)
 		number := ""
 		for n := 0; n < 10; n++ {
 			candidate := prefix + string(rune('0'+n))

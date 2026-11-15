@@ -840,7 +840,8 @@
     {
       "name": "contiguous_card_inside_prose",
       "input": "prefix4111111111111111suffix",
-      "expected": "prefix[card ****1111]suffix"
+      "expected": "prefix4111111111111111suffix",
+      "card_count": 0
     },
     {
       "name": "json_preserve_crlf_whitespace",
@@ -932,13 +933,14 @@
     {
       "name": "ambiguous_numeric_prefix_readings",
       "input": "1004 4111 1111 1111 1111",
-      "expected": "[card ****1111]",
+      "expected": "1004 [card ****1111]",
       "synthetic_provenance": {
         "recipe": "canonical_pan_with_overlapping_prefix",
         "description": "Prepend the first four-digit integer starting at 1000 for which that integer plus the first twelve digits of the published Visa test PAN passes Luhn. Keep the entire test PAN after the prefix; the two sixteen-digit readings overlap.",
         "base_test_pan": "4111111111111111",
         "reference": "https://developer.paypal.com/braintree/docs/reference/general/testing/python/"
-      }
+      },
+      "card_count": 1
     },
     {
       "name": "json_code_surrounding_whitespace",
@@ -964,8 +966,9 @@
     {
       "name": "json_numeric_exponent_pan",
       "input": "{\"card\":4111111111111111e0,\"CVV\":9.87e2}",
-      "expected": "{\"card\": \"[card ****1111]e0\", \"CVV\": \"[redacted]\"}",
-      "json_result": true
+      "expected": "{\"card\":4111111111111111e0,\"CVV\":9.87e2}",
+      "json_result": true,
+      "card_count": 0
     },
     {
       "name": "json_numeric_fractional_pan_only",
@@ -1307,7 +1310,7 @@
         "expected": " CVC2: [redacted]"
       }
     ],
-    "corpus_sha256": "c6eedcbb9de9f20fa8c0be803520f28c48e6b342ffc26c1060af309fead66c55",
+    "corpus_sha256": "35b621ada20709c4b3d75c1bbd8ad32ccdff930c36802b380d7a1ce002569a70",
     "permutation_tokens": [
       "2026-11-15T09:12:13Z",
       "+1-202-555-0198",

@@ -195,16 +195,16 @@ def test_canonical_rebuild_does_not_rewrite_unaffected_source_timestamps(warehou
 
 
 def synthetic_pan(length):
-    """Derive at runtime from the published test PAN prefix plus a Luhn digit."""
+    """Published test digits, a length-valid issuer prefix, computed checksum."""
     from tests.card_redaction_properties import checksum_valid
-    prefix=('4111111111111111'*2)[:length-1]
+    prefix=(('4' if length in (13,16,19) else '6')+'1111111111111111'*2)[:length-1]
     return next(prefix+str(digit) for digit in range(10) if checksum_valid(prefix+str(digit)))
 
 
 def prefixed_card_cases():
     for length in (13,14,15):
         pan=synthetic_pan(length)
-        for prefix in ('menu','u','u1234 ','letters',chr(92),r'\u',r'\u1234 '):
+        for prefix in ('menu','card','u1234 ','letters ',chr(92),r'\u1234 '):
             yield prefix+pan+' CVV2: 987'
             encoded=''.join(r'\u%04x'%ord(c) if i%2 else c for i,c in enumerate(pan))
             yield prefix+encoded+' CVC2: 987'
@@ -291,7 +291,7 @@ def random_prefilter_cases():
         encoding=i%6
         if encoding:
             pan=''.join(r'\u%04x'%ord(c) if c.isdigit() and (encoding!=2 or j%2) else c for j,c in enumerate(pan))
-        for value in (prefix+pan+suffix,prefix+'menu'+pan+'|'+suffix):
+        for value in (prefix+pan+suffix,prefix+'|menu'+pan+'|'+suffix):
             if encoding>=3:
                 for _ in range(encoding-2):value=json.dumps({'payload':value})
             if encoding==4:value=value.replace('\\\\',r'\u005c')

@@ -545,7 +545,18 @@ are pending, never assumed zero.
 Reports contain counts only; repeat each dry-run afterward and require zero.
 Historical backups and WAL are not erased by these commands.
 
-The scrub SQL/archive prefilters bound both literal and decoded digit readings:
+PAN detection requires a checksum, a matching issuer IIN/length rule, and token
+boundaries. The single policy is `src/personal_data_warehouse/card_policy.json`;
+`scripts/generate_go_card_policy.py` generates the Go mirror and a test pins it.
+Contiguous alphanumeric/underscore identifiers are preserved. Exact attached
+labels `card`, `pan`, `cc`, `number`, `num`, and `menu` remain supported; `menu`
+retains the historical input shape without admitting arbitrary identifier words.
+Non-brand numbers stay unchanged even near a CVV/expiry label. Group layouts,
+overlapping starts and adjacent-code handling are otherwise unchanged.
+
+The scrub SQL/archive prefilters use the policy's minimum card length and bound
+both literal and decoded digit readings. They deliberately defer issuer and
+token decisions to the confirming detector so escaped payloads remain covered:
 remove backslashes, replace every possible Unicode unit by **four** digit
 sentinels, then select 13 digits within a 49-character normalized window.
 Four preserves up to four literal digits after an ordinary word ending in `u`

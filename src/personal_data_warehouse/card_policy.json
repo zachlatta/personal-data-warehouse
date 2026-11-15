@@ -1,0 +1,15 @@
+{
+  "attached_labels": ["card", "pan", "cc", "number", "num", "menu"],
+  "issuers": [
+    {"name":"Visa", "lengths":[13,16,19], "ranges":[["4","4"]]},
+    {"name":"Mastercard", "lengths":[16], "ranges":[["51","55"],["2221","2720"]]},
+    {"name":"Amex", "lengths":[15], "ranges":[["34","34"],["37","37"]]},
+    {"name":"Discover", "lengths":[16,17,18,19], "ranges":[["6011","6011"],["644","649"],["65","65"],["622126","622925"]]},
+    {"name":"JCB", "lengths":[16,17,18,19], "ranges":[["3528","3589"]]},
+    {"name":"Diners", "lengths":[14,15,16,17,18,19], "ranges":[["36","36"]]},
+    {"name":"Diners", "lengths":[16,17,18,19], "ranges":[["38","39"],["300","305"]]},
+    {"name":"UnionPay", "lengths":[16,17,18,19], "ranges":[["62","62"]]},
+    {"name":"Maestro", "lengths":[13,14,15,16,17,18,19], "ranges":[["50","50"],["56","58"],["60","69"]]},
+    {"name":"Mir", "lengths":[16], "ranges":[["2200","2204"]]}
+  ]
+}
