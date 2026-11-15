@@ -21,6 +21,49 @@ pdw search --source agent_session --mode exact 'ugd76wbdoyr5blb6uda3su5o56'   # 
 for an id, error string or URL add `"mode": "exact"`.
 {{- end}}
 
+Automated prompts are `background`, even on the user channel in an interactive
+session. Automation evidence includes sidechain/subagent metadata, `agent-` session
+IDs, Codex's first session header identifying a subagent, `isMeta`/`isCompactSummary`,
+and helper execution from the root `/tmp` or `/private/tmp` directory without a
+project branch (empty or `HEAD`), even when entrypoint metadata is absent.
+Malformed provider JSON supplies no metadata.
+
+Opening declarations of a subagent, runner, reviewer or parent-owned assignment
+are automation evidence. This includes bounded read-only/smoke probes, Muse's
+assignment envelope and interrupted openers in email/voice dispatch worktrees.
+Asking to start a subagent or consult a reviewer stays `self`; page-generated
+“Check N contracts” requests also stay `self`. Formal messages from another agent
+are `background` within a human session. PDW does not yet ingest Paseo's parent-agent
+registry; these text signals are heuristics. Independent self-focused samples
+measure precision as well as gold-self recall, both with a 90% floor.
+
+Agent-delivered turns are `background` when another session's delivery tool call
+in the preceding ten minutes matches the prompt. Separate text fingerprints
+tolerate shell interpolation; short common replies alone are insufficient proof.
+
+Sending a request to two agents stays `self`. Subagent copies do not demote the
+human original. A dispatcher fan-out delivers an identical payload of at least
+40 characters to four independent sessions within five minutes; known subagents
+do not count toward that minimum. An identical opening prompt of at least
+eight characters in the same provider and project workspace on three distinct days
+within ±7 days, at the same New York clock time (±5 minutes), indicates a daily
+schedule. Worktree run slugs and daylight-saving changes do not split its scope.
+Weekly schedules repeat a 64-character opening prefix on three dates within
+±21 days, in the same provider and project workspace, weekday and New York clock
+time (±5 minutes, including daylight-saving changes). Each run may use a fresh
+linked worktree. Repeating `continue` inside one session is not a schedule.
+
+Harness envelopes include XML/system and cron wrappers, compaction continuation
+headers, factory handoffs, formal review headers with sender-agent UUIDs,
+automatic dispatch and repository-routing headers, reviewer stage transitions,
+and workflow envelopes with run UUIDs or explicit unattended-session markers.
+A declaration that this is a run of a Paseo schedule can appear anywhere in the
+opener and includes one-shot runs. Role briefs and a 64-character opening prefix
+shared by at least four early user rows are measured automation baselines. A pair
+of duplicate human requests is not that repeated-opener signal.
+A machine opener keeps its session in
+`background` after later steering.
+
 `self,background` is the right scope: Zach's prompts are `self`, the model's replies and
 tool output are `background`, and orchestrator-spawned sessions are `background` entirely.
 Transcripts are indexed **per turn**, so a hit lands on the matching turn: a turn ref is
@@ -51,8 +94,9 @@ ORDER BY seq DESC LIMIT 5;
   the raw per-provider streams the mart unions.
 
 `entrypoint` separates interactive from automated work: `cli` and `codex-tui` are Zach at
-a keyboard; `sdk-cli`, `codex_exec` and OpenClaw's entrypoints are scheduled or
-fleet-driven runs. `chatgpt` sessions have no entrypoint and `claude_desktop` `device`
+a keyboard; `codex_exec` and OpenClaw's entrypoints are scheduled or fleet-driven.
+`sdk-cli` also launches sessions Zach types into, so it is not sufficient automation
+evidence by itself. `chatgpt` sessions have no entrypoint and `claude_desktop` `device`
 values are opaque; read nothing into either.
 
 **Muse** (Meta's hosted personal agent) writes its own background loops — self-improvement,

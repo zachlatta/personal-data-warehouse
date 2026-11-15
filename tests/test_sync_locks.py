@@ -187,6 +187,13 @@ def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
     # The blanket poll's warm tier: conversations active in the last two weeks
     # are rotated in after the ones active inside the freshness window.
     assert freshness["freshness_warm_window"] == timedelta(days=14)
+    # Three minutes of polling, so the whole run -- ~10s of preamble, the
+    # polls, the read-state pass and the timeline fast lane -- fits its
+    # five-minute schedule. At 240s the pass used to be cut at ~180s by the
+    # rate-limit sleep budget anyway; once the sweep gave calls back
+    # (2026-11-11) passes ran the full 240s and the runs took 4m53s-5m32s,
+    # so the next tick was skipped and a hot DM waited ten minutes.
+    assert freshness["freshness_pass_budget"] == timedelta(seconds=180)
     assert all(call["sync_users"] is False for call in calls)
     assert all(call["sync_members"] is False for call in calls)
     # Freshness fetches replies inline so brand-new threads are captured complete.
@@ -401,10 +408,14 @@ def test_slack_public_sweep_polls_public_channels_regardless_of_membership(monke
     assert len(summaries) == 1
     call = calls[0]
     assert call["sync_public_sweep_only"] is True
-    assert call["sweep_hot_limit"] == 20
-    # Cold is the bigger bucket because there are ~11.8k cold channels to ~1.5k
-    # hot ones; this is what makes the full rotation about a day.
-    assert call["sweep_cold_limit"] == 40
+    # Forty polls a run, split by where the channels are: measured 2026-11-11
+    # there were 9,395 non-member channels active within the week and 5,549
+    # quieter ones, so thirty and ten put each bucket's rotation at about 26
+    # and 46 hours, inside the four-day cycle. It was sixty (twenty hot, forty
+    # cold) when the hot bucket was ~1.5k; the twenty calls it gives back go
+    # to the freshness pass, which shares the conversations.history budget.
+    assert call["sweep_hot_limit"] == 30
+    assert call["sweep_cold_limit"] == 10
     assert call["sweep_hot_within_days"] == 7
     assert call["skip_known_errors"] is True
     # Replies are left to the thread-backfill drain, as coverage does: fetching

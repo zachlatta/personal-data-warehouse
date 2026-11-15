@@ -161,6 +161,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Workers:           *workers,
 		SaveState:         saveState,
 		BeforeUploadCheck: common.UploadGuard(env, networkPolicyPrefix, cfg.BaseURL),
+		Observe:           client.PostSourceObservation,
 	}).Sync()
 	saveState()
 	if err != nil {

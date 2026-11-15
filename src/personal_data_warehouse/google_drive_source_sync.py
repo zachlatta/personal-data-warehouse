@@ -29,6 +29,7 @@ from xml.etree import ElementTree as ET
 from googleapiclient.http import MediaIoBaseDownload
 
 from personal_data_warehouse.config import GoogleDriveSourceConfig, Settings
+from personal_data_warehouse.source_sla import record_upstream_observation
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +261,7 @@ class DriveClient(Protocol):
     def iter_folders(self) -> Iterable[Mapping[str, Any]]: ...
     def iter_files(self) -> Iterable[Mapping[str, Any]]: ...
     def iter_changes(self, page_token: str, *, max_changes: int | None = None) -> tuple[list[Mapping[str, Any]], str]: ...
+    def newest_file(self) -> Mapping[str, Any] | None: ...
     def export_text(self, file_id: str, export_mime: str) -> bytes: ...
     def download_bytes(self, file_id: str) -> bytes: ...
 
@@ -328,9 +330,32 @@ class GoogleDriveSourceSyncRunner:
 
     def _sync_account(self, account: str, state: Any) -> AccountSyncSummary:
         client = self._client_factory(account)
+        self._observe_newest(account, client)
         if state is None or not getattr(state, "start_page_token", ""):
             return self._full_crawl(account, client)
         return self._incremental(account, client, state)
+
+    def _observe_newest(self, account: str, client: DriveClient) -> None:
+        """C11: Drive's own newest modified file, recorded before this run writes.
+
+        The changes feed is consumed in capped slices, so a burst or a stuck
+        page token leaves PDW behind while every run succeeds; asking
+        files.list for the newest file is the comparison that sees it.
+        """
+        try:
+            newest = client.newest_file()
+        except Exception as exc:  # noqa: BLE001 - the probe must not fail the sync
+            logger.warning("Google Drive newest-file probe failed for %s: %s", account, exc)
+            return
+        record_upstream_observation(
+            self._warehouse,
+            logger,
+            pipeline="google_drive",
+            scope=account,
+            upstream_newest_at=_parse_dt(newest.get("modifiedTime")) if newest else None,
+            upstream_newest_id=str((newest or {}).get("id", "")),
+            detail="files.list(orderBy='modifiedTime desc', pageSize=1)",
+        )
 
     def _build_tree(self, client: DriveClient) -> FolderTree:
         folders: dict[str, Mapping[str, Any]] = {}
@@ -712,11 +737,26 @@ class GoogleApiDriveClient:
             "nextPageToken,files(id,name,parents,driveId)",
         )
 
-    def iter_files(self) -> Iterator[Mapping[str, Any]]:
+    def _file_query(self) -> str:
         clauses = ["trashed = false", f"mimeType != '{FOLDER_MIME}'"]
         if not self._config.include_shared_with_me and not self._config.include_shared_drives:
             clauses.append("'me' in owners")
-        yield from self._list(" and ".join(clauses), f"nextPageToken,files({FILE_FIELDS})")
+        return " and ".join(clauses)
+
+    def iter_files(self) -> Iterator[Mapping[str, Any]]:
+        yield from self._list(self._file_query(), f"nextPageToken,files({FILE_FIELDS})")
+
+    def newest_file(self) -> Mapping[str, Any] | None:
+        """The most recently modified file among those the sync crawls."""
+        response = self._service.files().list(
+            q=self._file_query(),
+            orderBy="modifiedTime desc",
+            pageSize=1,
+            fields="files(id,modifiedTime)",
+            **self._shared_drive_params(),
+        ).execute()
+        files = response.get("files", [])
+        return files[0] if files else None
 
     def _list(self, query: str, fields: str) -> Iterator[Mapping[str, Any]]:
         page_token = ""

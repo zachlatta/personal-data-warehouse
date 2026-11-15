@@ -1,11 +1,10 @@
 # Personal Data Warehouse (PDW) — the agent guide
 
-One warehouse for everything about Zach: Gmail, Slack, Google Calendar, Google Drive,
-Google Contacts, iMessage and SMS, WhatsApp, Apple Notes, Apple Photos, Apple Voice Memos,
-WHOOP health, Plaid and statement-backed finances, meeting and voice-memo transcripts, and
-every prior AI agent session across all providers and machines. Any question about Zach's
-own life starts here — not from priors, not from a web search, and not from a single-source
-connector. Reads are safe. Built-in writes require human approval; connected MCP tools may write directly.
+One warehouse for Zach's mail, chats, calendar, contacts, files, notes, photos, voice
+transcripts, health, finances and prior agent sessions across providers and machines.
+Answer questions about his life from PDW, not from priors, not from a web search, not from a
+single-source connector. Built-in writes require human
+approval; connected MCP tools may write directly.
 
 Read a topic when your question enters its domain{{if .CLI}} (`pdw readme <topic>`){{else}} (`readme` with `{"topic": "<name>"}`){{end}}; the index is at the end.
 Never trust a relation or column name from memory, including one you read here; the
@@ -23,9 +22,9 @@ discovery calls below are what is current.
    That is the one way to read it. In SQL, `timeline.context(ref, before, after)` is the
    same function; name its columns (`SELECT *` returns the full `search_text`).
 3. **Structured questions** (aggregates, joins, predicates, drill-down) are SQL, walked
-   in layer order: bounded `timeline.events` filtered by priority → `marts_*` (stable
-   per-domain read views) → `base_*` (raw provider rows, reached from a hit's
-   `source_table`/`source_pk`). `derived_*` holds the modelled facts between them.
+   timeline first: bounded `timeline.events` filtered by priority → `marts_*` (stable
+   per-domain read views) or `derived_*` (the modelled facts behind them) → `base_*`
+   (raw provider rows, reached from a hit's `source_table`/`source_pk`).
 4. **Before any SQL**, confirm every relation's columns:
 {{if .CLI}}   `pdw columns <schema.relation>` — and `pdw schema` only to find a relation you do not know.{{else}}   `describe_table` with `{"relation": "<schema.relation>"}` — and `schema_overview` only to find a relation you do not know.{{end}}
 
@@ -194,6 +193,8 @@ own data and writes to the warehouse: never run it speculatively (topic `ingest`
 
 {{end -}}
 ## Topics
+
+{{if .CLI}}`pdw run script.js`{{else}}`run`{{end}} composes dependent warehouse reads in one fresh JavaScript sandbox. Topic `scripts`: API, examples, limits and pilot telemetry.
 
 {{range .Topics}}- `{{.Name}}` — {{.Summary}}
 {{end}}

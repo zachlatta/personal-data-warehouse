@@ -28,7 +28,14 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("configuration loaded", "addr", cfg.Addr, "base_url", cfg.BaseURL, "max_rows", cfg.MaxRows, "max_field_chars", cfg.MaxFieldChars, "query_timeout", cfg.QueryTimeout, "git_sha", buildinfo.GitSHA())
-	runner, err := query.NewPostgresRunnerWithRole(cfg.PostgresDatabaseURL, cfg.QueryTimeout, cfg.QueryPostgresRole)
+	queryURL := cfg.QueryPostgresDatabaseURL
+	if queryURL == "" {
+		// Keep ingestion and other writer services available, but the runner's
+		// per-transaction safety check refuses reads from a privileged login.
+		slog.Error("PDW_QUERY_POSTGRES_URL is missing; warehouse reads require an unprivileged login")
+		queryURL = cfg.PostgresDatabaseURL
+	}
+	runner, err := query.NewPostgresRunnerWithRole(queryURL, cfg.QueryTimeout, cfg.QueryPostgresRole)
 	if err != nil {
 		logger.Error("connect to Postgres failed", "error", err)
 		os.Exit(1)
@@ -36,6 +43,9 @@ func main() {
 	defer runner.Close()
 
 	authSvc := pdwauth.NewServiceWithKeyring(cfg.Keyring(), time.Now)
+	if cfg.IngestSecret != "" {
+		authSvc.SetIngestSecret([]byte(cfg.IngestSecret))
+	}
 	if cfg.PreviousSecretToken != "" {
 		logger.Warn("master secret rotation window open: the previous secret is still accepted; unset PDW_SECRET_TOKEN_PREVIOUS once clients are updated")
 	}
@@ -75,7 +85,8 @@ func main() {
 	workerDone := make(chan struct{})
 	go func() { defer close(workerDone); notificationSvc.Run(ctx) }()
 	logger.Info("personal data warehouse MCP server listening", "addr", cfg.Addr)
-	httpServer := &http.Server{Addr: cfg.Addr, Handler: server.NewMuxWithNotifications(cfg, authSvc, runner, notificationSvc, mutationSvc), ReadHeaderTimeout: 10 * time.Second}
+	handler, closeConnections := server.NewMuxWithBackground(ctx, cfg, authSvc, runner, notificationSvc, mutationSvc)
+	httpServer := &http.Server{Addr: cfg.Addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -93,6 +104,7 @@ func main() {
 	cancel()
 	<-workerDone
 	<-shutdownDone
+	closeConnections()
 	if failed {
 		os.Exit(1)
 	}

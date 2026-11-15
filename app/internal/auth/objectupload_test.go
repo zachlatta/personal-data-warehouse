@@ -1,6 +1,9 @@
 package auth
 
 import (
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
@@ -96,5 +99,34 @@ func TestObjectUploadVerifyMalformedInputs(t *testing.T) {
 		if err := svc.VerifyObjectUpload("/ingest/agent-sessions/batch", args[0], args[1], args[2]); err == nil {
 			t.Errorf("expected malformed inputs %v to be rejected", args)
 		}
+	}
+}
+
+// The ingest secret is what uploader hosts hold instead of the master secret:
+// it signs uploads and nothing else. As a bearer it is refused, so a host that
+// holds it cannot reach the API, let alone approve a mutation.
+func TestTheIngestSecretSignsUploadsAndIsNeverABearer(t *testing.T) {
+	const ingest = "ingest-only-secret-at-least-32-characters"
+	svc := uploadTestService()
+	svc.SetIngestSecret([]byte(ingest))
+	exp := svc.now().Add(time.Hour)
+	sig := base64.RawURLEncoding.EncodeToString(objectUploadMAC([]byte(ingest), "/ingest/agent-sessions/batch", "abc123", exp.Unix()))
+	if err := svc.VerifyObjectUpload("/ingest/agent-sessions/batch", "abc123", strconv.FormatInt(exp.Unix(), 10), sig); err != nil {
+		t.Fatalf("an upload signed with the ingest secret must verify: %v", err)
+	}
+	for _, path := range []string{"/api/tools", "/api/mutations/requests/req-1/approve", "/api/auth/tokens"} {
+		handler := svc.RequireStaticBearer()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req = req.WithContext(WithClientNameHolder(req.Context()))
+		req.Header.Set("Authorization", "Bearer uploader:"+ingest)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: the ingest secret as a bearer = %d, want 401", path, rec.Code)
+		}
+	}
+	// The master secret still verifies uploads during the move.
+	if err := svc.VerifyObjectUpload("/ingest/x", "abc", strconv.FormatInt(exp.Unix(), 10), svc.SignObjectUpload("/ingest/x", "abc", exp)); err != nil {
+		t.Fatal(err)
 	}
 }

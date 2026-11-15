@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
@@ -103,6 +104,15 @@ func NewService(store Store, cfg Config) *Service {
 func (s *Service) ProposeMutation(ctx context.Context, input ProposeMutationInput) (ProposalResponse, error) {
 	mutations := make([]MutationInput, 0, len(input.Mutations))
 	for index, raw := range input.Mutations {
+		// A type no agent may propose is refused before anything else.
+		operation := strings.TrimSpace(stringFromAny(raw["type"]))
+		if operation == "" {
+			operation = strings.TrimSpace(stringFromAny(raw["operation"]))
+		}
+		if !TypeRuleFor(operation).AgentProposable {
+			category, _ := ForbiddenCategory(operation)
+			return ProposalResponse{}, invalidProposalInput(fmt.Errorf("mutation %d: %s is forbidden: agents may never propose %s; ask Zach to do it himself", index, operation, category))
+		}
 		mutation, err := mutationInputFromMap(raw, index)
 		if err != nil {
 			return ProposalResponse{}, invalidProposalInput(err)
@@ -115,6 +125,8 @@ func (s *Service) ProposeMutation(ctx context.Context, input ProposeMutationInpu
 		Context:     cloneMap(input.Context),
 		Mutations:   mutations,
 		RequestedBy: requestActor(ctx),
+		// The id, not the name: a policy grant binds to who authenticated.
+		RequestedByTokenID: requestTokenID(ctx),
 	}
 	if replaces := strings.TrimSpace(input.ReplacesRequestID); replaces != "" {
 		create.Replaces = &RequestReplacement{
@@ -138,7 +150,23 @@ func requestActor(ctx context.Context) string {
 	return defaultRequestedBy
 }
 
+// requestTokenID is the authenticated token behind the call: an issued
+// token's id, or an OAuth connector grant's id. Empty for the master secret
+// and for a caller with no principal.
+func requestTokenID(ctx context.Context) string {
+	if principal, ok := auth.PrincipalFromContext(ctx); ok {
+		return principal.TokenID
+	}
+	return ""
+}
+
 func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (ProposalResponse, error) {
+	return s.createRequestNotifying(ctx, input, true)
+}
+
+// createRequestNotifying is createRequest; notify false skips the review
+// alert, for a request the caller approves at once (an undo).
+func (s *Service) createRequestNotifying(ctx context.Context, input CreateRequestInput, notify bool) (ProposalResponse, error) {
 	if s == nil || s.store == nil {
 		return ProposalResponse{}, errors.New("mutation store is not configured")
 	}
@@ -154,7 +182,7 @@ func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (
 	if err != nil {
 		return ProposalResponse{}, err
 	}
-	if s.cfg.RequestCreated != nil {
+	if notify && s.cfg.RequestCreated != nil {
 		s.cfg.RequestCreated(ctx, request)
 	}
 	response := s.responseForRequest(request)
@@ -224,6 +252,12 @@ func (s *Service) validateCreateInput(input CreateRequestInput) error {
 	}
 	if len(missing) > 0 {
 		return errors.New(strings.Join(missing, "; ") + " (required top-level fields: title, reason, mutations)")
+	}
+	now := time.Now().UTC()
+	for index, mutation := range input.Mutations {
+		if err := validateSchedule(mutation.Type, mutation.Schedule, now); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	}
 	if input.Replaces != nil {
 		if strings.TrimSpace(input.Replaces.RequestID) == "" {
@@ -426,8 +460,12 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		if _, err := thermostatChangeFromInput(mutation); err != nil {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
+	case PolicyChangeOperation:
+		if _, err := policyChangeFromInput(mutation); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	default:
-		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, gmail.create_filter, gmail.replace_filter, gmail.delete_filter, gmail.create_label, gmail.update_label, gmail.delete_label, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, android_messages.send_message, apple_messages.mark_read, slack.mark_conversation_read, slack.send_message, screen_timelapse.purge_moment, or printer.print_document", index, mutationType)
+		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, gmail.create_filter, gmail.replace_filter, gmail.delete_filter, gmail.create_label, gmail.update_label, gmail.delete_label, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, android_messages.send_message, apple_messages.mark_read, slack.mark_conversation_read, slack.send_message, screen_timelapse.purge_moment, printer.print_document, resideo.set_thermostat, or pdw.mutation_policy", index, mutationType)
 	}
 	return nil
 }
@@ -478,6 +516,10 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 	if strings.TrimSpace(mutationType) == "" {
 		mutationType = stringFromAny(raw["operation"])
 	}
+	schedule, raw, err := scheduleFromMap(raw)
+	if err != nil {
+		return MutationInput{}, fmt.Errorf("mutation %d %w", index, err)
+	}
 	deliveryMode := stringFromAny(raw["delivery_mode"])
 	if deliveryMode == "" {
 		deliveryMode = "send"
@@ -492,7 +534,11 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 	if account == "" && strings.TrimSpace(mutationType) == ResideoSetThermostatOperation {
 		account = ResideoAccount
 	}
+	if account == "" && strings.TrimSpace(mutationType) == PolicyChangeOperation {
+		account = PolicyChangeAccount
+	}
 	return MutationInput{
+		Schedule:           schedule,
 		Type:               strings.TrimSpace(mutationType),
 		Account:            account,
 		Title:              strings.TrimSpace(stringFromAny(raw["title"])),

@@ -5,6 +5,7 @@ import { Pressable, RefreshControl, SectionList, StyleSheet } from 'react-native
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { InboxRow } from '@/components/inbox-row';
+import { PolicySwitches } from '@/components/policy-switches';
 import { STATUS_COLORS } from '@/components/status-pill';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { Spacing } from '@/constants/theme';
@@ -14,6 +15,7 @@ import type { AppConfig } from '@/lib/config';
 import { peekMutationRequests, rememberMutationRequests } from '@/lib/mutation-cache';
 import { prefetchMutationRequest, prefetchPendingRequests } from '@/lib/review-prefetch';
 import { formatWhen } from '@/lib/format';
+import { policyBadge } from '@/lib/mutation-review';
 import { markReviewOpen } from '@/lib/review-paint';
 import { decisions } from '@/lib/undo-decision';
 import { useConfig } from '@/lib/session';
@@ -91,6 +93,7 @@ export default function MutationsScreen() {
       <SectionList
         contentContainerStyle={{ paddingBottom: tabSpace }}
         sections={sections}
+        ListFooterComponent={<PolicySwitches config={config} />}
         keyExtractor={(item) => item.id}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} />}
         renderSectionHeader={({ section }) => (
@@ -117,6 +120,7 @@ export default function MutationsScreen() {
             labels={[
               { text: item.status.replace(/_/g, ' '), color: STATUS_COLORS[item.status] },
               { text: `${item.mutation_count} mutation${item.mutation_count === 1 ? '' : 's'}` },
+              ...policyListLabel(item),
             ]}
             onPressIn={() => prefetchRequest(config, item.id)}
             onPress={() => {
@@ -142,3 +146,11 @@ const styles = StyleSheet.create({
   errorBox: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10, backgroundColor: '#E5636D22' },
   errorText: { color: '#E5636D' },
 });
+
+// A list row names only what a policy did or would do; why one did not cover
+// a request is detail for the review screen.
+function policyListLabel(request: MutationRequest): { text: string }[] {
+  const badge = policyBadge(request);
+  if (!badge || (badge.decision !== 'would_approve' && badge.decision !== 'approved')) return [];
+  return [{ text: badge.decision === 'approved' ? 'auto-approved' : 'would auto-approve' }];
+}

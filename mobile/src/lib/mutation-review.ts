@@ -2348,3 +2348,88 @@ export function gmailSettingsReview(mutation: MutationLike): GmailSettingsReview
     labelFacts,
   };
 }
+
+// The mutation policy's decision on a request (request.policy): "would
+// auto-approve" for a dry run, the approving policy for an enforced one, and
+// why a policy did not cover it. Null when no policy could touch the request.
+export type PolicyBadge = {
+  decision: string;
+  tone: 'ok' | 'info' | 'muted' | 'warn' | 'bad';
+  label: string;
+  reasons: string[];
+};
+
+const POLICY_TONES: Record<string, PolicyBadge['tone']> = {
+  approved: 'ok',
+  would_approve: 'info',
+  review: 'muted',
+  would_refuse: 'warn',
+  refused: 'bad',
+};
+
+export function policyBadge(request: { policy?: unknown } | null | undefined): PolicyBadge | null {
+  const policy = request && request.policy && typeof request.policy === 'object' ? (request.policy as Record<string, unknown>) : {};
+  const decision = typeof policy.decision === 'string' ? policy.decision.trim() : '';
+  if (!decision) return null;
+  const reasons = Array.isArray(policy.reasons)
+    ? policy.reasons.filter((line): line is string => typeof line === 'string' && line.trim() !== '').map((line) => line.trim())
+    : [];
+  const label = typeof policy.label === 'string' && policy.label.trim() ? policy.label.trim() : decision.replace(/_/g, ' ');
+  return { decision, tone: POLICY_TONES[decision] ?? 'muted', label, reasons };
+}
+
+// What a step's precondition checks, in plain words.
+export function preconditionText(precondition: unknown): string {
+  const p = precondition && typeof precondition === 'object' ? (precondition as Record<string, unknown>) : {};
+  const kind = typeof p.kind === 'string' ? p.kind.trim() : '';
+  if (!kind) return '';
+  if (kind === 'not_home') {
+    const minutes = typeof p.within_minutes === 'number' ? p.within_minutes : NaN;
+    return `Skipped if the phone was at home (or had no location) in the ${Number.isFinite(minutes) ? minutes : '?'} minutes before it runs`;
+  }
+  return `Precondition ${kind}`;
+}
+
+// One step's own "Runs at", deadline and precondition: a plan's steps each
+// carry their own (a trip's away step and its return step).
+export function mutationSchedule(mutation: { not_before?: string | null; not_after?: string | null; precondition?: unknown } | null | undefined): { runsAt: string; deadline: string; precondition: string } {
+  return {
+    runsAt: typeof mutation?.not_before === 'string' ? mutation.not_before.trim() : '',
+    deadline: typeof mutation?.not_after === 'string' ? mutation.not_after.trim() : '',
+    precondition: preconditionText(mutation?.precondition),
+  };
+}
+
+// A scheduled request's "Runs at" and deadline (the API's not_before /
+// not_after); empty strings when it runs once approved.
+export function requestSchedule(request: { not_before?: string | null; not_after?: string | null } | null | undefined): { runsAt: string; deadline: string } {
+  return {
+    runsAt: typeof request?.not_before === 'string' ? request.not_before.trim() : '',
+    deadline: typeof request?.not_after === 'string' ? request.not_after.trim() : '',
+  };
+}
+
+// A pdw.mutation_policy change as Zach reads it: PDW's verdict (does it only
+// narrow what runs without him?), why not, and the field-by-field diff.
+export type PolicyChangeReview = {
+  narrowing: boolean;
+  summary: string;
+  widens: string[];
+  diff: { field: string; before: string; after: string; verdict: string }[];
+};
+
+export function policyChangeReview(mutation: { operation?: string; preview?: unknown }): PolicyChangeReview | null {
+  if (mutation.operation !== 'pdw.mutation_policy') return null;
+  const preview = mutation.preview && typeof mutation.preview === 'object' ? (mutation.preview as Record<string, unknown>) : {};
+  const change = preview.policy_change && typeof preview.policy_change === 'object' ? (preview.policy_change as Record<string, unknown>) : {};
+  const show = (value: unknown) => (value === null || value === undefined ? 'none' : typeof value === 'string' ? value : JSON.stringify(value));
+  const diff = Array.isArray(change.diff) ? change.diff : [];
+  return {
+    narrowing: change.narrowing === true,
+    summary: typeof change.summary === 'string' ? change.summary : '',
+    widens: Array.isArray(change.widens) ? change.widens.filter((line): line is string => typeof line === 'string') : [],
+    diff: diff
+      .filter((line): line is Record<string, unknown> => !!line && typeof line === 'object')
+      .map((line) => ({ field: String(line.field ?? ''), before: show(line.before), after: show(line.after), verdict: String(line.verdict ?? '') })),
+  };
+}

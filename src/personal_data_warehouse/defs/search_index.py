@@ -147,7 +147,7 @@ def search_chunks(context) -> MaterializeResult:
                     )
                 else:
                     # A cold cache with no index-identity change is re-warmed
-                    # here, at most once a day: the identity-keyed prewarm
+                    # here, at most every six hours: the identity-keyed prewarm
                     # cannot see an eviction, and 2026-09-16..19 sat at 10%.
                     try:
                         warm = rewarm_search_indexes_if_cold(warehouse, residency)
@@ -252,7 +252,14 @@ def search_chunk_embeddings(context) -> MaterializeResult:
     )
 
 
-search_chunks_job = define_asset_job("search_chunks_job", selection=[search_chunks])
+# The chunk build (240 s budget), the index warm and the 180 s heap warm all
+# run here under one lock; a hung run must not hold a queue slot for the
+# global four-hour cap (tests/test_dagster_job_runtime_caps.py).
+search_chunks_job = define_asset_job(
+    "search_chunks_job",
+    selection=[search_chunks],
+    tags={"dagster/max_runtime": "1800"},
+)
 search_chunk_embeddings_job = define_asset_job("search_chunk_embeddings_job", selection=[search_chunk_embeddings])
 
 

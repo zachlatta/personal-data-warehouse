@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from personal_data_warehouse.mutation_notifications import (
     MUTATION_NOTIFICATION_CHANNEL,
@@ -104,7 +105,7 @@ def test_resident_worker_executes_slack_mutations_instead_of_spinning_on_them(mo
         def __exit__(self, *exc):
             return False
 
-    monkeypatch.setattr(upstream_mutation_worker, "load_settings", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "load_settings", lambda **kwargs: SimpleNamespace(resideo=None))
     monkeypatch.setattr(upstream_mutation_worker, "warehouse_from_settings", lambda settings: _Warehouse())
     monkeypatch.setattr(upstream_mutation_worker, "GmailMutationExecutor", lambda **kwargs: object())
     monkeypatch.setattr(upstream_mutation_worker, "GoogleContactMutationExecutor", lambda **kwargs: object())
@@ -147,7 +148,7 @@ def test_resident_worker_resyncs_gmail_labels_and_filters_after_a_settings_mutat
             return False
 
     resynced: list[set[str]] = []
-    monkeypatch.setattr(upstream_mutation_worker, "load_settings", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "load_settings", lambda **kwargs: SimpleNamespace(resideo=None))
     monkeypatch.setattr(upstream_mutation_worker, "warehouse_from_settings", lambda settings: _Warehouse())
     monkeypatch.setattr(upstream_mutation_worker, "GmailMutationExecutor", lambda **kwargs: object())
     monkeypatch.setattr(upstream_mutation_worker, "GoogleContactMutationExecutor", lambda **kwargs: object())
@@ -175,3 +176,54 @@ def test_every_mutation_batch_caller_must_say_what_happens_after_a_gmail_setting
 
     parameter = inspect.signature(process_upstream_mutation_batch).parameters["on_gmail_settings_changed"]
     assert parameter.default is inspect.Parameter.empty
+
+
+def test_resident_worker_passes_every_keyword_the_mutation_batch_takes(monkeypatch) -> None:
+    # A new required executor keyword on process_upstream_mutation_batch that
+    # only the Dagster caller passes makes every resident pass raise TypeError
+    # and reconnect, leaving the slower fallback to run every cloud mutation.
+    # The fakes above take **kwargs and cannot notice; this one binds against
+    # the real signature, so a keyword the resident worker misses fails here.
+    import inspect
+
+    from personal_data_warehouse import upstream_mutation_worker
+    from personal_data_warehouse.defs import upstream_mutations
+    from personal_data_warehouse.defs.upstream_mutations import UpstreamMutationWorkerSummary
+    from personal_data_warehouse.resideo_mutations import ResideoMutationExecutor
+
+    class _Warehouse:
+        def ensure_upstream_mutation_tables(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class _Settings:
+        resideo = None
+
+    class _Lock:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, *exc):
+            return False
+
+    signature = inspect.signature(upstream_mutations.process_upstream_mutation_batch)
+    bound: dict[str, object] = {}
+
+    def fake_batch(**kwargs):
+        bound.update(signature.bind(**kwargs).arguments)
+        return UpstreamMutationWorkerSummary()
+
+    monkeypatch.setattr(upstream_mutation_worker, "load_settings", lambda **kwargs: _Settings())
+    monkeypatch.setattr(upstream_mutation_worker, "warehouse_from_settings", lambda settings: _Warehouse())
+    monkeypatch.setattr(upstream_mutation_worker, "exclusive_sync_lock", lambda **kwargs: _Lock())
+    monkeypatch.setattr(upstream_mutation_worker, "process_upstream_mutation_batch", fake_batch)
+
+    upstream_mutation_worker.CloudMutationProcessor().process_pending()
+
+    executors = [name for name in signature.parameters if name.endswith("_executor")]
+    assert "resideo_executor" in executors
+    for name in executors:
+        assert bound.get(name) is not None, name
+    assert isinstance(bound["resideo_executor"], ResideoMutationExecutor)

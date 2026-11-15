@@ -821,8 +821,9 @@ func TestServerInstructionsNameTheTimelineTiersAndLayerOrder(t *testing.T) {
 	timeline := strings.Index(lowered, "timeline (the event stream)")
 	marts := strings.Index(lowered, "marts_*")
 	base := strings.Index(lowered, "base_*")
-	if timeline < 0 || marts < 0 || base < 0 || !(timeline < marts && marts < base) {
-		t.Fatalf("serverInstructions must give the timeline -> marts_* -> base_* order: %s", serverInstructions)
+	derived := strings.Index(lowered, "derived_*")
+	if timeline < 0 || marts < 0 || derived < 0 || base < 0 || !(timeline < marts && marts < derived && derived < base) {
+		t.Fatalf("serverInstructions must give the timeline -> marts_*/derived_* -> base_* order: %s", serverInstructions)
 	}
 }
 

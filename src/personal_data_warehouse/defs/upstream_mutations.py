@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 import json
 import os
 import socket
@@ -19,6 +19,7 @@ from dagster import (
     sensor,
 )
 
+from personal_data_warehouse.upstream_mutation_schedule import precondition_failure
 from personal_data_warehouse.resideo_mutations import (
     RESIDEO_PROVIDER,
     RESIDEO_SET_THERMOSTAT_OPERATION,
@@ -438,6 +439,16 @@ def process_upstream_mutation_batch(
 
     for mutation in claimed:
         if str(mutation["id"]) in processed_mutation_ids:
+            continue
+        # A scheduled step checks its precondition right before it runs.
+        skip_reason = precondition_failure(
+            warehouse._query_dicts,
+            mutation,
+            now=datetime.now(tz=UTC),
+            relation_exists=warehouse._relation_exists,
+        ) if mutation.get("precondition_json") else None
+        if skip_reason:
+            warehouse.skip_upstream_mutation_for_precondition(str(mutation["id"]), reason=skip_reason, actor_id=claimed_by)
             continue
         provider = mutation.get("provider")
         if provider == "google_people" and mutation.get("operation") == GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION:

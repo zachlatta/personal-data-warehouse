@@ -227,7 +227,7 @@ func wrapComment(line string, width int) []string {
 // per-relation lookup can tell them. Each paragraph earned its place from a
 // recurring failure in real transcripts.
 var overviewPreamble = `--
--- SCHEMA LAYERS (they sort in this order, which is also the order to reach for them):
+-- SCHEMA LAYERS (listed in sort order; READ them timeline → marts_*/derived_* → base_*):
 --   base_<source>    faithful provider data — every field the source gave us
 --   derived_<domain> modelled facts: identity resolution, enrichment, transcripts, ledger history
 --   marts_<domain>   stable domain read interfaces (finance, contacts, messages, photos, inbox, ...)

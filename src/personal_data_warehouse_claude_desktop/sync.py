@@ -66,6 +66,7 @@ class ClaudeDesktopUploadRunner:
         batch_size: int = DEFAULT_BATCH_SIZE,
         page_size: int = DEFAULT_PAGE_SIZE,
         before_upload_check: Callable[[], str | None] | None = None,
+        upstream_observation_callback: Callable[[datetime | None, str], Any] | None = None,
     ) -> None:
         if batch_uploader is None:
             raise ValueError("batch_uploader is required")
@@ -83,6 +84,7 @@ class ClaudeDesktopUploadRunner:
         self._batch_size = max(1, batch_size)
         self._page_size = max(1, page_size)
         self._before_upload_check = before_upload_check
+        self._upstream_observation_callback = upstream_observation_callback
         self._checked_network = False
 
     def sync(self) -> ClaudeDesktopUploadSummary:
@@ -101,6 +103,8 @@ class ClaudeDesktopUploadRunner:
                     continue
                 conversations_seen += 1
                 updated_at = str(summary.get("updated_at", ""))
+                if conversations_seen == 1:
+                    self._observe_newest(conversation_id, updated_at)
                 if self._is_unchanged(conversation_id, updated_at):
                     continue
                 if remaining is not None and remaining <= 0:
@@ -158,6 +162,17 @@ class ClaudeDesktopUploadRunner:
             deferred_for_limit=deferred,
             rate_limited=rate_limited,
         )
+
+    def _observe_newest(self, conversation_id: str, updated_at: str) -> None:
+        """C11: claude.ai lists conversations newest-updated first, so the first
+        is its own newest; recorded before anything is uploaded. Never raises."""
+        if self._upstream_observation_callback is None:
+            return
+        try:
+            newest = datetime.fromisoformat(updated_at.replace("Z", "+00:00")) if updated_at else None
+            self._upstream_observation_callback(newest, conversation_id)
+        except Exception as exc:  # noqa: BLE001 - evidence must not stop the sync
+            self._logger.warning("Claude Desktop upstream observation failed: %s", exc)
 
     def _is_unchanged(self, conversation_id: str, updated_at: str) -> bool:
         if self._mode != "incremental" or self._state is None:

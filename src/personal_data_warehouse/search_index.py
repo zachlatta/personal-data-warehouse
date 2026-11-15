@@ -105,8 +105,11 @@ SEARCH_RESIDENCY_REWARM_FLOOR = 0.20
 #: A forced warm is never repeated within this window: if one did not stick,
 #: something else is evicting the cache, and re-reading ~20 GB every five
 #: minutes would be that something. Find the evictor in pg_stat_statements
-#: (ORDER BY shared_blks_read DESC) rather than fighting it.
-SEARCH_RESIDENCY_REWARM_MIN_INTERVAL = timedelta(hours=24)
+#: (ORDER BY shared_blks_read DESC) rather than fighting it. Six hours, not
+#: 24, since 2026-11-11: a morning warm had decayed to 13% by the evening
+#: while searches waited on reads, and the timeline sidebar's ~95 GB/day
+#: scan that did most of the evicting is gone. Four warms a day read less.
+SEARCH_RESIDENCY_REWARM_MIN_INTERVAL = timedelta(hours=6)
 
 
 def should_rewarm_search_indexes(
@@ -156,7 +159,7 @@ def restore_search_cache_after_reconcile(
     and 17 HNSW loads in 24 hours on 2026-09-20 -- ~1.5 TB through an 18 GB
     cache, pg_prewarm the largest block reader on the host, residency 19.6%.
     Now the reconcile measures residency, publishes it, and warms only under
-    the same floor and daily interval the cold-cache guard uses.
+    the same floor and six-hour interval the cold-cache guard uses.
     """
     try:
         measured = record_search_cache_residency(warehouse)
@@ -206,6 +209,26 @@ def record_search_cache_residency(warehouse: Any) -> dict[str, int | float]:
         last_success_at=datetime.now(tz=UTC),
         last_error="",
     )
+    # The lexical pool's cold reads are mostly timeline heap pages, which the
+    # index gauge above cannot see (86% of them on 2026-11-11).
+    try:
+        heap = warehouse.measure_timeline_heap_residency()
+    except Exception as error:  # noqa: BLE001 - one gauge must not hide the other
+        warehouse.write_search_health("timeline_heap_residency", last_error=str(error)[:500])
+    else:
+        warehouse.write_search_health(
+            "timeline_heap_residency",
+            configured=1,
+            pgvector_available=1,
+            caught_up=1,
+            processed_rows=1,
+            pending_count=0,
+            resident_bytes=heap["resident_bytes"],
+            total_bytes=heap["total_bytes"],
+            resident_fraction=heap["resident_fraction"],
+            last_success_at=datetime.now(tz=UTC),
+            last_error="",
+        )
     return measured
 
 

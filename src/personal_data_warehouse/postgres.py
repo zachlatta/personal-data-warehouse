@@ -4,6 +4,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 import hashlib
+import base64
+import hmac
 import inspect
 import json
 import logging
@@ -15,6 +17,8 @@ from typing import Any
 import psycopg2
 from psycopg2 import Binary
 from psycopg2.extras import Json, execute_values
+
+from personal_data_warehouse.agent_delivery import delivery_call_predicate
 
 from personal_data_warehouse.search_benchmark_runner import (
     LATENCY_P50_TARGET_MS,
@@ -36,7 +40,14 @@ from personal_data_warehouse.agent_usage import (
     SQL_ERROR_SESSION_CEILING,
     AGENT_TOP_FAILURES,
 )
+from personal_data_warehouse.source_sla import (
+    landed_slack_seconds_sql,
+    SOURCE_UPSTREAM_INPUT_TABLES,
+    source_upstream_health_view_sql,
+)
 from personal_data_warehouse.schema import (
+    PRIORITY_BENCHMARK_LABEL_COLUMNS,
+    PRIORITY_BENCHMARK_RESULT_COLUMNS,
     ANSWER_BENCHMARK_QUESTION_COLUMNS,
     ANSWER_BENCHMARK_RESULT_COLUMNS,
     ANSWER_BENCHMARK_RUN_COLUMNS,
@@ -138,6 +149,7 @@ from personal_data_warehouse.schema import (
     COLLATION_HEALTH_COLUMNS,
     PGBACKREST_HEALTH_COLUMNS,
     UPLOADER_HEARTBEAT_COLUMNS,
+    SOURCE_UPSTREAM_OBSERVATION_COLUMNS,
     SEARCH_REQUEST_TIMING_COLUMNS,
     SEARCH_REQUEST_TIMING_STATE_COLUMNS,
     TIMELINE_PRIORITY_MIX_COLUMNS,
@@ -211,6 +223,11 @@ from personal_data_warehouse.schema import (
     SyncState,
 )
 from personal_data_warehouse.chatgpt_backend import token_expiry_warning
+from personal_data_warehouse.upstream_mutation_policy import (
+    lock_policy_state,
+    parse_policy_actor,
+    policy_recheck_failure,
+)
 from personal_data_warehouse.config import normalize_postgres_url
 from personal_data_warehouse.pipeline_health import (
     ACCOUNT_BASELINE_GAPS,
@@ -327,6 +344,23 @@ SEARCH_TEXT_BROAD_PER_BRANCH_CAP = 12
 # flattens. Re-measure with search_benchmark before moving it.
 SEARCH_TEXT_BROAD_POOL = 5000
 SEARCH_TEXT_BROAD_SMALL_POOL = 800
+#: How the search cache warm reads the attention-tier timeline heap: a bitmap
+#: heap scan over timeline_events_priority_time_idx, which PostgreSQL 18
+#: prefetches through its read stream (an index walk reads one page at a
+#: time). Measured 2026-11-11 on production: 86% of a cold scoped lexical
+#: leg's reads were these heap pages (1,309 of 1,529), about 14% of the heap's
+#: 5.04M pages, ~5.6 GB, read in 61 s on 4 workers. The warm runs inside the
+#: five-minute search_chunks job, after a chunk build of up to 240 s and while
+#: holding that job's lock, so its budget is 180 s (3x the measured warm): a
+#: saturated disk makes it a partial warm, never a run that outlives its tick
+#: by minutes. The job's dagster/max_runtime caps the rest.
+ATTENTION_HEAP_WARM_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("statement_timeout", "180s"),
+    ("enable_seqscan", "off"),
+    ("enable_indexscan", "off"),
+    ("enable_indexonlyscan", "off"),
+    ("jit", "off"),
+)
 # Which BM25 index a pooled row was scanned through, carried on the row so the
 # ranking stage can score a candidate against the same corpus statistics the
 # merge was built on. Two partitions means two bm25 corpora, and a low-volume
@@ -870,7 +904,7 @@ SLACK_ACCOUNT_STATE_ITEM_WINDOW = timedelta(days=30)
 SLACK_FINGERPRINT_THUMB_SIZES = (1024, 960, 800, 720, 480, 360, 160)
 SLACK_DM_LANDING_P95_SECONDS = 900
 SLACK_DM_LANDING_LATE_P95_SECONDS = 3600
-# A DM quiet past the four-hour hot window is polled every fifteen minutes,
+# A DM quiet past the four-hour hot window is polled every ten minutes,
 # every two hours once quiet two weeks, every twelve once quiet a year
 # (SLACK_FRESHNESS_DUE_INTERVALS), so the message that wakes it -- and any
 # written before it lands -- arrives up to that late by design. Live on
@@ -955,6 +989,11 @@ class IndexSpec:
 
 
 POSTGRES_TABLES: dict[str, TableSpec] = {
+    "script_runs": TableSpec(("occurred_at", "run_id", "client", "token_id", "surface", "duration_ms", "operations_json", "inner_errors", "bytes_returned", "truncated", "outcome"), ("run_id",), "occurred_at"),
+    "external_feed_items": TableSpec(
+        ("feed", "item_key", "sync_version", "payload_json", "recorded_at"),
+        ("feed", "item_key"),
+    ),
     "gmail_messages": TableSpec(
         MESSAGE_COLUMNS,
         ("account", "message_id"),
@@ -1443,6 +1482,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "collation_health": TableSpec(COLLATION_HEALTH_COLUMNS, ("object_id",), "collected_at"),
     "pgbackrest_health": TableSpec(PGBACKREST_HEALTH_COLUMNS, ("stanza",), "collected_at"),
     "uploader_heartbeats": TableSpec(UPLOADER_HEARTBEAT_COLUMNS, ("pipeline", "device")),
+    # C11: what each source itself says is its newest item, upserted by the
+    # collector that looked (and by the app for device uploaders, which
+    # creates it with the same DDL because it deploys first).
+    "source_upstream_observations": TableSpec(
+        SOURCE_UPSTREAM_OBSERVATION_COLUMNS, ("pipeline", "scope")
+    ),
     # C6's per-request evidence, appended by the app after every search and
     # pruned after SEARCH_REQUEST_TIMING_RETENTION_DAYS; the state row is the
     # writer's heartbeat. The app creates both itself too (same DDL), because
@@ -1461,6 +1506,8 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         SEARCH_BENCHMARK_HISTORY_COLUMNS, ("mode", "collected_at"), "collected_at"
     ),
     "search_benchmark_labels": TableSpec(SEARCH_BENCHMARK_LABEL_COLUMNS, ("query",)),
+    "priority_benchmark_labels": TableSpec(PRIORITY_BENCHMARK_LABEL_COLUMNS, ("label_set",)),
+    "priority_benchmark_results": TableSpec(PRIORITY_BENCHMARK_RESULT_COLUMNS, ("label_set",)),
     # C16: private questions and per-question answers, and an append-only ops
     # row of one run's counts (no question text) for marts_ops.answer_benchmark.
     "answer_benchmark_questions": TableSpec(ANSWER_BENCHMARK_QUESTION_COLUMNS, ("question_id",)),
@@ -1485,6 +1532,7 @@ PIPELINE_HEALTH_SNAPSHOT_TABLES = (
     "search_health",
     "pgbackrest_health",
     "uploader_heartbeats",
+    "source_upstream_observations",
     "timeline_priority_mix",
     "agent_usage",
     "agent_failure_shapes",
@@ -1559,6 +1607,29 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
                 f"ON @{table} ((left(text, 64))) WHERE role = 'user' AND seq <= 5",
             )
         )
+        # Broadcasts can occur beyond the opening turns. Bound the index key
+        # to a text prefix and timestamp; full-text equality is a heap recheck.
+        specs.append(
+            IndexSpec(
+                f"{table}_broadcast_prompt_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_broadcast_prompt_idx "
+                f"ON @{table} ((left(text, 64)), occurred_at) "
+                "WHERE role = 'user' AND length(text) >= 40",
+            )
+        )
+        # Delivery proof probes tool calls in a short received-turn time window.
+        # Index only execution/delivery candidates, rather than detoasting every
+        # event in that interval. The adapter uses this exact shared predicate.
+        specs.append(
+            IndexSpec(
+                f"{table}_agent_delivery_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_agent_delivery_idx "
+                f"ON @{table} (occurred_at DESC) WHERE "
+                + delivery_call_predicate(""),
+            )
+        )
         specs.append(
             IndexSpec(
                 f"{table}_ingested_at_idx",
@@ -1585,6 +1656,29 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
 
 
 POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
+    IndexSpec("script_runs_occurred_at_idx", "script_runs", "CREATE INDEX IF NOT EXISTS script_runs_occurred_at_idx ON @script_runs (occurred_at)"),
+    IndexSpec(
+        "external_feed_items_cursor_idx", "external_feed_items",
+        "CREATE INDEX IF NOT EXISTS external_feed_items_cursor_idx ON @external_feed_items (feed, sync_version)",
+    ),
+    # The external voice feed reads the mart's newest completed attempt per
+    # recording on every poll. Match its DISTINCT ON ordering, including ties.
+    IndexSpec(
+        "voice_enrichments_completed_lookup_idx",
+        "apple_voice_memos_enrichments",
+        "CREATE INDEX IF NOT EXISTS voice_enrichments_completed_lookup_idx "
+        "ON @apple_voice_memos_enrichments "
+        "(source, account, recording_id, created_at DESC, provider DESC, model DESC, prompt_version DESC) "
+        "WHERE status = 'completed'",
+    ),
+    IndexSpec(
+        "voice_transcriptions_completed_lookup_idx",
+        "apple_voice_memos_transcription_runs",
+        "CREATE INDEX IF NOT EXISTS voice_transcriptions_completed_lookup_idx "
+        "ON @apple_voice_memos_transcription_runs "
+        "(source, account, recording_id, completed_at DESC, requested_at DESC, provider DESC) "
+        "WHERE status = 'completed'",
+    ),
     IndexSpec(
         "finance_transactions_account_time_idx",
         "finance_transactions",
@@ -2771,8 +2865,87 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     ),
 )
 
-# Indexes that used to exist but have been superseded. Dropped idempotently
-# during _ensure_indexes so existing deployments converge with fresh installs.
+#: One partition's graph walk: the rows of its HNSW top-$5 for vector $4.
+#: search_hybrid_semantic inlines it for a lone walk; the walk function runs
+#: it per partition so several walks can share a Parallel Append. Both format
+#: it with (relation, scope) from _semantic_partition_scope_sql.
+SEMANTIC_ANN_BRANCH_SQL = """(SELECT v.adapter, v.event_id, v.chunk_id,
+                        v.embedding OPERATOR(public.<=>) $4 AS distance
+                    FROM %s v WHERE v.model = $1%s
+                    ORDER BY v.embedding OPERATOR(public.<=>) $4 LIMIT $5)"""
+
+
+def _semantic_partition_scope_sql(adapters: tuple[str, ...]) -> str:
+    """The plpgsql expression for one partition's WHERE suffix.
+
+    A dedicated partition holds one adapter, so only ``since`` narrows it; the
+    default partition also filters ``sem_adapters``. Reads the plpgsql
+    variables ``sem_adapters`` and ``since`` and emits ``$2``/``$3``.
+    """
+    if adapters:
+        return "CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
+    return (
+        "CASE WHEN sem_adapters IS NULL THEN '' ELSE ' AND v.adapter = ANY ($2)' END"
+        " || CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
+    )
+
+
+def _semantic_walk_function_sql() -> str:
+    """search_hybrid_semantic_walk: one partition's graph walk as a function.
+
+    PARALLEL SAFE so the semantic leg can hand each walk to its own worker
+    (a LIMIT subquery is never planned on a worker). ``part`` is the
+    1-based position in SEARCH_VECTOR_PARTITIONS.
+    """
+    whens = "\n                        ".join(
+        f"WHEN {position} THEN $q$@{table}$q$"
+        for position, (table, _) in enumerate(SEARCH_VECTOR_PARTITIONS, start=1)
+    )
+    scopes = "\n                        ".join(
+        f"WHEN {position} THEN {_semantic_partition_scope_sql(adapters)}"
+        for position, (_, adapters) in enumerate(SEARCH_VECTOR_PARTITIONS, start=1)
+    )
+    return f"""
+            CREATE OR REPLACE FUNCTION @search_hybrid_semantic_walk(
+                part integer,
+                embedding_model text,
+                sem_adapters text[],
+                since timestamptz,
+                qvec public.halfvec({SEARCH_EMBEDDING_DIMENSIONS}),
+                lim integer
+            )
+            RETURNS TABLE (adapter text, event_id text, chunk_id text, distance double precision)
+            LANGUAGE plpgsql
+            SET jit = off
+            STABLE
+            -- Reads only and sets nothing (the caller sets hnsw.* before the
+            -- walks start; workers inherit it), so a worker may run it.
+            PARALLEL SAFE
+            -- A walk reads thousands of pages cold; the cost makes the
+            -- planner hand two or more of them to workers.
+            COST 1000000
+            ROWS {SEARCH_HYBRID_MAX_CANDIDATES}
+            AS $walk$
+            DECLARE
+                relation text := CASE part
+                        {whens}
+                    END;
+            BEGIN
+                IF relation IS NULL THEN
+                    RAISE EXCEPTION 'search_hybrid_semantic_walk: no partition %', part;
+                END IF;
+                RETURN QUERY EXECUTE format(
+                    $q${SEMANTIC_ANN_BRANCH_SQL}$q$,
+                    relation,
+                    CASE part
+                        {scopes}
+                    END
+                ) USING embedding_model, sem_adapters, since, qvec, lim;
+            END;
+            $walk$;
+            """
+
+
 def _semantic_partition_branches_sql() -> str:
     """search_hybrid_semantic's per-partition routing, one IF block each.
 
@@ -2785,23 +2958,19 @@ def _semantic_partition_branches_sql() -> str:
     listed = [adapter for _, adapters in SEARCH_VECTOR_PARTITIONS for adapter in adapters]
     listed_array = "ARRAY[" + ", ".join(f"'{a}'" for a in listed) + "]::text[]"
     blocks = []
-    for table, adapters in SEARCH_VECTOR_PARTITIONS:
+    for position, (table, adapters) in enumerate(SEARCH_VECTOR_PARTITIONS, start=1):
+        scope = _semantic_partition_scope_sql(adapters)
         if adapters:
             in_scope = (
                 "sem_adapters IS NULL OR sem_adapters && ARRAY["
                 + ", ".join(f"'{a}'" for a in adapters)
                 + "]::text[]"
             )
-            scope = "CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
             whole = "since IS NULL"
         else:
             in_scope = (
                 "sem_adapters IS NULL OR EXISTS (SELECT 1 FROM unnest(sem_adapters) a"
                 f" WHERE a <> ALL ({listed_array}))"
-            )
-            scope = (
-                "CASE WHEN sem_adapters IS NULL THEN '' ELSE ' AND v.adapter = ANY ($2)' END"
-                " || CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
             )
             whole = "sem_adapters IS NULL AND since IS NULL"
         blocks.append(
@@ -2823,7 +2992,8 @@ def _semantic_partition_branches_sql() -> str:
                     IF part_exact THEN
                         exact_scans := exact_scans || format(exact_scan, $q$@{table}$q$, part_scope);
                     ELSE
-                        branches := branches || format(ann_branch, $q$@{table}$q$, part_scope);
+                        ann_branches := ann_branches || format(ann_branch, $q$@{table}$q$, part_scope);
+                        walk_parts := walk_parts || {position};
                     END IF;
                 END IF;"""
         )
@@ -3287,6 +3457,9 @@ TIMESTAMP_COLUMNS = {
     "conversation_started_at",
     # ops.uploader_heartbeats: when the current run-failure streak began.
     "failing_since",
+    # ops.source_upstream_observations: the source's own newest item (C11).
+    "upstream_newest_at",
+    "pending_since",
     # Muse workspace files: when a path stopped existing (epoch while it does).
     "deleted_at",
     # SimpleFIN: the bridge's own balance stamp, the day a transaction
@@ -4278,14 +4451,40 @@ class PostgresWarehouse:
 
     def read_only_connection(self):
         """Open a dedicated connection for untrusted read-only SQL."""
+        query_url = os.getenv("PDW_QUERY_POSTGRES_URL", "")
+        if not query_url:
+            config = self._query_login_config()
+            if config is None:
+                raise ValueError("PDW_QUERY_POSTGRES_URL or provisioned query login credentials are required for untrusted reads")
+            query_url = psycopg2.extensions.make_dsn(self._database_url, user=config[0], password=config[1])
         connection = psycopg2.connect(
-            self._database_url,
+            query_url,
             options="-c default_transaction_read_only=on -c statement_timeout=30000",
         )
         connection.autocommit = True
-        with connection.cursor() as cursor:
-            cursor.execute(self._search_path_sql())
-            cursor.execute(f"SET ROLE {_identifier(self._query_role)}")
+        try:
+            with connection.cursor() as cursor:
+                # This local admin helper is not an agent tool. It still must
+                # authenticate as an unprivileged session before SET ROLE;
+                # transaction read-only does not contain a superuser login.
+                cursor.execute("""SELECT session_user <> %s
+                  AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname=%s)
+                  AND pg_has_role(session_user,%s,'MEMBER')
+                  AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE
+                    ((r.rolname=session_user OR r.rolname=%s) AND
+                     (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls))
+                    OR (r.rolname NOT IN (session_user,%s) AND pg_has_role(session_user,r.oid,'MEMBER')))
+                  AND NOT EXISTS (SELECT 1 FROM pg_shdepend WHERE refclassid='pg_authid'::regclass
+                    AND refobjid=(SELECT oid FROM pg_roles WHERE rolname=session_user)
+                    AND (deptype='o' OR (deptype='a' AND classid<>'pg_database'::regclass)))
+                  """, (self._query_role,) * 5)
+                if not cursor.fetchone()[0]:
+                    raise ValueError("unsafe query database login; a dedicated unprivileged login is required")
+                cursor.execute(self._search_path_sql())
+                cursor.execute(f"SET ROLE {_identifier(self._query_role)}")
+        except Exception:
+            connection.close()
+            raise
         return connection
 
     def ensure_tables(self) -> None:
@@ -4468,6 +4667,8 @@ class PostgresWarehouse:
             cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (self._query_role,))
             if cursor.fetchone() is None:
                 return True
+            if self._query_login_setup_needed():
+                return True
             cursor.execute(
                 """
                 SELECT
@@ -4576,6 +4777,61 @@ class PostgresWarehouse:
         )
         return bool(rows and rows[0][0])
 
+    def _query_login_config(self) -> tuple[str, str] | None:
+        password = os.getenv("PDW_QUERY_POSTGRES_PASSWORD", "")
+        if not password:
+            return None
+        login = _validate_identifier(os.getenv("PDW_QUERY_POSTGRES_LOGIN", "pdw_query_login"))
+        if len(login.encode()) > 63 or login == self._query_role or len(password) < 32:
+            raise ValueError("query login must be distinct, at most 63 bytes, with a password of at least 32 characters")
+        return login, password
+
+    def _query_login_setup_needed(self) -> bool:
+        config = self._query_login_config()
+        if config is None:
+            return False
+        login, password = config
+        rows = self._query("SELECT rolcanlogin,rolsuper,rolcreaterole,rolcreatedb,rolreplication,rolbypassrls,rolinherit,rolpassword FROM pg_authid WHERE rolname=%s", (login,))
+        if not rows:
+            return True
+        flags, stored = rows[0][:-1], rows[0][-1]
+        if flags != (True, False, False, False, False, False, False):
+            raise ValueError("existing query login has unsafe attributes; choose a fresh dedicated login")
+        memberships = self._query("SELECT r.rolname,m.admin_option,m.inherit_option,m.set_option FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid JOIN pg_roles u ON u.oid=m.member WHERE u.rolname=%s", (login,))
+        if any(row != (self._query_role, False, False, True) for row in memberships):
+            raise ValueError("existing query login has unexpected role memberships; choose a fresh dedicated login")
+        # Compare SCRAM stored keys without issuing ALTER ROLE on every sensor
+        # tick. Rotation writes exactly once under the existing setup lock.
+        matches = False
+        if stored and stored.startswith("SCRAM-SHA-256$"):
+            try:
+                _, iterations_salt, keys = stored.split("$")
+                iterations, salt = iterations_salt.split(":")
+                salted = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(salt), int(iterations))
+                client_key = hmac.digest(salted, b"Client Key", "sha256")
+                matches = hmac.compare_digest(base64.b64encode(hashlib.sha256(client_key).digest()).decode(), keys.split(":")[0])
+            except (ValueError, TypeError):
+                matches = False
+        return not matches or not memberships
+
+    def _ensure_query_login_locked(self) -> None:
+        config = self._query_login_config()
+        if config is None or not self._query_login_setup_needed():
+            return
+        login, password = config
+        name = _identifier(login)
+        # The outer lock is namespace-local. This extra cluster-role lock also
+        # serializes login/password changes across namespaces in this database.
+        self._raw_command("SELECT pg_advisory_xact_lock(%s)", (QUERY_ROLE_SETUP_LOCK_ID,))
+        if not self._query_login_setup_needed():
+            return
+        if not self._query("SELECT 1 FROM pg_roles WHERE rolname=%s", (login,)):
+            self._raw_command(f"CREATE ROLE {name} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT")
+        self._raw_command("SET LOCAL password_encryption = 'scram-sha-256'")
+        # Use a bound value; never put the password in logs or source text.
+        self._raw_command(f"ALTER ROLE {name} PASSWORD %s", (password,))
+        self._raw_command(f"GRANT {_identifier(self._query_role)} TO {name} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE")
+
     def _ensure_query_role_membership(self) -> None:
         # The role and its membership are cluster-wide, unlike the rest of the
         # sweep, which only touches this namespace's schemas. Take the shared
@@ -4678,6 +4934,7 @@ class PostgresWarehouse:
         ]
         if allowlist:
             self._raw_command("; ".join(allowlist))
+        self._ensure_query_login_locked()
 
     def _ensure_plaid_finance_mart_views(self) -> None:
         # marts_finance.accounts / marts_finance.transactions are ledger views
@@ -6529,6 +6786,7 @@ class PostgresWarehouse:
                 *PIPELINE_HEALTH_SNAPSHOT_TABLES,
                 "search_benchmark_history",
                 "search_request_timings",
+                "script_runs",
                 "search_request_timing_state",
                 "answer_benchmark_questions",
                 "answer_benchmark_results",
@@ -6554,7 +6812,41 @@ class PostgresWarehouse:
             logger.info(
                 "widened search_benchmark_history with %s", ", ".join(added)
             )
+        self.ensure_priority_benchmark_tables()
         self._ensure_pipeline_health_mart_views()
+        self.ensure_source_upstream_health_view_if_possible()
+
+    def ensure_source_upstream_health_view_if_possible(self) -> None:
+        """C11's detector view, once every base table it compares against exists.
+
+        It reads every detected source's base table
+        (``SOURCE_UPSTREAM_INPUT_TABLES``), provisioned by ensure paths that
+        run in any order, so it is built by the ten-minute pipeline_health
+        ensure once all of them exist; until then the collector reads the
+        detector as ``unknown``.
+        """
+        # The ChatGPT poller creates its sync table on first use; the view reads
+        # it, so make sure it exists rather than leave the detector unbuilt.
+        self.ensure_chatgpt_conversation_sync_table()
+        if not all(self._relation_exists(table) for table in SOURCE_UPSTREAM_INPUT_TABLES):
+            return
+        self._ensure_view("marts_ops_source_upstream_health", source_upstream_health_view_sql())
+
+    def ensure_priority_benchmark_tables(self) -> None:
+        """Private labels and aggregate measurements, without timeline schema DDL."""
+        tables = ("priority_benchmark_labels", "priority_benchmark_results")
+        self._ensure_table_group(tables)
+        for table in tables:
+            self._reconcile_table_columns(table)
+        self._ensure_priority_correctness_view()
+
+    def _ensure_priority_correctness_view(self) -> None:
+        from personal_data_warehouse.priority_benchmark import mart_sql
+
+        self._ensure_view(
+            "marts_timeline_priority_correctness",
+            "CREATE OR REPLACE VIEW @marts_timeline_priority_correctness AS " + mart_sql(),
+        )
 
     def _ensure_pipeline_health_mart_views(self) -> None:
         """Publish pipeline freshness with a status computed at read time.
@@ -6604,7 +6896,10 @@ class PostgresWarehouse:
                     state_table, state_rows, state_error_rows, state_attention_rows,
                     NULLIF(last_error, '') AS last_error,
                     NULLIF(last_error_at, {epoch}) AS last_error_at,
-                    NULLIF(collected_at, {epoch}) AS collected_at
+                    NULLIF(collected_at, {epoch}) AS collected_at,
+                    NULLIF(sla_detector, '') AS sla_detector,
+                    NULLIF(sla_detector_status, '') AS sla_detector_status,
+                    NULLIF(sla_exemption, '') AS sla_exemption
                 FROM @pipeline_health
             ),
             judged AS (
@@ -6720,7 +7015,19 @@ class PostgresWarehouse:
                 last_error_at,
                 collected_at,
                 (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds,
-                note
+                note,
+                -- C11, appended so CREATE OR REPLACE keeps the old columns.
+                sla_detector,
+                -- A detector status older than the snapshot guard is a claim
+                -- about the collector, exactly like status above.
+                CASE
+                    WHEN sla_detector IS NULL THEN NULL
+                    WHEN collected_at IS NULL
+                      OR now() - collected_at > make_interval(
+                            secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
+                    ELSE sla_detector_status
+                END AS sla_detector_status,
+                sla_exemption
             FROM classified
             """,
         )
@@ -7364,6 +7671,28 @@ class PostgresWarehouse:
             """,
         )
 
+        self._ensure_view(
+            "marts_script_runs",
+            """
+            CREATE OR REPLACE VIEW @marts_script_runs AS
+            SELECT date_trunc('day', occurred_at) AS day, client, surface,
+                   count(*) AS runs,
+                   count(*) FILTER (WHERE outcome = 'ok') AS successful_runs,
+                   count(*) FILTER (WHERE outcome <> 'ok') AS failed_runs,
+                   sum(jsonb_array_length(coalesce(nullif(operations_json,''),'[]')::jsonb)) AS inner_operations,
+                   sum((SELECT count(*) FROM jsonb_array_elements(coalesce(nullif(operations_json,''),'[]')::jsonb) o WHERE o->>'method'='search')) AS search_operations,
+                   sum((SELECT count(*) FROM jsonb_array_elements(coalesce(nullif(operations_json,''),'[]')::jsonb) o WHERE o->>'method'='context')) AS context_operations,
+                   sum((SELECT count(*) FROM jsonb_array_elements(coalesce(nullif(operations_json,''),'[]')::jsonb) o WHERE o->>'method'='sql')) AS sql_operations,
+                   sum(inner_errors) AS inner_errors,
+                   sum(bytes_returned) AS bytes_returned,
+                   sum(truncated) AS truncated_runs,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) AS duration_p50_ms,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY duration_ms) AS duration_p90_ms,
+                   max(occurred_at) AS newest_run_at, outcome
+            FROM @script_runs GROUP BY 1, 2, 3, outcome
+            """,
+        )
+
         # C6: read-time windows over recorded real traffic. The timestamp index
         # bounds the shared scan to seven days. Errors remain latency samples;
         # synthetic probes never get to improve (or worsen) the traffic grade.
@@ -7781,6 +8110,17 @@ class PostgresWarehouse:
             if spec.table == "timeline_events" and spec.requires_pg_textsearch
         ]
 
+    def _pg_buffercache_view(self) -> str:
+        """The qualified pg_buffercache view the residency gauges read."""
+        extension = self._query(
+            "SELECT n.nspname FROM pg_extension e "
+            "JOIN pg_namespace n ON n.oid = e.extnamespace "
+            "WHERE e.extname = 'pg_buffercache'"
+        )
+        if not extension:
+            raise RuntimeError("pg_buffercache extension is not installed")
+        return f'{_identifier(str(extension[0][0]))}."pg_buffercache"'
+
     def measure_search_cache_residency(self) -> dict[str, int | float]:
         """Measure shared-buffer residency for the search working-set indexes.
 
@@ -7791,14 +8131,7 @@ class PostgresWarehouse:
         actually warm rather than leaving the cause in an SSH transcript.
         """
 
-        extension = self._query(
-            "SELECT n.nspname FROM pg_extension e "
-            "JOIN pg_namespace n ON n.oid = e.extnamespace "
-            "WHERE e.extname = 'pg_buffercache'"
-        )
-        if not extension:
-            raise RuntimeError("pg_buffercache extension is not installed")
-        buffer_view = f'{_identifier(str(extension[0][0]))}."pg_buffercache"'
+        buffer_view = self._pg_buffercache_view()
 
         timeline_schema = self._object_schema("timeline_events")
         embeddings_schema = self._object_schema("search_chunk_vectors")
@@ -7842,6 +8175,66 @@ class PostgresWarehouse:
             "resident_bytes": resident,
             "resident_fraction": (resident / total if total else 0.0),
         }
+
+    def measure_timeline_heap_residency(self) -> dict[str, int | float]:
+        """Shared-buffer residency of the timeline heap the lexical pool visits.
+
+        Each pooled BM25 hit is a heap visit, and on 2026-11-11 those were 86%
+        of a cold scoped lexical leg's reads, so index residency alone cannot
+        explain a slow keyword search. The attention-tier rows the warm loads
+        are ~14% of the heap's pages; this reads the whole heap's fraction.
+        """
+        buffer_view = self._pg_buffercache_view()
+        rows = self._query(
+            f"""
+            SELECT pg_relation_size(c.oid)::bigint,
+                   (SELECT count(*) FROM {buffer_view} b
+                     WHERE b.relfilenode = pg_relation_filenode(c.oid)
+                       AND b.relforknumber = 0
+                       AND b.reldatabase = (SELECT oid FROM pg_database
+                                            WHERE datname = current_database()))::bigint
+                       * current_setting('block_size')::bigint
+            FROM pg_class c WHERE c.oid = %s::regclass
+            """,
+            (self.sql_relation("timeline_events"),),
+        )
+        total, resident = (int(value or 0) for value in rows[0])
+        resident = min(resident, total)
+        return {
+            "total_bytes": total,
+            "resident_bytes": resident,
+            "resident_fraction": (resident / total if total else 0.0),
+        }
+
+    def _attention_heap_warm_sql(self) -> str:
+        return self._expand_relations(
+            "SELECT count(t.event_id) FROM @timeline_events t "
+            f"WHERE t.priority IN ({SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})"
+        )
+
+    def warm_attention_heap(self) -> dict[str, int | bool | None]:
+        """Read the attention-tier timeline heap into the cache, prefetched.
+
+        Reading a column forces every heap page to be visited; the planner
+        settings force the prefetching bitmap scan. A statement timeout is a
+        partial warm, not a failure: the pages already read stay cached.
+        """
+        with self._connection.cursor() as cursor:
+            cursor.execute("BEGIN")
+            try:
+                for name, value in ATTENTION_HEAP_WARM_SETTINGS:
+                    cursor.execute(f"SET LOCAL {name} = '{value}'")
+                cursor.execute(self._attention_heap_warm_sql())
+                rows = int(cursor.fetchone()[0] or 0)
+            except psycopg2.errors.QueryCanceled:
+                cursor.execute("ROLLBACK")
+                # A partial warm: the pages it read stay cached.
+                return {"heap_rows": None, "timed_out": True}
+            except Exception:
+                cursor.execute("ROLLBACK")
+                raise
+            cursor.execute("COMMIT")
+        return {"heap_rows": rows, "timed_out": False}
 
     def probe_bm25_indexes(self) -> dict[str, str]:
         """Scan rows through every BM25 index in the warehouse; return errors by name.
@@ -8088,6 +8481,7 @@ class PostgresWarehouse:
             "bm25_indexes",
             "bm25_index_bloat",
             "cache_residency",
+            "timeline_heap_residency",
         }:
             raise ValueError(f"unknown search health component: {component}")
         now = datetime.now(tz=UTC)
@@ -9239,6 +9633,10 @@ class PostgresWarehouse:
             "upstream_mutation_events",
             "upstream_mutation_request_events",
             "push_devices",
+            "mutation_policies",
+            "mutation_policy_grants",
+            "mutation_policy_evaluations",
+            "mutation_policy_settings",
         ):
             self._apply_catalog_grant(logical)
         self.ensure_app_access_token_tables()
@@ -9273,10 +9671,16 @@ class PostgresWarehouse:
                 updated_at timestamptz NOT NULL DEFAULT now()
             )
             """,
+            "ALTER TABLE @app_access_tokens ADD COLUMN IF NOT EXISTS request_count bigint NOT NULL DEFAULT 0",
             "CREATE INDEX IF NOT EXISTS app_access_tokens_updated_idx ON @app_access_tokens (updated_at)",
         ):
             self._command(sql)
         self._apply_catalog_grant("app_access_tokens")
+        self.ensure_external_feed_tables()
+
+    def ensure_external_feed_tables(self) -> None:
+        self._ensure_table_group(["external_feed_items"])
+        self._command("CREATE SEQUENCE IF NOT EXISTS @external_feed_seq")
 
     def _ensure_upstream_mutation_tables_ddl(self) -> None:
         self._command(
@@ -9373,6 +9777,15 @@ class PostgresWarehouse:
             "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS replaces_request_id text NOT NULL DEFAULT ''",
             "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_by text NOT NULL DEFAULT ''",
             "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            # The authenticated token behind a proposal (the Go app writes it;
+            # requested_by is only the caller-chosen client name).
+            "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS requested_by_token_id text NOT NULL DEFAULT ''",
+            # Approve now, run later (app/internal/mutations/schedule.go).
+            "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS not_before timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS not_after timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            "ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS not_before timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            "ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS not_after timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            "ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS precondition_json jsonb NOT NULL DEFAULT '{}'::jsonb",
             "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutation_requests_idempotency_idx ON @upstream_mutation_requests (idempotency_key) WHERE idempotency_key != ''",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_status_updated_idx ON @upstream_mutation_requests (status, updated_at)",
             "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutations_idempotency_idx ON @upstream_mutations (idempotency_key) WHERE idempotency_key != ''",
@@ -9380,6 +9793,69 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS upstream_mutations_status_updated_idx ON @upstream_mutations (status, updated_at)",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_request_events_request_idx ON @upstream_mutation_request_events (request_id, event_index)",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON @upstream_mutation_events (mutation_id, event_index)",
+            # Mutation policies (app/internal/mutations/policy_store.go owns
+            # every read and write; this is the twin of its DDL so a fresh
+            # warehouse matches the catalog). See docs/agents/mutations-and-app.md.
+            """
+            CREATE TABLE IF NOT EXISTS @mutation_policies (
+                id text NOT NULL,
+                version bigint NOT NULL,
+                operation text NOT NULL DEFAULT '',
+                account text NOT NULL DEFAULT '',
+                match_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                deny_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                limits_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                mode text NOT NULL DEFAULT 'off',
+                valid_from timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                valid_until timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                created_by text NOT NULL DEFAULT '',
+                approved_by text NOT NULL DEFAULT '',
+                change_request_id text NOT NULL DEFAULT '',
+                note text NOT NULL DEFAULT '',
+                created_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (id, version)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS mutation_policies_operation_idx ON @mutation_policies (operation, id, version)",
+            """
+            CREATE TABLE IF NOT EXISTS @mutation_policy_grants (
+                id text PRIMARY KEY,
+                policy_id text NOT NULL,
+                token_id text NOT NULL,
+                label text NOT NULL DEFAULT '',
+                expires_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                revoked_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                revoked_by text NOT NULL DEFAULT '',
+                created_by text NOT NULL DEFAULT '',
+                change_request_id text NOT NULL DEFAULT '',
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS mutation_policy_grants_policy_idx ON @mutation_policy_grants (policy_id, token_id)",
+            """
+            CREATE TABLE IF NOT EXISTS @mutation_policy_evaluations (
+                request_id text NOT NULL,
+                phase text NOT NULL DEFAULT 'propose',
+                policy_id text NOT NULL DEFAULT '',
+                policy_version bigint NOT NULL DEFAULT 0,
+                token_id text NOT NULL DEFAULT '',
+                decision text NOT NULL DEFAULT '',
+                reasons_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+                inputs_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                evaluated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS mutation_policy_evaluations_policy_idx ON @mutation_policy_evaluations (policy_id, evaluated_at)",
+            "CREATE INDEX IF NOT EXISTS mutation_policy_evaluations_request_idx ON @mutation_policy_evaluations (request_id, evaluated_at)",
+            """
+            CREATE TABLE IF NOT EXISTS @mutation_policy_settings (
+                key text PRIMARY KEY,
+                value jsonb NOT NULL DEFAULT 'null'::jsonb,
+                updated_by text NOT NULL DEFAULT '',
+                updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
             # Devices registered by the PDW iOS app for push notifications. The
             # Go app owns the writes (POST /api/push/register) and the sends; the
             # idempotent twin of this DDL lives in app/internal/push/store.go.
@@ -9456,39 +9932,100 @@ class PostgresWarehouse:
             exclude_providers=exclude_providers,
         )
         now = datetime.now(tz=UTC)
-        rows = self._query_dicts(
-            f"""
-            WITH candidates AS (
-                SELECT id
+        # One transaction: pick the rows, re-check every policy-approved one
+        # with the policy, grant and kill-switch rows locked FOR SHARE, and
+        # claim the rest. A switch-off or revoke committed before this point
+        # sends the request back to review; one committed after it waits on
+        # these locks and does not stop the write already claimed.
+        sent_back: dict[str, str] = {}
+        self._command("BEGIN")
+        try:
+            # A step whose not_after passed before it ran is not run late.
+            expired = self._query_dicts(
+                f"""
+                UPDATE @upstream_mutations
+                   SET status = 'failed_terminal', updated_at = %s,
+                       error = 'the approval expired at ' || to_char(not_after AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC before this ran; propose it again if it is still wanted'
+                 WHERE status = ANY(%s)
+                   {provider_filter}
+                   AND not_after > '1970-01-01 00:00:00+00'::timestamptz AND not_after < %s
+                RETURNING id, request_id, error
+                """,
+                (now, list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), *provider_params, now),
+            )
+            candidates = self._query_dicts(
+                f"""
+                SELECT id, request_id, approved_by, operation, payload_json
                 FROM @upstream_mutations
                 WHERE status = ANY(%s)
                   {provider_filter}
+                  -- Approved now, run later: not before its time.
+                  AND not_before <= %s
                 -- Mutations of one request share approved_at and created_at;
                 -- request_index keeps them in the order they were proposed
                 -- (a label is created before the filter that uses it).
                 ORDER BY approved_at ASC, created_at ASC, request_id ASC, request_index ASC, id ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
+                """,
+                (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), *provider_params, now, int(limit)),
             )
-            UPDATE @upstream_mutations AS mutation
-               SET status = 'executing',
-                   claimed_by = %s,
-                   claimed_at = %s,
-                   updated_at = %s,
-                   attempt_count = attempt_count + 1
-              FROM candidates
-             WHERE mutation.id = candidates.id
-            RETURNING mutation.*
-            """,
-            (
-                list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES),
-                *provider_params,
-                int(limit),
-                claimed_by,
-                now,
-                now,
-            ),
-        )
+            # The same locks every policy writer takes (kill switch, then each
+            # policy id, sorted), held to commit: a switch-off, a revoke or a
+            # new version either commits before this claim reads it, or waits
+            # for the claim to finish.
+            policy_ids = [
+                parsed[0] for candidate in candidates if (parsed := parse_policy_actor(str(candidate.get("approved_by") or "")))
+            ]
+            if policy_ids:
+                lock_policy_state(self._query_dicts, policy_ids)
+            rows: list[dict[str, Any]] = []
+            for candidate in candidates:
+                request_id = str(candidate.get("request_id") or "")
+                if request_id in sent_back:
+                    continue
+                reason = policy_recheck_failure(
+                    self._query_dicts, candidate, now=now, relation_exists=self._relation_exists
+                )
+                if reason:
+                    sent_back[request_id] = reason
+                    continue
+                # Claimed one by one, so the next candidate's limits count this
+                # one: two queued changes under a one-per-hour policy never
+                # both run in one pass.
+                rows.extend(
+                    self._query_dicts(
+                        """
+                        UPDATE @upstream_mutations AS mutation
+                           SET status = 'executing',
+                               claimed_by = %s,
+                               claimed_at = %s,
+                               updated_at = %s,
+                               attempt_count = attempt_count + 1
+                         WHERE mutation.id = %s
+                        RETURNING mutation.*
+                        """,
+                        (claimed_by, now, now, str(candidate["id"])),
+                    )
+                )
+            if sent_back:
+                self._send_policy_requests_back_to_review(sent_back, now=now)
+            self._command("COMMIT")
+        except BaseException:
+            self._command("ROLLBACK")
+            raise
+        for request_id in sorted(sent_back):
+            self._refresh_upstream_mutation_request_status(request_id)
+        for row in expired:
+            self._append_upstream_mutation_event(
+                str(row["id"]),
+                event_type="failed",
+                actor_type="dagster",
+                actor_id=claimed_by,
+                event_json={"status": "failed_terminal", "error": str(row["error"])},
+            )
+        for request_id in sorted({str(row["request_id"]) for row in expired if row.get("request_id")}):
+            self._refresh_upstream_mutation_request_status(request_id)
         # UPDATE ... RETURNING comes back in heap order, not the CTE's.
         rows.sort(
             key=lambda row: (
@@ -9773,6 +10310,37 @@ class PostgresWarehouse:
             self._refresh_upstream_mutation_request_status(request_id)
         return len(rows)
 
+    def skip_upstream_mutation_for_precondition(self, mutation_id: str, *, reason: str, actor_id: str) -> None:
+        """End a scheduled step whose precondition failed: never a write. The
+        request gets a precondition_skipped event, which the app reports."""
+        now = datetime.now(tz=UTC)
+        self._command(
+            "UPDATE @upstream_mutations SET status = 'skipped_precondition', error = %s, updated_at = %s, executed_at = %s WHERE id = %s",
+            (reason, now, now, mutation_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="skipped_precondition",
+            actor_type="dagster",
+            actor_id=actor_id,
+            event_json={"reason": reason},
+        )
+        mutation = self.get_upstream_mutation(mutation_id)
+        request_id = str((mutation or {}).get("request_id") or "")
+        if request_id:
+            self._command(
+                """
+                INSERT INTO @upstream_mutation_request_events (
+                    request_id, event_index, event_type, actor_type, actor_id, event_json, created_at
+                )
+                SELECT %s, COALESCE(max(event_index) + 1, 0), 'precondition_skipped', 'dagster', %s, %s, %s
+                FROM @upstream_mutation_request_events
+                WHERE request_id = %s
+                """,
+                (request_id, actor_id, _jsonb_param({"mutation_id": mutation_id, "reason": reason}), now, request_id),
+            )
+            self._refresh_upstream_mutation_request_status(request_id)
+
     def fail_upstream_mutation(
         self,
         mutation_id: str,
@@ -9820,12 +10388,18 @@ class PostgresWarehouse:
             providers=providers,
             exclude_providers=exclude_providers,
         )
+        # Only rows the worker can act on now: due (not_before reached) or
+        # past their deadline (the claim fails those). A step approved days
+        # ahead is not work yet; counting it made the sensor start an empty
+        # run every 10 seconds until its time.
         rows = self._query(
             f"""
             SELECT count(*)::bigint
             FROM @upstream_mutations
             WHERE status = ANY(%s)
               {provider_filter}
+              AND (not_before <= now()
+                   OR (not_after > '1970-01-01 00:00:00+00'::timestamptz AND not_after < now()))
             """,
             (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), *provider_params),
         )
@@ -10405,30 +10979,7 @@ class PostgresWarehouse:
         if not mutations:
             return
         statuses = [str(mutation["status"]) for mutation in mutations]
-        # A withdrawn row is the agent's retraction, a rejected one the
-        # reviewer's decision; neither is live work, and a request whose every
-        # row was withdrawn is withdrawn, not denied.
-        active_statuses = [status for status in statuses if status not in {"rejected", "withdrawn"}]
-        if not active_statuses:
-            status = "withdrawn" if all(status == "withdrawn" for status in statuses) else "rejected"
-        elif any(status == "pending_review" for status in active_statuses):
-            status = "pending_review"
-        elif any(status == "executing" for status in active_statuses):
-            status = "executing"
-        elif any(status == "approved" for status in active_statuses):
-            status = "approved"
-        elif any(status == "failed_retryable" for status in active_statuses):
-            status = "failed_retryable"
-        elif any(status == "blocked_missing_credentials" for status in active_statuses):
-            status = "blocked_missing_credentials"
-        elif any(status == "failed_terminal" for status in active_statuses):
-            status = "failed_terminal"
-        elif all(status == "observed" for status in active_statuses):
-            status = "observed"
-        elif all(status in {"succeeded", "observed"} for status in active_statuses):
-            status = "succeeded"
-        else:
-            status = request[0]["status"]
+        status = derive_request_status(statuses, str(request[0]["status"]))
 
         now = datetime.now(tz=UTC)
         executed_at = max((mutation["executed_at"] for mutation in mutations), default=request[0]["executed_at"])
@@ -10509,6 +11060,51 @@ class PostgresWarehouse:
             else:
                 return False
         return True
+
+    def _send_policy_requests_back_to_review(self, reasons: dict[str, str], *, now: datetime) -> None:
+        """Return policy-approved requests to Zach's review (inside the claim
+        transaction): every still-approved mutation goes back to
+        pending_review, approved_by is cleared, and the reason is the request's
+        error and a policy_recheck_failed event, which the app reports."""
+        for request_id, reason in reasons.items():
+            moved = self._query_dicts(
+                """
+                UPDATE @upstream_mutations
+                   SET status = 'pending_review', approved_by = '', approved_at = '1970-01-01 00:00:00+00'::timestamptz,
+                       updated_at = %s
+                 WHERE request_id = %s AND status IN ('approved', 'failed_retryable')
+                RETURNING id, approved_by
+                """,
+                (now, request_id),
+            )
+            self._command(
+                """
+                UPDATE @upstream_mutation_requests
+                   SET status = 'pending_review', approved_by = '', approved_at = '1970-01-01 00:00:00+00'::timestamptz,
+                       error = %s, updated_at = %s
+                 WHERE id = %s
+                """,
+                (reason, now, request_id),
+            )
+            for row in moved:
+                self._append_upstream_mutation_event(
+                    str(row["id"]),
+                    event_type="policy_recheck_failed",
+                    actor_type="policy",
+                    actor_id="pdw-policy-engine",
+                    event_json={"reason": reason},
+                )
+            self._command(
+                """
+                INSERT INTO @upstream_mutation_request_events (
+                    request_id, event_index, event_type, actor_type, actor_id, event_json, created_at
+                )
+                SELECT %s, COALESCE(max(event_index) + 1, 0), 'policy_recheck_failed', 'policy', 'pdw-policy-engine', %s, %s
+                FROM @upstream_mutation_request_events
+                WHERE request_id = %s
+                """,
+                (request_id, _jsonb_param({"reason": reason, "mutation_ids": [str(row["id"]) for row in moved]}), now, request_id),
+            )
 
     def _append_upstream_mutation_event(
         self,
@@ -14194,6 +14790,65 @@ class PostgresWarehouse:
             ALICE_VOICE_RECORDINGS_SYNC_STATE_COLUMNS,
         )
 
+    def record_run_heartbeat(
+        self,
+        *,
+        pipeline: str,
+        device: str,
+        ran_at: datetime,
+        ok: bool,
+        error: str,
+        duration_seconds: float,
+    ) -> None:
+        """One run of an in-warehouse pass, in ops.uploader_heartbeats.
+
+        For a pass whose output depends on how Zach uses a source (continuity
+        writes only when two recordings sit back to back), data age cannot say
+        whether it works; its run can. Same row shape and failure-streak rules
+        as the app's /ingest/heartbeat (app/internal/server/heartbeat_ingest.go),
+        so marts_ops.pipeline_health reads it like any uploader's heartbeat.
+        """
+        self._ensure_table_group(["uploader_heartbeats"])
+        exit_code = 0 if ok else 1
+        self._command(
+            """
+            INSERT INTO @uploader_heartbeats AS hb
+                (pipeline, device, ran_at, status, error, exit_code, duration_seconds,
+                 consecutive_failures, failing_since, updated_at, sync_version)
+            VALUES (%(pipeline)s, %(device)s, %(ran_at)s, %(status)s, %(error)s, %(exit_code)s,
+                    %(duration)s,
+                    CASE WHEN %(exit_code)s <> 0 THEN 1 ELSE 0 END,
+                    CASE WHEN %(exit_code)s <> 0 THEN %(ran_at)s::timestamptz
+                         ELSE TIMESTAMPTZ '1970-01-01 00:00:00+00' END,
+                    now(), %(sync_version)s)
+            ON CONFLICT (pipeline, device) DO UPDATE SET
+                ran_at = EXCLUDED.ran_at,
+                status = EXCLUDED.status,
+                error = EXCLUDED.error,
+                exit_code = EXCLUDED.exit_code,
+                duration_seconds = EXCLUDED.duration_seconds,
+                consecutive_failures = CASE WHEN EXCLUDED.exit_code <> 0 THEN hb.consecutive_failures + 1 ELSE 0 END,
+                failing_since = CASE
+                    WHEN EXCLUDED.exit_code = 0 THEN TIMESTAMPTZ '1970-01-01 00:00:00+00'
+                    WHEN hb.consecutive_failures = 0 THEN EXCLUDED.ran_at
+                    ELSE hb.failing_since
+                END,
+                updated_at = now(),
+                sync_version = EXCLUDED.sync_version
+            WHERE hb.sync_version <= EXCLUDED.sync_version
+            """,
+            {
+                "pipeline": pipeline,
+                "device": device,
+                "ran_at": ran_at,
+                "status": "ok" if ok else "error",
+                "error": error,
+                "exit_code": exit_code,
+                "duration": int(round(duration_seconds)),
+                "sync_version": int(ran_at.timestamp() * 1_000_000),
+            },
+        )
+
     def insert_voice_memo_files(self, rows: list[dict[str, Any]]) -> None:
         self.insert_apple_voice_memos_files(rows)
 
@@ -14588,6 +15243,85 @@ class PostgresWarehouse:
                 payloads[str(message_id)] = parsed
         return payloads
 
+    _source_upstream_observations_ensured: bool = False
+
+    def record_source_upstream_observation(
+        self,
+        *,
+        pipeline: str,
+        scope: str,
+        upstream_newest_at: datetime | None,
+        upstream_newest_id: str = "",
+        detail: str = "",
+        observed_at: datetime | None = None,
+    ) -> None:
+        """Store what a source itself says is its newest item (C11).
+
+        Written by the collector that just asked the provider, BEFORE it writes
+        what it fetched, so ``marts_ops.source_upstream_health`` can tell "the
+        provider has something PDW does not" from "the pipeline ran". A source
+        with nothing at all reports ``upstream_newest_at=None`` (stored as the
+        epoch), which is still a fresh observation. Idempotent per
+        (pipeline, scope); an older observation never overwrites a newer one.
+        """
+        observed = observed_at or datetime.now(tz=UTC)
+        if not self._source_upstream_observations_ensured:
+            self._ensure_table_group(["source_upstream_observations"])
+            self._source_upstream_observations_ensured = True
+        # Names its columns, like the app's upsert: pending_since belongs to
+        # the collector (advance_source_upstream_pending) and a fresh look
+        # must never reset it.
+        self._command(
+            """
+            INSERT INTO @source_upstream_observations AS o
+                (pipeline, scope, upstream_newest_at, upstream_newest_id, detail,
+                 observed_at, updated_at, sync_version)
+            VALUES (%s, %s, %s, %s, %s, %s, now(), %s)
+            ON CONFLICT (pipeline, scope) DO UPDATE SET
+                upstream_newest_at = EXCLUDED.upstream_newest_at,
+                upstream_newest_id = EXCLUDED.upstream_newest_id,
+                detail = EXCLUDED.detail,
+                observed_at = EXCLUDED.observed_at,
+                updated_at = now(),
+                sync_version = EXCLUDED.sync_version
+            WHERE o.sync_version <= EXCLUDED.sync_version
+            """,
+            (
+                pipeline,
+                scope,
+                upstream_newest_at or EPOCH_UTC,
+                upstream_newest_id,
+                detail[:500],
+                observed,
+                int(observed.timestamp() * 1_000_000),
+            ),
+        )
+
+    def advance_source_upstream_pending(self) -> None:
+        """Carry each source's oldest unlanded item until PDW passes it (C11).
+
+        Run by the pipeline_health collector every ten minutes. A row whose
+        newest item has landed clears; one whose pending item PDW has passed
+        (or that had none) starts a new pending period at the current newest
+        item; otherwise the pending item stays, so a stall keeps ageing while
+        a busy source names a fresher newest item on every look.
+        """
+        epoch = "'1970-01-01 00:00:00+00'::timestamptz"
+        self._command(
+            f"""
+            UPDATE @source_upstream_observations AS o SET pending_since = CASE
+                WHEN h.landed = 1 THEN {epoch}
+                WHEN o.pending_since = {epoch}
+                  OR COALESCE(h.pdw_newest_at >= o.pending_since
+                        - make_interval(secs => {landed_slack_seconds_sql("o.pipeline")}), false)
+                    THEN o.upstream_newest_at
+                ELSE o.pending_since
+            END
+            FROM @marts_ops_source_upstream_health AS h
+            WHERE h.pipeline = o.pipeline AND h.scope = o.scope
+            """
+        )
+
     def insert_sync_state(
         self,
         *,
@@ -14789,10 +15523,14 @@ class PostgresWarehouse:
         if zero_messages_only:
             where.append("COALESCE(m.message_count, 0) = 0")
         if skip_known_errors:
-            # 'gone' is terminal (deleted/archived/left channel) so retrying is a
-            # guaranteed identical failure; a transient 'error' stays in the
-            # candidate set so it can heal to 'ok' on the next attempt.
-            where.append("COALESCE(s.status, '') != 'gone'")
+            # 'gone' (deleted/archived/left channel) is terminal only while the
+            # conversation stays archived: the failure marked it so, and only a
+            # conversations.list that names it live can undo that. A live row
+            # with a gone verdict is one Slack listed again, so it is retried --
+            # eleven public channels sat 'gone' from May to October while
+            # discovery re-listed them, ten of them readable all along
+            # (2026-11-11). A transient 'error' always stays in the candidate set.
+            where.append("(COALESCE(s.status, '') != 'gone' OR c.is_archived = 0)")
         limit_clause = "LIMIT %s" if limit is not None else ""
         if limit is not None:
             params.append(int(limit))
@@ -14924,7 +15662,9 @@ class PostgresWarehouse:
                   AND c.team_id = %s
                   AND c.conversation_type = 'public_channel'
                   AND c.is_archived = 0
-                  AND COALESCE(s.status, '') <> 'gone'
+                  -- No 'gone' filter: a gone-code failure archives the row, so
+                  -- a live row with a gone verdict is one discovery re-listed,
+                  -- and the verdict is stale (load_slack_conversation_payloads).
                   AND {activity_predicate}
                 ORDER BY s.updated_at ASC NULLS FIRST, c.conversation_id
                 LIMIT %s
@@ -14955,17 +15695,21 @@ class PostgresWarehouse:
         Without this a quiet channel is re-polled every run and the rest of the
         workspace is never reached. The existing cursor, sync type and status are
         preserved on conflict: this says when we last looked, not what we know.
+        The one exception is a 'gone' verdict, which a poll that answered has
+        just disproved, so it becomes 'ok' and its error is cleared.
         """
         self._command(
             """
-            INSERT INTO @slack_sync_state (
+            INSERT INTO @slack_sync_state AS s (
                 account, team_id, object_type, object_id,
                 cursor_ts, last_sync_type, status, error, updated_at, sync_version
             )
             VALUES (%s, %s, 'conversation', %s, '', 'sweep', 'ok', '', %s, %s)
             ON CONFLICT (account, team_id, object_type, object_id) DO UPDATE
                SET updated_at = EXCLUDED.updated_at,
-                   sync_version = EXCLUDED.sync_version
+                   sync_version = EXCLUDED.sync_version,
+                   status = CASE WHEN s.status = 'gone' THEN 'ok' ELSE s.status END,
+                   error = CASE WHEN s.status = 'gone' THEN '' ELSE s.error END
             """,
             (account, team_id, conversation_id, _ensure_utc(updated_at), int(sync_version)),
         )
@@ -15411,7 +16155,9 @@ class PostgresWarehouse:
                 -- team_is_restricted on 2026-10-01 and removed), so every type
                 -- is judged. DMs, group DMs and private channels: the freshness
                 -- pass's coldest interval is twelve hours on the OAuth token
-                -- (SLACK_FRESHNESS_DUE_INTERVALS), so twenty-four with margin.
+                -- (SLACK_FRESHNESS_DUE_INTERVALS, and
+                -- SLACK_FRESHNESS_CHANNEL_DUE_INTERVALS for channels), so
+                -- twenty-four with margin.
                 -- Public channels: the sweep's own rotation (~2 days) with margin.
                 --
                 -- landing_p95_seconds is judged for the two DM types only, where
@@ -15551,12 +16297,14 @@ class PostgresWarehouse:
             landing_classified AS (
                 -- A scheduled wake-up: the anchor is older than the hot
                 -- window, so the conversation was not polled every pass but
-                -- due every fifteen minutes (two hours past the warm window,
+                -- due every ten minutes (two hours past the warm window,
                 -- twelve past the cool one), and the message landed inside
                 -- that interval plus a margin. A message into a hot DM is
-                -- always judged (the CASE is NULL). A brand-new conversation
-                -- has no anchor; discovery polls it at once, so it stays
-                -- judged too.
+                -- always judged (the CASE is NULL). A first message has no
+                -- anchor -- in a brand-new conversation, which discovery polls
+                -- at once, or in one never written in, which the freshness
+                -- pass polls once conversations.list moves its `updated` --
+                -- so it stays judged too.
                 SELECT
                     a.account,
                     a.team_id,
@@ -16743,6 +17491,8 @@ class PostgresWarehouse:
                 str(SEARCH_VECTOR_EXACT_SLICE_ROWS),
                 str(SEARCH_VECTOR_EXACT_SCAN_WORKERS),
                 repr(SEARCH_VECTOR_PARTITIONS),
+                _semantic_partition_branches_sql(),
+                _semantic_walk_function_sql(),
                 hybrid_state,
             ]
         )
@@ -16953,6 +17703,9 @@ class PostgresWarehouse:
             )
             if rows:
                 blocks += int(rows[0][0] or 0)
+        # Last: the heap rows the lexical pool visits (86% of a cold scoped
+        # leg's reads on 2026-11-11), which no index warm reaches.
+        heap = self.warm_attention_heap()
         self._command(
             "UPDATE @search_schema_state SET prewarmed_signature = %s, "
             "prewarmed_postmaster_started_at = %s, "
@@ -16964,6 +17717,8 @@ class PostgresWarehouse:
             "warmed": True,
             "reason": "forced" if force else "stale",
             "blocks": blocks,
+            "heap_rows": heap["heap_rows"],
+            "heap_timed_out": heap["timed_out"],
         }
 
     def _prewarm_search_indexes_best_effort(self, *, schema_signature: str) -> None:
@@ -17141,26 +17896,31 @@ class PostgresWarehouse:
 
         def two_partition_pool(
             high_index: str, low_index: str, high_part: int, low_part: int, extra_where: str = ""
-        ) -> str:
-            return (
-                pool_partition(
-                    f"t.adapter NOT IN ({low_volume_list})",
-                    high_index,
-                    SEARCH_TEXT_BROAD_POOL,
+        ) -> list[tuple[int, str]]:
+            return [
+                (
                     high_part,
-                    extra_where,
-                )
-                + "\n                        UNION ALL\n                        "
-                + pool_partition(
-                    f"t.adapter IN ({low_volume_list})",
-                    low_index,
-                    SEARCH_TEXT_BROAD_SMALL_POOL,
+                    pool_partition(
+                        f"t.adapter NOT IN ({low_volume_list})",
+                        high_index,
+                        SEARCH_TEXT_BROAD_POOL,
+                        high_part,
+                        extra_where,
+                    ),
+                ),
+                (
                     low_part,
-                    extra_where,
-                )
-            )
+                    pool_partition(
+                        f"t.adapter IN ({low_volume_list})",
+                        low_index,
+                        SEARCH_TEXT_BROAD_SMALL_POOL,
+                        low_part,
+                        extra_where,
+                    ),
+                ),
+            ]
 
-        broad_pool_sql = two_partition_pool(
+        broad_pool_parts = two_partition_pool(
             "timeline_events_search_text_bm25_idx",
             "timeline_events_search_text_bm25_lowvol_idx",
             SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
@@ -17238,12 +17998,91 @@ class PostgresWarehouse:
         # to_bm25query() pins an index by name and checks the plan used it.
         # The runtime `priorities` filter in pool_where still does the actual
         # selection (a call for just `self` must not return `direct`).
-        attention_pool_sql = two_partition_pool(
+        attention_pool_parts = two_partition_pool(
             "timeline_events_search_text_bm25_attention_idx",
             "timeline_events_search_text_bm25_attention_lowvol_idx",
             SEARCH_TEXT_POOL_PART_ATTENTION_HIGH_VOLUME,
             SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME,
             f" AND t.priority IN ({SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})",
+        )
+        # The pool's partitions run side by side, one per worker. Each is an
+        # index-ordered BM25 scan that fetches its heap rows one at a time,
+        # so in one backend the pool cost the SUM of its partitions (prod,
+        # 2026-11-11, cold, 'contract renewal' scoped to self/direct/cc:
+        # 13.1 s for the 5,000-row partition, then 1.65 s for the 800-row
+        # one). A LIMIT subquery is never planned on a worker and plpgsql's
+        # SELECT INTO never runs a parallel plan, so each partition is a
+        # PARALLEL SAFE function and the pool function returns their Parallel
+        # Append through RETURN QUERY EXECUTE. Rows are the partitions' rows.
+        pool_partition_whens = "\n                        ".join(
+            f"WHEN {part} THEN $part${one_shot_pool(sql)}$part$"
+            for part, sql in broad_pool_parts + attention_pool_parts
+        )
+
+        def pool_union(parts: list[tuple[int, str]]) -> str:
+            return " UNION ALL ".join(
+                f"SELECT * FROM @search_text_pool_partition($1, {part}, $2, $3)"
+                for part, _ in parts
+            )
+
+        search_text_pool_functions_sql = (
+            r"""
+            CREATE OR REPLACE FUNCTION @search_text_pool_partition(
+                query text,
+                partition_number integer,
+                priorities text[],
+                since timestamptz
+            )
+            RETURNS TABLE (adapter text, event_id text, source text, part integer, pool_rank bigint)
+            LANGUAGE plpgsql
+            SET jit = off
+            STABLE
+            -- Reads only and sets nothing (the caller pins enable_sort off
+            -- before the workers start; they inherit it), so a worker may run it.
+            PARALLEL SAFE
+            COST 10000000
+            ROWS """
+            + str(SEARCH_TEXT_BROAD_POOL)
+            + r"""
+            AS $partition$
+            DECLARE
+                partition_sql text := CASE partition_number
+                        """
+            + pool_partition_whens
+            + r"""
+                    END;
+            BEGIN
+                IF partition_sql IS NULL THEN
+                    RAISE EXCEPTION 'search_text_pool_partition: no partition %', partition_number;
+                END IF;
+                -- One-shot: the query reaches the planner as a literal.
+                RETURN QUERY EXECUTE format(partition_sql, query) USING priorities, since;
+            END;
+            $partition$;
+            CREATE OR REPLACE FUNCTION @search_text_pool(
+                query text,
+                attention boolean,
+                priorities text[],
+                since timestamptz
+            )
+            RETURNS TABLE (adapter text, event_id text, source text, part integer, pool_rank bigint)
+            LANGUAGE plpgsql
+            SET jit = off
+            VOLATILE
+            AS $pool$
+            BEGIN
+                IF attention THEN
+                    RETURN QUERY EXECUTE $q$"""
+            + pool_union(attention_pool_parts)
+            + r"""$q$ USING query, priorities, since;
+                ELSE
+                    RETURN QUERY EXECUTE $q$"""
+            + pool_union(broad_pool_parts)
+            + r"""$q$ USING query, priorities, since;
+                END IF;
+            END;
+            $pool$;
+            """
         )
         # Scoring a candidate needs the index its partition was scanned
         # through: the two partitions are two BM25 corpora with their own
@@ -17497,6 +18336,9 @@ class PostgresWarehouse:
                     '(\|[[:space:]]*|-{3,}[[:space:]]*)+(\||$)', ' ', 'g'),
                     '[[:space:]]{2,}', ' ', 'g')), '')
             $preview$;
+            """
+            + search_text_pool_functions_sql
+            + r"""
             CREATE OR REPLACE FUNCTION @search_text(
                 query text,
                 max_results integer DEFAULT 50,
@@ -17506,6 +18348,7 @@ class PostgresWarehouse:
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             -- Deliberately NOT parallel safe/restricted: this function calls
             -- set_config() below, and set_config raises "cannot set parameters
@@ -17589,30 +18432,21 @@ class PostgresWarehouse:
                     -- read the general indexes or it returns silently empty.
                     -- `priorities` is NULL-normalized to "all tiers" above, so
                     -- an unscoped call correctly fails this test.
-                    -- EXECUTE format(...), not a static statement: a cached
-                    -- plan for this scan re-scores every returned document
-                    -- (14-28s when a few are multi-megabyte); the query text
-                    -- must reach the planner as a literal. See one_shot_pool.
-                    IF priorities IS NOT NULL
-                       AND priorities <@ ARRAY[""" + SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + r"""] THEN
-                        EXECUTE format($pool$
-                        SELECT array_agg(p.adapter), array_agg(p.event_id),
-                               array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
-                          FROM (
-                            """ + one_shot_pool(attention_pool_sql) + r"""
-                          ) p$pool$, query)
-                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
-                          USING priorities, since;
-                    ELSE
-                        EXECUTE format($pool$
-                        SELECT array_agg(p.adapter), array_agg(p.event_id),
-                               array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
-                          FROM (
-                            """ + one_shot_pool(broad_pool_sql) + r"""
-                          ) p$pool$, query)
-                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
-                          USING priorities, since;
-                    END IF;
+                    -- search_text_pool runs both partitions on parallel
+                    -- workers, each as one-shot dynamic SQL: a cached plan for
+                    -- this scan re-scores every returned document (14-28s when
+                    -- a few are multi-megabyte), so the query text reaches the
+                    -- planner as a literal there. See one_shot_pool.
+                    SELECT array_agg(p.adapter), array_agg(p.event_id),
+                           array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
+                      INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
+                      FROM @search_text_pool(
+                          query,
+                          priorities IS NOT NULL
+                              AND priorities <@ ARRAY[""" + SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + r"""],
+                          priorities,
+                          since
+                      ) p;
                     PERFORM set_config('enable_sort', 'on', true);
                     RETURN QUERY
                         -- The per-source floor needs a RANK, not a score, and
@@ -17789,6 +18623,7 @@ class PostgresWarehouse:
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             -- Same reason as search_text: this body calls set_config(), which
             -- raises under IsInParallelMode() in the leader as well as in a
@@ -18335,6 +19170,7 @@ class PostgresWarehouse:
             # their wall times inside one backend. search_hybrid() below remains
             # the direct-SQL compatibility entry point and composes these same
             # helpers -- there is no second legacy ranking flow to drift.
+            self._command(_semantic_walk_function_sql())
             self._command(
                 r"""
             -- CREATE OR REPLACE with a new parameter OVERLOADS rather than
@@ -18355,6 +19191,7 @@ class PostgresWarehouse:
             )
             RETURNS TABLE (ref text, best bigint, fuse double precision, chunk_id text)
             LANGUAGE plpgsql
+            SET jit = off
             -- VOLATILE only because the router EXPLAINs the scoped slice,
             -- which Postgres refuses inside a STABLE function. It reads only.
             VOLATILE
@@ -18372,6 +19209,8 @@ class PostgresWarehouse:
                 part_exact boolean;
                 branches text[] := '{}';
                 exact_scans text[] := '{}';
+                ann_branches text[] := '{}';
+                walk_parts integer[] := '{}';
                 -- "+ 0" is the exact scan's plan barrier: the sort key no
                 -- longer matches the HNSW ordering operator, so the planner
                 -- cannot turn it back into an ANN scan. An OFFSET 0 subquery
@@ -18380,10 +19219,7 @@ class PostgresWarehouse:
                 exact_scan constant text := $q$SELECT v.adapter, v.event_id, v.chunk_id,
                         (v.embedding OPERATOR(public.<=>) $4) + 0 AS distance
                     FROM %s v WHERE v.model = $1%s$q$;
-                ann_branch constant text := $q$(SELECT v.adapter, v.event_id, v.chunk_id,
-                        v.embedding OPERATOR(public.<=>) $4 AS distance
-                    FROM %s v WHERE v.model = $1%s
-                    ORDER BY v.embedding OPERATOR(public.<=>) $4 LIMIT $5)$q$;
+                ann_branch constant text := $q$""" + SEMANTIC_ANN_BRANCH_SQL + r"""$q$;
                 qvec public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
@@ -18475,6 +19311,34 @@ class PostgresWarehouse:
                         array_to_string(exact_scans, ' UNION ALL ')
                     );
                 END IF;
+                -- Graph walks run side by side, one per worker. A walk is a
+                -- chain of synchronous random page reads, so walked one after
+                -- another in a single backend the leg cost the SUM of the
+                -- walks: production, 2026-11-11, unscoped, 6.47 s of which
+                -- 6.08 s was read wait (walks of 1.45 + 2.98 + 1.81 + 0.23 s)
+                -- on a host whose other 27 cores sat idle. Postgres will not
+                -- plan a LIMIT subquery on a worker, so each walk is a
+                -- PARALLEL SAFE function scan and the walks are the
+                -- non-partial children of one Parallel Append: the leg costs
+                -- the slowest walk. Rows are exactly the inline branches'.
+                IF coalesce(array_length(walk_parts, 1), 0) = 1 THEN
+                    branches := ann_branches || branches;
+                ELSIF coalesce(array_length(walk_parts, 1), 0) > 1 THEN
+                    IF current_setting('max_parallel_workers_per_gather')::integer
+                            < array_length(walk_parts, 1) THEN
+                        PERFORM set_config(
+                            'max_parallel_workers_per_gather',
+                            array_length(walk_parts, 1)::text, true
+                        );
+                    END IF;
+                    branches := ARRAY[format(
+                        '(SELECT w.* FROM (%s) w ORDER BY w.distance LIMIT $5)',
+                        (SELECT string_agg(
+                                    format($q$SELECT * FROM @search_hybrid_semantic_walk(%s, $1, $2, $3, $4, $5)$q$, p),
+                                    ' UNION ALL ' ORDER BY o)
+                           FROM unnest(walk_parts) WITH ORDINALITY AS u(p, o))
+                    )] || branches;
+                END IF;
                 IF coalesce(array_length(branches, 1), 0) = 0 THEN
                     RETURN;
                 END IF;
@@ -18534,6 +19398,7 @@ class PostgresWarehouse:
             )
             RETURNS TABLE (ref text, rnk bigint)
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             AS $exact$
             DECLARE
@@ -18870,6 +19735,7 @@ class PostgresWarehouse:
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             AS $fuse$
             DECLARE
@@ -18992,6 +19858,7 @@ class PostgresWarehouse:
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             AS $hybrid$
             DECLARE
@@ -20046,7 +20913,15 @@ class PostgresWarehouse:
                 -- were voice: 40 attachments, 10 recordings, 0 transcripts,
                 -- the Alice defect one source later. An attachment appears
                 -- once per note REVISION with the same sha, so it is collapsed
-                -- to one recording on the newest revision. Core Data stamps
+                -- to one recording on the newest revision: latest note
+                -- modified_at, then the revision ingested last. A recording
+                -- can grow or be replaced without the note's modified_at
+                -- moving, and revision_id is a content hash, so on a tie it
+                -- picked a revision at random: until 2026-11-11 an
+                -- attachment could serve its old bytes while the longer
+                -- revision was never transcribed. The newest bytes are a new
+                -- content_sha256, so transcription and enrichment redo them
+                -- (both are keyed on the sha). Core Data stamps
                 -- (seconds since 2001-01-01) are the recording's own creation
                 -- time; the revision's date is only the fallback.
                 SELECT DISTINCT ON (a.account, a.attachment_id)
@@ -20089,13 +20964,17 @@ class PostgresWarehouse:
                 FROM @apple_note_attachments a
                 LEFT JOIN @apple_note_revisions n
                   ON n.account = a.account AND n.note_id = a.note_id AND n.revision_id = a.revision_id
+                -- Only revisions that hold the audio: a newer 0-byte copy (an
+                -- iCloud stub, a failed export) carries the SHA-256 of empty
+                -- bytes, not an empty hash, and must never replace good audio.
                 WHERE a.is_missing = 0
+                  AND a.size_bytes > 0
                   AND a.content_sha256 <> ''
                   AND (
                       lower(a.content_type) LIKE 'audio/%'
                       OR lower(a.filename) ~ '\\.(m4a|mp3|caf|wav|aac|aiff?|opus|ogg)$'
                   )
-                ORDER BY a.account, a.attachment_id, n.modified_at DESC, a.revision_id DESC
+                ORDER BY a.account, a.attachment_id, n.modified_at DESC, a.ingested_at DESC, a.revision_id DESC
                 ) AS note_audio
             ),
             recordings AS (
@@ -20107,19 +20986,23 @@ class PostgresWarehouse:
                 -- not land twice on the timeline or be enriched twice. The
                 -- first copy ingested is the original and keeps its identity
                 -- (and the transcript and enrichment keyed to it). A row with
-                -- no hash cannot be matched and stands alone. Paid
+                -- no hash cannot be matched and stands alone, and so does a
+                -- row whose bytes are EMPTY: the SHA-256 of nothing is one
+                -- value, so until 2026-11-11 every zero-byte recording of
+                -- every source collapsed into one row (distinct memos read
+                -- as one). Paid
                 -- transcription is deduplicated by the same bytes one layer
                 -- down, in derived_enrichment.audio_transcripts.
                 SELECT DISTINCT ON (
                     CASE
-                        WHEN COALESCE(content_sha256, '') <> '' THEN content_sha256
+                        WHEN COALESCE(content_sha256, '') NOT IN ('', 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855') THEN content_sha256
                         ELSE source || '/' || account || '/' || recording_id
                     END
                 ) *
                 FROM source_recordings
                 ORDER BY
                     CASE
-                        WHEN COALESCE(content_sha256, '') <> '' THEN content_sha256
+                        WHEN COALESCE(content_sha256, '') NOT IN ('', 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855') THEN content_sha256
                         ELSE source || '/' || account || '/' || recording_id
                     END,
                     ingested_at ASC NULLS LAST,
@@ -20285,22 +21168,35 @@ class PostgresWarehouse:
         reads the session enrichment written over all its members; until that
         lands (merge_status 'pending') it falls back to the first member's
         title and summary. The transcript is always every member's, in order.
-        The previous recording is the one before it among non-deleted rows, so
-        a judgment for a pair that a deletion has since separated is ignored.
+        The previous recording is the one before it among non-deleted rows
+        WITH SPEECH, exactly as load_continuity_pair_candidates pairs them, so
+        a judgment for a pair that a deletion has since separated is ignored
+        and a silent clip between two halves of one event neither splits the
+        session nor joins it: it stays a session of one. Until 2026-11-11 the
+        silent clip counted as the previous recording, and the pair around it
+        was never even judged.
         """
         self._ensure_view(
             "marts_voice_memos_sessions",
             f"""
             CREATE OR REPLACE VIEW @marts_voice_memos_sessions AS
-            WITH ordered AS (
+            WITH spoken AS (
                 SELECT
                     r.*,
-                    LAG(r.recording_id) OVER (
-                        PARTITION BY r.source, r.account
-                        ORDER BY r.recorded_at NULLS FIRST, r.recording_id
-                    ) AS previous_recording_id
+                    (NULLIF(btrim(r.transcript), '') IS NOT NULL) AS has_speech
                 FROM @marts_voice_memos_recordings r
                 WHERE r.is_deleted = 0
+            ),
+            ordered AS (
+                SELECT
+                    s.*,
+                    CASE WHEN s.has_speech THEN
+                        LAG(s.recording_id) OVER (
+                            PARTITION BY s.source, s.account, s.has_speech
+                            ORDER BY s.recorded_at NULLS FIRST, s.recording_id
+                        )
+                    END AS previous_recording_id
+                FROM spoken s
             ),
             linked AS (
                 SELECT
@@ -20321,8 +21217,11 @@ class PostgresWarehouse:
             numbered AS (
                 SELECT
                     l.*,
+                    -- Numbered among recordings with speech, so a silent clip
+                    -- inside a session does not break the run; each silent
+                    -- clip is its own session (it never continues anything).
                     SUM(CASE WHEN l.continues_previous THEN 0 ELSE 1 END) OVER (
-                        PARTITION BY l.source, l.account
+                        PARTITION BY l.source, l.account, l.has_speech
                         ORDER BY l.recorded_at NULLS FIRST, l.recording_id
                         ROWS UNBOUNDED PRECEDING
                     ) AS session_seq
@@ -20351,7 +21250,7 @@ class PostgresWarehouse:
                     max(n.enriched_at) AS members_enriched_at,
                     count(*) FILTER (WHERE n.enriched_at IS NULL) AS members_unenriched
                 FROM numbered n
-                GROUP BY n.source, n.account, n.session_seq
+                GROUP BY n.source, n.account, n.has_speech, n.session_seq
             )
             SELECT
                 s.source,
@@ -21124,6 +22023,8 @@ def _literal(value: str) -> str:
 
 
 def _postgres_type(column: str, *, table: str | None = None) -> str:
+    if table == "script_runs" and column in {"inner_errors", "bytes_returned", "truncated"}:
+        return "bigint"
     # The timeline's priority tier is a self-describing native enum (see
     # timeline.py). The marker resolves to the timeline schema when the CREATE
     # TABLE runs through relation expansion.
@@ -21187,6 +22088,8 @@ UNMEASURED_SENTINEL_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
 
 
 def _default_sql(column: str, *, table: str | None = None) -> str:
+    if table == "script_runs" and column in {"inner_errors", "bytes_returned", "truncated"}:
+        return "0"
     if column in UNMEASURED_SENTINEL_COLUMNS_BY_TABLE.get(table or "", ()):
         return "-1"
     if table == "timeline_events" and column == "priority":
@@ -21663,6 +22566,41 @@ def _numeric_ts(expression: str) -> str:
 
 def _json_numeric(expression: str, field: str) -> str:
     return f"COALESCE(NULLIF(({expression}::jsonb ->> '{field}'), '')::numeric, 0)"
+
+
+def derive_request_status(statuses: Sequence[str], current: str) -> str:
+    """A request's status from every one of its mutations' statuses: the one
+    ladder Python and Go (app/internal/mutations/status_ladder.go) apply, held
+    equal by tests/contracts/request_status_ladder.json.
+
+    A withdrawn row is the agent's retraction, a rejected one the reviewer's
+    decision and a cancelled one a stopped step; none is live work, and a
+    request whose every row is one of those takes that status (rejected when
+    they differ). ``current`` stands for no rows or statuses the ladder does
+    not know.
+    """
+
+    if not statuses:
+        return current
+    active = [status for status in statuses if status not in {"rejected", "withdrawn", "cancelled"}]
+    if not active:
+        if all(status == "withdrawn" for status in statuses):
+            return "withdrawn"
+        if all(status == "cancelled" for status in statuses):
+            return "cancelled"
+        return "rejected"
+    for status in ("pending_review", "executing", "approved", "failed_retryable", "blocked_missing_credentials", "failed_terminal"):
+        if status in active:
+            return status
+    if all(status == "observed" for status in active):
+        return "observed"
+    if all(status in {"succeeded", "observed"} for status in active):
+        return "succeeded"
+    if all(status == "skipped_precondition" for status in active):
+        return "skipped_precondition"
+    if all(status in {"succeeded", "observed", "skipped_precondition"} for status in active):
+        return "succeeded"
+    return current
 
 
 def _upstream_mutation_provider_filter(

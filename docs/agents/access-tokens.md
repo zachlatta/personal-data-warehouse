@@ -16,7 +16,8 @@ when the token is issued.
 | credential | spelled | scope | lifetime |
 | --- | --- | --- | --- |
 | master secret | `PDW_SECRET_TOKEN` | `root`: everything, including token administration and ingest signing | until rotated in the deployment env |
-| issued token | `pdw_<id>_<secret>` | `full`: every bearer surface except token administration | dies after `idle_timeout` unused (default 30 days), optionally a hard `expires_at` |
+| issued token | `pdw_<id>_<secret>` | `full`: every bearer surface except token administration and mutation review decisions | dies after `idle_timeout` unused (default 30 days), optionally a hard `expires_at` |
+| reviewer token (the phone app) | `pdw_<id>_<secret>` | `reviewer`: what `full` reaches, plus approving, denying, editing and undoing mutation requests | as `full` |
 | CLI token from `cli_authorize` | `pdw_<id>_<secret>` | `agent`: `/api/tools` only (the CLI's entire surface) | hard expiry, default 24 h, max 7 days |
 | bootstrap code | `pdwb_<id>_<secret>` | none: redeemable once for one `agent` token | 15 minutes, single use |
 
@@ -49,6 +50,46 @@ Answers to the open questions in the original tasks:
   expiry.
 - **Single use:** the redemption marks the code row under `SELECT ... FOR UPDATE`. A
   second redemption, an expired code, or a revoked code returns 401 and issues nothing.
+
+## The upload-only key: `PDW_INGEST_SECRET`
+
+Uploads are authenticated by an HMAC over the endpoint, the body's sha256 and an expiry,
+never by a bearer. Until 2026-11 the only key was the master secret, so every uploader host
+held a credential that could also approve mutations and mint tokens. `PDW_INGEST_SECRET`
+(at least 32 characters, different from the master secret) is a second key the app accepts
+**for upload signatures only** (`auth.Service.SetIngestSecret`): as a bearer it is refused,
+so a host that holds it can upload and nothing else. Uploaders sign with it ahead of the
+master secret (`ingestclient.ResolveConfig`, `ingest_client.py`), and the master secret keeps
+verifying uploads while hosts move over. An uploader host's env file holds
+`PDW_INGEST_SECRET` and no `PDW_SECRET_TOKEN`.
+
+## Who may decide a mutation request
+
+Approve, deny, supersede, undo, cancel-by-reviewer and every edit route under
+`/api/mutations/requests/<id>/…` require a principal that `CanReview`: the master secret
+(the web app) or a `reviewer` token (the phone app). A `full` token, the kind a host CLI
+holds, gets 403 there, as do `agent` and feed tokens: an agent proposes with
+`propose_mutation` and withdraws with `withdraw_mutation`, and never decides. Reading a
+request (`GET`) stays open to `full`. Issue the phone's token with
+`pdw token create --name <phone> --scope reviewer`; never give a host a reviewer token, and never the master secret (hosts sign uploads with `PDW_INGEST_SECRET`).
+The test that holds this is `TestOnlyAReviewerPrincipalReachesAReviewRoute`
+(`app/internal/mutations/api_test.go`): add a new review route to its list.
+
+## Workflow identities and `requested_by_token_id`
+
+The `<client>` half of `Bearer <client>:<token>` is chosen by the caller, so it says
+nothing about who is calling. Every mutation request therefore stores
+`requested_by_token_id` beside `requested_by`: the issued token's id, or for an MCP
+connector its grant id (both rows of `private.app_access_tokens`); empty for the master
+secret. A mutation policy grant binds to that id, never to the name.
+
+A scheduled workflow that proposes mutations gets its own token:
+`pdw token create --name wf-<name> --scope agent --expires 2027-04-15`. An agent-scope
+token issued this way **must** carry a hard expiry, at most 183 days away
+(`MaxWorkflowTokenLifetime`), because a policy grant names that one token id for a season
+and cannot follow weekly renewals the way a `cli_authorize` token is renewed. Keep it
+readable only by the workflow (its own Unix user, mode `0600`), and design the grant so a
+stolen token is an acceptable outcome.
 
 ## Why `agent` is narrower than `full`
 
@@ -149,3 +190,73 @@ rotate:
    window authorizes again.
 4. Unset `PDW_SECRET_TOKEN_PREVIOUS` and deploy. Anything still signed only with the old
    secret stops verifying.
+
+## External feeds
+
+The web app's **External feeds** tab (`/external-feeds`) issues dedicated keys,
+shows creation, optional absolute expiry, last use and lifetime request counts,
+and revokes keys. Administration uses the same root-only `/api/auth/tokens`
+API as `pdw token`. Keys are shown once and stored only as SHA-256 hashes in
+`private.app_access_tokens`; no new credential table or upstream MCP connection
+is created. The name “External feeds” distinguishes these outgoing read interfaces
+from **Connections**, which proxies upstream MCP tools.
+
+The first scope is `feed:voice-memos`. It permits only
+`GET /api/external-feeds/voice-memos`, with
+`Authorization: Bearer <client>:<key>`. A feed key cannot query SQL, use MCP,
+read other PDW endpoints or administer keys. Other credentials cannot read the
+feed; issue a dedicated key. Feed keys have no idle expiry; an optional
+`expires_at` (RFC3339, in the future) is a hard deadline. Revocation and expiry
+are checked on every request, including conditional requests.
+
+The response is `{feed: "feed:voice-memos", recordings: [...], next_cursor: "...", has_more: false}`.
+Each recording includes `source`, `account`, `recording_id`, `content_sha256`,
+`recorded_at`, duration, title, summary, transcript, participants/action-items/evidence
+JSON text, calendar result and transcription/enrichment timestamps. Storage URLs
+and audio credentials are excluded. Identity is the source/account/recording-id
+triple; use `enriched_at` to detect revised enrichment.
+
+Start with a GET without `since`. After processing a response, persist its opaque
+`next_cursor` and pass it as `?since=<next_cursor>`. Drain pages immediately while
+`has_more` is true; otherwise poll once per second with that cursor. Each response
+has at most 200 recordings in arrival order. Keep the cursor on a 304 or error;
+only advance after processing a successful response. Retain the ETag for the
+same request URL and send `If-None-Match`; unchanged results return 304.
+
+`ops.external_feed_items` stores only the current ready version of each item.
+Refreshes read the unified mart, remove ineligible items, and allocate new arrival
+numbers from `ops.external_feed_seq` when a memo becomes ready or its payload
+changes. A transaction advisory lock covers allocation through commit, so a reader
+cannot advance past an uncommitted arrival. Late/backdated enrichments and arrivals
+between pages receive later numbers and cannot be skipped by cursor paging.
+The indexed `(feed, sync_version)` read is bounded to 201 rows (one lookahead);
+the entire refresh/read has a two-second deadline. The 48-hour window remains
+based on recording time. A consumer offline beyond that window cannot recover
+expired recordings from this endpoint.
+
+Each refresh materializes the mart query once and filters changed payloads before
+calling `nextval` or upserting. An unchanged refresh neither allocates sequence
+values nor locks/writes item tuples; only the separate per-key usage counter is
+written. The sequence's catalog-qualified name is bound as a regclass parameter,
+not placed inside a quoted relation marker.
+
+Voice enrichment must postdate its latest transcription (`enriched_at >= transcribed_at`).
+A re-transcribed memo disappears until re-enrichment finishes. Calendar matching
+is part of enrichment; unmatched outcomes qualify. Session joining does not hold
+recordings back, so a stopped-and-restarted memo may arrive as separate parts.
+There are no deletion notices or tombstones when a memo disappears or ages out.
+A memo that re-qualifies after re-transcription and re-enrichment is delivered
+again at a new cursor position. Consumers should upsert/deduplicate by the stable
+`(source, account, recording_id)` identity, rather than treating each delivery as
+a different recording.
+
+The registry in `app/internal/externalfeeds/registry.go` supplies scope, endpoint,
+display name, source query and handler. Authentication, server mounting and the
+web UI consume it; the UI discovers definitions at `GET /api/external-feeds`.
+Voice memos are the only registered feed.
+
+Usage counts every authorized GET, including 304 and failed feed reads, and stamps
+last use on each request. Per-poll writes change only unindexed `request_count`
+and `last_used_at`, allowing HOT updates rather than churning the `updated_at`
+index. Counters are exact and constant space per key; there is no per-poll log.
+If usage cannot be recorded, the feed returns 503 rather than serving an untracked request.

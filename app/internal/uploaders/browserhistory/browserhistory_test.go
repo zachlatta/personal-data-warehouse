@@ -3,6 +3,7 @@ package browserhistory
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -304,10 +305,29 @@ func TestRunUploadsEveryBrowserThenOnlyNewVisits(t *testing.T) {
 		t.Fatal("safari redirect/synced flags wrong")
 	}
 
+	// C11: every run posts the device's own newest visit, in the field the
+	// upload carries as visited_at, so a healthy source lands.
+	newest := ""
+	for _, visit := range visits {
+		if at := visit["visited_at"].(string); at > newest {
+			newest = at
+		}
+	}
+	var observation map[string]any
+	for _, call := range app.Calls() {
+		if call.Path == "/ingest/source-observation" {
+			json.Unmarshal(call.Body, &observation)
+		}
+	}
+	if observation["pipeline"] != "browser_history" || observation["scope"] != "owner@example.com/testmac" ||
+		observation["upstream_newest_at"] != newest {
+		t.Fatalf("observation = %v, newest uploaded = %s", observation, newest)
+	}
+
 	// Nothing new: nothing uploaded.
-	before := len(app.Calls())
-	if code, out, _ := runCLI(t, args, env, cfg); code != 0 || !strings.Contains(out, "visits=0") || len(app.Calls()) != before {
-		t.Fatalf("second run: code=%d out=%q calls=%d", code, out, len(app.Calls())-before)
+	before := len(uploadedRecords(app))
+	if code, out, _ := runCLI(t, args, env, cfg); code != 0 || !strings.Contains(out, "visits=0") || len(uploadedRecords(app)) != before {
+		t.Fatalf("second run: code=%d out=%q records=%d", code, out, len(uploadedRecords(app))-before)
 	}
 
 	// One new visit: only it ships.

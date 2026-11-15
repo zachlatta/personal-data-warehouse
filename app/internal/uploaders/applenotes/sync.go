@@ -2,6 +2,7 @@ package applenotes
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -54,6 +55,9 @@ type Runner struct {
 	Limit             int
 	Workers           int
 	SaveState         func() // called after every state change
+	// Observe posts the Mac's own newest note edit (contract C11); nil
+	// disables it.
+	Observe ingestclient.ObservationPoster
 
 	stateMu sync.Mutex
 }
@@ -112,6 +116,7 @@ func (r *Runner) syncNotes(notes []Note) (Summary, error) {
 	if r.Now == nil {
 		r.Now = func() time.Time { return time.Now().UTC() }
 	}
+	r.observeNewest(notes)
 	current := map[string]bool{}
 	var revisions []Revision
 	for _, note := range notes {
@@ -371,4 +376,20 @@ func HTMLDocumentForNote(note Note) string {
 		body = "<pre>" + PyHTMLEscape(note.BodyText) + "</pre>"
 	}
 	return `<!doctype html><html><head><meta charset="utf-8"><title>` + PyHTMLEscape(title) + `</title></head><body>` + body + `</body></html>`
+}
+
+// observeNewest posts the newest modification among the notes this Mac's
+// NoteStore holds, the field the warehouse stores as modified_at, before
+// anything is uploaded (contract C11). It sees only what iCloud delivered to
+// the Mac, so it measures the Mac-to-PDW leg; iCloud's own delivery is
+// outside what any device-side detector can see.
+func (r *Runner) observeNewest(notes []Note) {
+	var newest Note
+	for _, note := range notes {
+		if note.ModifiedAt.After(newest.ModifiedAt) {
+			newest = note
+		}
+	}
+	ingestclient.Observe(r.Observe, r.Logger, "apple_notes", r.Account, newest.ModifiedAt, newest.NoteID,
+		fmt.Sprintf("NoteStore: the newest modification of %d notes", len(notes)), r.Now())
 }

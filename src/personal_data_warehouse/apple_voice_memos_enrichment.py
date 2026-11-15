@@ -337,7 +337,10 @@ def load_enrichment_candidates(
     max_error_attempts: int = DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
 ) -> list[dict[str, Any]]:
     filters = [
-        "r.provider = 'assemblyai'",
+        # The transcript the mart serves, whichever provider made it: AssemblyAI
+        # for audio, or a source's own transcript document for a recording
+        # whose audio is gone (alice_transcript_document).
+        "r.provider = f.transcript_provider",
         "r.status = 'completed'",
         "e.recording_id IS NULL",
     ]
@@ -400,7 +403,8 @@ def load_enrichment_candidates(
             COALESCE(f.recorded_at, f.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
             f.source_title,
             r.transcript_text,
-            r.provider_transcript_id
+            r.provider_transcript_id,
+            r.provider AS transcript_provider
         FROM @marts_voice_memos_recordings AS f
         INNER JOIN @apple_voice_memos_transcription_runs AS r
             ON f.source = r.source
@@ -439,12 +443,18 @@ def load_enrichment_candidates(
         "title",
         "transcript_text",
         "provider_transcript_id",
+        "transcript_provider",
     )
     return [dict(zip(columns, row, strict=True)) for row in rows]
 
 
+def recording_transcript_provider(recording: Mapping[str, Any]) -> str:
+    """Which provider's run and segments the recording was enriched from."""
+    return str(recording.get("transcript_provider") or "assemblyai")
+
+
 def current_provider_transcript_id(warehouse, recording: Mapping[str, Any]) -> str:
-    """The AssemblyAI transcript the recording's segments now come from."""
+    """The transcript the recording's segments now come from."""
     rows = warehouse._query(
         f"""
         SELECT provider_transcript_id
@@ -452,7 +462,7 @@ def current_provider_transcript_id(warehouse, recording: Mapping[str, Any]) -> s
         WHERE source = {_sql_string(voice_recording_source(recording))}
           AND account = {_sql_string(str(recording.get("account", "")))}
           AND recording_id = {_sql_string(str(recording.get("recording_id", "")))}
-          AND provider = 'assemblyai'
+          AND provider = {_sql_string(recording_transcript_provider(recording))}
         """
     )
     return str(rows[0][0]) if rows else ""
@@ -504,7 +514,7 @@ def load_transcript_segments(warehouse, recording: Mapping[str, Any]) -> list[di
         WHERE source = {_sql_string(voice_recording_source(recording))}
           AND account = {_sql_string(str(recording.get("account", "")))}
           AND recording_id = {_sql_string(str(recording.get("recording_id", "")))}
-          AND provider = 'assemblyai'
+          AND provider = {_sql_string(recording_transcript_provider(recording))}
         ORDER BY segment_index
         LIMIT {TRANSCRIPT_SEGMENTS_READ_LIMIT}
         """

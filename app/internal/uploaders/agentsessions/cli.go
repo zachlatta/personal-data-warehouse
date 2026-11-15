@@ -127,6 +127,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Limit:             *limit,
 		BatchSize:         *batchSize,
 		BeforeUploadCheck: common.UploadGuard(env, "AGENT_SESSIONS", cfg.BaseURL),
+		Observe:           client.PostSourceObservation,
 	}
 	if *watch > 0 {
 		return runWatch(runner, *watch, *interval, stdout, stderr)

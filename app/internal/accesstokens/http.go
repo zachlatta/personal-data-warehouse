@@ -28,6 +28,7 @@ const (
 
 // TokenView is a token as the API shows it: never its secret.
 type TokenView struct {
+	RequestCount    int64      `json:"request_count"`
 	ID              string     `json:"id"`
 	Kind            string     `json:"kind"`
 	Scope           string     `json:"scope"`
@@ -54,6 +55,7 @@ func viewOf(t Token, now time.Time) TokenView {
 		return &at
 	}
 	v := TokenView{
+		RequestCount:    t.RequestCount,
 		ID:              t.ID,
 		Kind:            t.Kind,
 		Scope:           string(t.Scope),
@@ -110,6 +112,7 @@ func Register(mux *http.ServeMux, svc *Service, bearer func(http.Handler) http.H
 }
 
 func (s *Service) serveAdmin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	id := strings.Trim(strings.TrimPrefix(r.URL.Path, TokensPath), "/")
 	switch {
 	case id == "" && r.Method == http.MethodGet:
@@ -127,11 +130,12 @@ func (s *Service) serveAdmin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"tokens": views})
 	case id == "" && r.Method == http.MethodPost:
 		var body struct {
-			ClientName  string `json:"client_name"`
-			Label       string `json:"label"`
-			Scope       string `json:"scope"`
-			IdleTimeout string `json:"idle_timeout"`
-			TTL         string `json:"ttl"`
+			ClientName  string     `json:"client_name"`
+			Label       string     `json:"label"`
+			Scope       string     `json:"scope"`
+			IdleTimeout string     `json:"idle_timeout"`
+			TTL         string     `json:"ttl"`
+			ExpiresAt   *time.Time `json:"expires_at"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes)).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
@@ -147,12 +151,21 @@ func (s *Service) serveAdmin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ttl: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		var expires time.Time
+		if body.ExpiresAt != nil {
+			expires = *body.ExpiresAt
+			if expires.IsZero() {
+				http.Error(w, "expires_at must be in the future", 400)
+				return
+			}
+		}
 		issued, err := s.Issue(r.Context(), IssueRequest{
 			ClientName:  body.ClientName,
 			Label:       body.Label,
 			Scope:       pdwauth.Scope(body.Scope),
 			IdleTimeout: idle,
 			TTL:         ttl,
+			ExpiresAt:   expires,
 			CreatedBy:   pdwauth.ClientNameFromContext(r.Context()),
 		})
 		if err != nil {

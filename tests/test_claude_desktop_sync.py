@@ -129,6 +129,25 @@ def test_runner_uploads_header_and_messages(tmp_path) -> None:
     state.close()
 
 
+def test_runner_reports_claudes_own_newest_conversation_before_uploading(tmp_path) -> None:
+    """C11: claude.ai lists newest-updated first; the first entry is the source's newest."""
+    client = FakeClient(
+        [{"uuid": "c2", "updated_at": "2026-06-03T00:00:00Z"}, {"uuid": "c1", "updated_at": "2026-06-02T00:00:00Z"}],
+        {
+            "c2": _tree("c2", "2026-06-03T00:00:00Z", [_msg("m1", "human", "hi")]),
+            "c1": _tree("c1", "2026-06-02T00:00:00Z", [_msg("m2", "human", "yo")]),
+        },
+    )
+    store = FakeBatchUploader()
+    state = ClaudeDesktopSyncState.open(tmp_path / "s.sqlite", account="account@example.com")
+    observed: list[tuple] = []
+
+    _runner(client, store, state, upstream_observation_callback=lambda at, cid: observed.append((at, cid, len(store.batches)))).sync()
+
+    assert observed == [(datetime(2026, 6, 3, tzinfo=UTC), "c2", 0)]
+    state.close()
+
+
 def test_runner_skips_unchanged_then_repolls_when_updated(tmp_path) -> None:
     client = FakeClient(
         [{"uuid": "c1", "updated_at": "2026-06-02T00:00:00Z"}],

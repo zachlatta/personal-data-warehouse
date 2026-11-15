@@ -795,8 +795,9 @@ def test_retired_objects_are_pruned_from_the_snapshot(warehouse):
     assert "index:public.dropped_idx" not in _findings(warehouse)
 
 
-def test_read_only_query_role_can_read_the_collation_view(warehouse):
+def test_read_only_query_role_can_read_the_collation_view(warehouse, query_login):
     CollationHealthCollector(warehouse).run()
+    query_login(warehouse)
     connection = warehouse.read_only_connection()
     try:
         with connection.cursor() as cursor:

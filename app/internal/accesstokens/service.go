@@ -19,6 +19,7 @@ import (
 	"time"
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/externalfeeds"
 )
 
 const (
@@ -38,6 +39,13 @@ const (
 	// expiry that use does not extend.
 	DefaultAgentTTL = 24 * time.Hour
 	MaxAgentTTL     = 7 * 24 * time.Hour
+
+	// MaxWorkflowTokenLifetime bounds an agent-scope token issued with `pdw
+	// token create --scope agent`: one scheduled workflow's identity, which a
+	// mutation policy grant names by token id. It must carry a hard expiry
+	// (a grant names one token id, so it cannot be renewed weekly like a
+	// cli_authorize token) and that expiry is at most about one season away.
+	MaxWorkflowTokenLifetime = 183 * 24 * time.Hour
 
 	// BootstrapCodeLifetime is how long a cli_authorize command can wait to be
 	// run before its code is useless.
@@ -63,6 +71,7 @@ var ErrNotFound = errors.New("token not found")
 // Token is one row of private.app_access_tokens, without its secret. Zero
 // times mean "never" (the warehouse stores the epoch).
 type Token struct {
+	RequestCount    int64         `json:"request_count"`
 	ID              string        `json:"id"`
 	Kind            string        `json:"kind"`
 	Scope           pdwauth.Scope `json:"scope"`
@@ -114,6 +123,7 @@ type Store interface {
 	Insert(ctx context.Context, token Token, secretHash string) error
 	Get(ctx context.Context, id string) (Token, string, error)
 	Touch(ctx context.Context, id string, at time.Time) error
+	RecordFeedUse(ctx context.Context, id string, at time.Time) error
 	List(ctx context.Context) ([]Token, error)
 	Revoke(ctx context.Context, id string, at time.Time) error
 	// Redeem locks the bootstrap row codeID, calls mint with it and its
@@ -142,13 +152,14 @@ func NewService(store Store, now func() time.Time, logger *slog.Logger) *Service
 }
 
 // IssueRequest asks for a long-lived token. Zero IdleTimeout means
-// DefaultIdleTimeout; zero TTL means no hard expiry; zero Scope means full.
+// DefaultIdleTimeout; zero TTL and ExpiresAt mean no hard expiry; zero Scope means full.
 type IssueRequest struct {
 	ClientName  string
 	Label       string
 	Scope       pdwauth.Scope
 	IdleTimeout time.Duration
 	TTL         time.Duration
+	ExpiresAt   time.Time // absolute deadline; takes precedence over TTL
 	CreatedBy   string
 }
 
@@ -162,19 +173,37 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (Issued, error) {
 		scope = pdwauth.ScopeFull
 	}
 	if !scope.Issuable() {
-		return Issued{}, fmt.Errorf("scope must be %q or %q", pdwauth.ScopeFull, pdwauth.ScopeAgent)
+		return Issued{}, fmt.Errorf("scope must be full, agent, reviewer or a registered external feed scope")
 	}
 	idle := req.IdleTimeout
 	if idle == 0 {
 		idle = DefaultIdleTimeout
 	}
-	if idle < MinIdleTimeout || idle > MaxIdleTimeout {
+	if externalfeeds.IsScope(string(scope)) {
+		idle = 0
+	}
+	if !externalfeeds.IsScope(string(scope)) && (idle < MinIdleTimeout || idle > MaxIdleTimeout) {
 		return Issued{}, fmt.Errorf("idle timeout must be between %s and %s", MinIdleTimeout, MaxIdleTimeout)
 	}
 	if req.TTL < 0 {
 		return Issued{}, errors.New("ttl must not be negative")
 	}
 	now := s.now().UTC()
+	if !req.ExpiresAt.IsZero() && !req.ExpiresAt.After(now) {
+		return Issued{}, errors.New("expires_at must be in the future")
+	}
+	if scope == pdwauth.ScopeAgent {
+		deadline := req.ExpiresAt
+		if deadline.IsZero() && req.TTL > 0 {
+			deadline = now.Add(req.TTL)
+		}
+		if deadline.IsZero() {
+			return Issued{}, errors.New("an agent-scope token needs a hard expiry: pass ttl or expires_at")
+		}
+		if deadline.Sub(now) > MaxWorkflowTokenLifetime {
+			return Issued{}, fmt.Errorf("an agent-scope token may live at most %s", formatDuration(MaxWorkflowTokenLifetime))
+		}
+	}
 	token := Token{
 		Kind:        KindAccess,
 		Scope:       scope,
@@ -187,6 +216,9 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (Issued, error) {
 	}
 	if req.TTL > 0 {
 		token.ExpiresAt = now.Add(req.TTL)
+	}
+	if !req.ExpiresAt.IsZero() {
+		token.ExpiresAt = req.ExpiresAt.UTC()
 	}
 	return s.insert(ctx, token, accessPrefix)
 }
@@ -224,7 +256,7 @@ func (s *Service) AuthenticateToken(ctx context.Context, raw string) (pdwauth.Pr
 	if status := token.Status(now); status != StatusActive {
 		return pdwauth.Principal{}, &pdwauth.TokenRejectedError{Reason: rejectionReason(token, status)}
 	}
-	if now.Sub(token.LastUsedAt) >= touchEvery {
+	if !externalfeeds.IsScope(string(token.Scope)) && now.Sub(token.LastUsedAt) >= touchEvery {
 		if err := s.store.Touch(ctx, id, now); err != nil {
 			// A missed touch costs at most a minute of idle clock; it is not
 			// worth failing an otherwise valid request over.
@@ -248,6 +280,9 @@ func rejectionReason(token Token, status string) string {
 	}
 	if token.Scope == pdwauth.ScopeAgent {
 		return reason + "; ask for a new one with the cli_authorize MCP tool"
+	}
+	if externalfeeds.IsScope(string(token.Scope)) {
+		return reason + "; issue a new feed key on the /external-feeds page"
 	}
 	return reason + "; issue a new one with `pdw token create`"
 }
@@ -401,4 +436,8 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dd", d/(24*time.Hour))
 	}
 	return d.String()
+}
+
+func (s *Service) RecordFeedUse(ctx context.Context, id string) error {
+	return s.store.RecordFeedUse(ctx, id, s.now().UTC())
 }

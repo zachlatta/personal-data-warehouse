@@ -36,6 +36,7 @@ from personal_data_warehouse.config import GmailAccount, Settings, env_slug
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.warehouse import warehouse_from_settings
 from personal_data_warehouse.schema import SyncState
+from personal_data_warehouse.source_sla import record_upstream_observation
 from personal_data_warehouse.google_auth import google_token_json_from_env, load_google_credentials
 from personal_data_warehouse.objectstore import ObjectStore, StoredObject
 
@@ -433,12 +434,18 @@ class GmailSyncRunner:
         synced_at = datetime.now(tz=UTC)
         fetched = 0
         attachments_written = 0
+        observed = False
         for message_ids in iter_full_message_id_batches(
             service=service,
             page_size=self._settings.gmail_page_size,
             include_spam_trash=self._settings.gmail_include_spam_trash,
             query=query,
         ):
+            if not observed:
+                # Gmail lists newest first: its first id is the mailbox's own
+                # newest message, recorded before this pass writes anything.
+                self._observe_newest(account=account, service=service, message_id=message_ids[0])
+                observed = True
             existing = self._warehouse.existing_message_ids(account=account.email_address, message_ids=message_ids)
             missing = [message_id for message_id in message_ids if message_id not in existing]
             if not missing:
@@ -459,6 +466,17 @@ class GmailSyncRunner:
             self._warehouse.insert_attachments(attachment_rows)
             fetched += len(messages)
             attachments_written += len(attachment_rows)
+        if not observed:
+            # Nothing in the reconcile window: the mailbox has nothing newer
+            # than that for PDW to be missing.
+            record_upstream_observation(
+                self._warehouse,
+                self._logger,
+                pipeline="gmail",
+                scope=account.email_address,
+                upstream_newest_at=None,
+                detail=f"no message matches {query!r}",
+            )
         if fetched:
             self._logger.info(
                 "Gmail reconcile for %s fetched %s recent message(s) history had not delivered",
@@ -469,6 +487,25 @@ class GmailSyncRunner:
             summary,
             reconciled_messages=summary.reconciled_messages + fetched,
             attachments_written=summary.attachments_written + attachments_written,
+        )
+
+    def _observe_newest(self, *, account: GmailAccount, service, message_id: str) -> None:
+        """C11: what Gmail itself says is this mailbox's newest message."""
+        try:
+            message = fetch_message_or_none(service, message_id, message_format="minimal")
+        except Exception as exc:  # noqa: BLE001 - the probe must not fail the tick
+            self._logger.warning("Gmail newest-message probe failed for %s: %s", account.email_address, exc)
+            return
+        if message is None:
+            return
+        record_upstream_observation(
+            self._warehouse,
+            self._logger,
+            pipeline="gmail",
+            scope=account.email_address,
+            upstream_newest_at=datetime.fromtimestamp(int(message.get("internalDate", 0)) / 1000, tz=UTC),
+            upstream_newest_id=message_id,
+            detail="users.messages.list(maxResults) first id + messages.get(format=minimal)",
         )
 
     def _attachment_object_store(self, account: GmailAccount) -> ObjectStore | None:
@@ -1166,15 +1203,17 @@ def history_message_ids(history_record: Mapping[str, object]) -> set[str]:
     return message_ids
 
 
-def fetch_message(service, message_id: str) -> Mapping[str, object]:
+def fetch_message(service, message_id: str, *, message_format: str = "full") -> Mapping[str, object]:
     return execute_gmail_request(
-        lambda: service.users().messages().get(userId="me", id=message_id, format="full").execute()
+        lambda: service.users().messages().get(userId="me", id=message_id, format=message_format).execute()
     )
 
 
-def fetch_message_or_none(service, message_id: str) -> Mapping[str, object] | None:
+def fetch_message_or_none(
+    service, message_id: str, *, message_format: str = "full"
+) -> Mapping[str, object] | None:
     try:
-        return fetch_message(service, message_id)
+        return fetch_message(service, message_id, message_format=message_format)
     except HttpError as exc:
         if _http_status(exc) == 404:
             return None

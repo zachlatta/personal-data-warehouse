@@ -6,26 +6,30 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"golang.org/x/oauth2"
 )
 
 type summary struct {
-	Name          string   `json:"name"`
-	URL           string   `json:"url"`
-	Enabled       bool     `json:"enabled"`
-	AllClients    bool     `json:"all_clients"`
-	Clients       []string `json:"clients"`
-	Loopback      bool     `json:"loopback"`
-	Status        string   `json:"status"`
-	ToolCount     int      `json:"tool_count"`
-	Version       int64    `json:"version"`
-	Authenticated bool     `json:"authenticated"`
+	DiscoveryStatus        string    `json:"discovery_status"`
+	LastDiscoveryAttemptAt time.Time `json:"last_discovery_attempt_at"`
+	LastDiscoveredAt       time.Time `json:"last_discovered_at"`
+	Name                   string    `json:"name"`
+	URL                    string    `json:"url"`
+	Enabled                bool      `json:"enabled"`
+	AllClients             bool      `json:"all_clients"`
+	Clients                []string  `json:"clients"`
+	Loopback               bool      `json:"loopback"`
+	Status                 string    `json:"status"`
+	ToolCount              int       `json:"tool_count"`
+	Version                int64     `json:"version"`
+	Authenticated          bool      `json:"authenticated"`
 }
 
 func summarize(c record) summary {
-	return summary{Name: c.Name, URL: c.URL, Enabled: c.Enabled, AllClients: c.AllClients, Clients: c.Clients, Loopback: c.Loopback, Status: c.Status, ToolCount: len(c.Tools), Version: c.Version, Authenticated: c.Token.AccessToken != ""}
+	return summary{DiscoveryStatus: c.DiscoveryStatus, LastDiscoveryAttemptAt: c.LastDiscoveryAttemptAt, LastDiscoveredAt: c.LastDiscoveredAt, Name: c.Name, URL: c.URL, Enabled: c.Enabled, AllClients: c.AllClients, Clients: c.Clients, Loopback: c.Loopback, Status: c.Status, ToolCount: len(c.Tools), Version: c.Version, Authenticated: c.Token.AccessToken != ""}
 }
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")

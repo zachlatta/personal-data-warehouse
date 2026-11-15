@@ -54,12 +54,15 @@ minutes old, and `marts_ai_conversations.sessions` / `.events` read `late` with
 `cause_pipelines = {pi}`. So a **usage-driven** source declares `freshness_escalates=False`:
 past its interval its `data_status` / `event_status` read `quiet` — observed, never
 colouring `status`, a mart, or `stalest_pipeline` — and the run heartbeat alone escalates.
-That is pi, `muse_code`, `argon`, `alice_voice_recordings` and `search_requests` (searches
-stop when nobody searches; the app's timing writer beats every ten minutes), pinned by
-`test_exactly_the_usage_driven_sources_skip_freshness_escalation`, which also requires each
-to declare a heartbeat. `data=None` is not the same thing: it reads `manual`, a claim that
-no cadence exists at all. Sources with a real data SLA (contacts, browser history, voice
-memos) keep escalating.
+That is pi, `muse_code`, `argon`, `alice_voice_recordings`, `apple_voice_memos` (since the
+Pixel replaced the iPhone on 2026-10-23 a Mac memo is occasional), `voice_memo_continuity`
+(it writes only when two memos sit back to back; its Dagster run posts a heartbeat to
+`ops.uploader_heartbeats` under device `dagster`, see [voice.md](voice.md)) and
+`search_requests` (searches stop when nobody searches; the app's timing writer beats every
+ten minutes), pinned by `test_exactly_the_usage_driven_sources_skip_freshness_escalation`,
+which also requires each to declare a heartbeat. `data=None` is not the same thing: it reads
+`manual`, a claim that no cadence exists at all. Sources with a real data SLA (contacts,
+browser history) keep escalating.
 
 The rule both cases point at: **a loose data SLA is only honest when something else is
 tight.** Loosening one without a heartbeat is how `manual_finance` (`data=None`) made its own
@@ -251,6 +254,78 @@ lock. Deriving the DDL from the spec also exposed a disagreement it had been hid
 hand-written migration gave the host-saturation gauges the `-1` "unmeasured" default while a
 freshly created table gave them `0`, which the view reads as an **idle host**, the one
 verdict C6 acts on. `UNMEASURED_SENTINEL_COLUMNS_BY_TABLE` is now the single source for both.
+
+## A source's own SLA (C11)
+
+A green pipeline row says the pipeline **ran and wrote**. It cannot say that PDW holds what
+the source holds: a history cursor that skips a change, a Drive changes feed capped behind a
+backlog, a WhatsApp batch stuck between the linked device and the Drive inbox all leave the
+row green. Until 2026-11-11 only Slack, Plaid, SimpleFIN and voice memos had a detector of
+their own, and 16 of 41 sources did not even state where their interval came from.
+
+Every `kind="source"` entry in `PIPELINES` now carries three things, enforced by
+`tests/test_source_sla.py`:
+
+- `data_basis` — the stated SLA: a measurement (the gap query in `pipeline_health.py`,
+  re-run 2026-11-11 for the sources that had none) or the reason there is no cadence.
+- `detector` — the catalog id of the `marts_ops` view that compares PDW with the source
+  itself; **or** `sla_exemption`, which says why no comparison can exist: PDW is the source
+  (feed, scans, screen_timelapse, android_location, manual_finance), nothing upstream keeps
+  history (android_notifications), the source is retired (apple_photos), or every run is
+  already the whole comparison (gmail_settings, hacker_news, resideo). Exactly one; the test
+  pins which ten sources may be exempt, so "not built yet" is never an exemption.
+
+The collector reads each detector view once per collection (filtered to the pipeline by its
+`pipeline` or `source` column, `DETECTOR_SCOPE_COLUMNS`) and writes its worst row into
+`marts_ops.pipeline_health.sla_detector_status`; a detector with no row for the pipeline is
+`unknown`, because silence is not health. It does **not** colour `status` — that stays C7's
+claim about the pipeline; C11 grades `sla_detector_status` (`scripts/contract_audit.py`).
+
+**`marts_ops.source_upstream_health`** is the detector for every source below. Each
+collector, or device uploader through `POST /ingest/source-observation`, records what the
+provider or the device's own store says is its newest item in
+`ops.source_upstream_observations` (one row per pipeline and scope), before writing what it
+fetched:
+
+| source | upstream evidence | compared with |
+| --- | --- | --- |
+| `gmail` | `messages.list` first id + `messages.get(format=minimal)` `internalDate`, every reconcile pass (10 min) | `base_gmail.messages.internal_date` per account |
+| `google_calendar` | the top-level `updated` of the sync's own `events.list` response (present even on an empty incremental page; checked 2026-11-11), every run | `base_google_calendar.events.updated_at` per account/calendar |
+| `google_drive` | `files.list(orderBy='modifiedTime desc', pageSize=1)` over the files the sync crawls, every run | `base_google_drive.files.modified_time`, plus that file by id (it may be excluded) |
+| `whatsapp` | the linked-device client's newest delivered message, every 5 min while connected | `base_whatsapp.messages.message_at` |
+| `apple_messages` | `pdw ingest apple-messages` posts the newest message in the chat.db snapshot it just read to `/ingest/source-observation` | `base_apple_messages.messages.message_at` |
+| `google_contacts` | `connections.list(personFields=metadata)`, every page: the newest CONTACT-source `updateTime` (the API's own last-modified order ranks PROFILE churn first) | `base_google_contacts.cards.source_updated_at` |
+| `whoop` / `whoop_private` | `GET /v2/cycle?limit=1` with no window / `cycles/details` over three days: the newest cycle's start | `base_whoop.cycles` / `base_whoop_private.cycles` `start_at` |
+| `github` | page one of the newest-first `/users/<login>/events` feed, per credential | `base_github.events.created_at` |
+| `chatgpt` | the first conversation of `order=updated` | the poller's per-conversation `update_time`, stored after its events land |
+| `claude_desktop` | the first conversation of claude.ai's newest-updated list | that conversation's header row (`seq = 0`) `updated_at` in `base_claude_desktop.events` |
+| `comma` | the newest route in the retained `routes_segments` window | `base_comma.routes.start_at` |
+| `alice_voice_recordings` | the newest `created_at` in the daily listing | `base_alice_voice_recordings.recordings.recorded_at` |
+| `claude_code`, `codex`, `openclaw`, `pi`, `muse_code`, `argon`, `muse` | `pdw ingest agent-sessions` / `muse` read the end of every transcript modified within a day of the tool's newest (and the OpenClaw store): the newest event time, in the field the ingest reads as `occurred_at`, and its session | the newest `occurred_at` PDW holds for that session (`(session_id, seq)` index) |
+| `apple_contacts` / `apple_notes` | the Mac's AddressBook / NoteStore: the newest modification | `base_apple_contacts.cards.source_updated_at` / `base_apple_notes.notes.modified_at` |
+| `browser_history` | the Mac's History databases: the newest visit across profiles | `base_browser_history.visits.visited_at` per device |
+| `android_photos` | MediaStore: the newest gallery file by `date_added`, with its relative path | that exact file by `source_native_id` in `base_android_photos.files` |
+| `android_messages` / `android_screen_time` | bugle_db's newest `received_timestamp` / UsageStatsManager's newest event | `base_android_messages.messages.message_at` / `base_android_screen_time.events.event_at` per device |
+
+The view is live: a row is `ok` once PDW's newest is at least the source's newest (1 s
+slack), `late` when the **oldest** item PDW has not caught up with has been missing for
+longer than the check's `tolerance` (`SOURCE_UPSTREAM_CHECKS` in `source_sla.py`), `failing`
+past six times that, and `unknown` once the observation is older than the collector's own
+interval — a detector that stopped looking is not evidence. The oldest, not the newest:
+on a busy source every look names a fresher newest item, so judging the newest read a
+three-day Gmail stall as `ok` (`missing_seconds = 120`). The pipeline_health collector
+carries `pending_since`, the first upstream item PDW did not catch up with, until PDW
+passes it (`advance_source_upstream_pending`); writers never set it, and the app's DDL for
+the table is checked line by line against a golden file the Python TableSpec generates. Each comparison is one indexed lookup. On 2026-11-11
+the Calendar API's `updated` matched `max(updated_at)` exactly on both calendars and the
+Gmail API's newest message matched `max(internal_date)` to the second on both mailboxes.
+
+Adding a source-side check for another source: record an observation from the collector
+(Python: `source_sla.record_upstream_observation`; a device uploader: `POST
+/ingest/source-observation` through `ingestclient.PostSourceObservation`), add an
+`UpstreamCheck`, and point the pipeline's `detector` at
+`SOURCE_UPSTREAM_HEALTH_VIEW`. Each exemption in `PIPELINES` already says which evidence
+that source would need.
 
 ## Collation drift and index corruption
 

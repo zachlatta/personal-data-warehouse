@@ -313,6 +313,21 @@ green and the contract audit graded them "untranscribable". The skip now require
 audio object and the sidecar; a `size_bytes = 0` row with a live source id is a fetch
 failure to investigate, never a quiet source.
 
+**An Alice recording with no audio but a mailed transcript is transcribed from the document
+(2026-11-11).** The Gmail recovery pass archives the `.transcript-formatted.docx` Alice mails
+as a `voice_recording_transcript` artifact, and for a recording whose audio Alice no longer
+serves that document is the only copy of what was said; a meeting could sit with 0 audio
+bytes and no transcript beside its stored transcript. The
+`alice_voice_recordings_transcript_import` asset (in the daily Alice job, after the Drive
+ingest) copies the document's text into `derived_voice_memos.transcription_runs` under
+provider `alice_transcript_document`, one segment per paragraph, verbatim: speaker names and
+timestamps stay in the text for the enrichment agent to read, not parsed out. Enrichment reads
+whichever transcript the mart serves (`transcript_provider`), so calendar matching and
+continuity follow. A recording with audio is never imported this way; AssemblyAI transcribes
+the audio. A zero-byte Alice row can have neither: Alice reports `media_file_ready = false`,
+`transcript_ready = false` and the media URL answers 404 on every daily poll, and no Alice
+email names it, so it is an empty upstream stub.
+
 The three derived tables — `derived_voice_memos.transcription_runs`, `.transcript_segments`
 and `.enrichments` — are keyed by **`source` first**, because a `recording_id` is unique
 only inside its own source. Without that column a second source's run upserts onto the
@@ -329,13 +344,16 @@ them together under `sources => ARRAY['transcript']`.
 able to transition them over"; it must understand the content, not guess from timing). The
 `voice_memo_continuity` asset runs after enrichment (hourly :47 plus a two-minute backlog
 sensor; `VOICE_MEMO_CONTINUITY_ENABLED=0` turns it off). Step one: every pair of consecutive
-recordings of one source and account that sit within 30 minutes
+recordings with speech of one source and account that sit within 30 minutes
 (`VOICE_MEMO_CONTINUITY_MAX_GAP_SECONDS`) goes to the fleet agent with the end of the first
 transcript, the start of the second and both summaries; it answers `same_event` or `separate`
 with a confidence and reason, stored per pair in `derived_voice_memos.continuity_judgments`
 and asked again when either transcript changes. Time only proposes: measured over 60 days,
 the window holds every real restart (a lecture split by 3 s, a demo session by 8 s) and
-dozens of unrelated task memos a minute apart. Step two: a run of recordings joined by
+dozens of unrelated task memos a minute apart. A recording with an empty transcript (a
+pocket clip, a provider rejection) is skipped when pairing, never a seam: until 2026-11-11
+one between two halves of an event hid the pair, so back-to-back pairs went unjudged. It
+stays a session of one. Step two: a run of recordings joined by
 `same_event` at confidence 0.7 or more is a session, and a session of two or more gets one
 enrichment written over all its members (`derived_voice_memos.session_enrichments`, keyed by
 the member list, redone when a member is re-enriched). A session that ended inside the window
@@ -344,6 +362,16 @@ recording exactly one session (a lone recording is a session of one with its own
 enrichment); `merge_status` is `single`, `pending` (joined, merged record not written yet:
 the first member's title stands in) or `merged`. Each member recording keeps its own row in
 `marts_voice_memos.recordings` and on the timeline; sessions are not a timeline source yet.
+
+**Continuity health is its run, not its output (2026-11-11).** A judgment is written only when
+Zach records two memos back to back, so data age says nothing about whether the pass works:
+the newest back-to-back pair is often over 14 days old while the pass is healthy. In
+`marts_ops.pipeline_health` `voice_memo_continuity` is usage-driven (data reads `quiet`), and every run posts a heartbeat to `ops.uploader_heartbeats` (device `dagster`),
+judged on the hourly cadence. The heartbeat reads `error` when a judgment or merge failed, or
+when an eligible pair (consecutive recordings with speech, both enriched over 2 h ago) still has
+no current judgment although the run had room for it. That check
+(`count_unjudged_eligible_pairs`) deliberately does not reuse the candidate query, so a
+candidate bug or a pair abandoned after three agent failures stays red until someone looks.
 
 ## Google Recorder on the Pixel
 
@@ -432,6 +460,14 @@ This Mac is intended to run the local Voice Memos uploader through a user Launch
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/voice-memos-upload.heartbeat`
 - Status helper: `bin/voice-memos-upload-status`
 
+**A quiet Mac library reads `quiet`, not `late` (2026-11-11).** Since the Pixel replaced the
+iPhone, new memos are Google Recorder recordings and a Mac memo is occasional, so
+`apple_voice_memos` is usage-driven in `marts_ops.pipeline_health` (`freshness_escalates=False`):
+past its 7-day interval the data age reads `quiet` and the uploader heartbeat colours the row.
+That is a real detector: the uploader exits non-zero when a settled, nonempty memo in the
+Recordings folder fails to upload, and a stopped LaunchAgent reads `late`/`stale` on run age.
+What it cannot see is a memo iCloud never materializes on the Mac (deferred with exit 0).
+
 Each run also performs the **enriched-title write-back**: memos that still carry an
 app-assigned name ("New Recording N" / geocoded location names — detected by the
 `0x1000` auto-named bit in `ZFLAGS`, or the literal `New Recording N` pattern for
@@ -482,3 +518,23 @@ binaries are signed with a stable identity; if it breaks anyway, `codesign -d --
 ~/.local/bin/pdw` must show `Identifier=com.zachlatta.pdw` (a local `go build` is ad-hoc signed
 and does NOT inherit the grant — install a release with `pdw update --force`). Then kickstart
 the LaunchAgent again.
+
+## External voice-memo feed
+
+`/external-feeds` in the web app manages dedicated read-only keys for
+`GET /api/external-feeds/voice-memos`. See [access tokens](access-tokens.md#external-feeds)
+for authentication, polling and pagination. This reads the unified recordings mart,
+so all voice sources share its deduplication and resolved contents. Eligibility
+requires completed transcription AND current completed recording enrichment
+(`enriched_at >= transcribed_at`), a nonempty
+transcript, a nondeleted recording, and a recording timestamp in the last 48 hours.
+Calendar matching is part of recording enrichment: an unmatched outcome is eligible.
+Session continuity and merged-session enrichment are separate passes and do not
+hold back individual recordings; a later recording can change a session's membership.
+A consumer may therefore receive parts of a stopped-and-restarted memo separately.
+A new transcription hides the old enrichment until re-enrichment completes.
+When it re-qualifies, the memo is delivered again at a new cursor position;
+consumers should upsert/deduplicate by `(source, account, recording_id)`.
+Disappearing or aged-out memos produce no deletion notices or tombstones.
+Use `next_cursor` as `?since=` to read new arrivals without skipping recordings
+when new enrichments land between pages. This is a recording feed, not a merged-session feed.

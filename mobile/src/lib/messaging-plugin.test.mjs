@@ -76,6 +76,27 @@ test('the native renderer and the server agree on the channels and payload keys'
   for (const field of fields) assert.match(kotlin, new RegExp(`opt\\w+\\("${field}"\\)`), `the phone does not read ${field}`);
 });
 
+// The phone's notification listener uploads string extras. Stamping the
+// push's delivery id on every alert the app draws is how the server learns
+// which phone (listener account/device) a push device is, and so whose
+// notifications may stand in for an alert to it.
+test('every alert the app draws carries its delivery id, under the key the server reads', () => {
+  const kotlin = plugin.KOTLIN('com.zachlatta.pdw');
+  const goSender = readFileSync(path.join(mobile, '../app/internal/notifications/sender.go'), 'utf8');
+  const goWitness = readFileSync(path.join(mobile, '../app/internal/notifications/suppression.go'), 'utf8');
+  const key = /DELIVERY_ID_EXTRA = "([\w.]+)"/.exec(kotlin)[1];
+  assert.equal(key, 'pdw.delivery_id');
+  assert.match(goWitness, new RegExp(`'${key.replace('.', '\\.')}'`));
+  assert.match(goSender, /"delivery_id": d\.ID/);
+  assert.match(kotlin, /putString\(DELIVERY_ID_EXTRA, data\.optString\("delivery_id"\)\)/);
+  // The chat, the plain chat and the alert (with or without a picture) all carry it.
+  for (const fn of ['fun post(', 'fun postPlain(', 'private fun drawAlert(']) {
+    const start = kotlin.indexOf(fn);
+    const body = kotlin.slice(start, kotlin.indexOf('\n  }\n', start));
+    assert.match(body, /addExtras\(deliveryExtras\(data\)\)/, `${fn} does not stamp the delivery id`);
+  }
+});
+
 test('a non-chat alert goes through the same eviction, pacing and tap as a chat', () => {
   const kotlin = plugin.KOTLIN('com.zachlatta.pdw');
   assert.match(kotlin, /@Synchronized\s+fun postAlert\(/);

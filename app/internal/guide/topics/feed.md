@@ -109,7 +109,9 @@ all-time most engaged cards; and cards seen twice or more with no engagement. {{
 counts, rates, dismissals, dwell and read time. Read it before writing
 the next batch, and write less of what he skips. {{if .CLI}}`pdw feed list` (`--view feed` is exactly what the Feed shows him) and `pdw feed events`{{else}}`feed_list` (`view: "feed"` is exactly what the Feed shows him) and `feed_events`{{end}} give per card and raw detail.
 
-In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressions`,
+In SQL, cards are `base_feed.items`: the id column is `item_id` (a card is keyed by `source` + `item_key`; there
+is no bare `id`), and `base_feed.events.item_id` and `marts_feed.item_engagement.item_id` join to it.
+`marts_feed.item_engagement` (one row per card: `link_count`, `impressions`,
 `dwell_ms`, `scroll_pasts` (impressions under 1 s), `opens`, `links_opened`, `read_ms`,
 `expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`, `shares`, `saved`, `saved_at`, `liked`, `liked_at`, `autoplays`, `watch_ms`),
 `marts_feed.source_engagement`, and the raw log `base_feed.events` (`event_type`,

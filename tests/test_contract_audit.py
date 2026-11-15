@@ -3,12 +3,34 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
 from personal_data_warehouse import search_benchmark
 from personal_data_warehouse.search_benchmark import SearchResult
 from scripts import contract_audit
+
+
+@pytest.mark.parametrize("missing_tier,quality,expected", [
+    (False, "ok", "green"),
+    (True, "ok", "yellow"),
+    (False, "failing", "red"),
+    (False, None, "red"),
+])
+def test_c2_requires_five_tiers_and_passing_labeled_correctness(monkeypatch, missing_tier, quality, expected):
+    tiers = ["self", "direct", "cc", "noise", "background"]
+    if missing_tier:
+        tiers.pop()
+    def query(question, sql):
+        if question == "priority mix":
+            return [dict(source="example", priority=t, status="ok", events_7d=1) for t in tiers]
+        if quality is None:
+            return None
+        return [dict(adapter=a, status=quality, accuracy=1, missing=0)
+                for a in ("slack_message", "agent_session_turn", "agent_session", "gmail_email")]
+    monkeypatch.setattr(contract_audit, "pdw_sql", query)
+    assert contract_audit.c2_priority_tiers().status == expected
 
 
 def _search_payload(**overrides: object) -> str:
@@ -662,6 +684,32 @@ def test_c12_is_red_when_agents_md_outgrows_one_sitting(monkeypatch: pytest.Monk
     assert contract_audit.c12_future_developers().status == contract_audit.RED
 
 
+@pytest.mark.parametrize(
+    "citation",
+    [
+        "`test_a_shape_nobody_ever_wrote`",
+        "`TestAGoShapeNobodyEverWrote`",
+        "`tests/no_such_helper.py`",
+        "`app/internal/guide/no_such_test.go`",
+        # The basename exists (tests/test_timeline.py); this path does not.
+        "`tests/unit/test_timeline.py`",
+    ],
+)
+def test_c12_flags_a_dangling_test_citation_outside_the_contracts_section(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, citation: str
+) -> None:
+    """A 'copy this test' pointer anywhere in the file is graded, not only a contract's."""
+    real = contract_audit.AGENTS_MD.read_text(encoding="utf-8")
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(real + f"\n## Some later rule\n\n{citation} is the shape to copy.\n", encoding="utf-8")
+    monkeypatch.setattr(contract_audit, "AGENTS_MD", agents)
+
+    verdict = contract_audit.c12_future_developers()
+
+    assert verdict.status == contract_audit.YELLOW, verdict.evidence
+    assert citation.strip("`") in verdict.evidence
+
+
 # --- C4/C10 must see the database's own integrity -----------------------------
 #
 # On 2026-10-03 the audit graded C4 and C10 green while production held 9,125
@@ -749,9 +797,10 @@ def test_c10_and_c4_detect_index_or_heap_corruption_with_clean_page_checksums(
 def test_c11_grades_failing_derived_or_enrichment_pipelines(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, str] = {}
     rows = {
-        "slack health": [{"conversation_type": "im", "status": "ok"}],
-        "plaid health": [{"institution_name": "Bank", "status": "ok"}],
-        "simplefin health": [{"org_name": "Org", "name": "Checking", "status": "ok", "shared_with_plaid": 0}],
+        "source slas": [
+            {"pipeline": "gmail", "data_basis": "measured", "sla_detector": "marts_ops.source_upstream_health",
+             "sla_detector_status": "ok", "sla_exemption": None},
+        ],
         "source pipeline health": [
             {"pipeline": "finance_ledger", "status": "failing"},
             {"pipeline": "receipt_enrichment", "status": "stale"},

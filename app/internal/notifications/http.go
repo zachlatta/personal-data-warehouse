@@ -111,14 +111,17 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// One row past the page says whether there is more without a second count.
-	rows, err := s.DB.QueryContext(r.Context(), s.q(`SELECT n.id,n.source,n.priority,n.created_at,n.payload->>'actor',n.payload->>'title',n.payload->>'snippet',n.status,n.payload,
+	// Timeline notifications only (mutation alerts are not part of the
+	// experiment); a payload field an event lacks reads as empty, never NULL.
+	rows, err := s.DB.QueryContext(r.Context(), s.q(`SELECT n.id,n.source,n.priority,n.created_at,COALESCE(n.payload->>'actor',''),COALESCE(n.payload->>'title',''),COALESCE(n.payload->>'snippet',''),n.status,n.payload,
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.accepted_at>'epoch'),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.opened_at>'epoch'),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status IN ('failed','unknown')),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_read'),
- (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_replied')
- FROM @notification_events n WHERE ($1::timestamptz IS NULL OR (n.created_at, n.id) < ($1, $2)) ORDER BY n.created_at DESC, n.id DESC LIMIT $3`), nullableTime(page.before), page.beforeID, page.limit+1)
+ (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_replied'),
+ (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_notified')
+ FROM @notification_events n WHERE n.adapter <> '`+MutationAdapter+`' AND ($1::timestamptz IS NULL OR (n.created_at, n.id) < ($1, $2)) ORDER BY n.created_at DESC, n.id DESC LIMIT $3`), nullableTime(page.before), page.beforeID, page.limit+1)
 	if err != nil {
 		unavailable(w)
 		return
@@ -131,9 +134,9 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, source, priority, actor, title, body, state string
 		var created time.Time
-		var devices, accepted, opened, failed, suppressedRead, suppressedReplied int
+		var devices, accepted, opened, failed, suppressedRead, suppressedReplied, suppressedNotified int
 		var payload []byte
-		if rows.Scan(&id, &source, &priority, &created, &actor, &title, &body, &state, &payload, &devices, &accepted, &opened, &failed, &suppressedRead, &suppressedReplied) != nil {
+		if rows.Scan(&id, &source, &priority, &created, &actor, &title, &body, &state, &payload, &devices, &accepted, &opened, &failed, &suppressedRead, &suppressedReplied, &suppressedNotified) != nil {
 			unavailable(w)
 			return
 		}
@@ -147,7 +150,7 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(payload, &snapshot)
 		preview, _ := snapshot["presentation"].(map[string]any)
 
-		events = append(events, map[string]any{"preview": preview, "id": id, "source": source, "priority": priority, "created_at": created.UTC().Format(time.RFC3339Nano), "actor": actor, "title": title, "body": body, "status": state, "devices": devices, "accepted": accepted, "opened": opened, "failed": failed, "suppressed_read": suppressedRead, "suppressed_replied": suppressedReplied})
+		events = append(events, map[string]any{"preview": preview, "id": id, "source": source, "priority": priority, "created_at": created.UTC().Format(time.RFC3339Nano), "actor": actor, "title": title, "body": body, "status": state, "devices": devices, "accepted": accepted, "opened": opened, "failed": failed, "suppressed_read": suppressedRead, "suppressed_replied": suppressedReplied, "suppressed_notified": suppressedNotified})
 	}
 	if rows.Err() != nil {
 		unavailable(w)
@@ -195,9 +198,11 @@ func (s *Service) settings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err == nil && value == 0 {
-		_, err = tx.ExecContext(r.Context(), s.q(`UPDATE @notification_events SET status='cancelled' WHERE status='pending'`))
+		// Timeline work only: a mutation alert is not part of the experiment.
+		_, err = tx.ExecContext(r.Context(), s.q(`UPDATE @notification_events SET status='cancelled' WHERE status='pending' AND adapter<>'`+MutationAdapter+`'`))
 		if err == nil {
-			_, err = tx.ExecContext(r.Context(), s.q(`UPDATE @notification_deliveries SET status='cancelled',updated_at=now() WHERE status IN ('pending','retry','sending')`))
+			_, err = tx.ExecContext(r.Context(), s.q(`UPDATE @notification_deliveries SET status='cancelled',updated_at=now() WHERE status IN ('pending','retry','sending')
+ AND NOT EXISTS (SELECT 1 FROM @notification_events n WHERE n.id = notification_id AND n.adapter='`+MutationAdapter+`')`))
 		}
 	}
 	if err != nil || tx.Commit() != nil {

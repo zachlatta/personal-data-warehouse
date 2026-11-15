@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
 
 // APIPath is the JSON surface the iOS app reviews mutations through. It is
@@ -24,6 +26,8 @@ func (s *Service) APIHandler(requireAuth func(http.Handler) http.Handler) http.H
 	mux := http.NewServeMux()
 	mux.Handle(APIPath+"/requests", requireAuth(http.HandlerFunc(s.apiListRequests)))
 	mux.Handle(APIPath+"/requests/", requireAuth(http.HandlerFunc(s.apiRequestRoute)))
+	mux.Handle(PolicyAPIPath, requireAuth(http.HandlerFunc(s.apiPolicies)))
+	mux.Handle(PolicyAPIPath+"/", requireAuth(http.HandlerFunc(s.apiPolicies)))
 	return mux
 }
 
@@ -120,6 +124,10 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 	if actor == apiReviewerActorPrefix {
 		actor = apiReviewerActorPrefix + "ios"
 	}
+	if r.Method != http.MethodGet && !requestCanReview(r) {
+		apiError(w, http.StatusForbidden, reviewerOnlyMessage)
+		return
+	}
 	page, err := apiMutationPage(r)
 	if err != nil {
 		apiError(w, http.StatusBadRequest, err.Error())
@@ -134,6 +142,43 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.apiWriteRequestPage(w, r, requestID, page)
+	case len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost:
+		var body struct {
+			Reason string `json:"reason"`
+		}
+		if err := decodeOptionalJSON(r, &body); err != nil {
+			apiError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		reason := strings.TrimSpace(body.Reason)
+		if reason == "" {
+			reason = "cancelled from the review"
+		}
+		if _, err := s.CancelRequest(r.Context(), requestID, CancelInput{Actor: actor, Reason: reason}); err != nil {
+			var inputErr *proposalInputError
+			var stateErr *RequestStateError
+			if errors.As(err, &inputErr) || errors.As(err, &stateErr) {
+				apiError(w, http.StatusConflict, err.Error())
+				return
+			}
+			apiStoreError(w, err)
+			return
+		}
+		s.apiWriteRequestPage(w, r, requestID, page)
+	case len(parts) == 2 && parts[1] == "undo" && r.Method == http.MethodPost:
+		// Undo proposes and approves the inverse of a thermostat change that
+		// ran; the answer is the new request, not the undone one.
+		undone, err := s.UndoRequest(r.Context(), requestID, actor)
+		if err != nil {
+			var inputErr *proposalInputError
+			if errors.As(err, &inputErr) {
+				apiError(w, http.StatusConflict, err.Error())
+				return
+			}
+			apiStoreError(w, err)
+			return
+		}
+		s.apiWriteRequestPage(w, r, undone.ID, page)
 	case len(parts) == 2 && parts[1] == "reject" && r.Method == http.MethodPost:
 		var body struct {
 			Reason string `json:"reason"`
@@ -218,6 +263,17 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// reviewerOnlyMessage is the 403 an agent sees when it calls a review route.
+const reviewerOnlyMessage = "only Zach's web or phone session can approve, deny, supersede, undo or edit a mutation request; " +
+	"an agent proposes with propose_mutation, withdraws with withdraw_mutation and cancels its own approved request with cancel_mutation"
+
+// requestCanReview reports whether the request's static-bearer principal may
+// decide a mutation request. A request with no principal never may.
+func requestCanReview(r *http.Request) bool {
+	principal, ok := auth.PrincipalFromContext(r.Context())
+	return ok && principal.CanReview()
 }
 
 // apiMutationPage reads ?offset=&limit= — the window of the request's
@@ -319,23 +375,28 @@ func (s *Service) RequestJSON(request Request, withMutations bool) map[string]an
 
 func (s *Service) requestJSON(request Request, withMutations bool) map[string]any {
 	item := map[string]any{
-		"id":             request.ID,
-		"status":         request.Status,
-		"title":          request.Title,
-		"reason":         request.Reason,
-		"error":          request.Error,
-		"superseded_by":  request.SupersededBy,
-		"replaces":       request.ReplacesRequestID,
-		"revision":       request.Revision,
-		"requested_by":   request.RequestedBy,
-		"approved_by":    request.ApprovedBy,
-		"withdrawn_by":   request.WithdrawnBy,
-		"withdrawn_at":   nullableTime(request.WithdrawnAt),
-		"created_at":     nullableTime(request.CreatedAt),
-		"updated_at":     nullableTime(request.UpdatedAt),
-		"approved_at":    nullableTime(request.ApprovedAt),
-		"executed_at":    nullableTime(request.ExecutedAt),
-		"observed_at":    nullableTime(request.ObservedAt),
+		"id":                    request.ID,
+		"status":                request.Status,
+		"title":                 request.Title,
+		"reason":                request.Reason,
+		"error":                 request.Error,
+		"superseded_by":         request.SupersededBy,
+		"replaces":              request.ReplacesRequestID,
+		"revision":              request.Revision,
+		"requested_by":          request.RequestedBy,
+		"requested_by_token_id": request.RequestedByTokenID,
+		"approved_by":           request.ApprovedBy,
+		"withdrawn_by":          request.WithdrawnBy,
+		"withdrawn_at":          nullableTime(request.WithdrawnAt),
+		"created_at":            nullableTime(request.CreatedAt),
+		"updated_at":            nullableTime(request.UpdatedAt),
+		"approved_at":           nullableTime(request.ApprovedAt),
+		"executed_at":           nullableTime(request.ExecutedAt),
+		"observed_at":           nullableTime(request.ObservedAt),
+		// Approve now, run later: the earliest a step runs and the latest
+		// deadline (null when it runs once approved); the review's "Runs at".
+		"not_before":     nullableTime(request.NotBefore),
+		"not_after":      nullableTime(request.NotAfter),
 		"mutation_count": request.MutationCount,
 		// What approving runs now, across every page of the request.
 		"pending_mutation_count": request.PendingMutationCount,
@@ -343,6 +404,8 @@ func (s *Service) requestJSON(request Request, withMutations bool) map[string]an
 		// Only a request nothing else can move may be closed out by naming
 		// its replacement; the status list lives here, not in each client.
 		"can_supersede": strings.TrimSpace(request.SupersededBy) == "" && requestIsSupersedable(request.Status),
+		// The policy's decision: the review's "would auto-approve" badge.
+		"policy": request.Policy,
 	}
 	// context and result are review detail, not list columns: a request's
 	// context is the agent's whole proposal snapshot and result carries a
@@ -357,6 +420,8 @@ func (s *Service) requestJSON(request Request, withMutations bool) map[string]an
 			mutations = append(mutations, mutationJSON(mutation))
 		}
 		item["mutations"] = mutations
+		item["can_undo"] = canUndo(request)
+		item["can_cancel"] = canCancel(request)
 	}
 	return item
 }
@@ -385,6 +450,9 @@ func mutationJSON(mutation Mutation) map[string]any {
 		"approved_at":   nullableTime(mutation.ApprovedAt),
 		"executed_at":   nullableTime(mutation.ExecutedAt),
 		"observed_at":   nullableTime(mutation.ObservedAt),
+		"not_before":    nullableTime(mutation.NotBefore),
+		"not_after":     nullableTime(mutation.NotAfter),
+		"precondition":  mutation.Precondition,
 	}
 	if isGmailEmailMutation(mutation) {
 		item["email"] = gmailEmailView(mutation)

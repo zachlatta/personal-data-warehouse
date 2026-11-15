@@ -39,6 +39,7 @@ from personal_data_warehouse.relations import relation
 from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
+    ATTENTION_HEAP_WARM_SETTINGS,
     ATTACHMENT_BACKFILL_STATE_COLUMNS,
     ATTACHMENT_COLUMNS,
     FLOAT_COLUMNS,
@@ -399,9 +400,19 @@ def test_search_index_prewarm_reads_hnsw_then_every_bm25_index_and_never_buffers
         lambda sql, params=None: state_updates.append((sql, params)),
     )
 
+    def warm_heap():
+        prewarm_calls.append(("timeline.events attention heap", "bitmap"))
+        return {"heap_rows": 7, "timed_out": False}
+
+    monkeypatch.setattr(warehouse, "warm_attention_heap", warm_heap)
+
     result = warehouse.prewarm_search_indexes_if_needed(schema_signature="new-signature")
 
     assert result["warmed"] is True
+    assert result["heap_rows"] == 7
+    # The heap the lexical pool visits is warmed LAST, after every index.
+    assert prewarm_calls[-1] == ("timeline.events attention heap", "bitmap")
+    prewarm_calls.pop()
     assert prewarm_calls[:4] == [
         (f"derived_search.search_chunk_vectors_{partition}_hnsw_idx", "read")
         for partition in ("gmail", "slack", "slack_file", "other")
@@ -417,6 +428,76 @@ def test_search_index_prewarm_reads_hnsw_then_every_bm25_index_and_never_buffers
         now,
         "new-fingerprint",
     )
+
+
+def test_attention_heap_warm_reads_the_tier_heap_through_a_prefetched_bitmap_scan(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The lexical pool's cold cost is the timeline heap, not its indexes.
+
+    Measured 2026-11-11 on production: of the 1,529 reads a cold
+    `search_text('boiler inspection', 20, self/direct/cc)` made, 1,309 (86%)
+    were `timeline.events` heap pages and 171 the attention BM25 index, so a
+    warm of the indexes alone leaves the leg cold. The attention-tier heap
+    (~14% of heap pages) is warmed by a bitmap heap scan over the priority
+    index, which PostgreSQL 18 prefetches through its read stream, instead of
+    an index walk that reads one page at a time.
+    """
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(
+        """
+        INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table,
+                                     search_text, priority, actor, title, snippet, context)
+        SELECT 'slack_message', 'hw-' || p || '-' || g, 'slack', 'message', now() - g * interval '1 minute',
+               'slack_messages', 'heap warm probe', p, 'a', 't', 's', 'c'
+        FROM generate_series(1, 30) g,
+             unnest(ARRAY['self', 'direct', 'cc', 'noise', 'background']::@timeline_priority[]) p
+        """
+    )
+    warehouse._command("ANALYZE @timeline_events")
+
+    result = warehouse.warm_attention_heap()
+    assert result == {"heap_rows": 90, "timed_out": False}
+
+    warehouse._command("BEGIN")
+    try:
+        for name, value in ATTENTION_HEAP_WARM_SETTINGS:
+            warehouse._command(f"SET LOCAL {name} = '{value}'")
+        plan = "\n".join(
+            row[0] for row in warehouse._query("EXPLAIN " + warehouse._attention_heap_warm_sql())
+        )
+    finally:
+        warehouse._command("ROLLBACK")
+    assert "Bitmap Heap Scan on events" in plan, plan
+    assert "Bitmap Index Scan on timeline_events_priority_time_idx" in plan, plan
+    # The warm runs inside the five-minute search_chunks job, after a chunk
+    # build of up to 240 s: its budget must leave the tick room to finish.
+    assert dict(ATTENTION_HEAP_WARM_SETTINGS)["statement_timeout"] == "180s"
+
+
+def test_a_heap_warm_cut_off_by_its_budget_is_a_partial_warm(
+    warehouse: PostgresWarehouse, monkeypatch
+) -> None:
+    """On a saturated disk the 180 s budget ends the warm: that is a partial
+    warm reported as such, never an error that fails the search_chunks pass,
+    and it leaves the session as it found it."""
+    import personal_data_warehouse.postgres as postgres_module
+
+    _ensure_all_table_groups(warehouse)
+    monkeypatch.setattr(
+        postgres_module,
+        "ATTENTION_HEAP_WARM_SETTINGS",
+        (("statement_timeout", "50ms"),),
+    )
+    monkeypatch.setattr(
+        warehouse, "_attention_heap_warm_sql", lambda: "SELECT count(*) FROM pg_sleep(5)"
+    )
+    started = time.monotonic()
+    assert warehouse.warm_attention_heap() == {"heap_rows": None, "timed_out": True}
+    assert time.monotonic() - started < 4
+    # SET LOCAL ended with the rolled-back transaction, and the connection works.
+    assert warehouse._query("SHOW statement_timeout")[0][0] != "50ms"
+    assert warehouse._query("SELECT 1") == [(1,)]
 
 
 def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(
@@ -460,9 +541,17 @@ def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(
         lambda sql, params=None: calls.append(sql),
     )
 
+    heap_warms: list[bool] = []
+    monkeypatch.setattr(
+        warehouse,
+        "warm_attention_heap",
+        lambda: heap_warms.append(True) or {"heap_rows": 1, "timed_out": False},
+    )
+
     result = warehouse.prewarm_search_indexes_if_needed(schema_signature="sig")
 
     assert result == {"warmed": False, "reason": "current", "blocks": 0}
+    assert heap_warms == [], "a current cache reads no heap either"
     assert calls == []
 
     forced = warehouse.prewarm_search_indexes_if_needed(
@@ -470,6 +559,7 @@ def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(
     )
     assert forced["warmed"] is True
     assert prewarm_calls
+    assert heap_warms == [True]
     assert calls, "a forced post-maintenance warm must update the state marker"
 
 
@@ -2063,6 +2153,8 @@ def test_postgres_ai_conversation_event_tables_create_read_path_indexes(
         assert f"{table}_session_seq_idx" in index_names, table
         assert f"{table}_occurred_at_idx" in index_names, table
         assert f"{table}_first_prompt_idx" in index_names, table
+        assert f"{table}_broadcast_prompt_idx" in index_names, table
+        assert f"{table}_agent_delivery_idx" in index_names, table
         assert f"{table}_ingested_at_idx" in index_names, table
 
 
@@ -2308,7 +2400,7 @@ def test_search_hybrid_semantic_helper_can_override_its_candidate_pool() -> None
     assert "candidate_limit integer DEFAULT NULL" in semantic
     assert "requested_candidates integer" in semantic
     assert "USING embedding_model, sem_adapters, since, qvec, requested_candidates" in semantic
-    assert semantic.count("LIMIT $5") == 3  # exact branch, graph branch, merge
+    assert semantic.count("LIMIT $5") == 4  # exact branch, graph branch, parallel walks, merge
     assert "DROP FUNCTION IF EXISTS @search_hybrid_semantic(text, text, integer, text[], timestamptz)" in sql
 
 
@@ -3982,6 +4074,94 @@ def test_search_text_returns_hits_under_default_search_path(warehouse: PostgresW
     assert rows == [("slack_message:dp1",)]
 
 
+def test_every_search_function_runs_with_jit_off(warehouse: PostgresWarehouse) -> None:
+    """Measured 2026-11-11 on prod: a priority-scoped lexical pool scan is
+    costed at 5.5M, so Postgres JIT-compiled it on every call (22 functions,
+    ~600 ms of inlining and optimization) for a statement that then ran in
+    ~200 ms warm: 811-868 ms with JIT against 185-215 ms without. Every
+    search statement returns a page of rows, never the long analytic scan JIT
+    pays off on, so each search function pins jit off for everything it runs.
+    The test database already sets jit off per role, which is why only the
+    catalog can show this."""
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    rows = warehouse._query(
+        """
+        SELECT p.proname, coalesce(p.proconfig, '{}')
+        FROM pg_proc p
+        JOIN pg_language l ON l.oid = p.prolang
+        WHERE p.pronamespace = to_regnamespace(%s)
+          AND l.lanname = 'plpgsql'
+          AND p.proname LIKE 'search%%'
+        ORDER BY p.proname
+        """,
+        (warehouse._object_schema("search_text"),),
+    )
+    names = {name for name, _config in rows}
+    assert {
+        "search_text",
+        "search_text_exact",
+        "search_hybrid",
+        "search_hybrid_semantic",
+        "search_hybrid_exact",
+        "search_hybrid_fuse",
+    } <= names
+    assert [name for name, config in rows if "jit=off" not in config] == []
+
+
+@pytest.mark.parametrize("priorities", [None, ["self", "direct", "cc"]], ids=["broad", "attention"])
+def test_search_text_runs_its_pool_partitions_on_parallel_workers(
+    warehouse: PostgresWarehouse, priorities: list[str] | None
+) -> None:
+    """Contract C6: each pool partition is an index-ordered BM25 scan that
+    fetches its heap rows one at a time, and in one backend the pool cost the
+    sum of its partitions (prod, 2026-11-11, cold, scoped: 13.1 s and then
+    1.65 s). The partitions must run as the children of one Parallel Append,
+    each on its own process, and the pool must still hold both partitions'
+    rows."""
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(
+        """
+        INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table,
+                                     search_text, priority, actor, title, snippet, context)
+        VALUES ('slack_message', 'pp1', 'slack', 'message', now(), 'slack_messages',
+                'quokka parallel pool probe', 'direct', 'a', 't', 's', 'c'),
+               ('apple_note_revision', 'pp2', 'apple_notes', 'note_edit', now(),
+                'apple_note_revisions', 'quokka parallel pool note', 'self', 'a', 't', 's', 'c')
+        """
+    )
+    connection = warehouse._connection
+    warehouse._command("LOAD 'auto_explain'")
+    warehouse._command("SET auto_explain.log_min_duration = 0")
+    warehouse._command("SET auto_explain.log_analyze = on")
+    warehouse._command("SET auto_explain.log_nested_statements = on")
+    warehouse._command("SET client_min_messages = log")
+    del connection.notices[:]
+    try:
+        rows = warehouse._query(
+            "SELECT ref FROM @search_text('quokka', 10, NULL, NULL, %s::text[])",
+            (priorities,),
+        )
+        plans = "".join(connection.notices)
+    finally:
+        warehouse._command("RESET client_min_messages")
+        warehouse._command("RESET auto_explain.log_min_duration")
+
+    assert "Parallel Append" in plans, plans
+    assert plans.count("Function Scan on search_text_pool_partition") == 2, plans
+    launched = [int(n) for n in re.findall(r"Workers Launched: (\d+)", plans)]
+    assert launched and max(launched) >= 1, plans
+    assert {ref for (ref,) in rows} == {
+        "slack_message:pp1",
+        "apple_note_revision:pp2",
+    }
+
+
 def test_search_text_preview_strips_tracking_urls_and_table_scaffolding(warehouse: PostgresWarehouse) -> None:
     # Measured 2026-09-22: a newsletter hit's whole 800-char preview was
     # squarespace-mail.com redirect URLs and `| | --- |` markdown-table debris,
@@ -4890,39 +5070,73 @@ def test_postgres_public_sweep_offers_hot_channels_then_the_least_recently_polle
     assert [payload["id"] for payload in both] == ["C-hot", "C-cold", "C-cold-polled"]
 
 
-def test_postgres_public_sweep_skips_a_conversation_known_gone(
+def test_postgres_a_gone_verdict_holds_only_while_the_conversation_is_archived(
     warehouse: PostgresWarehouse,
 ) -> None:
+    """Slack listing a conversation again overrules an old channel_not_found.
+
+    A gone-code failure marks the conversation archived; only conversations.list
+    can set it live again, and it does so only for a conversation Slack lists.
+    Measured 2026-11-11: eleven public channels carried a 'gone' verdict from
+    May to October while discovery kept re-listing them as live, so
+    marts_ops.slack_conversation_health counted them as live and unpolled (the
+    oldest since 2026-05-28) -- and ten of the eleven answered
+    conversations.history normally that day. The verdict was a transient
+    channel_not_found that nothing ever retried.
+    """
     warehouse.ensure_slack_tables()
     warehouse.insert_slack_conversations(
         [
             _slack_conversation_row(
-                conversation_id="C-gone",
+                conversation_id="C-relisted",
                 conversation_type="public_channel",
                 is_member=0,
-                raw_json='{"id":"C-gone"}',
-            )
+                raw_json='{"id":"C-relisted"}',
+            ),
+            _slack_conversation_row(
+                conversation_id="C-archived",
+                conversation_type="public_channel",
+                is_member=0,
+                is_archived=1,
+                raw_json='{"id":"C-archived","is_archived":true}',
+            ),
+            _slack_conversation_row(
+                conversation_id="G-relisted",
+                conversation_type="private_channel",
+                raw_json='{"id":"G-relisted","is_private":true}',
+            ),
         ]
     )
-    warehouse.insert_slack_sync_state(
-        account="zrl",
-        team_id="T1",
-        object_type="conversation",
-        object_id="C-gone",
-        cursor_ts="",
-        last_sync_type="full",
-        status="gone",
-        error="channel_not_found",
-        updated_at=datetime(2026, 5, 1, tzinfo=UTC),
-        sync_version=1,
-    )
-
-    assert (
-        warehouse.load_slack_public_sweep_candidate_payloads(
-            account="zrl", team_id="T1", hot_limit=10, cold_limit=10
+    for conversation_id in ("C-relisted", "C-archived", "G-relisted"):
+        warehouse.insert_slack_sync_state(
+            account="zrl",
+            team_id="T1",
+            object_type="conversation",
+            object_id=conversation_id,
+            cursor_ts="",
+            last_sync_type="partial",
+            status="gone",
+            error="conversations.history failed: channel_not_found",
+            updated_at=datetime(2026, 5, 28, tzinfo=UTC),
+            sync_version=1,
         )
-        == []
+
+    swept = warehouse.load_slack_public_sweep_candidate_payloads(
+        account="zrl", team_id="T1", hot_limit=10, cold_limit=10
     )
+    assert [payload["id"] for payload in swept] == ["C-relisted"]
+
+    live = warehouse.load_slack_conversation_payloads(
+        account="zrl", team_id="T1", skip_known_errors=True
+    )
+    assert sorted(payload["id"] for payload in live) == ["C-relisted", "G-relisted"]
+
+    # The archived-only coverage stages still never retry an archived channel
+    # that Slack reported gone: nothing would list it live again.
+    archived = warehouse.load_slack_conversation_payloads(
+        account="zrl", team_id="T1", archived_only=True, skip_known_errors=True
+    )
+    assert archived == []
 
 
 def test_postgres_touch_slack_conversation_sync_state_keeps_the_cursor_and_moves_the_clock(
@@ -4982,6 +5196,39 @@ def test_postgres_touch_slack_conversation_sync_state_keeps_the_cursor_and_moves
         ("zrl", "T1", "C2"),
     )
     assert fresh == [("", "sweep", "ok")]
+
+    # A poll that answered proves the conversation is reachable, so a 'gone'
+    # verdict from an earlier channel_not_found is cleared -- otherwise the
+    # tombstone outlives the conversation's return. The cursor and sync type
+    # are still preserved.
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation",
+        object_id="C3",
+        cursor_ts="1770000000.000011",
+        last_sync_type="partial",
+        status="gone",
+        error="conversations.history failed: channel_not_found",
+        updated_at=datetime(2026, 5, 1, tzinfo=UTC),
+        sync_version=1,
+    )
+    warehouse.touch_slack_conversation_sync_state(
+        account="zrl",
+        team_id="T1",
+        conversation_id="C3",
+        updated_at=polled_at,
+        sync_version=3,
+    )
+    healed = warehouse._query(
+        """
+        SELECT cursor_ts, last_sync_type, status, error, updated_at
+        FROM @slack_sync_state
+        WHERE account = %s AND team_id = %s AND object_type = 'conversation' AND object_id = %s
+        """,
+        ("zrl", "T1", "C3"),
+    )
+    assert healed == [("1770000000.000011", "partial", "ok", "", polled_at)]
 
 
 def test_postgres_mark_slack_conversation_inactive_excludes_it_from_active_loads(
@@ -5365,10 +5612,14 @@ def test_postgres_slack_thread_parent_refs_skip_gone_but_retry_errors(
 def test_postgres_slack_conversation_payloads_skip_gone_but_retry_errors(
     warehouse: PostgresWarehouse,
 ) -> None:
+    # The archived-only coverage stages: a gone verdict on an archived
+    # conversation is never retried, a transient error always is. (A live
+    # conversation's gone verdict is retried; see
+    # test_postgres_a_gone_verdict_holds_only_while_the_conversation_is_archived.)
     warehouse.ensure_slack_tables()
     warehouse.insert_slack_conversations(
         [
-            _slack_conversation_row(conversation_id=cid, raw_json=f'{{"id":"{cid}"}}')
+            _slack_conversation_row(conversation_id=cid, is_archived=1, raw_json=f'{{"id":"{cid}"}}')
             for cid in ("C-gone", "C-error", "C-fresh")
         ]
     )
@@ -5387,7 +5638,9 @@ def test_postgres_slack_conversation_payloads_skip_gone_but_retry_errors(
         error="conversations.history failed: fatal_error",
     )
 
-    payloads = warehouse.load_slack_conversation_payloads(account="zrl", team_id="T1", skip_known_errors=True)
+    payloads = warehouse.load_slack_conversation_payloads(
+        account="zrl", team_id="T1", archived_only=True, skip_known_errors=True
+    )
 
     assert sorted(p["id"] for p in payloads) == ["C-error", "C-fresh"]
 
@@ -6640,6 +6893,92 @@ def test_voice_mart_treats_apple_notes_audio_as_a_voice_source(warehouse: Postgr
     }
 
 
+def test_voice_mart_serves_the_newest_bytes_of_a_revised_note_recording(warehouse: PostgresWarehouse) -> None:
+    """A Notes recording that grew is the new bytes, transcribed again.
+
+    An attachment's audio replaced by a longer recording while the note's
+    modified_at did not move tied every revision, and the tie fell to
+    revision_id, a content hash: the mart could keep serving the older bytes
+    and the new revision was never transcribed. Within a tie the
+    revision ingested last is the newest.
+    """
+    now = datetime(2026, 10, 15, 20, tzinfo=UTC)
+    warehouse.ensure_apple_notes_tables()
+    # Revision ids are hashes, so their order says nothing; "f..." sorts last.
+    revisions = [("f-old-1", now), ("a-old-2", now + timedelta(hours=4)),
+                 ("9-new-1", now + timedelta(days=1)), ("0-new-2", now + timedelta(days=2))]
+    warehouse.insert_apple_note_revisions(
+        [
+            _default_row(APPLE_NOTE_REVISION_COLUMNS, account="z", note_id="n1", revision_id=rev,
+                         title="Meeting", modified_at=now, ingested_at=ingested)
+            for rev, ingested in revisions
+        ]
+    )
+    warehouse.insert_apple_note_attachments(
+        [
+            _default_row(APPLE_NOTE_ATTACHMENT_COLUMNS, account="z", note_id="n1", revision_id=rev,
+                         attachment_id="att-audio", filename="Recording.m4a", content_type="audio/mp4",
+                         size_bytes=20 if rev.endswith(("new-1", "new-2")) else 10,
+                         content_sha256="sha-new" if rev.endswith(("new-1", "new-2")) else "sha-old",
+                         is_missing=0, storage_file_id=f"drive-{rev}", ingested_at=ingested)
+            for rev, ingested in revisions
+        ]
+    )
+    # The old bytes were transcribed when they were the only ones.
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    warehouse.insert_apple_voice_memos_transcription_runs(
+        [
+            _default_row(VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS, source="apple_notes", account="z",
+                         recording_id="att-audio", content_sha256="sha-old", provider="assemblyai",
+                         provider_transcript_id="t-old", status="completed", transcript_text="first half",
+                         requested_at=now, completed_at=now)
+        ]
+    )
+
+    (row,) = warehouse._query_dicts(
+        "SELECT content_sha256, size_bytes FROM @marts_voice_memos_recordings WHERE source = 'apple_notes'"
+    )
+    assert (row["content_sha256"], row["size_bytes"]) == ("sha-new", 20)
+    (candidate,) = warehouse.load_untranscribed_voice_recordings(provider="assemblyai", limit=10)
+    assert (candidate["recording_id"], candidate["content_sha256"]) == ("att-audio", "sha-new")
+
+
+def test_voice_mart_never_replaces_a_note_recording_with_a_newer_empty_revision(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The newest NONEMPTY revision is the recording.
+
+    A later note revision whose copy of the attachment is 0 bytes (an iCloud
+    stub, a failed export) carries the SHA-256 of empty bytes, not an empty
+    hash, so a hash check alone let it replace good audio.
+    """
+    now = datetime(2026, 10, 15, 20, tzinfo=UTC)
+    warehouse.ensure_apple_notes_tables()
+    revisions = [("r-good", now, 1000, "sha-good"),
+                 ("r-empty", now + timedelta(days=1), 0, hashlib.sha256(b"").hexdigest())]
+    warehouse.insert_apple_note_revisions(
+        [
+            _default_row(APPLE_NOTE_REVISION_COLUMNS, account="z", note_id="n1", revision_id=rev,
+                         title="Meeting", modified_at=at, ingested_at=at)
+            for rev, at, _size, _sha in revisions
+        ]
+    )
+    warehouse.insert_apple_note_attachments(
+        [
+            _default_row(APPLE_NOTE_ATTACHMENT_COLUMNS, account="z", note_id="n1", revision_id=rev,
+                         attachment_id="att-audio", filename="Recording.m4a", content_type="audio/mp4",
+                         size_bytes=size, content_sha256=sha, is_missing=0,
+                         storage_file_id=f"drive-{rev}", ingested_at=at)
+            for rev, at, size, sha in revisions
+        ]
+    )
+
+    (row,) = warehouse._query_dicts(
+        "SELECT content_sha256, size_bytes FROM @marts_voice_memos_recordings WHERE source = 'apple_notes'"
+    )
+    assert (row["content_sha256"], row["size_bytes"]) == ("sha-good", 1000)
+
+
 def test_postgres_sync_state_round_trips_latest_update(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     older = datetime(2026, 5, 19, 11, tzinfo=UTC)
@@ -6819,6 +7158,26 @@ def test_search_text_broad_pool_scans_low_volume_adapters_separately() -> None:
     )
 
 
+
+def _search_text_pool_partitions_sql() -> str:
+    """The partition scans: the CASE body of search_text_pool_partition()."""
+    sql = _search_text_function_sql()
+    start = sql.index("CREATE OR REPLACE FUNCTION @search_text_pool_partition(")
+    body = sql[sql.index("partition_sql text := CASE partition_number", start) :]
+    return body[: body.index("END;")]
+
+
+def _search_text_pool_window_sql() -> str:
+    """search_text()'s statement under the enable_sort hint."""
+    sql = _search_text_function_sql()
+    fn = sql[sql.index("CREATE OR REPLACE FUNCTION @search_text(") :]
+    return fn[
+        fn.index("set_config('enable_sort', 'off', true)") : fn.index(
+            "set_config('enable_sort', 'on', true)"
+        )
+    ]
+
+
 def test_search_text_broad_pool_forces_the_index_ordered_plan() -> None:
     # With the default cost model the planner reads every row of a selective
     # adapter filter and recomputes the bm25 operator per row, which is ~100x
@@ -6835,16 +7194,17 @@ def test_search_text_broad_pool_forces_the_index_ordered_plan() -> None:
     # too left the planner no sane way to feed the window function: at a 10k
     # pool one query ran for five MINUTES. The pool is therefore collected in
     # its own statement, into arrays, before the hint is restored.
-    off_at = sql.index("set_config('enable_sort', 'off', true)")
-    on_at = sql.index("set_config('enable_sort', 'on', true)")
-    scoped = sql[off_at:on_at]
-    assert "array_agg" in scoped, (
+    scoped = _search_text_pool_window_sql()
+    assert "array_agg" in scoped and "@search_text_pool(" in scoped, (
         "the pooled scan must be collected in its own statement while the "
         "enable_sort hint is in force"
     )
     assert "PARTITION BY" not in scoped, (
         "the per-source ranking must run AFTER enable_sort is restored"
     )
+    # The scans themselves run in search_text_pool_partition on parallel
+    # workers, which inherit the hint from the session that launched them.
+    scoped = _search_text_pool_partitions_sql()
     # The one window allowed under the hint is the bare `row_number() OVER ()`
     # that captures each partition's scan ordinal. It carries no PARTITION BY
     # and no ORDER BY, so it needs no sort and cannot be the plan the disabled
@@ -6940,10 +7300,7 @@ def test_search_text_broad_pool_ranks_by_scan_ordinal_not_a_per_row_rescore() ->
     This is the guard for the defect, not for the fix: it fails on the shape
     that was shipped.
     """
-    sql = _search_text_function_sql()
-    off_at = sql.index("set_config('enable_sort', 'off', true)")
-    on_at = sql.index("set_config('enable_sort', 'on', true)")
-    pooled = sql[off_at:on_at]
+    pooled = _search_text_pool_partitions_sql()
     assert "<@>" in pooled, "the pooled scan must still ORDER BY the bm25 operator"
     for match in re.finditer("<@>", pooled):
         assert pooled[: match.start()].rstrip().endswith("ORDER BY t.search_text"), (
@@ -7484,12 +7841,7 @@ def test_search_text_serves_an_attention_scoped_call_from_the_attention_index() 
     """
     import personal_data_warehouse.postgres as postgres_module
 
-    sql = _search_text_function_sql()
-    pool = sql[
-        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
-            "set_config('enable_sort', 'on', true)"
-        )
-    ]
+    pool = _search_text_pool_window_sql()
     assert (
         "priorities <@ ARRAY["
         + postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL
@@ -7498,9 +7850,11 @@ def test_search_text_serves_an_attention_scoped_call_from_the_attention_index() 
         "the broad pool must choose the attention index only when the requested "
         "tiers are a SUBSET of the ones it contains"
     )
-    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_idx')" in pool
+    partitions = _search_text_pool_partitions_sql()
+    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_idx')" in partitions
     assert (
-        "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_lowvol_idx')" in pool
+        "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_lowvol_idx')"
+        in partitions
     )
 
 
@@ -7516,17 +7870,13 @@ def test_search_text_pool_is_one_shot_dynamic_sql_with_the_query_inlined() -> No
     query needs to be a literal; priorities and since travel through USING.
     """
     sql = _search_text_function_sql()
-    pool = sql[
-        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
-            "set_config('enable_sort', 'on', true)"
-        )
-    ]
+    pool = _search_text_pool_partitions_sql()
     assert "to_bm25query(query," not in pool, (
         "the pool must inline the query as a literal (%1$L), never reference "
         "the plpgsql variable, which makes it a cached parameterized plan"
     )
-    assert pool.count("EXECUTE format($pool$") == 2, "both the attention and the broad pool run as one-shot dynamic SQL"
-    assert pool.count("USING priorities, since;") == 2
+    assert pool.count("to_bm25query(%1$L,") == 4, "all four partitions inline the query"
+    assert "RETURN QUERY EXECUTE format(partition_sql, query) USING priorities, since;" in sql
     assert "($1 IS NULL OR t.priority::text = ANY ($1))" in pool
     assert "($2 IS NULL OR t.occurred_at >= $2)" in pool
     assert "(priorities IS NULL OR" not in pool and "(since IS NULL OR" not in pool
@@ -7985,12 +8335,7 @@ def test_the_attention_pool_repeats_the_index_predicate_as_a_literal() -> None:
     """
     import personal_data_warehouse.postgres as postgres_module
 
-    sql = _search_text_function_sql()
-    pool = sql[
-        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
-            "set_config('enable_sort', 'on', true)"
-        )
-    ]
+    pool = _search_text_pool_partitions_sql()
     literal = f"t.priority IN ({postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})"
     assert pool.count(literal) == 2, (
         "both attention partitions must carry the index predicate as a literal; "
@@ -8018,21 +8363,34 @@ def test_a_non_subset_priority_call_keeps_the_general_indexes() -> None:
     import personal_data_warehouse.postgres as postgres_module
 
     sql = _search_text_function_sql()
-    pool = sql[
-        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
-            "set_config('enable_sort', 'on', true)"
-        )
-    ]
-    # The attention pool sits under a guard; the general pool is the ELSE.
+    # The attention pool sits under a guard, passed to search_text_pool as
+    # its `attention` flag; the general pool is that function's ELSE.
     guard = "priorities <@ ARRAY[" + postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + "]"
-    assert guard in pool
-    general = pool[pool.index("ELSE", pool.index(guard)) :]
-    assert "attention" not in general, (
-        "the fallback pool must not name an attention index: it cannot answer "
-        "a call for noise/cc/background at all"
+    window = _search_text_pool_window_sql()
+    assert "priorities IS NOT NULL" in window and guard in window
+    pool_fn = sql[sql.index("CREATE OR REPLACE FUNCTION @search_text_pool(") :]
+    pool_fn = pool_fn[: pool_fn.index("$pool$;")]
+    general = pool_fn[pool_fn.index("ELSE") :]
+    general_parts = {
+        int(part) for part in re.findall(r"@search_text_pool_partition\(\$1, (\d+),", general)
+    }
+    assert general_parts == {
+        postgres_module.SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
+        postgres_module.SEARCH_TEXT_POOL_PART_LOW_VOLUME,
+    }
+    partitions = _search_text_pool_partitions_sql()
+    for part in general_parts:
+        branch = partitions[partitions.index(f"WHEN {part} THEN") :]
+        branch = branch[: branch.index("$part$", branch.index("$part$") + 1)]
+        assert "attention" not in branch, (
+            "the fallback pool must not name an attention index: it cannot answer "
+            "a call for noise/cc/background at all"
+        )
+    general_sql = "".join(
+        partitions[partitions.index(f"WHEN {part} THEN") :][:4000] for part in general_parts
     )
-    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_idx')" in general
-    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_lowvol_idx')" in general
+    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_idx')" in general_sql
+    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_lowvol_idx')" in general_sql
 
 
 def test_search_schema_signature_covers_the_attention_tiers() -> None:

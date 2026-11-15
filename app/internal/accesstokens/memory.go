@@ -101,3 +101,18 @@ func (m *MemoryStore) Redeem(_ context.Context, codeID string, mint func(Token, 
 	m.rows[codeID] = row
 	return minted, nil
 }
+
+func (m *MemoryStore) RecordFeedUse(_ context.Context, id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.rows[id]
+	if !ok {
+		return ErrNotFound
+	}
+	row.token.RequestCount++
+	if at.After(row.token.LastUsedAt) {
+		row.token.LastUsedAt = at
+	}
+	m.rows[id] = row
+	return nil
+}

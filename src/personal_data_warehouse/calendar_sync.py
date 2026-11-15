@@ -12,6 +12,7 @@ from googleapiclient.errors import HttpError
 
 from personal_data_warehouse.config import CalendarAccount, Settings
 from personal_data_warehouse.google_auth import load_google_credentials
+from personal_data_warehouse.source_sla import record_upstream_observation
 
 EPOCH_UTC = datetime.fromtimestamp(0, tz=UTC)
 
@@ -228,11 +229,27 @@ class CalendarSyncRunner:
             account.email_address,
             calendar_id,
         )
+        def observe(updated: datetime | None) -> None:
+            # C11: the calendar's own newest change, recorded before writing.
+            # A response without the stamp is no observation (it ages to
+            # unknown), not a claim that the calendar is empty.
+            if updated is None:
+                return
+            record_upstream_observation(
+                self._warehouse,
+                self._logger,
+                pipeline="google_calendar",
+                scope=f"{account.email_address}/{calendar_id}",
+                upstream_newest_at=updated,
+                detail=f"events.list top-level updated ({sync_type} sync)",
+            )
+
         for events, page_sync_token in iter_event_pages(
             service=service,
             calendar_id=calendar_id,
             page_size=self._settings.calendar_page_size,
             sync_token=sync_token,
+            on_calendar_updated=observe,
         ):
             rows = [
                 event_to_row(
@@ -370,8 +387,18 @@ def iter_event_pages(
     calendar_id: str,
     page_size: int,
     sync_token: str | None = None,
+    on_calendar_updated: Callable[[datetime | None], None] | None = None,
 ) -> Iterator[tuple[list[Mapping[str, Any]], str | None]]:
+    """Page through events; ``on_calendar_updated`` gets the calendar's own stamp.
+
+    Every events.list response carries the calendar's last-modification time
+    in its top-level ``updated``, including an incremental response with no
+    items (checked 2026-11-11), so the sync learns what Google says is the
+    newest change at no extra call. It is reported once, from the first page,
+    before that page is written.
+    """
     page_token: str | None = None
+    reported = False
     while True:
         list_kwargs: dict[str, Any] = {
             "calendarId": calendar_id,
@@ -384,6 +411,9 @@ def iter_event_pages(
             list_kwargs["syncToken"] = sync_token
 
         response = execute_calendar_request(lambda: service.events().list(**list_kwargs).execute())
+        if on_calendar_updated is not None and not reported:
+            reported = True
+            on_calendar_updated(parse_rfc3339(str(response.get("updated", ""))))
         items = [item for item in response.get("items", []) if isinstance(item, Mapping)]
         next_sync_token = response.get("nextSyncToken")
         yield items, str(next_sync_token) if next_sync_token else None

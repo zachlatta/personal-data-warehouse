@@ -48,6 +48,22 @@ their transcripts (`marts_ai_conversations.events`) and writes two things:
   `pdw sql` / `query` result carries `SQLSTATE` 42703, 42P01, 42883, 42501, 57014 or 42804.
   Until 2026-10-28 it matched the bare digits, so a result row holding `42703` counted, and
   42804 (`NOT is_deleted` on an integer flag) did not count at all.
+  The search-first share is the C3 timeline-first share: a session's first question call is
+  `search`, or SQL that names `timeline.events` / `timeline.search_text[_exact]`.
+  Three rules keep the denominator to sessions that asked the warehouse something. A Codex `item_completed` row is classified by its `command` only, not the
+  output it printed or a message naming a command (a printed skill or README names
+  `pdw sql` at a line start without running it). `pdw list` and `pdw describe <connection>__<tool>`
+  are connection calls, like MCP `connections`. Tool help (`pdw describe <tool>`,
+  `pdw call --help`, MCP `readme`, `propose_mutation_help`) and writes (`propose_mutation`,
+  `withdraw_mutation`, `notify`, `cli_authorize`, Feed push/update/remove/restore/rank/save)
+  are admin calls. Reads stay reads: `get_mutation` and the Feed reads (list, get, history,
+  stats, events, on both surfaces) are `other_read`, so opening on one is not search-first.
+  The correction raises the search-first share and also the SQL-error share, because the
+  removed sessions had made no SQL errors.
+  A default search scope was considered and rejected: the weekly search benchmark's paired
+  attention leg (`marts_ops.search_benchmark`) loses much of the recall of an all-tier search
+  and falls below its MRR floor, and a server-side default would be counted as a priority
+  filter the agent never chose. The default stays all tiers; the guidance asks for the scope.
 - `marts_ops.agent_top_failures`: one row per ISO week (Monday, UTC) and failure shape,
   ranked by sessions. A shape is the SQLSTATE plus the normalized message (aliases and
   numbers dropped), with the relations the statement read for a missing column or a

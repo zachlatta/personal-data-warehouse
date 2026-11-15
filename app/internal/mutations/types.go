@@ -123,6 +123,11 @@ type CreateRequestInput struct {
 	Context     map[string]any
 	Mutations   []MutationInput
 	RequestedBy string
+	// RequestedByTokenID is the authenticated token behind the proposal: the
+	// issued token's id, or the OAuth connector grant's id; empty for the
+	// master secret. RequestedBy is only the name the caller chose to send;
+	// a mutation policy grant binds to this id, never to that name.
+	RequestedByTokenID string
 	// Replaces names the earlier request this proposal stands in for. The
 	// store closes that request out in the same transaction — withdrawing it
 	// if it is still pending, linking it if it is dead — or refuses the whole
@@ -172,6 +177,9 @@ type UpdateTextMessageMutationInput struct {
 }
 
 type MutationInput struct {
+	// Schedule is the entry's not_before, not_after and precondition, lifted
+	// off before the type parses the rest (schedule.go).
+	Schedule           MutationSchedule
 	Type               string
 	Account            string
 	Title              string
@@ -246,7 +254,10 @@ type Request struct {
 	ReplacesRequestID string
 	Revision          int64
 	RequestedBy       string
-	ApprovedBy        string
+	// RequestedByTokenID is the authenticated token that proposed the
+	// request (see CreateRequestInput).
+	RequestedByTokenID string
+	ApprovedBy         string
 	// WithdrawnBy is the agent identity that withdrew the request; the
 	// reason is in Error, exactly where a reviewer's denial reason lives.
 	WithdrawnBy   string
@@ -262,6 +273,13 @@ type Request struct {
 	PendingMutationCount int
 	// Mutations is the page GetRequest was asked for, in request order.
 	Mutations []Mutation
+	// NotBefore is the earliest any mutation may run, NotAfter the latest
+	// deadline (zero: none). The review shows "runs at".
+	NotBefore time.Time
+	NotAfter  time.Time
+	// Policy is the mutation policy's decision on the request
+	// (context.policy), nil when no policy could touch it.
+	Policy map[string]any
 }
 
 type Mutation struct {
@@ -290,4 +308,9 @@ type Mutation struct {
 	ApprovedAt     time.Time
 	ExecutedAt     time.Time
 	ObservedAt     time.Time
+	// NotBefore and NotAfter bound when the worker may run it (zero: none);
+	// Precondition is checked right before it runs.
+	NotBefore    time.Time
+	NotAfter     time.Time
+	Precondition map[string]any
 }

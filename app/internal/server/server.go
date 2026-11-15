@@ -19,6 +19,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/chatgptsession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/clirelease"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/externalfeeds"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/feed"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/hackernewssession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mcpproxy"
@@ -27,6 +28,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/push"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/scripts"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/slacksession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
@@ -45,6 +47,9 @@ func mcpToolHooks(logger *slog.Logger) tool.Hooks {
 				return
 			}
 			logged := marshalToolOutput(output)
+			if name == "run" {
+				logged = "<not logged>"
+			}
 			if redactedResultTools[name] && !isError {
 				logged = "[redacted: the result is a credential]"
 			}
@@ -121,9 +126,9 @@ type sqlInput struct {
 var serverInstructions = "Call the readme tool first: it is the brief agent guide to this warehouse (workflow, tool map, priority tiers, SQL traps, where each domain lives), with topic full for the long form and topics for search, sql, sources, agent-sessions, finance, health, slack, mutations, ops and connections. Connected upstream MCP servers (skills, tasks, other warehouses) are reached through the connections tool (list, then a tool's schema) and connection_call; they are live upstream calls with the connected account, not warehouse queries, and they may write. If you can run shell commands, cli_authorize returns a one-line command that sets up the pdw CLI there. " +
 	"Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, photos, health, and Plaid-backed finance data. " +
 	"START AT THE TIMELINE. timeline.events is one row per real-world event from every source; the search tool queries it and needs no schema discovery, so call search FIRST for any text, topic, person, phrase, or identifier. Search with the FEWEST, most distinctive words the answering record would contain -- a name, an id, a product, an amount, a subject-line phrase -- not the question and not a long bag of generic terms: measured on the labeled benchmark, \"Mt Foolery\" ranks first and \"Woody Mt Foolery cancelled postponed weather\" is not in the top 50. Search an identifier alone. Prefer several short searches over one long one, and on a miss drop words rather than add them. " +
-	"Every event carries a priority tier, and scoping to it is usually the difference between an answer and the whole corpus: " + warehouse.TimelinePriorityEqualsDefinitions() + ". \"What needs my attention\" means priorities " + strings.Join(warehouse.TimelineAttentionPriorities(), "/") + ", not everything. " +
+	"Every event carries a priority tier, and scoping to it is usually the difference between an answer and the whole corpus: " + warehouse.TimelinePriorityEqualsDefinitions() + ". \"What needs my attention\" means priorities " + strings.Join(warehouse.TimelineAttentionPriorities(), "/") + ", not everything. Pass priorities on the first search, not only after a noisy result: [\"" + strings.Join(warehouse.TimelineAttentionPriorities(), "\",\"") + "\"] for attention or correspondence, [\"" + strings.Join(warehouse.TimelineAgentWorkPriorities(), "\",\"") + "\"] for prior agent work; omit them only when every tier matters. " +
 	"For an email, chat/channel, or agent-turn hit, read the conversation around it with the context tool (the hit's ref) — a Gmail hit returns its thread, a Slack hit its thread or channel, a message its chat; each hit's source_table/source_pk drill straight to the authoritative row. " +
-	"Only for structured predicates, aggregates, joins, or drill-down after a hit, write SQL — and walk the layers in order: timeline (the event stream) -> marts_* (stable per-domain read views) -> base_* (raw provider detail), with derived_* as the modelled facts between them. Call describe_table on every relation you reference; call schema_overview only to find a relation you do not know. Do not guess relation or column names."
+	"Only for structured predicates, aggregates, joins, or drill-down after a hit, write SQL — and walk the layers in order: timeline (the event stream) -> marts_* (stable per-domain read views) or derived_* (the modelled facts behind them) -> base_* (raw provider detail). Call describe_table on every relation you reference; call schema_overview only to find a relation you do not know. Do not guess relation or column names."
 
 const schemaFirstReminder = "Call describe_table for each relation before SQL that references it; call schema_overview only to find a relation you do not know. The conversation around a search hit is the context tool, not SQL."
 
@@ -164,6 +169,7 @@ func NewMCPServerWithMutations(runner query.Runner, opts query.Options, mutation
 func buildRegistry(runner query.Runner, opts query.Options, mutationSvc *mutations.Service, _ *slog.Logger, extra ...tool.Tool) (*tool.Registry, *query.Service) {
 	svc := query.NewService(runner, opts)
 	tools := readOnlyTools(svc)
+	tools = append(tools, scriptTool(runner, opts))
 	tools = append(tools, extra...)
 	return tool.NewRegistry(tools, mutations.Tools(mutationSvc)), svc
 }
@@ -200,6 +206,16 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 }
 
 func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, notificationSvc *notifications.Service, mutationSvcs ...*mutations.Service) http.Handler {
+	handler, _ := NewMuxWithBackground(nil, cfg, authSvc, runner, notificationSvc, mutationSvcs...)
+	return handler
+}
+
+// NewMuxWithBackground attaches periodic proxy discovery to the app lifecycle.
+// A nil context builds a request-only mux for tests and embedded callers.
+// The caller must invoke cleanup after HTTP shutdown has finished draining
+// requests. Cancelling ctx stops discovery but does not close the shared store.
+func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, notificationSvc *notifications.Service, mutationSvcs ...*mutations.Service) (http.Handler, func()) {
+	cleanup := func() {}
 	logger := slog.Default().With("component", "http")
 	mux := http.NewServeMux()
 	if notificationSvc != nil {
@@ -251,8 +267,15 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		push.NewHandler(pushStore, notifier, time.Now, logger).Register(mux, authSvc.RequireStaticBearer())
 		if mutationSvc != nil {
 			mutationSvc.SetRequestCreated(func(_ context.Context, request mutations.Request) {
+				// A request a policy approved is not waiting on Zach: it gets
+				// the quiet alert after it runs, through the notification outbox
+				// (mutations.ClaimPolicyOutcomes queues it).
+				if request.Status != mutations.StatusPendingReview {
+					return
+				}
 				notifier.NotifyAsync(mutationNotification(request, mutationSvc.RequestJSON))
 			})
+			go mutationSvc.RunPolicyOutcomes(ctx, policyOutcomeInterval)
 			mutationSvc.SetRequestWithdrawn(func(_ context.Context, request mutations.Request) {
 				notifier.NotifyAsync(mutationWithdrawnNotification(request))
 			})
@@ -267,6 +290,41 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	authSvc.SetTokenAuthenticator(tokenSvc)
 	authSvc.SetOAuthGrants(tokenSvc)
 	accesstokens.Register(mux, tokenSvc, authSvc.RequireStaticBearer(), baseURL)
+	var feedStore externalfeeds.Store = externalfeeds.NewMemoryStore()
+	if cfg.PostgresDatabaseURL != "" {
+		store, err := externalfeeds.NewPostgresStore(cfg.PostgresDatabaseURL)
+		if err != nil {
+			logger.Error("external feed store initialization failed", "error", err)
+			feedStore = externalfeeds.UnavailableStore{}
+		} else {
+			feedStore = store
+		}
+	}
+	mux.Handle("/api/external-feeds", authSvc.RequireStaticBearer()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"feeds": externalfeeds.All()})
+	})))
+	for _, feed := range externalfeeds.All() {
+		handler := feed.Handler(feed, feedStore)
+		mux.Handle(feed.Path, authSvc.RequireStaticBearer()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			p, _ := pdwauth.PrincipalFromContext(r.Context())
+			if string(p.Scope) != feed.Scope {
+				http.Error(w, "use a dedicated key for this feed", 403)
+				return
+			}
+			if r.Method == http.MethodGet {
+				if err := tokenSvc.RecordFeedUse(r.Context(), p.TokenID); err != nil {
+					http.Error(w, "usage store unavailable", 503)
+					return
+				}
+			}
+			handler.ServeHTTP(w, r)
+		})))
+	}
 	// The pdw installer and its release, proxied from GitHub so a sandbox
 	// whose egress GitHub refuses can still install the CLI.
 	clirelease.Register(mux, clirelease.New(clirelease.Options{Logger: logger.With("component", "cli_release")}), baseURL)
@@ -288,6 +346,15 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		logger.Warn("ignoring deprecated environment variable", "variable", deprecated)
 	}
 	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, Logger: slog.Default()}
+	var closeScriptStore func()
+	if cfg.PostgresDatabaseURL != "" {
+		if scriptStore, err := scripts.NewStore(cfg.PostgresDatabaseURL); err == nil {
+			queryOpts.ScriptRecorder = scripts.Recorder(scriptStore.Record)
+			closeScriptStore = func() { _ = scriptStore.Close() }
+		} else {
+			logger.Error("script telemetry initialization failed", "error", err)
+		}
+	}
 	if embedder := query.NewEmbeddingsClient(query.EmbeddingsOptions{
 		BaseURL:     cfg.SearchEmbeddingsBaseURL,
 		APIKey:      cfg.SearchEmbeddingsAPIKey,
@@ -458,6 +525,23 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 			mux.Handle(uploaderHeartbeatEndpoint, hbSvc.handler())
 			logger.Info("uploader heartbeat ingestion enabled", "endpoint", uploaderHeartbeatEndpoint)
 		}
+
+		// C11: a device's own newest item, posted by the uploader that read it,
+		// so marts_ops.source_upstream_health can compare it with base_*.
+		obsStore, obsErr := newSourceObservationStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if obsErr != nil {
+			logger.Error("source observation store failed to initialize; source observations disabled", "error", obsErr.Error())
+		} else {
+			obsSvc := &sourceObservationIngestService{
+				store:    obsStore,
+				signer:   authSvc,
+				maxBytes: cfg.IngestMaxObjectBytes,
+				timeout:  cfg.QueryTimeout,
+				logger:   logger,
+			}
+			mux.Handle(sourceObservationEndpoint, obsSvc.handler())
+			logger.Info("source observation ingestion enabled", "endpoint", sourceObservationEndpoint)
+		}
 	}
 	// The Feed tab (docs/feed.md): an optional module, off with PDW_FEED_ENABLED=0.
 	extra = append(extra, feed.Register(mux, feed.Options{DatabaseURL: cfg.PostgresDatabaseURL, Timeout: cfg.QueryTimeout, Auth: authSvc.RequireStaticBearer(), Getenv: os.Getenv, Logger: logger})...)
@@ -481,6 +565,33 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 			}
 			proxy = mcpproxy.New(store, baseURL, nil)
 			proxy.Register(mux, authSvc.RequireStaticBearer())
+			cleanup = func() { _ = store.Close() }
+			if ctx != nil {
+				refreshDone := make(chan struct{})
+				cleanup = func() { <-refreshDone; _ = store.Close() }
+				go func() {
+					defer close(refreshDone)
+					var hb *uploaderHeartbeatStore
+					defer func() {
+						if hb != nil {
+							_ = hb.Close()
+						}
+					}()
+					proxy.RunRefreshLoop(ctx, func(refreshErr error) {
+						if hb == nil {
+							var err error
+							hb, err = newUploaderHeartbeatStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+							if err != nil {
+								logger.Error("MCP refresh heartbeat store unavailable")
+								return
+							}
+						}
+						if err := recordMCPRefreshHeartbeat(ctx, hb, cfg.QueryTimeout, refreshErr); err != nil {
+							logger.Error("MCP refresh heartbeat could not be recorded")
+						}
+					})
+				}()
+			}
 		}
 	}
 	if proxy == nil {
@@ -528,7 +639,7 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		}
 		return current.Filter(toolShowsOnCLI), nil
 	}, slog.Default())
-	apiProtected := authSvc.RequireStaticBearer()(apiHandler)
+	apiProtected := authSvc.RequireStaticBearer()(withScriptExclusions(apiHandler))
 	apiTraced := withSearchSurface("api", mcpproxy.TraceMiddleware(apiProtected))
 	mux.Handle("/api/tools", apiTraced)
 	mux.Handle("/api/tools/", apiTraced)
@@ -580,7 +691,13 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		logger.Info("pipeline freshness endpoints enabled", "page", pipelinesPagePath)
 	}
 
-	return logRequests(logger, mux)
+	closeProxy := cleanup
+	return logRequests(logger, mux), func() {
+		closeProxy()
+		if closeScriptStore != nil {
+			closeScriptStore()
+		}
+	}
 }
 
 // newAccessTokenService keeps tokens in Postgres when the app has it. Without
@@ -643,7 +760,7 @@ func mutationNotification(request mutations.Request, encode func(mutations.Reque
 		// One alert per request: a withdrawal later replaces this alert in
 		// place instead of leaving an Approve button on a request that no
 		// longer exists to approve.
-		CollapseID: mutationCollapseID(request.ID),
+		CollapseID: push.MutationCollapseID(request.ID),
 		// A request waits on a human, so it may break through a Focus
 		// that allows time-sensitive alerts; it is not critical (which
 		// would bypass silent mode).
@@ -665,6 +782,11 @@ func mutationNotification(request mutations.Request, encode func(mutations.Reque
 	delete(n.Data, "request")
 	return n
 }
+
+// policyOutcomeInterval is how often the app queues what policy-approved
+// requests did into the notification outbox; the worker applies a change
+// within seconds of approval.
+const policyOutcomeInterval = 10 * time.Second
 
 // partialRequestJSON marks a list-shaped request as one whose mutations the
 // phone still has to fetch, so it renders a loading row rather than "no
@@ -747,8 +869,6 @@ func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
-func mutationCollapseID(requestID string) string { return "mutation-request:" + requestID }
-
 // mutationWithdrawnNotification replaces the review alert for a request an
 // agent withdrew. It is passive — nothing is waiting on the reader — and it
 // carries no action category, so a stale Approve cannot be tapped; the
@@ -770,7 +890,7 @@ func mutationWithdrawnNotification(request mutations.Request) push.Notification 
 		Body:              body,
 		Route:             "/mutations/" + request.ID,
 		ThreadID:          "mutations",
-		CollapseID:        mutationCollapseID(request.ID),
+		CollapseID:        push.MutationCollapseID(request.ID),
 		InterruptionLevel: push.InterruptionPassive,
 		Data: map[string]any{
 			"request_id": request.ID,

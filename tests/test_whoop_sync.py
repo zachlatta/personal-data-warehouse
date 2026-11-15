@@ -52,6 +52,7 @@ class FakeWhoopWarehouse:
     def __init__(self, state=None) -> None:
         self.state = state or {}
         self.ensure_called = False
+        self.observations = []
         self.profiles = []
         self.body_measurements = []
         self.cycles = []
@@ -133,6 +134,9 @@ class FakeWhoopWarehouse:
     def insert_whoop_sync_state(self, **row):
         self.state_rows.append(row)
 
+    def record_source_upstream_observation(self, **observation):
+        self.observations.append(observation)
+
 
 class FakeWhoopClient:
     def __init__(self, *, profile=None, body=None, pages=None, fail_path=None, fail_error=None) -> None:
@@ -142,8 +146,15 @@ class FakeWhoopClient:
         self.calls = []
         self.fail_path = fail_path
         self.fail_error = fail_error
+        self.probe_calls = []
+        self.newest_cycle = None
 
     def get_json(self, path, *, params=None):
+        if path == "/v2/cycle" and dict(params or {}) == {"limit": 1} and not self.calls:
+            # The C11 newest-cycle probe (a sync's first call; validate_all's
+            # limit=1 reads come after the profile), kept apart from the pages.
+            self.probe_calls.append(path)
+            return {"records": [self.newest_cycle] if self.newest_cycle else []}
         self.calls.append((path, dict(params or {})))
         if self.fail_error is not None:
             raise self.fail_error
@@ -754,6 +765,35 @@ def test_nine_hour_recurrence_cannot_resurrect_the_stale_bootstrap(monkeypatch) 
     assert clients_built == []
     assert warehouse.oauth_token == rotated_then_rejected
     assert warehouse.oauth_token_updates == []
+
+
+def test_sync_runner_records_whoops_own_newest_cycle(monkeypatch) -> None:
+    """C11: asked with no window, so a wrong sync window cannot hide the newest cycle."""
+    monkeypatch.setenv("WHOOP_ACCOUNT", "zach@example.com")
+    monkeypatch.setenv("WHOOP_TOKEN_JSON_B64", encode_whoop_token_env(_token_json()))
+    settings = load_settings(require_postgres=False, require_gmail=False, require_whoop=True)
+    empty = {"records": [], "next_token": ""}
+    client = FakeWhoopClient(pages={path: [empty] for path in ("/v2/cycle", "/v2/recovery", "/v2/activity/sleep", "/v2/activity/workout")})
+    client.newest_cycle = {"id": 77, "start": "2026-07-09T04:00:00Z"}
+    warehouse = FakeWhoopWarehouse()
+
+    WhoopSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda _config: client,
+        now=lambda: datetime(2026, 7, 9, 12, tzinfo=UTC),
+    ).sync_all()
+
+    assert warehouse.observations == [
+        {
+            "pipeline": "whoop",
+            "scope": "zach@example.com",
+            "upstream_newest_at": datetime(2026, 7, 9, 4, tzinfo=UTC),
+            "upstream_newest_id": "77",
+            "detail": "GET /v2/cycle?limit=1: the newest cycle's start",
+        }
+    ]
 
 
 def test_sync_runner_fetches_profile_body_and_collections_with_state(monkeypatch) -> None:

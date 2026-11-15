@@ -30,6 +30,9 @@ how to use the warehouse well, starting at the timeline. Read it once per
 session; read a topic when a question enters that domain.
 
 COMMANDS
+  run FILE|-                 Compose warehouse reads in server-side JavaScript.
+                             --args @file.json; --timeout-ms N (max 60000).
+                             Read ` + "`pdw readme scripts`" + ` for examples and limits.
   readme [full|topic]        Print the brief agent guide (bare "pdw" too), the
                              full guide ("full"), or one topic (connections, search,
                              sql, sources, agent-sessions, finance, health, slack,
@@ -139,8 +142,7 @@ COMMANDS
                              by default, one batch with --once. Providers:
                              apple-notes, apple-contacts. See "pdw mutations --help".
   slack publish-session      Publish a Slack web session pasted from a browser,
-                             so the sync can ask Slack what changed in one
-                             request instead of polling every conversation.
+                             for reviewed Slack writes (sends, mark-reads).
                              Talks to nothing but the warehouse. See
                              "pdw slack --help".
   chatgpt publish-session    Publish this Mac's chatgpt.com browser session so
@@ -364,6 +366,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	client.SetTraceID(resolveTraceID(getenv))
 
 	switch cmd {
+	case "run":
+		return runScript(client, rest, stdin, stdout, stderr)
 	case "list":
 		return runList(client, rest, stdout, stderr)
 	case "describe":
@@ -1014,6 +1018,10 @@ func isWarehouseSchemaName(name string) bool {
 // did. It runs before any --help handling, in run and in runCall, so
 // `pdw call query --help` gets the redirect rather than the global usage.
 func callFenceRedirect(name string, stderr io.Writer) bool {
+	if name == "run" {
+		fmt.Fprintln(stderr, "pdw call: compose reads with `pdw run script.js` or `pdw run -` instead")
+		return true
+	}
 	// There is exactly one supported way to run SQL: the `sql` command. The
 	// CLI/HTTP tool is named sql and the MCP tool is named query, so callers
 	// arrive here under either name. Redirect both to the single path instead

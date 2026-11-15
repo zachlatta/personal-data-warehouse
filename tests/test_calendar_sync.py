@@ -68,6 +68,7 @@ class FakeCalendarWarehouse:
         self.active_recurring_event_ids = []
         self.deleted_event_ids = []
         self.state_rows = []
+        self.observations = []
         self.ensure_calendar_tables_called = False
 
     def ensure_calendar_tables(self) -> None:
@@ -88,6 +89,9 @@ class FakeCalendarWarehouse:
 
     def insert_calendar_sync_state(self, **row) -> None:
         self.state_rows.append(row)
+
+    def record_source_upstream_observation(self, **observation) -> None:
+        self.observations.append(observation)
 
 
 def test_load_settings_defaults_calendar_accounts_to_gmail_accounts(monkeypatch) -> None:
@@ -287,6 +291,35 @@ def test_runner_incremental_sync_uses_sync_token_and_counts_cancelled(monkeypatc
     assert summaries[0].deleted_events == 1
     assert warehouse.events[0]["is_deleted"] == 1
     assert warehouse.state_rows[0]["sync_token"] == "new-token"
+
+
+def test_runner_records_the_calendars_own_last_modification_before_writing(monkeypatch) -> None:
+    """C11: an incremental page with no items still carries the calendar's `updated`."""
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
+    service = FakeCalendarService(
+        [
+            {"items": [], "updated": "2026-11-04T15:08:25.345Z", "nextSyncToken": "new-token"},
+            {"items": [], "updated": "2026-11-04T15:08:25.345Z"},
+        ]
+    )
+    warehouse = FakeCalendarWarehouse(
+        state={("zach@example.com", "primary"): {"sync_token": "old-token", "last_sync_type": "full"}}
+    )
+
+    CalendarSyncRunner(
+        settings=settings, warehouse=warehouse, logger=FakeLogger(), service_factory=lambda account: service
+    ).sync_all()
+
+    assert warehouse.observations == [
+        {
+            "pipeline": "google_calendar",
+            "scope": "zach@example.com/primary",
+            "upstream_newest_at": datetime(2026, 11, 4, 15, 8, 25, 345000, tzinfo=UTC),
+            "upstream_newest_id": "",
+            "detail": "events.list top-level updated (partial sync)",
+        }
+    ]
 
 
 def test_runner_falls_back_to_full_sync_when_sync_token_is_stale(monkeypatch) -> None:

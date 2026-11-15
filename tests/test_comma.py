@@ -140,6 +140,12 @@ class FakeWarehouse:
         self.state = []
         self.segments = []
         self.points = []
+        self.observations = []
+        self.events = []
+
+    def record_source_upstream_observation(self, **observation):
+        self.events.append("observe")
+        self.observations.append(observation)
 
     def comma_tracked_segments(self, *, account, dongle_id, route_names):
         return {(row["route_name"], row["segment_number"]) for row in self.segments}
@@ -152,6 +158,7 @@ class FakeWarehouse:
         self.devices.extend(rows)
 
     def upsert_comma_routes(self, rows):
+        self.events.append("write")
         self.routes.extend(rows)
         return len(rows)
 
@@ -279,6 +286,18 @@ def test_a_poll_stores_the_device_its_totals_and_every_route():
     assert warehouse.state[-1]["token_expires_at"] == NOW + timedelta(days=90)
     # The whole retained window: comma keeps a free account's drives for days.
     assert client.route_windows == [(0, int(NOW.timestamp() * 1000))]
+
+
+def test_a_poll_records_commas_own_newest_drive_before_writing():
+    """C11: the newest route comma lists is what the detector compares with."""
+    warehouse = FakeWarehouse()
+    run_sync(warehouse, FakeClient())
+    [observation] = warehouse.observations
+    assert observation["pipeline"] == "comma"
+    assert observation["scope"] == f"{USER}/{DONGLE}"
+    assert observation["upstream_newest_at"] == warehouse.routes[0]["start_at"]
+    assert observation["upstream_newest_id"] == warehouse.routes[0]["route_name"]
+    assert warehouse.events.index("observe") < warehouse.events.index("write")
 
 
 def test_a_device_without_a_location_keeps_the_epoch():

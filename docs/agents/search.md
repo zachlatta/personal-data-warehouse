@@ -605,6 +605,98 @@ resident in shared buffers and barely more in the page cache 9 hours after a ful
 the semantic leg's time was all read wait. The median is a residency question; read
 `cache_residency` beside the latency before deciding what a slow median needs.
 
+**2026-11-11: the legs ran on one core each, and JIT taxed every scoped search.** Real
+traffic read 24h p50 5.4 s / p90 16.2 s, and 45% of slow requests were on a host the
+guest saw as idle. Three plan faults, fixed in the functions themselves, and a cache gap:
+
+- *The semantic leg walked its four HNSW graphs one after another.* Unscoped,
+  `EXPLAIN (ANALYZE, BUFFERS)` read 12,456 pages in 6.47 s, 6.08 s of it read wait, as a
+  Merge Append whose walks took 1.45 + 2.98 + 1.81 + 0.23 s in one backend. Postgres never
+  plans a LIMIT subquery on a worker (`set_rel_consider_parallel`), so each walk is now
+  `internal.search_hybrid_semantic_walk(part, ...)`, a PARALLEL SAFE function, and two or more
+  walks are the non-partial children of one Gather → Parallel Append: the leg costs its
+  slowest walk. The same four walks from four sessions against one session: median 4.6 s
+  against 9.9 s over five fresh vectors, on a disk saturated by a neighbour (see below).
+  The rows are the inline walks' rows, so ranking and MRR do not move.
+- *JIT compiled the priority-scoped lexical pool on every call.* That plan is costed at
+  5.5M, past `jit_above_cost`, so it paid ~600 ms of inlining and optimization (22
+  functions) for a scan that runs in ~200 ms warm: 811-868 ms with JIT against 185-215 ms
+  without. Every `timeline.search*` plpgsql function now carries `SET jit = off`
+  (`test_every_search_function_runs_with_jit_off`). That is the warm case only. Cold, the
+  same leg is read wait: `search_text('contract renewal', 20, priorities =>
+  ARRAY['self','direct','cc'])` with JIT off took 14.8 s, 14.1 s of it waiting on 5,784
+  reads. The 5,000-row `bm25_attention_idx` partition fetched its heap rows one at a time
+  in 13.1 s (2.28 s to its first row), and the 800-row low-volume partition then took
+  another 1.65 s. Ten fresh scoped queries ran 2.6-5.0 s cold for both partitions.
+- *The lexical pool ran its partitions one after another.* Each partition is now
+  `internal.search_text_pool_partition(query, part, ...)`, a PARALLEL SAFE function, and
+  `internal.search_text_pool` returns their Parallel Append through `RETURN QUERY
+  EXECUTE`, so the low-volume partition no longer adds to the cold pool
+  (`test_search_text_runs_its_pool_partitions_on_parallel_workers`). plpgsql never runs a
+  parallel plan for `SELECT ... INTO`, which is why the pool is a function of its own.
+  This is the smaller half: the 5,000-row partition stays one serial chain of heap reads,
+  and running the two partitions from two sessions gave 3.4-4.2 s against 2.6-5.0 s
+  serial. Three things keep that chain serial, and each was checked:
+  - pg_textsearch 1.5.1's `bm25` access method has no bitmap scan and no returnable
+    column (`pg_index_has_property(..., 'bitmap_scan')` and `'returnable'` are false), so
+    every pooled row is a heap visit. PostgreSQL 18 prefetches heap pages for bitmap heap
+    scans and sequential scans, not for plain index scans, so `effective_io_concurrency`
+    and `io_workers` do not reach these reads.
+  - One index-ordered scan cannot be split across workers. A filter on a hash or a ctid
+    is applied after the heap visit, so each worker would fetch as many rows as the whole
+    scan. Splitting by adapter would need comparable scores, which the pool deliberately
+    does not compute.
+  - The pool's depth is a measured ranking trade (2000/300 scored MRR 0.278 against
+    0.292 at 5000/800; see `SEARCH_TEXT_BROAD_POOL`), so it is not shrunk to save reads.
+
+  So the cold lexical leg costs about one random read per pooled row, and those reads
+  are the timeline heap, not the index: of the 1,529 reads a cold
+  `search_text('boiler inspection', 20, self/direct/cc)` made, 1,309 (86%) were
+  `timeline.events` heap pages and 171 the attention BM25 index. Keeping the BM25 indexes
+  resident therefore barely moves it.
+- *The cache warm now reads the attention-tier heap.* `warm_attention_heap()` runs last in
+  `prewarm_search_indexes_if_needed`, so on every deploy, restart, REINDEX and six-hourly
+  cold-cache re-warm, after the indexes. It visits every `self`/`direct`/`cc` row through
+  a bitmap heap scan over `timeline_events_priority_time_idx`, which PostgreSQL 18
+  prefetches and parallelizes, unlike the pool's index walk, under a 180 s statement
+  budget (`ATTENTION_HEAP_WARM_SETTINGS`); a timeout is a partial warm, not a failure.
+  Those rows sit on ~14% of the heap's pages, ~5.6 GB. Measured on production
+  2026-11-11 with the same read-only SELECT: a Parallel Bitmap Heap Scan on 4 workers
+  read 2.69M rows in 61 s, and the heap's shared-buffer residency went from 5.0% to 18.1%.
+  Six fresh scoped searches took 2.6-3.8 s before it (median 3.1 s) and six others
+  0.38-0.72 s after (median 0.43 s). `marts_ops.search_health` carries the heap's
+  residency as `timeline_heap_residency` beside `cache_residency`; the attention rows are
+  ~14% of the heap, so ~15-20% there means they are warm. An unscoped search pools from
+  the whole heap, which does not fit in memory; it still pays the disk read latency
+  below.
+- *Under search load the heap warm lasts minutes, so it is not repeated on a clock.* The
+  bitmap scan fills both cache layers (16.5% of the heap in shared buffers and 16.4% in
+  the page cache right after a warm at 02:46Z on 2026-11-12). By 02:55:51Z it read 3.4%,
+  and 2.5% at 02:57:31Z: an agent's ~30 scoped searches between 02:47 and 02:50 pulled
+  the index `cache_residency` from 0.117 to 0.494, and HNSW pages, touched again and
+  again, displaced heap pages the warm had touched once. Two hours after the first warm
+  the heap read 3.2% in shared buffers and 0.7% (0.3 of 41.3 GB) in the page cache, with
+  fresh scoped searches back at 1.3-8.0 s. An hourly heap re-warm was built and removed
+  the same day: it would have bought about ten warm minutes an hour for up to ~134 GB a
+  day of reads. The heap warm therefore runs only inside the full warm (deploy, database
+  restart, REINDEX, and the six-hourly cold-index guard), and `timeline_heap_residency`
+  stays as the gauge. A smaller warm set does not help either: on six scoped queries only
+  3-41% of the 5,000 pooled rows were from the last 12 months (attention rows overall:
+  ~31%). The cause is memory: `shared_buffers` (20 GB) is smaller than the index set
+  plus this heap (~21.9 + 5.6 GB), and the guest has 52 GiB. Until that changes, a
+  scoped search is fast after a warm and while the cache holds, and pays one disk read
+  per pooled row after that. The warm's statement budget is 180 s, inside the five-minute
+  `search_chunks` tick after a chunk build of up to 240 s, and `search_chunks_job`
+  carries a 30-minute `dagster/max_runtime`.
+
+What it did not fix is the read wait itself. Cold reads ran 0.5-0.7 ms each because the
+guest's disk is a qcow2 on mew's `md0` RAID1 (a Samsung 970 EVO Plus and a Viper VPN100),
+which it shares with `mew-dev`: in a 10 s sample `md0` was 98.5% busy, mew-dev read
+262 MB/s and wrote 53 MB/s against production's 27 MB/s, and the Viper's reads waited
+1.9 ms. A guest-side `idle` reading does not mean the disk was idle. Check the hypervisor
+(`iostat -x` and `virsh domblkstat` on mew) before reading a slow idle-host search as a
+plan problem.
+
 **The query tool warns before the timeout, not after.** A statement that pattern-matches
 (`ILIKE`, `LIKE`, `~`, `regexp_*`, `position()`) over a raw `base_*` table with no `timeline.`
 reference gets a `hint` attached to its result before it runs — that shape was every
@@ -740,7 +832,7 @@ every warm evicted every other page Postgres held; and the global BM25 index was
 **13.4 GB on disk with 6.4 GB of live segments** — pg_textsearch spills and merges park
 displaced pages for deferred reclaim and never truncate the file, so a day after a plain
 REINDEX to 6.36 GB the warm was reading 7 GB of dead pages every time. Now the
-post-reconcile repair measures residency and goes through the same floor and 24-hour
+post-reconcile repair measures residency and goes through the same floor and
 interval as the cold-cache guard (`restore_search_cache_after_reconcile`), the warm has
 no `buffer` pass, and `marts_ops.search_health` carries a `bm25_index_bloat` row
 (`resident_bytes` = live segment bytes, `total_bytes` = file bytes, `attention` below
@@ -762,17 +854,21 @@ as file cache: the host's real page cache is ~10 GB, which is why a 10 GB HNSW g
 cannot stay resident there while the sync workload runs beside it.
 
 **A cold cache with no index-identity change is re-warmed by the five-minute search
-health pass, at most once a day.** `prewarm_search_indexes_if_needed` fires on a schema
+health pass, at most every six hours.** `prewarm_search_indexes_if_needed` fires on a schema
 signature, a database restart, or a REINDEX (the relfilenode fingerprint) — and none of
 those happened between 2026-09-16 and 09-19, while the 09-14..16 index-definition flap
 (`bm25_attention_lowvol_idx` rebuilt 1,705 times, ~57 TB through the page cache in nine
 days) had left residency at 10% for three days with unscoped hybrid at 3-4s. The
 `search_chunks` asset now calls `rewarm_search_indexes_if_cold` after it records
 `cache_residency`: below `SEARCH_RESIDENCY_REWARM_FLOOR` (20%) and more than
-`SEARCH_RESIDENCY_REWARM_MIN_INTERVAL` (24h) since the last warm, it forces one. The
+`SEARCH_RESIDENCY_REWARM_MIN_INTERVAL` (6h) since the last warm, it forces one. The
 interval is the point: a forced warm that did not stick means something else is evicting
 the cache, and the answer to that is `pg_stat_statements ORDER BY shared_blks_read DESC`,
-not another 20 GB read every five minutes.
+not another 20 GB read every five minutes. It was 24h until 2026-11-11, when a 07:52 warm
+had decayed to 13% by 19:12 while searches waited on reads. That day the evictor search
+found was the timeline sidebar's `GROUP BY source, kind`: 37 GB of heap per call,
+332 GB in 3.5 days, the largest reader in the database. It now reads `pg_stats` and bound
+index counts instead, and four ~20 GB warms a day read less than it did.
 
 The second coordinate on the fresh keyset is non-negotiable: one chunk-builder batch
 stamps thousands of rows with the same `built_at`. A timestamp-only cursor once stopped in

@@ -18,6 +18,8 @@ type Config struct {
 	Addr                string
 	BaseURL             string
 	PostgresDatabaseURL string
+	// Dedicated unprivileged login, separate from the app's writer pool.
+	QueryPostgresDatabaseURL string
 	// QueryPostgresRole is the NOLOGIN database role assumed for every
 	// user-authored read-only query. It has SELECT on queryable schemas but no
 	// USAGE/SELECT on the private schema.
@@ -39,7 +41,11 @@ type Config struct {
 	// accepted wherever SecretToken is verified (never for signing, never at
 	// the OAuth consent page) until it is unset. See "Rotating the master
 	// secret" in docs/agents/access-tokens.md.
-	PreviousSecretToken     string
+	PreviousSecretToken string
+	// IngestSecret (PDW_INGEST_SECRET) verifies upload signatures and nothing
+	// else. Uploader hosts hold it instead of the master secret, so what a
+	// host holds can never authenticate to the API or decide a mutation.
+	IngestSecret            string
 	MaxRows                 int
 	MaxFieldChars           int
 	QueryTimeout            time.Duration
@@ -169,17 +175,19 @@ func (c Config) IngestEnabled() bool {
 
 func LoadFromEnv(getenv func(string) string) (Config, error) {
 	cfg := Config{
-		Addr:                    valueOrDefault(getenv("MCP_ADDR"), ":8080"),
-		BaseURL:                 strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
-		PostgresDatabaseURL:     normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
-		QueryPostgresRole:       valueOrDefault(strings.TrimSpace(getenv("PDW_QUERY_POSTGRES_ROLE")), "pdw_query"),
-		TimelineDatabaseURL:     normalizePostgresURL(getenv("PDW_TIMELINE_DATABASE_URL")),
-		TimelineMediaBaseURL:    strings.TrimRight(strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_BASE_URL")), "/"),
-		TimelineMediaSigningKey: strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_SIGNING_KEY")),
-		SecretToken:             firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
-		PreviousSecretToken:     strings.TrimSpace(getenv("PDW_SECRET_TOKEN_PREVIOUS")),
-		MaxRows:                 100000,
-		MaxFieldChars:           4000,
+		Addr:                     valueOrDefault(getenv("MCP_ADDR"), ":8080"),
+		BaseURL:                  strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
+		PostgresDatabaseURL:      normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
+		QueryPostgresRole:        valueOrDefault(strings.TrimSpace(getenv("PDW_QUERY_POSTGRES_ROLE")), "pdw_query"),
+		QueryPostgresDatabaseURL: normalizePostgresURL(getenv("PDW_QUERY_POSTGRES_URL")),
+		TimelineDatabaseURL:      normalizePostgresURL(getenv("PDW_TIMELINE_DATABASE_URL")),
+		TimelineMediaBaseURL:     strings.TrimRight(strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_BASE_URL")), "/"),
+		TimelineMediaSigningKey:  strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_SIGNING_KEY")),
+		SecretToken:              firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
+		PreviousSecretToken:      strings.TrimSpace(getenv("PDW_SECRET_TOKEN_PREVIOUS")),
+		IngestSecret:             strings.TrimSpace(getenv("PDW_INGEST_SECRET")),
+		MaxRows:                  100000,
+		MaxFieldChars:            4000,
 		// One end-to-end query budget. No caller can wait longer than the
 		// public edge allows (~100s at the CDN; the CLI default is aligned to
 		// this value), so a larger server-side ceiling only produced orphaned
@@ -215,6 +223,12 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if cfg.PreviousSecretToken != "" && len(cfg.PreviousSecretToken) < MinSecretTokenLength {
 		return Config{}, fmt.Errorf("PDW_SECRET_TOKEN_PREVIOUS must be at least %d characters", MinSecretTokenLength)
+	}
+	if cfg.IngestSecret != "" && len(cfg.IngestSecret) < MinSecretTokenLength {
+		return Config{}, fmt.Errorf("PDW_INGEST_SECRET must be at least %d characters", MinSecretTokenLength)
+	}
+	if cfg.IngestSecret != "" && (cfg.IngestSecret == cfg.SecretToken || cfg.IngestSecret == cfg.PreviousSecretToken) {
+		return Config{}, fmt.Errorf("PDW_INGEST_SECRET must differ from the master secret: it exists so uploader hosts need not hold that")
 	}
 	if cfg.PreviousSecretToken == cfg.SecretToken {
 		cfg.PreviousSecretToken = ""

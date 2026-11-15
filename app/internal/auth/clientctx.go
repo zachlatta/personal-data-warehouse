@@ -17,8 +17,23 @@ type clientNameKey struct{}
 // back out after the handler returns. Context values are normally immutable,
 // so we share a pointer to a mutable struct instead.
 type clientNameHolder struct {
+	check     func(context.Context) error
 	name      string
 	principal *Principal
+}
+
+// CheckAuthorization rechecks the request credential before each script read.
+// Credentials remain in this host-only closure and never enter the worker.
+func CheckAuthorization(ctx context.Context) error {
+	if h, ok := ctx.Value(clientNameKey{}).(*clientNameHolder); ok && h.check != nil {
+		return h.check(ctx)
+	}
+	return nil
+}
+func setAuthorizationCheck(ctx context.Context, check func(context.Context) error) {
+	if h, ok := ctx.Value(clientNameKey{}).(*clientNameHolder); ok {
+		h.check = check
+	}
 }
 
 // WithClientNameHolder installs an empty client-name slot on the context.

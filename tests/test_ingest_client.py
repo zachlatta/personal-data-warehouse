@@ -167,6 +167,7 @@ _INGEST_ENV_VARS = (
     "MCP_BASE_URL",
     "PDW_SECRET_TOKEN",
     "MCP_SECRET_TOKEN",
+    "PDW_INGEST_SECRET",
 )
 
 
@@ -184,6 +185,17 @@ def test_from_env_uses_main_api_url(monkeypatch: pytest.MonkeyPatch) -> None:
     client = ingest_client_from_env()
     assert client._base_url == "https://warehouse.example"
     assert client._signing_key == b"tok"
+
+
+def test_from_env_signs_with_the_ingest_secret_a_host_should_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    # PDW_INGEST_SECRET signs uploads and can do nothing else, so an uploader
+    # host holds it instead of the master secret; it wins when both are set.
+    _clear_ingest_env(monkeypatch)
+    monkeypatch.setenv("PDW_API_URL", "https://warehouse.example")
+    monkeypatch.setenv("PDW_INGEST_SECRET", "ingest-only")
+    assert ingest_client_from_env()._signing_key == b"ingest-only"
+    monkeypatch.setenv("PDW_SECRET_TOKEN", "master")
+    assert ingest_client_from_env()._signing_key == b"ingest-only"
 
 
 def test_from_env_accepts_mcp_base_url_alias(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -13,8 +13,10 @@ Raw/query tables are `base_plaid.items`, `base_plaid.accounts`, `base_plaid.tran
 `marts_finance.investment_transactions`, and `marts_finance.liabilities`. Access tokens are
 isolated in `private.plaid_item_tokens`. Warehouse initialization provisions the NOLOGIN
 `PDW_QUERY_POSTGRES_ROLE` (default `pdw_query`), revokes `private` from it/`PUBLIC`, and both Go and
-Python read-only query runners assume that role for every user-authored query; never bypass this
-boundary or expose the token table through normal query surfaces.
+Python read-only query runners assume that role for every user-authored query, from the dedicated
+unprivileged login `PDW_QUERY_POSTGRES_LOGIN` (default `pdw_query_login`; Go reads it through
+`PDW_QUERY_POSTGRES_URL`) and refuse a privileged session; never bypass this boundary or expose
+the token table through normal query surfaces.
 
 For a finance read or investigation, start with `pdw search` or bounded SQL over
 `timeline.events`, move to `marts_finance.*` / `marts_ops.*`, and drill into `base_plaid.*`

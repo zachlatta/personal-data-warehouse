@@ -34,6 +34,9 @@ type PostgresStore struct {
 }
 
 type storedMutation struct {
+	// Schedule is carried from the input entry; it is not part of the
+	// stored payload (json:"-" keeps old idempotency keys stable).
+	Schedule  MutationSchedule `json:"-"`
 	Provider  string
 	Operation string
 	Account   string
@@ -142,6 +145,19 @@ func (s *PostgresStore) ensureTablesNow(ctx context.Context) error {
 			return err
 		}
 	}
+	for _, statement := range mutationPolicySchemaStatements {
+		if _, err := execContext(ctx, s.db, statement); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("notification_events"))); err != nil {
+		return err
+	}
+	for _, statement := range notificationOutboxStatements {
+		if _, err := execContext(ctx, s.db, statement); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -168,6 +184,9 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 		return Request{}, err
 	}
 	if normalized, err = s.enrichThermostatChanges(ctx, normalized); err != nil {
+		return Request{}, err
+	}
+	if normalized, err = s.enrichPolicyChanges(ctx, normalized); err != nil {
 		return Request{}, err
 	}
 	s.enrichContactPreviews(ctx, normalized)
@@ -211,17 +230,19 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if _, err := execContext(ctx, tx, `
 		INSERT INTO @upstream_mutation_requests (
 			id, status, title, reason, context_json, result_json, idempotency_key,
-			requested_by, created_at, updated_at
+			requested_by, requested_by_token_id, created_at, updated_at, not_before, not_after
 		)
-		VALUES ($1, 'pending_review', $2, $3, $4::jsonb, '{}'::jsonb, $5, $6, $7, $8)
-	`, requestID, input.Title, input.Reason, jsonString(input.Context), idempotencyKey, input.RequestedBy, now, now); err != nil {
+		VALUES ($1, 'pending_review', $2, $3, $4::jsonb, '{}'::jsonb, $5, $6, $7, $8, $9, $10, $11)
+	`, requestID, input.Title, input.Reason, jsonString(input.Context), idempotencyKey, input.RequestedBy, input.RequestedByTokenID, now, now,
+		scheduleTime(requestNotBefore(normalized)), scheduleTime(requestNotAfter(normalized))); err != nil {
 		return Request{}, err
 	}
 	if err := appendRequestEvent(ctx, tx, requestID, "created", "agent", input.RequestedBy, map[string]any{
-		"title":          input.Title,
-		"reason":         input.Reason,
-		"context":        input.Context,
-		"mutation_count": len(normalized),
+		"requested_by_token_id": input.RequestedByTokenID,
+		"title":                 input.Title,
+		"reason":                input.Reason,
+		"context":               input.Context,
+		"mutation_count":        len(normalized),
 	}); err != nil {
 		return Request{}, err
 	}
@@ -234,10 +255,11 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 			INSERT INTO @upstream_mutations (
 				id, request_id, request_index, provider, operation, account, status, title, reason,
 				payload_json, preview_json, result_json, idempotency_key,
-				requested_by, created_at, updated_at
+				requested_by, created_at, updated_at, not_before, not_after, precondition_json
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, 'pending_review', $7, $8, $9::jsonb, $10::jsonb, '{}'::jsonb, '', $11, $12, $13)
-		`, mutationID, requestID, index, mutation.Provider, mutation.Operation, mutation.Account, mutation.Title, mutation.Reason, jsonString(mutation.Payload), jsonString(mutation.Preview), input.RequestedBy, now, now); err != nil {
+			VALUES ($1, $2, $3, $4, $5, $6, 'pending_review', $7, $8, $9::jsonb, $10::jsonb, '{}'::jsonb, '', $11, $12, $13, $14, $15, $16::jsonb)
+		`, mutationID, requestID, index, mutation.Provider, mutation.Operation, mutation.Account, mutation.Title, mutation.Reason, jsonString(mutation.Payload), jsonString(mutation.Preview), input.RequestedBy, now, now,
+			scheduleTime(mutation.Schedule.NotBefore), scheduleTime(mutation.Schedule.NotAfter), jsonString(mutation.Schedule.Precondition)); err != nil {
 			return Request{}, err
 		}
 		if err := appendMutationEvent(ctx, tx, mutationID, "created", "agent", input.RequestedBy, map[string]any{
@@ -248,6 +270,35 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 			"payload":       mutation.Payload,
 			"preview":       mutation.Preview,
 		}); err != nil {
+			return Request{}, err
+		}
+	}
+	// The policy decision rides in the proposal's transaction, under the
+	// policies' advisory locks, so its rate limits count exactly.
+	evaluation, err := evaluateRequestPolicy(ctx, tx, input.RequestedByTokenID, normalized, now)
+	if err != nil {
+		return Request{}, fmt.Errorf("evaluate mutation policy: %w", err)
+	}
+	if evaluation.Decision == PolicyDecisionRefused {
+		return Request{}, invalidProposalInput(fmt.Errorf("refused: %s", strings.Join(evaluation.Reasons, "; ")))
+	}
+	if evaluation.Relevant() {
+		if err := recordPolicyEvaluation(ctx, tx, requestID, "propose", evaluation); err != nil {
+			return Request{}, err
+		}
+	}
+	if allNarrowings(normalized) {
+		// A policy change PDW proved only narrows (or a kill switch) applies
+		// at once, judged again under the policy's lock as it is applied.
+		if err := approveAsNarrowing(ctx, tx, requestID, now); err != nil {
+			return Request{}, err
+		}
+	}
+	if evaluation.Decision == PolicyDecisionApproved {
+		// An enforced policy approves in the proposal's own transaction: the
+		// request never sits in review, and a worker is woken only once the
+		// approval is committed.
+		if err := approveByPolicy(ctx, tx, requestID, evaluation, now); err != nil {
 			return Request{}, err
 		}
 	}
@@ -295,11 +346,15 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 		       NULL::jsonb AS context_json, NULL::jsonb AS result_json,
 		       request.error, request.idempotency_key,
 		       request.superseded_by_request_id, request.replaces_request_id, request.revision,
-		       request.requested_by, request.approved_by, request.withdrawn_by,
+		       request.requested_by, request.requested_by_token_id, request.approved_by, request.withdrawn_by,
 		       request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
+		       request.not_before, request.not_after,
 		       count(mutation.id)::bigint AS mutation_count,
-		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count
+		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count,
+		       -- The policy decision is a badge on the list, so it rides apart
+		       -- from the context it is stored in.
+		       request.context_json->'policy' AS policy_json
 		FROM @upstream_mutation_requests AS request
 		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
 		%s
@@ -897,6 +952,10 @@ func (s *PostgresStore) ApproveRequest(ctx context.Context, id string, actor str
 	if err := appendRequestEvent(ctx, tx, id, "approved", "human", actor, map[string]any{"approved_mutation_ids": pendingIDs}); err != nil {
 		return Request{}, err
 	}
+	// A policy change applies in this transaction: nothing claims it.
+	if err := applyPolicyChanges(ctx, tx, id, actor, false, now); err != nil {
+		return Request{}, err
+	}
 	// PostgreSQL delivers NOTIFY only after this transaction commits, so a
 	// worker can never wake up before the approved rows are visible. A rolled
 	// back approval emits nothing.
@@ -993,11 +1052,15 @@ func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, err
 		SELECT request.id, request.status, request.title, request.reason, request.context_json,
 		       request.result_json, request.error, request.idempotency_key,
 		       request.superseded_by_request_id, request.replaces_request_id, request.revision,
-		       request.requested_by, request.approved_by, request.withdrawn_by,
+		       request.requested_by, request.requested_by_token_id, request.approved_by, request.withdrawn_by,
 		       request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
+		       request.not_before, request.not_after,
 		       count(mutation.id)::bigint AS mutation_count,
-		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count
+		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count,
+		       -- The policy decision is a badge on the list, so it rides apart
+		       -- from the context it is stored in.
+		       request.context_json->'policy' AS policy_json
 		FROM @upstream_mutation_requests AS request
 		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
 		WHERE request.id = $1
@@ -1023,7 +1086,7 @@ func (s *PostgresStore) listMutationsForRequest(ctx context.Context, requestID s
 		SELECT id, request_id, request_index, provider, operation, account, status, title, reason,
 		       payload_json, preview_json, result_json, error, idempotency_key, revision, attempt_count,
 		       requested_by, approved_by, claimed_by, claimed_at, created_at, updated_at, approved_at,
-		       executed_at, observed_at
+		       executed_at, observed_at, not_before, not_after, precondition_json
 		FROM @upstream_mutations
 		WHERE request_id = $1
 		ORDER BY request_index ASC, created_at ASC, id ASC
@@ -1675,6 +1738,7 @@ func scanRequest(row scanner) (Request, error) {
 	var request Request
 	var contextJSON, resultJSON []byte
 	var mutationCount, pendingMutationCount int64
+	var policyJSON []byte
 	err := row.Scan(
 		&request.ID,
 		&request.Status,
@@ -1688,6 +1752,7 @@ func scanRequest(row scanner) (Request, error) {
 		&request.ReplacesRequestID,
 		&request.Revision,
 		&request.RequestedBy,
+		&request.RequestedByTokenID,
 		&request.ApprovedBy,
 		&request.WithdrawnBy,
 		&request.CreatedAt,
@@ -1696,11 +1761,17 @@ func scanRequest(row scanner) (Request, error) {
 		&request.ExecutedAt,
 		&request.ObservedAt,
 		&request.WithdrawnAt,
+		&request.NotBefore,
+		&request.NotAfter,
 		&mutationCount,
 		&pendingMutationCount,
+		&policyJSON,
 	)
 	if err != nil {
 		return Request{}, err
+	}
+	if len(policyJSON) > 0 {
+		request.Policy = decodeJSONMap(policyJSON)
 	}
 	request.Context = decodeJSONMap(contextJSON)
 	request.Result = decodeJSONMap(resultJSON)
@@ -1711,7 +1782,7 @@ func scanRequest(row scanner) (Request, error) {
 
 func scanMutation(row scanner) (Mutation, error) {
 	var mutation Mutation
-	var payloadJSON, previewJSON, resultJSON []byte
+	var payloadJSON, previewJSON, resultJSON, preconditionJSON []byte
 	err := row.Scan(
 		&mutation.ID,
 		&mutation.RequestID,
@@ -1738,9 +1809,15 @@ func scanMutation(row scanner) (Mutation, error) {
 		&mutation.ApprovedAt,
 		&mutation.ExecutedAt,
 		&mutation.ObservedAt,
+		&mutation.NotBefore,
+		&mutation.NotAfter,
+		&preconditionJSON,
 	)
 	if err != nil {
 		return Mutation{}, err
+	}
+	if precondition := decodeJSONMap(preconditionJSON); len(precondition) > 0 {
+		mutation.Precondition = precondition
 	}
 	mutation.Payload = decodeJSONMap(payloadJSON)
 	mutation.Preview = decodeJSONMap(previewJSON)
@@ -1751,6 +1828,7 @@ func scanMutation(row scanner) (Mutation, error) {
 func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 	out := []storedMutation{}
 	for index, mutation := range input.Mutations {
+		start := len(out)
 		account := normalizeAccount(mutation.Account)
 		reason := optionalTitle(mutation.Reason, input.Reason)
 		switch mutation.Type {
@@ -2020,6 +2098,19 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Reason:    reason,
 				Payload:   thermostatChangePayload(change),
 			})
+		case PolicyChangeOperation:
+			payload, err := policyChangeFromInput(mutation)
+			if err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			out = append(out, storedMutation{
+				Provider:  PolicyChangeProvider,
+				Operation: PolicyChangeOperation,
+				Account:   PolicyChangeAccount,
+				Title:     optionalTitle(mutation.Title, "Change mutation policies: "+stringFromAny(payload["action"])),
+				Reason:    reason,
+				Payload:   payload,
+			})
 		case PrinterPrintDocumentOperation:
 			doc, err := printDocumentFromInput(mutation)
 			if err != nil {
@@ -2106,6 +2197,9 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 			})
 		default:
 			return nil, fmt.Errorf("mutation %d has unsupported type %q", index, mutation.Type)
+		}
+		for i := start; i < len(out); i++ {
+			out[i].Schedule = mutation.Schedule
 		}
 	}
 	return out, nil
@@ -2742,11 +2836,30 @@ func contactMutationTitle(operation map[string]any, index int) string {
 }
 
 func requestIdempotencyKey(input CreateRequestInput, mutations []storedMutation) (string, error) {
-	data, err := json.Marshal(map[string]any{
+	identity := map[string]any{
 		"title":     input.Title,
 		"reason":    input.Reason,
 		"mutations": mutations,
-	})
+	}
+	// The same change at another time is another request; an unscheduled
+	// request hashes exactly as before schedules existed.
+	var schedules []map[string]any
+	for _, mutation := range mutations {
+		if !mutation.Schedule.IsZero() {
+			schedules = append(schedules, map[string]any{
+				"not_before": mutation.Schedule.NotBefore, "not_after": mutation.Schedule.NotAfter, "precondition": mutation.Schedule.Precondition,
+			})
+		} else {
+			schedules = append(schedules, nil)
+		}
+	}
+	for _, schedule := range schedules {
+		if schedule != nil {
+			identity["schedules"] = schedules
+			break
+		}
+	}
+	data, err := json.Marshal(identity)
 	if err != nil {
 		return "", err
 	}
@@ -2762,7 +2875,20 @@ func randomID(prefix string) (string, error) {
 	return prefix + "_" + hex.EncodeToString(data[:]), nil
 }
 
+// lockRequestMutations locks a request's mutation rows. The one lock order
+// for a request, in Go and in the Python worker (claim, send-back, status
+// rollup) alike, is its mutations first, then the request row: every Go path
+// that locks a request row calls this first, so none can deadlock against a
+// worker holding the mutations and updating the request.
+func lockRequestMutations(ctx context.Context, tx *sql.Tx, requestID string) error {
+	_, err := execContext(ctx, tx, `SELECT id FROM @upstream_mutations WHERE request_id = $1 ORDER BY request_index, id FOR UPDATE`, requestID)
+	return err
+}
+
 func requestStatusForUpdate(ctx context.Context, tx *sql.Tx, id string) (string, error) {
+	if err := lockRequestMutations(ctx, tx, id); err != nil {
+		return "", err
+	}
 	var status string
 	err := queryRowContext(ctx, tx, `SELECT status FROM @upstream_mutation_requests WHERE id = $1 FOR UPDATE`, id).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -2802,7 +2928,7 @@ func mutationForUpdate(ctx context.Context, tx *sql.Tx, requestID string, mutati
 		SELECT id, request_id, request_index, provider, operation, account, status, title, reason,
 		       payload_json, preview_json, result_json, error, idempotency_key, revision, attempt_count,
 		       requested_by, approved_by, claimed_by, claimed_at, created_at, updated_at, approved_at,
-		       executed_at, observed_at
+		       executed_at, observed_at, not_before, not_after, precondition_json
 		FROM @upstream_mutations
 		WHERE request_id = $1 AND id = $2
 		FOR UPDATE
@@ -2934,6 +3060,16 @@ var upstreamMutationSchemaStatements = []string{
 	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS replaces_request_id text NOT NULL DEFAULT ''`,
 	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_by text NOT NULL DEFAULT ''`,
 	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz`,
+	// The authenticated token behind a proposal (2026-11-11); requested_by is
+	// only the caller-chosen client name. The Python ensure path declares it too.
+	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS requested_by_token_id text NOT NULL DEFAULT ''`,
+	// Approve now, run later (2026-11-11, schedule.go). The Python ensure
+	// path declares the same five columns.
+	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS not_before timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz`,
+	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS not_after timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz`,
+	`ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS not_before timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz`,
+	`ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS not_after timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz`,
+	`ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS precondition_json jsonb NOT NULL DEFAULT '{}'::jsonb`,
 	`CREATE TABLE IF NOT EXISTS @upstream_mutation_events (
 		mutation_id text NOT NULL,
 		event_index bigint NOT NULL,
@@ -3738,4 +3874,38 @@ func (s *PostgresStore) loadSlackSendPreviewRows(ctx context.Context, detail sla
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+// requestNotBefore is the earliest not_before of a request's mutations, and
+// zero when any step has none: such a step runs once approved, so the request
+// starts then, not at a later step's time.
+func requestNotBefore(mutations []storedMutation) time.Time {
+	var earliest time.Time
+	for _, mutation := range mutations {
+		at := mutation.Schedule.NotBefore
+		if at.IsZero() {
+			return time.Time{}
+		}
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+	}
+	return earliest
+}
+
+// requestNotAfter is the latest not_after of a request's mutations, and zero
+// when any step has none (that step has no deadline, so neither does the
+// request).
+func requestNotAfter(mutations []storedMutation) time.Time {
+	var latest time.Time
+	for _, mutation := range mutations {
+		at := mutation.Schedule.NotAfter
+		if at.IsZero() {
+			return time.Time{}
+		}
+		if at.After(latest) {
+			latest = at
+		}
+	}
+	return latest
 }

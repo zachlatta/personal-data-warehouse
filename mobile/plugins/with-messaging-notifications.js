@@ -127,6 +127,10 @@ object PdwNotifications {
   private const val SHORTCUT_PREFIX = "chat:"
   private const val MAX_SHORTCUTS = 10
   private const val EVENT_IDS_EXTRA = "pdw.event_ids"
+  // The push's delivery id on every drawn alert. The phone's notification
+  // listener uploads it, which tells the server which phone this push device
+  // is, so only that phone's other notifications can stand in for an alert.
+  private const val DELIVERY_ID_EXTRA = "pdw.delivery_id"
   private const val MAX_ACTIVE_NOTIFICATIONS = 30
   private const val CANCEL_POLL_INTERVAL_MS = 25L
   private const val CANCEL_POLL_MAX_MS = 250L
@@ -217,6 +221,7 @@ object PdwNotifications {
       .setWhen(messageTime)
       .setShowWhen(true)
       .addExtras(extras)
+      .addExtras(deliveryExtras(data))
     if (source.isNotEmpty()) builder.setSubText(source)
     evictIfNeeded(context, NOTIFICATION_TAG, id)
     paceNotify()
@@ -239,6 +244,7 @@ object PdwNotifications {
       .setContentText(body)
       .setStyle(NotificationCompat.BigTextStyle().bigText(body))
       .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+      .addExtras(deliveryExtras(data))
     if (eventId.isNotEmpty()) {
       builder.addExtras(Bundle().apply { putString(EVENT_IDS_EXTRA, eventId) })
     }
@@ -273,6 +279,7 @@ object PdwNotifications {
       .setWhen(if (sentAt > 0) sentAt else System.currentTimeMillis())
       .setShowWhen(true)
       .setSilent(alert.optBoolean("silent"))
+      .addExtras(deliveryExtras(data))
     alert.optString("subtitle").takeIf { it.isNotEmpty() }?.let { builder.setSubText(it) }
     if (picture != null) {
       builder.setLargeIcon(picture).setStyle(
@@ -285,6 +292,9 @@ object PdwNotifications {
     paceNotify()
     NotificationManagerCompat.from(context).notify(ALERT_TAG, id, builder.build())
   }
+
+  private fun deliveryExtras(data: JSONObject): Bundle =
+    Bundle().apply { putString(DELIVERY_ID_EXTRA, data.optString("delivery_id")) }
 
   private fun evictIfNeeded(context: Context, targetTag: String, targetId: Int) {
     val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager

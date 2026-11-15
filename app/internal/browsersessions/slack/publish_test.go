@@ -134,8 +134,10 @@ func TestRunPublishesThePastedWorkspaceSessionWithoutCallingSlack(t *testing.T) 
 		p.TeamURL != "https://hackclub.slack.com/" {
 		t.Fatalf("published = %+v", p)
 	}
-	if !strings.Contains(report["next"].(string), "freshness pass") {
-		t.Fatalf("report does not say when the session is first used: %v", report)
+	// Polling left the session on 2026-10-03; reviewed writes are what use it.
+	next := report["next"].(string)
+	if !strings.Contains(next, "reviewed Slack write") || strings.Contains(next, "polls with this session") {
+		t.Fatalf("report does not say what uses the session: %v", report)
 	}
 }
 

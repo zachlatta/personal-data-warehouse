@@ -195,6 +195,16 @@ func (s *PostgresStore) ClaimApproved(ctx context.Context, limit int, claimedBy 
 	args = append(args, limit, claimedBy, now, now, RetryBackoffBase.Seconds(), RetryBackoffMax.Seconds())
 	// A failed_retryable row waits out RetryBackoff(attempt_count) from its
 	// failure (updated_at) before it is claimable again.
+	// Approve now, run later (mutations/schedule.go): a step is not claimed
+	// before not_before, and one past its not_after is failed below, not run.
+	// A row a policy approved is never claimed here: device types are never
+	// auto-approvable, and this queue does not re-check a policy at claim the
+	// way the cloud worker does (upstream_mutation_policy.py).
+	providerFilter += `
+			  AND approved_by NOT LIKE 'policy:%'`
+	providerFilter += fmt.Sprintf(`
+			  AND not_before <= $%d::timestamptz
+			  AND (not_after <= '1970-01-01 00:00:00+00'::timestamptz OR not_after >= $%d::timestamptz)`, n+3, n+3)
 	statement := fmt.Sprintf(`
 		WITH candidates AS (
 			SELECT id
@@ -229,6 +239,9 @@ func (s *PostgresStore) ClaimApproved(ctx context.Context, limit int, claimedBy 
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	if err := s.expireScheduled(ctx, tx, included, claimedBy, now); err != nil {
+		return nil, err
+	}
 	rows, err := tx.QueryContext(ctx, expand(statement), args...)
 	if err != nil {
 		return nil, err
@@ -268,6 +281,48 @@ func (s *PostgresStore) ClaimApproved(ctx context.Context, limit int, claimedBy 
 		return nil, err
 	}
 	return claimed, nil
+}
+
+// expireScheduled fails every claimable row of these providers whose
+// not_after passed before it ran: a scheduled step is never run late.
+func (s *PostgresStore) expireScheduled(ctx context.Context, tx *sql.Tx, providers []string, actor string, now time.Time) error {
+	filter := ""
+	args := []any{ClaimableStatuses, now}
+	if len(providers) > 0 {
+		filter = "AND provider = ANY($3)"
+		args = append(args, providers)
+	}
+	rows, err := tx.QueryContext(ctx, expand(`
+		UPDATE @upstream_mutations
+		   SET status = 'failed_terminal', updated_at = $2,
+		       error = 'the approval expired before this ran; propose it again if it is still wanted'
+		 WHERE status = ANY($1) `+filter+`
+		   AND not_after > '1970-01-01 00:00:00+00'::timestamptz AND not_after < $2
+		RETURNING id, request_id`), args...)
+	if err != nil {
+		return err
+	}
+	type expired struct{ id, requestID string }
+	var all []expired
+	for rows.Next() {
+		var e expired
+		if err := rows.Scan(&e.id, &e.requestID); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, e)
+	}
+	rows.Close()
+	requestIDs := map[string]bool{}
+	for _, e := range all {
+		if err := appendEvent(ctx, tx, e.id, "failed", "dagster", actor, map[string]any{"status": "failed_terminal", "error": "approval expired"}, now); err != nil {
+			return err
+		}
+		if e.requestID != "" {
+			requestIDs[e.requestID] = true
+		}
+	}
+	return s.refreshRequests(ctx, tx, requestIDs)
 }
 
 // Complete implements Store.
@@ -428,14 +483,12 @@ func (s *PostgresStore) refreshRequestStatus(ctx context.Context, tx *sql.Tx, re
 	if len(mutationRows) == 0 {
 		return nil
 	}
-	var active []string
+	var all []string
 	statuses := map[string]string{}
 	executedAt, observedAt := requestExecutedAt, requestObservedAt
 	for i, r := range mutationRows {
 		statuses[r.id] = r.status
-		if r.status != "rejected" {
-			active = append(active, r.status)
-		}
+		all = append(all, r.status)
 		if i == 0 || r.executedAt.After(executedAt) {
 			executedAt = r.executedAt
 		}
@@ -443,7 +496,7 @@ func (s *PostgresStore) refreshRequestStatus(ctx context.Context, tx *sql.Tx, re
 			observedAt = r.observedAt
 		}
 	}
-	status := DeriveRequestStatus(active, requestStatus)
+	status := mutations.DeriveRequestStatus(all, requestStatus)
 	now := s.now()
 	_, err = tx.ExecContext(ctx, expand(`
 		UPDATE @upstream_mutation_requests
@@ -455,56 +508,6 @@ func (s *PostgresStore) refreshRequestStatus(ctx context.Context, tx *sql.Tx, re
 		 WHERE id = $6
 	`), status, jsonString(map[string]any{"mutation_statuses": statuses}), executedAt, observedAt, now, requestID)
 	return err
-}
-
-// DeriveRequestStatus is the precedence ladder the Python request refresh
-// applies to the non-rejected mutation statuses of one request.
-func DeriveRequestStatus(active []string, current string) string {
-	if len(active) == 0 {
-		return "rejected"
-	}
-	anyIs := func(want string) bool {
-		for _, s := range active {
-			if s == want {
-				return true
-			}
-		}
-		return false
-	}
-	allIn := func(want ...string) bool {
-		for _, s := range active {
-			ok := false
-			for _, w := range want {
-				if s == w {
-					ok = true
-					break
-				}
-			}
-			if !ok {
-				return false
-			}
-		}
-		return true
-	}
-	switch {
-	case anyIs("pending_review"):
-		return "pending_review"
-	case anyIs("executing"):
-		return "executing"
-	case anyIs("approved"):
-		return "approved"
-	case anyIs("failed_retryable"):
-		return "failed_retryable"
-	case anyIs("blocked_missing_credentials"):
-		return "blocked_missing_credentials"
-	case anyIs("failed_terminal"):
-		return "failed_terminal"
-	case allIn("observed"):
-		return "observed"
-	case allIn("succeeded", "observed"):
-		return "succeeded"
-	}
-	return current
 }
 
 func jsonString(value map[string]any) string {

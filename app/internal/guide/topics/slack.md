@@ -10,7 +10,9 @@ somebody else. Confirm any id you build a who-said-what query on from `base_slac
 
 ## Relations
 
-- `base_slack.messages` — time column `message_datetime`; `thread_ts` marks a reply;
+- `base_slack.messages` — keyed by `conversation_id` + `message_ts` (no `channel_id`, no bare
+  `id`); the sender is `user_id` / `username` (no `user_name`; names are in `base_slack.users`,
+  channel names in `base_slack.conversations.name`); time column `message_datetime`; `thread_ts` marks a reply;
   `subtype` carries Slack's own message kinds. A permalink is
   `https://<team_domain>.slack.com/archives/<conversation_id>/p<ts without the dot>`
   (with `?thread_ts=…&cid=…` for a reply); the team domain is in `base_slack.teams`.
@@ -36,13 +38,16 @@ people talking about him in public are `cc`.
 ## What is synced, and the edges
 
 - Everything Zach participates in — DMs, group DMs, private channels, his active member
-  channels — is **polled**: a conversation active in the last four hours every five
-  minutes, within two weeks every 15 minutes, within a year every two hours, older every
-  twelve hours, and a brand-new DM or group DM is found by listing within five minutes. A
-  DM that wakes after months of quiet can therefore take hours to land. DM landing latency
+  channels — is **polled**. A DM or group DM active in the last four hours every five
+  minutes, within two weeks every ten minutes, within a year every two hours, older every
+  twelve hours. A brand-new one is found by listing within five minutes, and so is the
+  first message in one that was never written in (Slack moves its `updated`). Channels he
+  is in go after DMs: within two weeks every thirty minutes (a private channel active in
+  the last three hours every five). A DM that wakes after months of quiet can take hours
+  to land. DM landing latency
   is judged in `marts_ops.slack_conversation_health` (`landing_p95_seconds`); a wake-up
   landing inside its tier's interval is counted in `landing_wakeups_excluded_24h` instead.
-- The ~13k public channels he is **not** in are swept on a rotation of about a day. They
+- The ~15k public channels he is **not** in are swept on a rotation of one to two days. They
   were listed but never re-read between roughly May and 2026-08-27, so any answer drawn
   from a non-member public channel in that window came from a fraction of the corpus.
   `history_polled_fraction` in the health view says how much of the rotation is current.

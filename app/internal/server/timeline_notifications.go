@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/notifications"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/push"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
@@ -135,6 +136,9 @@ ORDER BY min(recent.message_at)
 LIMIT 20`
 
 func renderTimelineNotification(row map[string]any, baseURL string, env timelineLinkEnv) notifications.Alert {
+	if linkString(row, "adapter") == mutations.PolicyOutcomeAdapter {
+		return renderPolicyOutcome(row)
+	}
 	source := linkString(row, "source")
 	brand, ok := notificationSources[source]
 	if !ok {
@@ -378,4 +382,22 @@ func NewTimelineNotifications(cfg config.Config, publicKey, privateKey, subscrib
 		return withAvatar(renderTimelineNotification(row, cfg.BaseURL, env), row, notificationAvatar(svc.DB), time.Second)
 	}
 	return svc, nil
+}
+
+// renderPolicyOutcome draws a mutation policy outcome the outbox carries
+// (mutations.PolicyOutcomeAlert): its own title, body and route, the action
+// category (Undo after an automatic change, Approve/Deny when sent back) and
+// the request the buttons act on.
+func renderPolicyOutcome(row map[string]any) notifications.Alert {
+	quiet, _ := row["quiet"].(bool)
+	return notifications.Alert{
+		Title:     notificationText(linkString(row, "title"), 90),
+		Body:      notificationText(linkString(row, "snippet"), 280),
+		Route:     linkString(row, "route"),
+		ThreadID:  "mutations",
+		Category:  linkString(row, "category"),
+		Kind:      linkString(row, "kind"),
+		RequestID: linkString(row, "request_id"),
+		Quiet:     quiet,
+	}
 }

@@ -34,6 +34,12 @@ class FakeWarehouse:
         self.events: list[dict] = []
         self.sync_map = dict(sync_map or {})
         self.recorded: list[dict] = []
+        self.observations: list[dict] = []
+        self.log: list[str] = []
+
+    def record_source_upstream_observation(self, **observation) -> None:
+        self.log.append("observe")
+        self.observations.append(observation)
 
     def ensure_agent_sessions_tables(self) -> None:
         self.ensure_called = True
@@ -42,6 +48,7 @@ class FakeWarehouse:
         return dict(self.sync_map)
 
     def insert_agent_session_events(self, rows) -> None:
+        self.log.append("write")
         self.events.extend(rows)
 
     def record_chatgpt_conversation_synced(self, *, account, session_id, update_time, event_count, synced_at) -> None:
@@ -117,6 +124,19 @@ def test_fetches_all_new_conversations_and_writes_events():
     assert summary.conversations_fetched == 2
     assert summary.events_written == 2  # one user row per convo
     assert {r["session_id"] for r in wh.recorded} == {"c1", "c2"}
+
+
+def test_records_chatgpts_own_newest_conversation_before_writing():
+    """C11: the list is newest-first by update_time; its first entry is the source's newest."""
+    refs = [ConversationRef("c1", "one", 1.0, 200.0), ConversationRef("c2", "two", 2.0, 150.0)]
+    wh = FakeWarehouse()
+    runner(wh, FakeClient(refs, {"c1": _convo("c1"), "c2": _convo("c2")})).sync()
+
+    [observation] = wh.observations
+    assert observation["pipeline"] == "chatgpt"
+    assert observation["upstream_newest_id"] == "c1"
+    assert observation["upstream_newest_at"] == datetime.fromtimestamp(200.0, tz=UTC)
+    assert wh.log.index("observe") < wh.log.index("write")
 
 
 def test_skips_conversations_not_updated_since_last_sync():

@@ -53,6 +53,17 @@ than paging deeper.
 ## Reading a hit
 
 Every hit carries `priority`, `ref`, `source_table`, `source_pk` and `drill_sql`.
+
+Untargeted public community Slack chatter is `noise`, regardless of channel membership:
+the public firehose is outside the attention scope. Private channels/group DMs, public
+name mentions and replies under his broadcasts follow the `cc`/`direct` rules.
+Bots and system notices are `noise`; empty attachment shells are `background`.
+Automated agent prompts are `background`, even on the user channel.
+`marts_ops.timeline_priority_correctness` measures a labeled regression sample per audited
+adapter: at least 90% must match; missing events count as errors. It is a small blind
+hash sample with tier strata, not a corpus-wide accuracy guarantee. Labels are private;
+unpublished, unmeasured, incomplete or stale evidence fails C2.
+
 `source_table` is the catalog's logical id (`gmail_messages`, `slack_messages`), not a
 relation name, so do not build the drill-down by hand: {{if .CLI}}the `sql:` line under each hit{{else}}`drill_sql`{{end}} is
 the ready statement that reads the authoritative row (one row per column, payloads dropped,
@@ -91,7 +102,8 @@ with 42883). Hybrid retrieval from SQL does not exist; use {{if .CLI}}`pdw searc
   `marts_ops.search_health` component `bm25_indexes`.
 - Slow cold searches on a quiet host are usually a cache question, not a query one:
   `marts_ops.search_health` rows `cache_residency` (share of the working set in shared
-  buffers) and `bm25_index_bloat` (live bytes vs file bytes of the BM25 indexes) say so.
+  buffers), `timeline_heap_residency` (the timeline heap a keyword search reads) and
+  `bm25_index_bloat` (live bytes vs file bytes of the BM25 indexes) say so.
 - **The search document is not the whole row.** For agent sessions it is the title, the
   first prompt, the working directory and the user/assistant turns — tool calls and tool
   results are not in it. For Slack, WhatsApp and iMessage it is the message plus any

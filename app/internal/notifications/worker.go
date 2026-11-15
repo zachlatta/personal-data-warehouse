@@ -30,6 +30,14 @@ type Alert struct {
 	NotificationID string         `json:"notification_id"`
 	DeliveryID     string         `json:"delivery_id"`
 	OpenProof      string         `json:"open_proof"`
+	// Category, Kind and RequestID are set for an alert about a mutation
+	// request (a policy outcome): the action buttons the phone draws and the
+	// request they act on. Quiet makes it passive, with no sound. A timeline
+	// alert leaves them empty.
+	Category  string `json:"category,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+	Quiet     bool   `json:"quiet,omitempty"`
 	// Android is set for chat alerts (messages, WhatsApp, Slack). An Android
 	// device that reports push.CapabilityAndroidNativeAlerts is sent it as a
 	// data-only push its native code draws as a conversation; every other
@@ -58,6 +66,30 @@ type AndroidStyle struct {
 	EventID string `json:"event_id"`
 }
 
+// MutationAdapter is the outbox adapter of mutation alerts (policy outcomes,
+// app/internal/mutations/policy_outcomes.go). They are not part of the
+// timeline-notification experiment: they deliver whether or not its switch
+// (ops.notification_state, id 'timeline') is on, switching it off never
+// cancels them, and the timeline notifications page does not list them.
+const MutationAdapter = "mutation_policy"
+
+// timelineGate is the per-row condition an outbox event (aliased n) must meet:
+// the experiment switch is on, or it is a mutation alert.
+const timelineGate = `(n.adapter = '` + MutationAdapter + `' OR EXISTS (SELECT 1 FROM @notification_state WHERE id='timeline' AND enabled=1))`
+
+// deliveryGate is the same for a delivery row (its notification_id column).
+var deliveryGate = deliveryGateFor("notification_id")
+
+func deliveryGateFor(notificationID string) string {
+	return `(EXISTS (SELECT 1 FROM @notification_events n WHERE n.id = ` + notificationID + ` AND n.adapter = '` + MutationAdapter + `') OR EXISTS (SELECT 1 FROM @notification_state WHERE id='timeline' AND enabled=1))`
+}
+
+func (s *Service) isMutationAlert(ctx context.Context, tx *sql.Tx, notificationID string) (bool, error) {
+	var mutation bool
+	err := tx.QueryRowContext(ctx, s.q(`SELECT EXISTS (SELECT 1 FROM @notification_events WHERE id=$1 AND adapter='`+MutationAdapter+`')`), notificationID).Scan(&mutation)
+	return mutation, err
+}
+
 type Delivery struct {
 	ID, NotificationID, DeviceID, Transport, Status, LeaseID, TicketID string
 	Endpoint                                                           json.RawMessage
@@ -81,6 +113,8 @@ type Service struct {
 	PublicKey string
 	Sender    Sender
 	Render    func(map[string]any) Alert
+	// WitnessTimeout bounds each phone lookup; zero is DefaultWitnessTimeout.
+	WitnessTimeout time.Duration
 	// Expand is overridden only by integration tests with isolated schemas.
 	Expand func(string) string
 }
@@ -140,11 +174,10 @@ func (s *Service) Run(ctx context.Context) {
 }
 
 func (s *Service) Tick(ctx context.Context) error {
-	var enabled bool
-	if err := s.DB.QueryRowContext(ctx, s.q(`SELECT enabled=1 FROM @notification_state WHERE id='timeline'`)).Scan(&enabled); err != nil {
-		return err
-	}
-	if enabled {
+	// Mutation alerts (MutationAdapter) are not part of the timeline
+	// experiment: the fan-out and claim below gate each row on the switch
+	// (timelineGate) unless it is one, so they run whether or not it is on.
+	{
 		// A process can die after its final send but before storing the verdict.
 		// Bound crash recovery too; do not create an infinite retrying lease.
 		_, err := s.DB.ExecContext(ctx, s.q(`UPDATE @notification_deliveries SET status='unknown',error='send attempts exhausted after interrupted worker',updated_at=now() WHERE status='sending' AND lease_until<now() AND attempt_count>=6`))
@@ -175,13 +208,17 @@ func (s *Service) Tick(ctx context.Context) error {
 			result := Result{Status: "cancelled", Error: "device disabled or experiment paused"}
 			if active {
 				reason, err := s.suppressionReason(ctx, d)
-				if err != nil {
+				unchecked := errors.Is(err, errWitnessUnchecked)
+				if err != nil && !unchecked {
 					return err
 				}
 				if reason != "" {
 					result = Result{Status: "suppressed", Error: reason}
 				} else {
 					result = s.Sender.Send(ctx, d)
+					if unchecked && result.Error == "" {
+						result.Error = errWitnessUnchecked.Error()
+					}
 				}
 			}
 			if err = s.settle(ctx, d, result, false); err != nil {
@@ -217,16 +254,15 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	defer tx.Rollback()
-	var enabled bool
-	if err = tx.QueryRowContext(ctx, s.q(`SELECT enabled=1 FROM @notification_state WHERE id='timeline' FOR SHARE`)).Scan(&enabled); err != nil {
+	// Serialize with the switch, which a timeline event waits on; a mutation
+	// alert does not.
+	if _, err = tx.ExecContext(ctx, s.q(`SELECT 1 FROM @notification_state WHERE id='timeline' FOR SHARE`)); err != nil {
 		return false, err
-	}
-	if !enabled {
-		return false, nil
 	}
 	var id string
 	var payload []byte
-	err = tx.QueryRowContext(ctx, s.q(`SELECT id,payload FROM @notification_events WHERE status='pending' AND EXISTS (SELECT 1 FROM @notification_state WHERE id='timeline' AND enabled=1) ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`)).Scan(&id, &payload)
+	var phoneHoldUntil time.Time
+	err = tx.QueryRowContext(ctx, s.q(`SELECT id,payload,greatest(now(),`+phoneWitnessAnchor+`+$1::interval) FROM @notification_events n WHERE status='pending' AND `+timelineGate+` ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`), interval(PhoneWitnessHold)).Scan(&id, &payload, &phoneHoldUntil)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -276,7 +312,19 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (notification_id,device_id) DO NOTHING`), deliveryID, id, deviceID(d.transport+":"+d.id), d.transport, d.endpoint, raw)
+		// An Android delivery waits for the phone's own apps to post and
+		// upload their notification for this event (see suppression.go).
+		var notBefore any
+		if isAndroid(d.endpoint) {
+			// Hold only a device whose phone is known: with no phone there is
+			// no evidence to wait for. A failed lookup holds nothing either.
+			if _, known, err := s.phoneOf(ctx, deviceID(d.transport+":"+d.id)); err != nil {
+				slog.Warn("phone lookup failed at fan-out; not holding", "notification_id", id, "error", err)
+			} else if known {
+				notBefore = phoneHoldUntil
+			}
+		}
+		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,next_attempt_at) VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::timestamptz,now())) ON CONFLICT (notification_id,device_id) DO NOTHING`), deliveryID, id, deviceID(d.transport+":"+d.id), d.transport, d.endpoint, raw, notBefore)
 		if err != nil {
 			return false, err
 		}
@@ -297,7 +345,7 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 }
 
 func (s *Service) claim(ctx context.Context, receipt bool) (Delivery, error) {
-	predicate := `status IN ('pending','retry','sending') AND next_attempt_at<=now() AND lease_until<now() AND EXISTS (SELECT 1 FROM @notification_state WHERE id='timeline' AND enabled=1)`
+	predicate := `status IN ('pending','retry','sending') AND next_attempt_at<=now() AND lease_until<now() AND ` + deliveryGate
 	status := "sending"
 	if receipt {
 		predicate = `status='accepted' AND transport='expo' AND ticket_id<>'' AND next_attempt_at<=now() AND lease_until<now()`
@@ -345,16 +393,21 @@ func (s *Service) finish(ctx context.Context, d Delivery, r Result, receipt bool
 		if err = tx.QueryRowContext(ctx, s.q(`SELECT enabled=1 FROM @notification_state WHERE id='timeline' FOR SHARE`)).Scan(&enabled); err != nil {
 			return err
 		}
-		if !enabled {
+		mutation, err := s.isMutationAlert(ctx, tx, d.NotificationID)
+		if err != nil {
+			return err
+		}
+		if !enabled && !mutation {
 			r.Status = "cancelled"
 		}
 	}
-	res, err := tx.ExecContext(ctx, s.q(`UPDATE @notification_deliveries SET status=$3,error=$4,
+	// A receipt with nothing to say keeps the send's note (phone_witness_unchecked).
+	res, err := tx.ExecContext(ctx, s.q(`UPDATE @notification_deliveries SET status=$3,error=CASE WHEN $6 AND $4='' THEN error ELSE $4 END,
  ticket_id=CASE WHEN $5<>'' THEN $5 ELSE ticket_id END,
  accepted_at=CASE WHEN $3 IN ('accepted','provider_accepted') AND accepted_at='epoch'::timestamptz THEN now() ELSE accepted_at END,
  receipt_at=CASE WHEN $6 AND $3 NOT IN ('accepted','unknown') THEN now() ELSE receipt_at END,
  updated_at=now(),next_attempt_at=now()+$7::interval,lease_until='epoch',lease_id=''
- WHERE id=$1 AND lease_id=$2`), d.ID, d.LeaseID, r.Status, r.Error, r.TicketID, receipt, fmt.Sprintf("%f seconds", delay.Seconds()))
+ WHERE id=$1 AND lease_id=$2`), d.ID, d.LeaseID, r.Status, r.Error, r.TicketID, receipt, interval(delay))
 	if err != nil {
 		return err
 	}
@@ -380,6 +433,14 @@ func (s *Service) finish(ctx context.Context, d Delivery, r Result, receipt bool
 	return tx.Commit()
 }
 
+func interval(d time.Duration) string { return fmt.Sprintf("%f seconds", d.Seconds()) }
+
+func isAndroid(endpoint []byte) bool {
+	var e struct{ Platform string }
+	_ = json.Unmarshal(endpoint, &e)
+	return e.Platform == "android"
+}
+
 func endpointURL(raw []byte) string {
 	var e struct{ Endpoint string }
 	_ = json.Unmarshal(raw, &e)
@@ -395,12 +456,12 @@ func (s *Service) deliveryActive(ctx context.Context, d Delivery) (bool, error) 
 		var endpoint struct{ Token string }
 		_ = json.Unmarshal(d.Endpoint, &endpoint)
 		key = endpoint.Token
-		query = `SELECT EXISTS(SELECT 1 FROM @push_devices WHERE expo_push_token=$1 AND status='active') AND EXISTS(SELECT 1 FROM @notification_state WHERE id='timeline' AND enabled=1)`
+		query = `SELECT EXISTS(SELECT 1 FROM @push_devices WHERE expo_push_token=$1 AND status='active') AND ` + deliveryGateFor("$2")
 	} else {
 		key = endpointURL(d.Endpoint)
-		query = `SELECT EXISTS(SELECT 1 FROM @web_push_devices WHERE subscription->>'endpoint'=$1 AND status='active') AND EXISTS(SELECT 1 FROM @notification_state WHERE id='timeline' AND enabled=1)`
+		query = `SELECT EXISTS(SELECT 1 FROM @web_push_devices WHERE subscription->>'endpoint'=$1 AND status='active') AND ` + deliveryGateFor("$2")
 	}
-	err := s.DB.QueryRowContext(ctx, s.q(query), key).Scan(&active)
+	err := s.DB.QueryRowContext(ctx, s.q(query), key, d.NotificationID).Scan(&active)
 	return active, err
 }
 

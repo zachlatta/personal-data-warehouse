@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -863,6 +864,9 @@ def test_record_search_cache_residency_refreshes_the_living_health_row() -> None
                 "resident_fraction": 0.25,
             }
 
+        def measure_timeline_heap_residency(self):
+            return {"resident_bytes": 800, "total_bytes": 8_000, "resident_fraction": 0.1}
+
         def write_search_health(self, component, **facts):
             self.writes.append((component, facts))
 
@@ -876,6 +880,64 @@ def test_record_search_cache_residency_refreshes_the_living_health_row() -> None
     assert facts["caught_up"] == 1
     assert facts["last_error"] == ""
     assert facts["last_success_at"].tzinfo is UTC
+    # 86% of a cold scoped lexical leg's reads are timeline heap pages
+    # (2026-11-11), so the heap's residency is published beside the indexes'.
+    component, facts = warehouse.writes[1]
+    assert component == "timeline_heap_residency"
+    assert facts["resident_bytes"] == 800 and facts["total_bytes"] == 8_000
+    assert facts["resident_fraction"] == 0.1
+    assert facts["last_error"] == ""
+
+
+def test_a_failing_heap_gauge_is_its_own_error_and_keeps_the_index_gauge() -> None:
+    class Warehouse:
+        def __init__(self) -> None:
+            self.writes = []
+
+        def measure_search_cache_residency(self):
+            return {"target_count": 5, "resident_bytes": 2_500, "total_bytes": 10_000, "resident_fraction": 0.25}
+
+        def measure_timeline_heap_residency(self):
+            raise RuntimeError("pg_buffercache extension is not installed")
+
+        def write_search_health(self, component, **facts):
+            self.writes.append((component, facts))
+
+    warehouse = Warehouse()
+    measured = record_search_cache_residency(warehouse)
+
+    assert measured["resident_fraction"] == 0.25
+    assert [component for component, _ in warehouse.writes] == [
+        "cache_residency",
+        "timeline_heap_residency",
+    ]
+    assert warehouse.writes[0][1]["last_error"] == ""
+    assert "pg_buffercache" in warehouse.writes[1][1]["last_error"]
+
+
+def test_timeline_heap_residency_is_measured_and_shown_beside_the_indexes(
+    warehouse: PostgresWarehouse,
+) -> None:
+    _provision(warehouse)
+    warehouse.ensure_pipeline_health_tables()
+    measured = warehouse.measure_timeline_heap_residency()
+    assert measured["total_bytes"] >= 0
+    assert 0.0 <= measured["resident_fraction"] <= 1.0
+    warehouse.write_search_health(
+        "timeline_heap_residency",
+        caught_up=1,
+        pending_count=0,
+        processed_rows=1,
+        resident_bytes=measured["resident_bytes"],
+        total_bytes=measured["total_bytes"],
+        resident_fraction=measured["resident_fraction"],
+        last_success_at=datetime.now(tz=UTC),
+        last_error="",
+    )
+    row = warehouse._query_dicts(
+        "SELECT * FROM @marts_search_health WHERE component = 'timeline_heap_residency'"
+    )[0]
+    assert row["status"] == "ok"
 
 
 def test_should_rewarm_only_when_cold_and_not_recently_warmed() -> None:
@@ -897,6 +959,45 @@ def test_should_rewarm_only_when_cold_and_not_recently_warmed() -> None:
     )
     # Unmeasured residency (no pg_buffercache) never triggers a warm.
     assert not should_rewarm_search_indexes(resident_fraction=-1, last_prewarmed_at=long_ago, now=now)
+
+
+def test_a_cold_cache_is_rewarmed_within_the_working_day() -> None:
+    # 2026-11-11: the warm at 07:52 had decayed to 13% residency by 19:12,
+    # and searches spent the afternoon at p50 4-9 s on read wait while the
+    # 24-hour guard waited for the next morning. The largest evictor (the
+    # timeline sidebar's 37 GB scan, ~95 GB a day) is gone; four ~20 GB warms
+    # a day cost less than it did, and restore the cache the same day.
+    now = datetime(2026, 11, 11, 19, 12, tzinfo=UTC)
+    assert should_rewarm_search_indexes(
+        resident_fraction=0.13, last_prewarmed_at=now - timedelta(hours=7), now=now
+    )
+    assert not should_rewarm_search_indexes(
+        resident_fraction=0.13, last_prewarmed_at=now - timedelta(hours=5), now=now
+    )
+
+
+def test_the_heap_warm_runs_only_inside_the_full_search_cache_warm() -> None:
+    """No separate heap re-warm: under search load it held ~10 minutes.
+
+    Production 2026-11-12: the attention heap read 16.5% of the timeline
+    heap in shared buffers right after a warm at 02:46Z, and 3.4% at
+    02:55:51Z, after an agent's ~30 scoped searches pulled the index
+    residency from 0.117 to 0.494. HNSW pages with higher usage counts
+    displaced the heap pages the warm had loaded once. An hourly heap warm
+    would buy about ten warm minutes an hour for up to 134 GB/day of reads,
+    so the heap is warmed only with the indexes (deploy, restart, REINDEX,
+    the six-hourly cold-index guard). Memory is the fix for the rest.
+    """
+    import inspect
+
+    import personal_data_warehouse.defs.search_index as search_index_defs
+    import personal_data_warehouse.search_index as search_index_module
+
+    assert "warm_attention_heap" not in inspect.getsource(search_index_defs)
+    assert "warm_attention_heap" not in inspect.getsource(search_index_module)
+    assert "self.warm_attention_heap()" in inspect.getsource(
+        PostgresWarehouse.prewarm_search_indexes_if_needed
+    )
 
 
 def test_rewarm_forces_a_prewarm_when_cold_and_records_why() -> None:
@@ -1361,6 +1462,80 @@ def test_semantic_leg_scopes_by_source_and_time_on_both_routes(
         "gmail_email:gmail_email|near-new#0-event",
         "gmail_email:gmail_email|far-new#0-event",
     ]
+
+
+def test_the_semantic_leg_walks_its_partition_graphs_on_parallel_workers(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Contract C6: a graph walk is a chain of synchronous page reads, and
+    walking four of them one after another in one backend made the unscoped
+    semantic leg cost their sum (6.47 s cold on production, 2026-11-11, with
+    27 idle cores). The walks must run as the children of one Parallel Append,
+    each on its own process, and return exactly what the serial walks did.
+
+    Every partition holds more rows than pgvector's default hnsw.ef_search
+    (40), so a worker that did not inherit the leg's hnsw.* settings would cut
+    its walk short; all of them must come back."""
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    ts = datetime(2026, 7, 5, tzinfo=UTC)
+    per_partition = 45
+    chunks = [
+        (f"{adapter}|{'near' if i == 0 else f'n{i}'}#0", adapter, 0.05 * i)
+        for adapter in ("gmail_email", "slack_message", "slack_file", "voice_memo")
+        for i in range(per_partition)
+    ]
+    for chunk_id, adapter, axis in chunks:
+        _insert_chunk(warehouse, chunk_id, adapter, f"sha-{chunk_id}", ts)
+        _insert_embedding(warehouse, f"sha-{chunk_id}", axis=axis)
+    warehouse._command("DELETE FROM @search_schema_state")
+    warehouse._ensure_search_views_if_possible()
+    query = vector_literal([1.0] + [0.0] * (SEARCH_EMBEDDING_DIMENSIONS - 1))
+
+    connection = warehouse._connection
+    warehouse._command("LOAD 'auto_explain'")
+    warehouse._command("SET auto_explain.log_min_duration = 0")
+    warehouse._command("SET auto_explain.log_analyze = on")
+    warehouse._command("SET auto_explain.log_nested_statements = on")
+    warehouse._command("SET client_min_messages = log")
+    del connection.notices[:]
+    try:
+        rows = warehouse._query(
+            "SELECT ref, best FROM @search_hybrid_semantic(%s, 'fake-model', 10, NULL, NULL)"
+            " ORDER BY best",
+            (query,),
+        )
+        plans = "".join(connection.notices)
+    finally:
+        warehouse._command("RESET client_min_messages")
+        warehouse._command("RESET auto_explain.log_min_duration")
+
+    assert "Parallel Append" in plans, plans
+    assert plans.count("Function Scan on search_hybrid_semantic_walk") == 4, plans
+    launched = [int(n) for n in re.findall(r"Workers Launched: (\d+)", plans)]
+    assert launched and max(launched) >= 1, plans
+
+    warehouse._command("SET hnsw.ef_search = 400")
+    try:
+        serial = warehouse._query(
+            " UNION ALL ".join(
+                f"SELECT * FROM @search_hybrid_semantic_walk({part}, 'fake-model', NULL, NULL,"
+                " %s::public.halfvec, 400)"
+                for part in range(1, 5)
+            ),
+            (query,) * 4,
+        )
+    finally:
+        warehouse._command("RESET hnsw.ef_search")
+    assert len(serial) == len(chunks)
+    assert len(rows) == len(chunks), "a walk on a worker stopped at the default ef_search"
+    nearest_first = [f"{adapter}:{chunk_id}-event" for chunk_id, adapter, _ in chunks]
+    assert {ref for ref, _ in rows} == set(nearest_first)
+    assert {ref for ref, best in rows if best <= 4} == {
+        ref for ref in nearest_first if "|near#" in ref
+    }
 
 
 def test_a_chunk_and_its_first_vector_committing_together_still_meet(

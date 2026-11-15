@@ -19,6 +19,7 @@ export function mount(container) {
   async function load() {
     try {
       const next = await request("/api/notifications"); if (stopped) return; state = next;
+      health.className = "notification-health " + (state.enabled ? (state.error ? "bad" : "on") : "off");
       health.textContent = `Experiment ${state.enabled ? "on" : "paused"} · ${state.status}${state.error ? " · " + state.error : ""}`;
       toggle.textContent = state.enabled ? "Pause all timeline notifications" : "Start experiment";
       register.disabled = !state.web_public_key || !("serviceWorker" in navigator) || !("PushManager" in window);
@@ -39,7 +40,7 @@ export function mount(container) {
         if (preview.route) { const link = node("a", "View timeline item"); link.href = preview.route; words.append(link); }
         content.append(words);
         card.append(top, content);
-        card.append( node("small", `${item.status} · ${item.accepted}/${item.devices} accepted · ${item.opened} opened${item.suppressed_read ? " · " + item.suppressed_read + " skipped: already read" : ""}${item.suppressed_replied ? " · " + item.suppressed_replied + " skipped: already replied" : ""}${item.failed ? " · " + item.failed + " failed/unknown" : ""}`));
+        card.append( node("small", `${item.status} · ${item.accepted}/${item.devices} accepted · ${item.opened} opened${item.suppressed_read ? " · " + item.suppressed_read + " skipped: already read" : ""}${item.suppressed_replied ? " · " + item.suppressed_replied + " skipped: already replied" : ""}${item.suppressed_notified ? " · " + item.suppressed_notified + " skipped: already on phone" : ""}${item.failed ? " · " + item.failed + " failed/unknown" : ""}`));
         list.append(card);
       }
     } catch (e) { if (!stopped) feedback.textContent = e.message; }

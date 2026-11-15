@@ -34,6 +34,7 @@ function deliveryLine(event: NotificationEvent): string {
   const parts = [`${event.accepted}/${event.devices} delivered`, `${event.opened} opened`];
   if (event.suppressed_read) parts.push(`${event.suppressed_read} skipped: read`);
   if (event.suppressed_replied) parts.push(`${event.suppressed_replied} skipped: replied`);
+  if (event.suppressed_notified) parts.push(`${event.suppressed_notified} skipped: already on phone`);
   if (event.failed) parts.push(`${event.failed} failed`);
   return parts.join(' · ');
 }

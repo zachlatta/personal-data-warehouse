@@ -26,7 +26,18 @@ function errorText(err) {
 
 // --- shared bits ---------------------------------------------------------------
 
-function pill(status) { return h("span", "mpill s-" + (status || "unknown"), status || "unknown"); }
+function pill(status) {
+  const label = (status || "unknown").replace(/_/g, " ");
+  return h("span", "mpill s-" + (status || "unknown"), label.charAt(0).toUpperCase() + label.slice(1));
+}
+
+function policyBadgeNode(request) {
+  const badge = V.policyBadge(request);
+  if (!badge) return null;
+  const node = h("span", "policy-badge policy-" + badge.tone, badge.label);
+  if (badge.reasons.length) node.title = badge.reasons.join("\n");
+  return node;
+}
 
 function pre(value) { return h("pre", "blob", typeof value === "string" ? value : V.prettyJSON(value)); }
 
@@ -1183,7 +1194,51 @@ function renderGeneric(mutation) {
   return article;
 }
 
+// renderMutation is a step's card with its own schedule (runs at, deadline,
+// precondition) when it has one.
 function renderMutation(request, mutation, actions) {
+  const card = renderMutationCard(request, mutation, actions);
+  const schedule = V.mutationSchedule(mutation);
+  if (!schedule.runsAt && !schedule.deadline && !schedule.precondition) return card;
+  const line = h("p", "mutation-schedule m");
+  const parts = [];
+  if (schedule.runsAt) parts.push("Runs at " + formatWhen(schedule.runsAt));
+  if (schedule.deadline) parts.push("deadline " + formatWhen(schedule.deadline));
+  if (schedule.precondition) parts.push(schedule.precondition);
+  line.textContent = parts.join(" · ");
+  if (schedule.runsAt) line.title = fmtFull(schedule.runsAt);
+  card.insertBefore(line, card.firstChild ? card.firstChild.nextSibling : null);
+  return card;
+}
+
+function renderPolicyChange(mutation) {
+  const view = V.policyChangeView(mutation);
+  const article = h("article", "mut policy-change");
+  article.appendChild(mutationHead("pdw", mutation.title || "Change mutation policies", mutation.status));
+  article.appendChild(h("p", view.narrowing ? "ok" : "warn", view.narrowing
+    ? "PDW checked this only narrows what may run without you."
+    : "Widens what may run without you: " + (view.widens.join("; ") || "not provably a narrowing")));
+  if (view.summary) article.appendChild(h("p", "mreason", view.summary));
+  if (mutation.reason) article.appendChild(h("p", "m", mutation.reason));
+  if (mutation.error) article.appendChild(h("p", "bad", mutation.error));
+  const diff = V.policyChangeTable(view);
+  const table = h("table", diff.className);
+  const thead = h("thead"); const head = h("tr");
+  diff.headers.forEach((t) => head.appendChild(h("th", "", t)));
+  thead.appendChild(head); table.appendChild(thead);
+  const tbody = h("tbody");
+  for (const row of diff.rows) {
+    const tr = h("tr", row.widens ? "widens" : "");
+    row.cells.forEach((cell, i) => tr.appendChild(h("td", i === row.cells.length - 1 ? (row.widens ? "bad" : "m") : "", cell)));
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  article.appendChild(table);
+  return article;
+}
+
+function renderMutationCard(request, mutation, actions) {
+  if (V.policyChangeView(mutation)) return renderPolicyChange(mutation);
   if (V.isGmailEmailMutation(mutation)) return renderGmailEmail(request, mutation, actions);
   if (V.isGmailSettingsMutation(mutation)) return renderGmailSettings(mutation);
   if (V.isCalendarMutation(mutation)) return renderCalendar(mutation);
@@ -1293,7 +1348,7 @@ function renderRequestTable(title, requests, emptyText) {
   if (!requests.length) { sect.appendChild(h("p", "m", emptyText)); return sect; }
   const table = h("table", "rtable");
   const thead = h("thead"); const hr = h("tr");
-  ["status", "request", "mutations", "created"].forEach((t) => hr.appendChild(h("th", "", t)));
+  ["Status", "Request", "Mutations", "Created"].forEach((t) => hr.appendChild(h("th", "", t)));
   thead.appendChild(hr); table.appendChild(thead);
   const tbody = h("tbody");
   for (const request of requests) {
@@ -1302,6 +1357,8 @@ function renderRequestTable(title, requests, emptyText) {
     const td = h("td", "rtitle");
     td.appendChild(link(requestPath(request.id), request.title || request.id));
     if (request.reason) td.appendChild(h("div", "m", request.reason));
+    const badge = policyBadgeNode(request);
+    if (badge) td.appendChild(badge);
     tr.appendChild(td);
     tr.appendChild(h("td", "num", V.requestMutationCount(request)));
     const created = h("td", "m", formatWhen(request.created_at)); created.title = fmtFull(request.created_at);
@@ -1315,7 +1372,7 @@ function renderRequestTable(title, requests, emptyText) {
 async function renderList(root, ctx, alive) {
   ctx.setSubtitle("mutation review");
   ctx.setStats("");
-  const refresh = button("refresh", "", () => renderList(root, ctx, alive));
+  const refresh = button("Refresh", "", () => renderList(root, ctx, alive));
   ctx.setControls(refresh);
   function paint(requests, refreshing) {
     const { pending, past } = V.splitRequestsForList(requests);
@@ -1323,7 +1380,11 @@ async function renderList(root, ctx, alive) {
     clear(root);
     root.appendChild(renderRequestTable("Pending review", pending, "No requests are waiting for review."));
     root.appendChild(renderRequestTable("Past requests", past, "No approved or denied requests yet."));
+    root.appendChild(policyPanel);
   }
+  // Automatic approvals: the kill switch and each policy's mode.
+  const policyPanel = h("section", "rsect policy-panel");
+  renderPolicyPanel(policyPanel);
   // The last answer paints at once; the fetch below replaces it.
   const cached = cache.peekList();
   if (cached) paint(cached, true); else clear(root).appendChild(h("p", "m", "loading…"));
@@ -1338,6 +1399,56 @@ async function renderList(root, ctx, alive) {
   paint(cache.rememberList(requests), false);
 }
 
+async function renderPolicyPanel(sect) {
+  clear(sect);
+  sect.appendChild(h("h2", "", "Automatic approvals"));
+  let overview;
+  try { overview = await mutations.policies(); } catch (err) {
+    sect.appendChild(h("p", "m", errorText(err) || "could not load policies"));
+    return;
+  }
+  const errorNode = h("p", "bad");
+  const act = (fn) => async () => {
+    errorNode.textContent = "";
+    try { if ((await fn()) === false) return; await renderPolicyPanel(sect); } catch (err) { errorNode.textContent = errorText(err); }
+  };
+  const top = h("p", "policy-switch");
+  if (overview.auto_approve_forced_off) {
+    top.appendChild(h("strong", "", "Off (PDW_MUTATION_AUTO_APPROVE=0 on the deployment)"));
+  } else if (overview.auto_approve) {
+    top.appendChild(h("strong", "", "On. "));
+    top.appendChild(button("Switch every automatic approval off", "danger", act(() => mutations.setAutoApprove(false))));
+  } else {
+    top.appendChild(h("strong", "", "Off: everything comes to you. "));
+    top.appendChild(button("Switch on", "", act(() => {
+      if (!confirmDialog("Switch automatic approvals back on?")) return false;
+      return mutations.setAutoApprove(true);
+    })));
+  }
+  sect.appendChild(top);
+  const policies = overview.policies || [];
+  if (!policies.length) sect.appendChild(h("p", "m", "No policies yet. An agent proposes one as a pdw.mutation_policy request."));
+  for (const policy of policies) {
+    const row = h("div", "policy-row");
+    row.appendChild(h("strong", "", policy.id + " v" + policy.version));
+    row.appendChild(h("span", "m", " " + policy.operation + " · " + String(policy.mode).replace("_", " ")));
+    if (policy.unreadable) row.appendChild(h("span", "bad", " unreadable: " + policy.unreadable));
+    for (const mode of ["off", "dry_run", "enforce"]) {
+      if (mode === policy.mode) continue;
+      row.appendChild(button(mode.replace("_", " "), mode === "off" ? "danger" : "", act(() => {
+        if (mode === "enforce" && !confirmDialog("Enforce " + policy.id + "? Changes inside it will run without asking you.")) return false;
+        return mutations.setPolicyMode(policy.id, mode);
+      })));
+    }
+    const grants = (overview.grants || []).filter((grant) => grant.policy_id === policy.id);
+    for (const grant of grants) {
+      row.appendChild(h("div", "m", "grant " + (grant.label || grant.id) + " → token " + grant.token_id + (grant.active ? " (active" + (grant.expires_at ? ", until " + formatWhen(grant.expires_at) : "") + ")" : " (inactive)")));
+    }
+    sect.appendChild(row);
+  }
+  sect.appendChild(errorNode);
+}
+
 function renderRequestHeader(request) {
   const sect = h("section", "rsect rhead review-hero");
   sect.appendChild(h("div", "review-hero-icon", "✓"));
@@ -1348,11 +1459,22 @@ function renderRequestHeader(request) {
   main.appendChild(eyebrow);
   main.appendChild(h("h1", "", request.title || request.id));
   if (request.reason) main.appendChild(h("p", "mreason", request.reason));
+  const badge = policyBadgeNode(request);
+  if (badge) {
+    const line = h("p", "policy-line");
+    line.appendChild(badge);
+    const reasons = V.policyBadge(request).reasons;
+    if (reasons.length) line.appendChild(h("span", "m", " " + reasons.join("; ")));
+    main.appendChild(line);
+  }
   const meta = h("div", "request-meta");
   const metaPairs = [
     ["By", request.requested_by, ""], ["Created", formatWhen(request.created_at), request.created_at],
     ["Approved by", request.approved_by, ""], ["Approved", formatWhen(request.approved_at), request.approved_at],
     ["Executed", formatWhen(request.executed_at), request.executed_at], ["Updated", formatWhen(request.updated_at), request.updated_at],
+    // Approve now, run later: when the worker may run it, and its deadline.
+    ["Runs at", formatWhen(V.requestSchedule(request).runsAt), V.requestSchedule(request).runsAt],
+    ["Deadline", formatWhen(V.requestSchedule(request).deadline), V.requestSchedule(request).deadline],
   ];
   for (const [label, value, rawTime] of metaPairs) {
     if (!value) continue;
@@ -1415,6 +1537,37 @@ function renderDecisionDock(request, actions) {
     controls.appendChild(button("Deny", "danger", async () => {
       errorNode.textContent = "";
       try { await mutations.reject(request.id, reason.value.trim()); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
+    }));
+    dock.appendChild(controls);
+  } else if (request.can_cancel === true) {
+    const copy = h("div", "decision-copy");
+    const schedule = V.requestSchedule(request);
+    copy.appendChild(h("strong", "", schedule.runsAt ? "Scheduled" : "Approved"));
+    copy.appendChild(h("span", "", schedule.runsAt ? "Runs at " + formatWhen(schedule.runsAt) : "Waiting for the worker"));
+    dock.appendChild(copy);
+    const controls = h("div", "decision-controls");
+    const reason = h("input"); reason.placeholder = "why (optional)"; reason.className = "reason";
+    controls.appendChild(reason);
+    controls.appendChild(button("Cancel", "danger", async () => {
+      if (!confirmDialog("Cancel? What has not run yet never will.")) return;
+      errorNode.textContent = "";
+      try { await mutations.cancel(request.id, reason.value.trim()); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
+    }));
+    dock.appendChild(controls);
+  } else if (request.can_undo === true) {
+    const copy = h("div", "decision-copy");
+    copy.appendChild(h("strong", "", "Ran"));
+    copy.appendChild(h("span", "", "Undo puts the thermostat back to what it was before"));
+    dock.appendChild(copy);
+    const controls = h("div", "decision-controls");
+    controls.appendChild(button("Undo", "danger", async () => {
+      if (!confirmDialog("Undo? The thermostat goes back to its previous setpoint.")) return;
+      errorNode.textContent = "";
+      try {
+        const undone = await mutations.undo(request.id);
+        mutationsChanged();
+        window.location.assign(requestPath(undone.id));
+      } catch (err) { errorNode.textContent = errorText(err); }
     }));
     dock.appendChild(controls);
   } else if (!V.trimStr(request.superseded_by) && request.can_supersede === true) {
@@ -1492,7 +1645,7 @@ function renderSlackBatch(request, list) {
 
 async function renderDetail(root, ctx, id, alive) {
   ctx.setSubtitle("mutation review");
-  ctx.setControls(link(LIST_PATH, "← all requests"));
+  ctx.setControls(link(LIST_PATH, "← All requests"));
   const actions = { reload() { if (alive()) renderDetail(root, ctx, id, alive); } };
   const query = V.mutationPageQuery(V.mutationPageFromSearch(location.search));
   // A request already read this session paints from memory while the API
@@ -1507,7 +1660,7 @@ async function renderDetail(root, ctx, id, alive) {
     if (!alive()) return;
     if (cached) { ctx.setStats(errorText(err) || "could not refresh"); return; }
     clear(root);
-    root.appendChild(link(LIST_PATH, "← all requests", "back"));
+    root.appendChild(link(LIST_PATH, "← All requests", "back"));
     root.appendChild(h("p", "bad", errorText(err) || "could not load request"));
     return;
   }
@@ -1536,7 +1689,7 @@ function paintDetail(root, ctx, request, actions, refreshing) {
   const total = V.requestMutationCount(request);
   ctx.setStats(total + " mutation" + V.plural(total) + " · " + V.requestListStatus(request) + (refreshing ? " · refreshing…" : ""));
   clear(root);
-  root.appendChild(link(LIST_PATH, "← all requests", "back"));
+  root.appendChild(link(LIST_PATH, "← All requests", "back"));
   root.appendChild(renderRequestHeader(request));
   const decision = renderDecisionDock(request, actions);
   if (decision) root.appendChild(decision);

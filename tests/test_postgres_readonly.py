@@ -30,9 +30,10 @@ def _postgres_url() -> str:
     return url
 
 
-def test_postgres_readonly_runner_uses_dedicated_read_only_connection() -> None:
+def test_postgres_readonly_runner_uses_dedicated_read_only_connection(query_login) -> None:
     schema = make_test_schema("readonly")
     warehouse = PostgresWarehouse(_postgres_url(), schema=schema)
+    query_login(warehouse)
     runner = PostgresReadOnlyRunner(warehouse)
     try:
         assert runner._connection is not warehouse._connection
@@ -45,6 +46,28 @@ def test_postgres_readonly_runner_uses_dedicated_read_only_connection() -> None:
         with runner._connection.cursor() as cursor:
             cursor.execute("SHOW statement_timeout")
             assert cursor.fetchone()[0] in ("30s", "30000ms", "30000")
+            cursor.execute("SELECT session_user,current_user")
+            login, role = cursor.fetchone()
+            assert login != role and role == warehouse.query_role
+            with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+                cursor.execute("SELECT set_config('role','postgres',true)")
+            with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+                cursor.execute("SELECT pg_read_file('/etc/passwd')")
     finally:
         runner.close()
+        cleanup_test_warehouse(warehouse)
+
+
+def test_python_untrusted_reader_refuses_superuser_url(monkeypatch) -> None:
+    schema = make_test_schema("readonly")
+    warehouse = PostgresWarehouse(_postgres_url(), schema=schema)
+    monkeypatch.setenv("PDW_QUERY_POSTGRES_URL", _postgres_url())
+    try:
+        with pytest.raises(ValueError, match="unsafe query database login"):
+            warehouse.read_only_connection()
+        monkeypatch.delenv("PDW_QUERY_POSTGRES_URL")
+        monkeypatch.delenv("PDW_QUERY_POSTGRES_PASSWORD", raising=False)
+        with pytest.raises(ValueError, match="required for untrusted reads"):
+            warehouse.read_only_connection()
+    finally:
         cleanup_test_warehouse(warehouse)

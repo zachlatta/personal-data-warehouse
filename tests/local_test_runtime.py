@@ -9,9 +9,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import fcntl
 import functools
 import inspect
 import os
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -639,6 +641,71 @@ class DisposableDatabases:
         return urlunsplit(urlsplit(self._admin_url)._replace(path=f"/{database}"))
 
 
+#: Suites that may own a disposable Postgres on one host at once. On
+#: 2026-11-11 about ten agents' suites ran together on mew-dev: load reached
+#: 190, one `docker run` took 69 s, every suite's Postgres missed its
+#: readiness timeout, and each suite's ~7 GB of writes went to the disk the
+#: production warehouse reads from. Override with PDW_TEST_MAX_SUITES.
+DEFAULT_MAX_SUITES = 3
+#: How long a suite waits for a slot before failing with a clear message.
+SUITE_SLOT_WAIT_SECONDS = 20 * 60
+
+
+class SuiteSlots:
+    """A host-wide cap on concurrent suites: one flock-held file per slot.
+
+    The kernel drops a flock when its process exits, so a crashed or killed
+    suite never leaks a slot.
+    """
+
+    def __init__(
+        self,
+        directory: str | os.PathLike[str] = "/tmp/pdw-test-suite-slots",
+        *,
+        slots: int = DEFAULT_MAX_SUITES,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+        wait_seconds: float = SUITE_SLOT_WAIT_SECONDS,
+    ) -> None:
+        self._directory = Path(directory)
+        self._slots = max(1, slots)
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._wait_seconds = wait_seconds
+        self._held: int | None = None
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str]) -> "SuiteSlots":
+        raw = env.get("PDW_TEST_MAX_SUITES", "").strip()
+        return cls(slots=int(raw) if raw.isdigit() else DEFAULT_MAX_SUITES)
+
+    def acquire(self) -> None:
+        self._directory.mkdir(mode=0o777, parents=True, exist_ok=True)
+        deadline = self._monotonic() + self._wait_seconds
+        while True:
+            for slot in range(self._slots):
+                fd = os.open(self._directory / f"slot-{slot}", os.O_RDWR | os.O_CREAT, 0o666)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(fd)
+                    continue
+                self._held = fd
+                return
+            if self._monotonic() >= deadline:
+                raise LocalTestStartupError(
+                    f"all {self._slots} test-suite slots on this host stayed busy for "
+                    f"{self._wait_seconds:.0f}s; wait for another suite to finish, or raise "
+                    "PDW_TEST_MAX_SUITES if this host has room"
+                )
+            self._sleep(5)
+
+    def release(self) -> None:
+        fd, self._held = self._held, None
+        if fd is not None:
+            os.close(fd)
+
+
 class PostgresTestRuntime:
     """Own one disposable extension-complete Postgres for a pytest session."""
 
@@ -654,8 +721,11 @@ class PostgresTestRuntime:
         readiness_timeout_seconds: float = 120,
         unit_only: bool = False,
         probe_configured_url: Callable[[str], None] = refuse_live_warehouse,
+        suite_slots: SuiteSlots | None = None,
     ) -> None:
         self._env = env
+        self._suite_slots = suite_slots if suite_slots is not None else SuiteSlots.from_env(env)
+        self._slot_held = False
         self._probe_configured_url = probe_configured_url
         self._runner = runner
         self._which = which
@@ -686,6 +756,9 @@ class PostgresTestRuntime:
         if int(getattr(daemon, "returncode", 1)) != 0:
             self._raise_startup_error("Docker daemon is unavailable")
 
+        # One of a few host-wide slots, held until close(): see SuiteSlots.
+        self._suite_slots.acquire()
+        self._slot_held = True
         container = self._name_factory()
         self._owned_container = container
         image = self._env.get("PDW_POSTGRES_IMAGE", "").strip() or DEFAULT_POSTGRES_IMAGE
@@ -779,6 +852,9 @@ class PostgresTestRuntime:
         if self._injected_url is not None and self._env.get("POSTGRES_DATABASE_URL") == self._injected_url:
             self._env.pop("POSTGRES_DATABASE_URL", None)
         self._injected_url = None
+        if self._slot_held:
+            self._slot_held = False
+            self._suite_slots.release()
 
     def _run(self, command: list[str], *, timeout: float, failure: str) -> subprocess.CompletedProcess:
         try:

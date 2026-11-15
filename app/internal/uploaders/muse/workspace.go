@@ -60,6 +60,29 @@ type Workspace struct {
 	MaxInlineBytes int64
 	MaxBlobBytes   int64
 	BatchRecords   int
+	// Generated are records the uploader writes itself rather than reads
+	// from disk (the session manifest). Their paths sit under GeneratedDir,
+	// which the walk never enters, so they cannot collide with a real file;
+	// nothing is written to the VM.
+	Generated []GeneratedFile
+	// GeneratedMinInterval is how long a generated path that changed waits
+	// after its last upload before it is sent again; 0 sends every change.
+	GeneratedMinInterval time.Duration
+	// KeepGenerated leaves every generated path the warehouse already holds
+	// as it is: set when this run could not build Generated, so a failure is
+	// not mistaken for every shard having gone.
+	KeepGenerated bool
+}
+
+// GeneratedDir is the top-level directory generated records live under. It is
+// a dot directory, which the walk skips, so it names no file on the VM.
+const GeneratedDir = ".pdw"
+
+// GeneratedFile is one record the uploader produces in memory.
+type GeneratedFile struct {
+	Path     string // relative, under GeneratedDir
+	MimeType string
+	Content  []byte
 }
 
 // WorkspaceSummary is one run's counts.
@@ -72,6 +95,11 @@ type WorkspaceSummary struct {
 	FilesTooLarge   int
 	BatchesUploaded int
 	LimitReached    bool
+	// GeneratedSent counts generated records uploaded this run;
+	// GeneratedDeferred those that changed but are inside their interval.
+	GeneratedSent     int
+	GeneratedDeferred int
+	GeneratedTooLarge int
 }
 
 // skippedTopLevel are home entries that are not the agent's workspace: the
@@ -244,9 +272,17 @@ func (w *Workspace) Sync() (WorkspaceSummary, error) {
 	if walkErr != nil {
 		return summary, walkErr
 	}
+	for _, generated := range w.Generated {
+		if err := w.addGenerated(batch, generated, known, seen, &summary); err != nil {
+			return summary, err
+		}
+	}
 	if !summary.LimitReached && w.State != nil {
 		var gone []string
 		for path := range known {
+			if w.KeepGenerated && strings.HasPrefix(path, GeneratedDir+"/") {
+				continue
+			}
 			if !seen[path] {
 				gone = append(gone, path)
 			}
@@ -267,9 +303,57 @@ func (w *Workspace) Sync() (WorkspaceSummary, error) {
 	if err := w.flush(batch, &summary); err != nil {
 		return summary, err
 	}
-	w.Logger.Infof("Muse workspace upload summary: seen=%d changed=%d inline=%d blobs=%d deleted=%d too_large=%d batches=%d",
-		summary.FilesSeen, summary.FilesChanged, summary.FilesInline, summary.FilesBlob, summary.FilesDeleted, summary.FilesTooLarge, summary.BatchesUploaded)
+	w.Logger.Infof("Muse workspace upload summary: seen=%d changed=%d inline=%d blobs=%d deleted=%d too_large=%d generated=%d generated_deferred=%d batches=%d",
+		summary.FilesSeen, summary.FilesChanged, summary.FilesInline, summary.FilesBlob, summary.FilesDeleted, summary.FilesTooLarge, summary.GeneratedSent, summary.GeneratedDeferred, summary.BatchesUploaded)
 	return summary, nil
+}
+
+// addGenerated ships one generated record when its content differs from what
+// the warehouse holds and its interval has passed. Its stat in the state file
+// is the upload time, which is what the interval is measured from.
+func (w *Workspace) addGenerated(batch *fileBatch, generated GeneratedFile, known map[string]FileProgress, seen map[string]bool, summary *WorkspaceSummary) error {
+	rel := filepath.ToSlash(filepath.Clean(generated.Path))
+	if !strings.HasPrefix(rel, GeneratedDir+"/") {
+		return errors.New("generated path " + generated.Path + " is not under " + GeneratedDir + "/")
+	}
+	seen[rel] = true
+	if int64(len(generated.Content)) > w.MaxInlineBytes {
+		// Generated records ride inline; the builder splits a manifest
+		// shard long before this. Refuse rather than fail the batch.
+		summary.GeneratedTooLarge++
+		w.Logger.Warningf("Not sending %s: %s is above the %s inline cap", rel, common.FormatBytes(int64(len(generated.Content))), common.FormatBytes(w.MaxInlineBytes))
+		return nil
+	}
+	sha := common.BytesSHA256(generated.Content)
+	prior, hadPrior := known[rel]
+	if w.Mode == "incremental" && hadPrior && prior.ContentSHA256 == sha {
+		return nil
+	}
+	now := w.Now().UTC()
+	if w.Mode == "incremental" && hadPrior && w.GeneratedMinInterval > 0 && now.Sub(time.Unix(0, prior.MtimeNS)) < w.GeneratedMinInterval {
+		summary.GeneratedDeferred++
+		return nil
+	}
+	mimeType := generated.MimeType
+	if mimeType == "" {
+		mimeType = "application/json"
+	}
+	record := w.envelope(map[string]any{
+		"path":            rel,
+		"content_sha256":  sha,
+		"size_bytes":      int64(len(generated.Content)),
+		"modified_at":     common.ISOFormat(now),
+		"mime_type":       mimeType,
+		"is_text":         true,
+		"content_text":    string(generated.Content),
+		"storage_backend": "",
+		"storage_key":     "",
+		"storage_file_id": "",
+		"storage_url":     "",
+		"deleted":         false,
+	})
+	summary.GeneratedSent++
+	return w.add(batch, record, pendingFile{path: rel, size: int64(len(generated.Content)), mtimeNS: now.UnixNano(), sha: sha}, summary)
 }
 
 func (w *Workspace) fileRecord(rel string, info fs.FileInfo, content []byte, sha string) (map[string]any, bool, error) {
