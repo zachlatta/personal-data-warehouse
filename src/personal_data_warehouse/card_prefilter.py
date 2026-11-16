@@ -57,11 +57,12 @@ class ConfirmationPool:
         self._pool = None
         self._lock = threading.Lock()
 
-    def counts(self, rows):
+    def counts(self, rows, *, statistics=None):
         counts = self._map(self.selector.count_row if self.selector else count_row,rows)
         if self.selector and self.selector.scope != "all":
             total = sum(self._map(count_row,rows))
             with self._lock: self.left_alone += total - sum(counts)
+            if statistics is not None: statistics['left_alone'] += total - sum(counts)
         return counts
 
     def redacted(self, rows):

@@ -627,7 +627,18 @@ use disjoint block ranges under one exported read-only snapshot so live tuple
 updates cannot escape discovery; ordinary scans allow parallel PostgreSQL plans.
 Apply rechecks saved identities, checks timeline/chunk changes since the
 discovery cursors and confirms a bounded MVCC delta under writer locks.
-New selected candidates outside its plan roll back the repair and require fresh discovery.
+New selected candidates outside its plan roll back the repair and require live catch-up.
+`--resume --plan <private-path>` checkpoints discovery by source table and UTC
+month, with counts-only progress and the original conservative transaction
+horizon retained across restarts. Use one process per checkpoint; its scan
+threads share the connection-aware `--workers` budget. `--catch-up --plan
+<private-path>` merges selected changed rows into that plan while ingestion
+continues. Only SQL-prefilter hits reach Python confirmation. Each complete
+pass advances the horizon; an interrupted pass leaves the previous checkpoint.
+Apply counts changed rows that still hold selected readings, rather than all
+changed rows. Clean ingestion churn cannot exhaust that gate. Unknown selected
+IDs still abort for catch-up, and the locked transaction always has a maximum
+60-second rollback deadline. Incomplete partition plans cannot be applied.
 Planned keys and canonical regenerated rows are verified transactionally;
 whole-corpus verification follows restoration of workers.
 

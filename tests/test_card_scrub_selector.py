@@ -86,7 +86,7 @@ def test_delta_limit_and_writer_lock_fail_before_mutation(warehouse):
     row=event()
     warehouse._insert_rows('claude_code_events',[row],AGENT_SESSION_EVENT_COLUMNS)
     plan=discover(warehouse)
-    warehouse._insert_rows('claude_code_events',[dict(row,event_uuid='new',text='safe')],AGENT_SESSION_EVENT_COLUMNS)
+    warehouse._insert_rows('claude_code_events',[dict(row,event_uuid='new')],AGENT_SESSION_EVENT_COLUMNS)
     with pytest.raises(RuntimeError,match='delta limit'):
         scrub(warehouse,apply=True,plan=plan,max_delta_rows=0)
     conn=psycopg2.connect(warehouse._database_url)
