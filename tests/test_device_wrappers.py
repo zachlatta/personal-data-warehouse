@@ -338,6 +338,26 @@ def test_android_service_holds_its_wakelock_past_the_timeout_under_platform_sh(m
     assert service.index(lock) < service.index(run) < service.index('echo "$WAKE" > /sys/power/wake_unlock', service.index(run))
 
 
+# pichu's Android 17 build has no `cmd user is-user-unlocked` ("Unknown
+# command"), so a supervisor waiting on it never left its wait loop and the
+# call recordings module never uploaded (2026-11-16). The platform's own
+# signal for credential-encrypted storage being readable is the
+# `sys.user.0.ce_available` property, which the other CE-state modules use.
+@pytest.mark.parametrize("module", sorted(ANDROID_UPLOADERS))
+def test_android_service_waits_for_the_unlock_with_a_command_the_phone_has(module: str) -> None:
+    service = (REPO_ROOT / "ops" / "android" / module / "service.sh").read_text()
+    assert "is-user-unlocked" not in service
+
+
+def test_call_recordings_service_waits_for_credential_encrypted_storage() -> None:
+    service = (REPO_ROOT / "ops" / "android" / "pdw-call-recordings" / "service.sh").read_text()
+    wait = re.search(r"(?m)^until (.*); do$", service)
+    assert wait is not None
+    assert '[ "$(getprop sys.boot_completed)" = 1 ]' in wait.group(1)
+    assert '[ "$(getprop sys.user.0.ce_available)" = true ]' in wait.group(1)
+    assert '[ -d "$STATE" ]' in wait.group(1)
+
+
 @pytest.mark.parametrize("module", sorted(ANDROID_UPLOADERS))
 def test_android_wrapper_runs_pdw_through_the_shared_stoppable_runner(module: str) -> None:
     wrapper, _, _ = ANDROID_UPLOADERS[module]

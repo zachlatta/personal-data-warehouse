@@ -22,6 +22,46 @@ func linkFor(t *testing.T, adapter, sourceTable, pk, metadata string) *timelineD
 	})
 }
 
+func TestTimelineDeepLinkAndroidMessages(t *testing.T) {
+	cases := []struct{ name, metadata, want string }{
+		{"phone", `{"chat_key":"+15555550123","group":false}`, "sms:+15555550123"},
+		{"formatted phone", `{"chat_key":"+1 (555) 555-0123","group":false}`, "sms:+15555550123"},
+		{"email", `{"chat_key":"test+chat@example.test","group":false}`, "sms:test+chat@example.test"},
+		{"group", `{"chat_key":"bugle:42","group":true}`, ""},
+		{"group with handle", `{"chat_key":"+15555550123","group":true}`, ""},
+		{"opaque", `{"chat_key":"bugle:42","group":false}`, ""},
+		{"punctuation is not digits", `{"chat_key":"1....","group":false}`, ""},
+		{"query injection", `{"chat_key":"test@example.test?body=unexpected","group":false}`, ""},
+		{"recipient injection", `{"chat_key":"test@example.test,+15555550123","group":false}`, ""},
+		{"missing", `{}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			link := linkFor(t, "android_message", "android_messages", `{"device":"test-phone","message_key":"content://mms/123"}`, tc.metadata)
+			if tc.want == "" {
+				if link != nil {
+					t.Fatalf("expected PDW fallback, got %#v", link)
+				}
+				return
+			}
+			if link == nil || link.URL != tc.want || link.AppURL != tc.want || link.Label != "Messages" {
+				t.Fatalf("link = %#v, want %s", link, tc.want)
+			}
+			// Alert taps and timeline source buttons must get the same link.
+			row := map[string]any{"source": "android_messages", "source_table": "android_messages", "adapter": "android_message", "metadata": tc.metadata}
+			alert := renderTimelineNotification(row, "https://pdw.example.test", timelineLinkEnv{})
+			if alert.Open == nil || *alert.Open != *link {
+				t.Fatalf("alert link = %#v, want %#v", alert.Open, link)
+			}
+			item := map[string]any{}
+			attachDeepLink(item, row, timelineLinkEnv{})
+			if open, ok := item["open"].(*timelineDeepLink); !ok || *open != *link {
+				t.Fatalf("timeline link = %#v, want %#v", item["open"], link)
+			}
+		})
+	}
+}
+
 func TestTimelineDeepLinkSlackMessagePermalink(t *testing.T) {
 	link := linkFor(t, "slack_message", "slack_messages",
 		`{"account":"zrl","team_id":"T0266FRGM","conversation_id":"D06CU09AX52","message_ts":"1787777184.214849"}`,

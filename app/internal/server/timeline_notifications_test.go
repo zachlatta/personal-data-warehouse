@@ -27,6 +27,23 @@ func TestTimelineNotificationSourcePresentationAndLinks(t *testing.T) {
 		t.Fatalf("oversized preview %d", len(raw))
 	}
 }
+
+// The notification sweep hands rows over with jsonb already decoded into
+// maps, and the adapter emits "group" as a JSON boolean.
+func TestAndroidMessagesNotificationLinkFromDecodedMetadata(t *testing.T) {
+	row := func(meta map[string]any) map[string]any {
+		return map[string]any{"source": "android_messages", "source_table": "android_messages", "adapter": "android_message", "event_id": "me|pichu|content://mms/1",
+			"source_pk": map[string]any{"account": "me", "device": "pichu", "message_key": "content://mms/1"}, "metadata": meta}
+	}
+	a := renderTimelineNotification(row(map[string]any{"chat_key": "+1 (555) 555-0100", "group": false}), "https://pdw.example", timelineLinkEnv{})
+	if a.Open == nil || a.Open.URL != "sms:+15555550100" || a.Open.AppURL != "sms:+15555550100" {
+		t.Fatalf("1:1 chat: %+v", a.Open)
+	}
+	if a := renderTimelineNotification(row(map[string]any{"chat_key": "+15555550100", "group": true}), "https://pdw.example", timelineLinkEnv{}); a.Open != nil {
+		t.Fatalf("group chat must fall back to PDW: %+v", a.Open)
+	}
+}
+
 func TestUnknownSourceHasHonestFallback(t *testing.T) {
 	a := renderTimelineNotification(map[string]any{"source": "unknown", "adapter": "new", "event_id": "1", "title": "Event"}, "https://pdw.example", timelineLinkEnv{})
 	if a.Open != nil || a.Route != "/timeline/new/1" || a.Title != "Event" {

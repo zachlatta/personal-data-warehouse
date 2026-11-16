@@ -228,6 +228,12 @@ Notes `showNote?identifier=` scheme. `app_url` is the native scheme a phone trie
 and falls back from — the phone app never calls `canOpenURL`, which on iOS would need
 every scheme declared in the native Info.plist. A source with no honest URL (health, photos, voice memos,
 a group chat, a CLI agent transcript) gets **no** link rather than a guessed one.
+Android Messages one-to-one chats use `sms:<handle>` for phone numbers or email
+handles, including RCS chats. Timeline source buttons and push taps share this link.
+Opaque Android group keys still open in PDW: they cannot address a conversation
+through `sms:`, and the mobile client has no package-launch capability. Opening
+Google Messages' inbox for those groups would require a mobile client update;
+an `intent:` URL alone is not supported by the current notification allowlist.
 `/api/timeline/item` also inlines `context` — `timeline.context(ref, 15, 15)`, the same
 function agents call — with `is_anchor` on the row asked about; both UIs render it as a
 scrollable transcript with earlier/later controls up to the function's 50-a-side cap.
