@@ -17,6 +17,10 @@ def test_shared_issuer_and_identifier_cases():
     for case in cases:
         pan=number(case['prefix'],case['length'])
         value=case.get('before','')+pan+case.get('after','')
+        if case.get('pad_to_quartet'):
+            import base64
+            value+='A'*(-len(value)%4)
+            assert base64.b64encode(base64.b64decode(value,validate=True)).decode()==value
         expected=case.get('before','')+'[card ****'+pan[-4:]+']'+case.get('after','') if case['mask'] else value
         assert redact(value)==expected,case['name']
         assert card_count(value)==int(case['mask']),case['name']
@@ -41,7 +45,7 @@ def payment_label_cases():
                     value='pan='+rendered+delimiter+label+'=987'
                     expected='pan=[card ****'+pan[-4:]+']'+delimiter+label+'='+('987' if label in ('exp','expiry') else '[redacted]')
                     yield value,expected
-                    yield label+delimiter+rendered,label+delimiter+'[card ****'+pan[-4:]+']'
+                    yield label+'='+rendered+delimiter,label+'=[card ****'+pan[-4:]+']'+delimiter
 
 
 def test_payment_labels_across_punctuation():
@@ -96,6 +100,7 @@ def test_issuer_policy_through_writer_scrub_and_sql_prefilter(warehouse):
     for i,case in enumerate(cases):
         pan=number(case['prefix'],case['length'])
         value=case.get('before','')+pan+case.get('after','')
+        if case.get('pad_to_quartet'):value+='A'*(-len(value)%4)
         encoded=json.dumps({'text':value})
         if case['mask']:
             assert warehouse._query('SELECT '+sql_prefilter('%s'),(encoded,))[0][0]

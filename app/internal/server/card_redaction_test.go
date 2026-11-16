@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -79,6 +80,7 @@ func TestSharedIssuerAndIdentifierCases(t *testing.T) {
 		Name, Prefix, Before, After string
 		Length                      int
 		Mask                        bool
+		PadToQuartet                bool `json:"pad_to_quartet"`
 	}
 	if json.Unmarshal(data, &cases) != nil {
 		t.Fatal("invalid issuer fixtures")
@@ -95,6 +97,13 @@ func TestSharedIssuerAndIdentifierCases(t *testing.T) {
 				}
 			}
 			value := c.Before + pan + c.After
+			if c.PadToQuartet {
+				value += strings.Repeat("A", (4-len(value)%4)%4)
+				decoded, err := base64.StdEncoding.Strict().DecodeString(value)
+				if err != nil || base64.StdEncoding.EncodeToString(decoded) != value {
+					t.Fatal("noncanonical encoded fixture")
+				}
+			}
 			want := value
 			if c.Mask {
 				want = c.Before + "[card ****" + pan[len(pan)-4:] + "]" + c.After
@@ -150,8 +159,8 @@ func TestPaymentLabelsAcrossPunctuation(t *testing.T) {
 					if redactCardText(value, false) != want || cardCount(value) != 1 {
 						t.Fatalf("label/delimiter %s/%s failed", label, delimiter)
 					}
-					value = label + delimiter + form
-					want = label + delimiter + "[card ****" + pan[len(pan)-4:] + "]"
+					value = label + "=" + form + delimiter
+					want = label + "=[card ****" + pan[len(pan)-4:] + "]" + delimiter
 					if redactCardText(value, false) != want || cardCount(value) != 1 {
 						t.Fatalf("preceding label %s/%s failed", label, delimiter)
 					}

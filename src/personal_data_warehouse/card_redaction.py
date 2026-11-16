@@ -8,11 +8,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 CARD_POLICY = json.loads(Path(__file__).with_name('card_policy.json').read_text())
-_ATTACHED_LABELS = frozenset(CARD_POLICY['attached_labels'])
+_LITERAL_ATTACHED_LABELS = frozenset(CARD_POLICY['literal_attached_labels'])
 _PAYMENT_LABELS = '(?:' + '|'.join(re.escape(label) for label in CARD_POLICY['attached_labels']) + '|' + CARD_POLICY['payment_label_pattern'] + ')'
-_PAYMENT_CONTEXT = re.compile(r'(?i)(?:^|[^A-Za-z0-9_])'+_PAYMENT_LABELS+r'(?:$|[^A-Za-z0-9_])')
-_PAYMENT_AFTER = re.compile(r'(?i)^[\s/|;#=&+:\-]{1,24}'+_PAYMENT_LABELS+r'(?:$|[^A-Za-z0-9_])')
-_PAYMENT_BEFORE = re.compile(r'(?i)(?:^|[^A-Za-z0-9_])'+_PAYMENT_LABELS+r'[\s/|;#=&+:\-]{1,24}$')
+_FIELD_SEPARATOR = CARD_POLICY['payment_field_separator_pattern']
+_PAYMENT_AFTER = re.compile(r'(?i)^[\s/|;#=&+,:\-\x22\x27]{1,24}'+_PAYMENT_LABELS+_FIELD_SEPARATOR+r'[0-9]')
+_PAYMENT_BEFORE = re.compile(r'(?i)(?:^|[^A-Za-z0-9_])'+_PAYMENT_LABELS+_FIELD_SEPARATOR+'$')
 
 
 def card_brands(digits):
@@ -24,25 +24,25 @@ def _word_char(char):
     return char.isascii() and (char.isalnum() or char == '_')
 
 
+def _encoded_char(char):
+    return _word_char(char) or char in '+/=-'
+
+
 def card_token_boundary(value,start,end):
+    # Determine the maximal opaque token before considering any label. A path
+    # segment /pan/ is not a field, and short encodings need the same protection.
     left=start
-    while left and _word_char(value[left-1]):left-=1
+    while left and _encoded_char(value[left-1]):left-=1
     right=end
-    while right<len(value) and _word_char(value[right]):right+=1
-    if not ((left==start or value[left:start].lower() in _ATTACHED_LABELS) and
-            (right==end or value[end:right].lower() in _ATTACHED_LABELS)):
-        return False
-    # A formatted card wins over speculative encodings. For a contiguous PAN,
-    # only a long, mixed letter/digit encoding token WITHOUT payment labels can
-    # veto punctuation context. Labels such as /CVV= are ordinary card fields.
-    if not value[start:end].isdigit():return True
-    if _PAYMENT_AFTER.search(value[end:end+96]) or _PAYMENT_BEFORE.search(value[max(0,start-96):start]):return True
-    left=start;right=end
-    while left and (_word_char(value[left-1]) or value[left-1] in '+/=-'):left-=1
-    while right<len(value) and (_word_char(value[right]) or value[right] in '+/=-'):right+=1
+    while right<len(value) and _encoded_char(value[right]):right+=1
+    # The explicit compatibility exception is the whole token menu<PAN>, never
+    # a menu segment embedded in a larger encoding.
+    payment_after=bool(_PAYMENT_AFTER.search(value[end:end+128]))
+    if value[left:start].lower() in _LITERAL_ATTACHED_LABELS and (right==end or payment_after):return True
+    if start and _word_char(value[start-1]) or end<len(value) and _word_char(value[end]):return False
     token=value[left:right]
-    return (len(token)<CARD_POLICY['encoded_token_min_length'] or
-            not any(c.isalpha() for c in token) or bool(_PAYMENT_CONTEXT.search(token)))
+    if not any(c.isalpha() for c in token):return True
+    return bool(payment_after or _PAYMENT_BEFORE.search(value[max(0,start-128):start]))
 
 _LABEL = r'(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*code)'
 _CODE = re.compile(r'(?i)(\b' + _LABEL + r'\b(?:\s+is)?[\s\\\x22\x27:=,-]{0,24})([0-9]{3,4})(?![0-9])')
@@ -145,6 +145,7 @@ def _text_edits(value):
             end = code.end()
     for match in _CODE.finditer(decoded):
         start, end = match.span(2)
+        if not card_token_boundary(decoded,start,end):continue
         if not any(start < b and end > a for a, b, _ in edits):
             edits.append((start, end, '[redacted]'))
     return [(bounds[a], bounds[b], replacement) for a, b, replacement in sorted(edits)]

@@ -150,6 +150,9 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 			context = replacement
 		}
 		following := config.FollowingContexts[(i/(len(formats)*len(config.PrecedingContexts)))%len(config.FollowingContexts)]
+		if following.Input == "-end" {
+			context += "pan="
+		}
 		length := 0
 		for _, n := range f.groups {
 			length += n

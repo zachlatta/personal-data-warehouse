@@ -71,6 +71,9 @@ func cardTextEdits(s string) []cardEdit {
 	}
 	for _, match := range codeValue.FindAllStringSubmatchIndex(value, -1) {
 		start, end := match[4], match[5]
+		if !cardTokenBoundary(value, start, end) {
+			continue
+		}
 		overlaps := false
 		for _, edit := range edits {
 			if start < edit.end && end > edit.start {

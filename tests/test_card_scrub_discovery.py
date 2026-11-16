@@ -204,7 +204,7 @@ def synthetic_pan(length):
 def prefixed_card_cases():
     for length in (13,14,15):
         pan=synthetic_pan(length)
-        for prefix in ('menu','card','u1234 ','letters ',chr(92),r'\u1234 '):
+        for prefix in ('menu','card=','u1234 ','letters ',chr(92),r'\u1234 '):
             yield prefix+pan+' CVV2: 987'
             encoded=''.join(r'\u%04x'%ord(c) if i%2 else c for i,c in enumerate(pan))
             yield prefix+encoded+' CVC2: 987'

@@ -113,6 +113,9 @@ def property_cases():
         context = {'$four_digits ': context_line+' ', '$phone ': context_phone+' ', '$phone_prefix ': area+' '+exchange+' ',
                    '$date ': date+' ', '$order ': order+' '}.get(context, context)
         following = config['following_contexts'][(i//(len(formats)*len(config['preceding_contexts'])))%len(config['following_contexts'])]
+        # A bare -end suffix is also a URL-safe token. Use an actual field for
+        # this positive case; the fieldless shape is pinned as preservation.
+        if following['input']=='-end':context+='pan='
         for attempt in range(1000):
             number=valid_number(sum(grouping))
             pan=render_groups(number,grouping,variant)
