@@ -2,6 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { OpenQueue, notificationOpenLink } from './notification-open-queue.ts';
 
+test('Android Messages source links survive notification validation', () => {
+ for (const url of ['sms:+15555550123', 'sms:test+chat@example.test']) {
+  const link = { url, app_url: url, label: 'Messages' };
+  assert.deepEqual(notificationOpenLink(link), link);
+ }
+});
+
 test('offline opens survive a new queue instance and retries are idempotent', async () => {
  const values = new Map(); const kv = { get: async k => values.get(k) ?? null, set: async (k,v) => { values.set(k,v); }, remove: async k => { values.delete(k); } };
  const open = { delivery_id: 'one', open_proof: 'proof', baseUrl: 'https://example.test' };
