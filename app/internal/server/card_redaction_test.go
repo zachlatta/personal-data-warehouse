@@ -229,3 +229,31 @@ func TestNestedEscapedConversationJSON(t *testing.T) {
 		t.Fatal("nested JSON not sanitized")
 	}
 }
+
+// An adjacent-code edit used to overlap the next card reading, which made
+// applyCardEdits slice behind its cursor and panic every upload that held it.
+func TestOverlappingCodeAndCardEditsMergeWithoutLeaking(t *testing.T) {
+	line := `{"text":"4111 1111 1111 1111 - 012 0000 004242 4242 4242 4242 done"}` + "\n"
+	edits := cardRedactionEdits(line, true)
+	for i := 1; i < len(edits); i++ {
+		if edits[i].start < edits[i-1].end {
+			t.Fatalf("edits overlap: %v then %v", edits[i-1], edits[i])
+		}
+	}
+	body, err := redactConversationBatch(conversationTestBatch(line), 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(r)
+	_ = r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "4111 1111") || strings.Contains(string(raw), "004242 4242") || !json.Valid(bytes.TrimSpace(raw)) {
+		t.Fatalf("overlapping edits must stay redacted and valid JSON: %q", raw)
+	}
+}
