@@ -83,6 +83,24 @@ func cardTextEdits(s string) []cardEdit {
 		}
 	}
 	sort.Slice(edits, func(i, j int) bool { return edits[i].start < edits[j].start })
+	// The adjacent-code loop can claim digits a later card reading also covers.
+	// Merge overlapping edits into one span so every covered byte stays
+	// replaced and applyCardEdits never sees an edit behind its cursor.
+	merged := edits[:0]
+	for _, edit := range edits {
+		if n := len(merged); n > 0 && edit.start < merged[n-1].end {
+			last := &merged[n-1]
+			if edit.end > last.end {
+				last.end = edit.end
+			}
+			if !strings.HasPrefix(last.replacement, "[card ") && strings.HasPrefix(edit.replacement, "[card ") {
+				last.replacement = edit.replacement
+			}
+			continue
+		}
+		merged = append(merged, edit)
+	}
+	edits = merged
 	for i := range edits {
 		edits[i].start = bounds[edits[i].start]
 		edits[i].end = bounds[edits[i].end]
