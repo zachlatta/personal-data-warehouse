@@ -942,6 +942,8 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/call-recordings-upload-android on the phone",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_call_recordings"),
+        # The phone's own BCR inventory against landed calls, per device (C11).
+        detector="marts_ops_android_call_recordings_health",
     ),
     _source(
         "android_photos",
