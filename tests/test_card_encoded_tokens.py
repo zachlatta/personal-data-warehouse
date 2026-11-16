@@ -48,13 +48,15 @@ def test_menu_compatibility_requires_whole_token_or_real_field():
     assert redact(value)==value
 
 
-def test_numeric_prefix_cannot_join_an_opaque_grouped_token():
+def test_numeric_prefix_cannot_hide_a_card_crossing_token_boundaries():
     from tests.card_redaction_properties import checksum_valid
     pan=number('4',16)
     prefix=next(str(i) for i in range(8100,8200) if checksum_valid(str(i)+pan[:12]))
     opaque='-'.join(pan[i:i+4] for i in range(0,16,4))+'-end'
     value=prefix+' '+opaque
-    assert redact(value)==value and card_count(value)==0
+    # The reading spans a space, so it cannot be one encoded token. Both
+    # overlapping brand-valid readings must be covered by the mask union.
+    assert redact(value)=='[card ****'+pan[-4:]+']-end' and card_count(value)==1
     assert redact('pan='+opaque)=='pan=[card ****'+pan[-4:]+']-end'
 
 

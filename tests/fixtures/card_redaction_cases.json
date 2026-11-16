@@ -135,8 +135,7 @@
     {
       "name": "delimiter_0_2",
       "input": "4111111111111111-end CVC2: 987",
-      "expected": "4111111111111111-end CVC2: 987",
-      "card_count": 0
+      "expected": "[card ****1111]-end CVC2: [redacted]"
     },
     {
       "name": "delimiter_0_3",
@@ -191,8 +190,7 @@
     {
       "name": "delimiter_1_2",
       "input": "4111 1111 1111 1111-end CVC2: 987",
-      "expected": "4111 1111 1111 1111-end CVC2: 987",
-      "card_count": 0
+      "expected": "[card ****1111]-end CVC2: [redacted]"
     },
     {
       "name": "delimiter_1_3",
@@ -247,8 +245,7 @@
     {
       "name": "delimiter_2_2",
       "input": "4111-1111-1111-1111-end CVC2: 987",
-      "expected": "4111-1111-1111-1111-end CVC2: 987",
-      "card_count": 0
+      "expected": "[card ****1111]-end CVC2: [redacted]"
     },
     {
       "name": "delimiter_2_3",
@@ -303,8 +300,7 @@
     {
       "name": "review4_delimiter_0_2",
       "input": "4111111111111111-end CVC2: 987",
-      "expected": "4111111111111111-end CVC2: 987",
-      "card_count": 0
+      "expected": "[card ****1111]-end CVC2: [redacted]"
     },
     {
       "name": "review4_delimiter_0_3",
@@ -429,8 +425,7 @@
     {
       "name": "review4_delimiter_1_2",
       "input": "4111 1111 1111 1111-end CVC2: 987",
-      "expected": "4111 1111 1111 1111-end CVC2: 987",
-      "card_count": 0
+      "expected": "[card ****1111]-end CVC2: [redacted]"
     },
     {
       "name": "review4_delimiter_1_3",
@@ -561,8 +556,7 @@
     {
       "name": "review4_delimiter_2_2",
       "input": "4111-1111-1111-1111-end CVC2: 987",
-      "expected": "4111-1111-1111-1111-end CVC2: 987",
-      "card_count": 0
+      "expected": "[card ****1111]-end CVC2: [redacted]"
     },
     {
       "name": "review4_delimiter_2_3",
@@ -1316,7 +1310,7 @@
         "expected": " CVC2: [redacted]"
       }
     ],
-    "corpus_sha256": "c7d802c7b2d7bb6f7ced9eabab82dabf1fe2052d69dbb3002562c8606045c3fa",
+    "corpus_sha256": "3d4a3865b2802b25d27a1119e9834f7dd0d8b777c2634b52efcfdf1073ee966b",
     "permutation_tokens": [
       "2026-11-15T09:12:13Z",
       "+1-202-555-0198",

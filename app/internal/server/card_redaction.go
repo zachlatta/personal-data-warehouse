@@ -5,6 +5,7 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cardpolicy"
@@ -27,7 +28,7 @@ var cardDigits = regexp.MustCompile(`[0-9]+`)
 var cardSeparator = regexp.MustCompile(`^[ -]{1,3}$`)
 var adjacentCardCode = regexp.MustCompile(`^(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})`)
 var paymentCardLabels = `(?:` + strings.Join(cardpolicy.Rules.AttachedLabels, "|") + `|` + cardpolicy.Rules.PaymentLabelPattern + `)`
-var paymentCardAfter = regexp.MustCompile(`(?i)^[\s/|;#=&+,:\-\x22\x27]{1,24}` + paymentCardLabels + cardpolicy.Rules.PaymentFieldSeparatorPattern + `[0-9]`)
+var paymentCardAfter = regexp.MustCompile(`(?i)^(?:[\s/|;#=&+,:\-\x22\x27]{1,24}|-[A-Za-z]{1,16}[ \t]+)` + paymentCardLabels + cardpolicy.Rules.PaymentFieldSeparatorPattern + `[0-9]`)
 var paymentCardBefore = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_])` + paymentCardLabels + cardpolicy.Rules.PaymentFieldSeparatorPattern + `$`)
 
 func cardBrand(s string) bool {
@@ -55,6 +56,28 @@ func cardWordByte(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
 }
 func cardEncodedByte(c byte) bool { return cardWordByte(c) || strings.ContainsRune("+/=-", rune(c)) }
+func encodedCardToken(s string) bool {
+	letters, digits := false, false
+	for _, c := range []byte(s) {
+		letters = letters || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+		digits = digits || c >= '0' && c <= '9'
+	}
+	if !letters || !digits {
+		return false
+	}
+	codec := base64.StdEncoding.Strict()
+	if strings.ContainsAny(s, "-_") {
+		if strings.ContainsAny(s, "+/") {
+			return false
+		}
+		codec = base64.URLEncoding.Strict()
+	}
+	if !strings.Contains(s, "=") {
+		codec = codec.WithPadding(base64.NoPadding)
+	}
+	raw, err := codec.DecodeString(s)
+	return err == nil && codec.EncodeToString(raw) == s
+}
 func cardTokenBoundary(s string, start, end int) bool {
 	left, right := start, end
 	for left > 0 && cardEncodedByte(s[left-1]) {
@@ -68,6 +91,7 @@ func cardTokenBoundary(s string, start, end int) bool {
 		after = len(s)
 	}
 	paymentAfter := paymentCardAfter.MatchString(s[end:after])
+	prefix := strings.ToLower(s[left:start])
 	if right == end || paymentAfter {
 		for _, label := range cardpolicy.Rules.LiteralAttachedLabels {
 			if strings.EqualFold(s[left:start], label) {
@@ -75,24 +99,32 @@ func cardTokenBoundary(s string, start, end int) bool {
 			}
 		}
 	}
-	if start > 0 && cardWordByte(s[start-1]) || end < len(s) && cardWordByte(s[end]) {
-		return false
-	}
-	letters := false
-	for _, c := range []byte(s[left:right]) {
-		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' {
-			letters = true
-			break
+	attached := false
+	attachedSuffix := false
+	for _, label := range cardpolicy.Rules.AttachedLabels {
+		attached = attached || prefix == label
+		attachedSuffix = attachedSuffix || strings.EqualFold(s[end:right], label)
+		if paymentAfter && (prefix == label || strings.TrimRight(prefix, "/-") == label) {
+			return true
 		}
 	}
-	if !letters {
+	if paymentAfter && left == start {
 		return true
 	}
 	before := start - 128
 	if before < 0 {
 		before = 0
 	}
-	return paymentCardBefore.MatchString(s[before:start]) || paymentAfter
+	if paymentCardBefore.MatchString(s[before:start]) {
+		return true
+	}
+	if attached && right == end || attachedSuffix && left == start {
+		return !encodedCardToken(s[left:right])
+	}
+	if start > 0 && cardWordByte(s[start-1]) || end < len(s) && cardWordByte(s[end]) {
+		return false
+	}
+	return !encodedCardToken(s[left:right])
 }
 
 func standaloneCardTokenEnd(s string, end int) bool {

@@ -80,7 +80,8 @@ func TestSharedIssuerAndIdentifierCases(t *testing.T) {
 		Name, Prefix, Before, After string
 		Length                      int
 		Mask                        bool
-		PadToQuartet                bool `json:"pad_to_quartet"`
+		PadToQuartet                bool    `json:"pad_to_quartet"`
+		ExpectedAfter               *string `json:"expected_after"`
 	}
 	if json.Unmarshal(data, &cases) != nil {
 		t.Fatal("invalid issuer fixtures")
@@ -107,6 +108,9 @@ func TestSharedIssuerAndIdentifierCases(t *testing.T) {
 			want := value
 			if c.Mask {
 				want = c.Before + "[card ****" + pan[len(pan)-4:] + "]" + c.After
+				if c.ExpectedAfter != nil {
+					want = c.Before + "[card ****" + pan[len(pan)-4:] + "]" + *c.ExpectedAfter
+				}
 			}
 			if redactCardText(value, false) != want || (cardCount(value) > 0) != c.Mask {
 				t.Fatal("issuer or token boundary differs")

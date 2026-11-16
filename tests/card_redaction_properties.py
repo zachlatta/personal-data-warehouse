@@ -1,4 +1,6 @@
 """Independent fixed-seed corpus generator, mirrored in Go, configured by JSON."""
+import base64
+import binascii
 import json
 import re
 from pathlib import Path
@@ -19,6 +21,15 @@ def render_groups(number,grouping,variant):
             result+=options[(i-1)%len(options)]
         result+=number[pos:pos+n];pos+=n
     return result
+
+
+def canonical_url_token(value):
+    """Independent stdlib proof for the fieldless URL-safe insertion context."""
+    if not re.fullmatch(r'[A-Za-z0-9_-]+',value):return False
+    try:
+        decoded=base64.b64decode(value+'='*(-len(value)%4),altchars=b'-_',validate=True)
+        return base64.urlsafe_b64encode(decoded).decode().rstrip('=')==value
+    except (ValueError,binascii.Error):return False
 
 
 def unambiguous_insertion(context, pan, following, layouts):
@@ -113,9 +124,6 @@ def property_cases():
         context = {'$four_digits ': context_line+' ', '$phone ': context_phone+' ', '$phone_prefix ': area+' '+exchange+' ',
                    '$date ': date+' ', '$order ': order+' '}.get(context, context)
         following = config['following_contexts'][(i//(len(formats)*len(config['preceding_contexts'])))%len(config['following_contexts'])]
-        # A bare -end suffix is also a URL-safe token. Use an actual field for
-        # this positive case; the fieldless shape is pinned as preservation.
-        if following['input']=='-end':context+='pan='
         for attempt in range(1000):
             number=valid_number(sum(grouping))
             pan=render_groups(number,grouping,variant)
@@ -127,7 +135,11 @@ def property_cases():
         at=rand(len(tokens)+1)
         prefix=joiner.join(tokens[:at])+' | '+context
         suffix=' | '+joiner.join(tokens[at:])
-        yield f'insert-{i}', prefix+pan+following['input']+suffix, prefix+replacement+following['expected']+suffix
+        value=prefix+pan+following['input']+suffix
+        # Keep the original input. Only an independent canonical codec round
+        # trip can justify excluding a complete fieldless encoded token.
+        expected=value if following['input']=='-end' and canonical_url_token(pan+'-end') else prefix+replacement+following['expected']+suffix
+        yield f'insert-{i}', value, expected
     tokens = config['permutation_tokens']
     for i,a in enumerate(tokens):
         for j,b in enumerate(tokens):

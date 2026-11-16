@@ -21,7 +21,7 @@ def test_shared_issuer_and_identifier_cases():
             import base64
             value+='A'*(-len(value)%4)
             assert base64.b64encode(base64.b64decode(value,validate=True)).decode()==value
-        expected=case.get('before','')+'[card ****'+pan[-4:]+']'+case.get('after','') if case['mask'] else value
+        expected=case.get('before','')+'[card ****'+pan[-4:]+']'+case.get('expected_after',case.get('after','')) if case['mask'] else value
         assert redact(value)==expected,case['name']
         assert card_count(value)==int(case['mask']),case['name']
 
@@ -35,6 +35,12 @@ def test_nonbrand_number_is_preserved_even_with_code_label():
 def payment_label_cases():
     """Cross product consumed in Python and independently generated in Go."""
     from tests.card_redaction_properties import render_groups
+    pan=number('4',16)
+    for label in ('card','pan','cc','number','num'):
+        yield label+pan+' CVV: 987',label+'[card ****'+pan[-4:]+'] CVV: [redacted]'
+    for variant in ('plain','space','dash'):
+        grouped=render_groups(pan,(4,4,4,4),variant)
+        yield grouped+'-end CVC2: 987','[card ****'+pan[-4:]+']-end CVC2: [redacted]'
     for prefix,length in (('4',13),('4',16),('4',19),('3095',16),('3095',19)):
         pan=number(prefix,length)
         forms=[pan]

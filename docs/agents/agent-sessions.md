@@ -559,12 +559,17 @@ their supported formats, including DGN's additional JCB allocations, Diners
 3095, UnionPay 81, and provider-supported Visa/Mir/Maestro lengths. Historical
 JCB formats remain covered for stored conversations. Network routing summaries
 are subsets, so a routing range does not narrow a network's general prefix rule.
-Token membership is decided before payment context. A maximal mixed token of
-letters/digits and `+/=_-` is preserved regardless of length when it has no
-actual payment field. `/exp/`, `/pan/` and `/cvv/` segments do not create fields;
+An encoding exclusion requires the entire reading to lie within one maximal
+token with a strict canonical standard/URL-safe base64 decode/re-encode round
+trip, including padding and unused-bit validation. Alphabet membership alone
+is insufficient; a grouped reading crossing whitespace cannot be one encoding.
+`/exp/`, `/pan/` and `/cvv/` segments do not create payment fields;
 `pan=<value>` and `<value>/CVV:<code>` do. Whitespace, quotes, commas, ampersands,
 semicolons and pipes break encoded tokens. Expiry/phone suffix protection is
-unchanged. Short opaque tokens have the same preservation rule as long ones.
+unchanged. Actual following code fields establish payment context even after a
+decorative `-end` suffix or an exact attached `card`, `pan`, `cc`, `number` or
+`num` label. Arbitrary identifier prefixes keep their identifier protection.
+Short canonical encoded tokens have the same preservation rule as long ones.
 
 The scrub SQL/archive prefilters use the policy's minimum card length and bound
 both literal and decoded digit readings. They deliberately defer issuer and
