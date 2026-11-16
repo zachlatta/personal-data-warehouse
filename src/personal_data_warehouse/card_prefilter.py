@@ -6,11 +6,12 @@ import os
 import re
 import threading
 
-from personal_data_warehouse.card_redaction import card_count, redact_row
+from personal_data_warehouse.card_redaction import CARD_POLICY, card_count, redact_row
 
 UNICODE_UNIT = r'u[0-9a-fA-F]{4}'
 UNIT_DIGITS = '0000'
-DIGIT_WINDOW = r'[0-9]([ -]{0,3}[0-9]){12}'
+MIN_CARD_DIGITS = min(n for issuer in CARD_POLICY['issuers'] for n in issuer['lengths'])
+DIGIT_WINDOW = r'[0-9]([ -]{0,3}[0-9]){'+str(MIN_CARD_DIGITS-1)+'}'
 _UNIT = re.compile(UNICODE_UNIT)
 _WINDOW = re.compile(DIGIT_WINDOW)
 

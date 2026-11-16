@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -42,6 +43,11 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 				return json.Unmarshal([]byte(actual), &got) == nil && json.Unmarshal([]byte(c.Expected), &want) == nil && reflect.DeepEqual(got, want)
 			}
 			for _, context := range []bool{false, true} {
+				// A forced row context asserts a card exists elsewhere; it is
+				// intentionally inapplicable to standalone non-card fixtures.
+				if context && c.CardCount != nil && *c.CardCount == 0 {
+					continue
+				}
 				if !equal(redactCardText(c.Input, context)) {
 					t.Fatal("redaction contract failed")
 				}
@@ -62,6 +68,109 @@ func TestSharedAdversarialCardCases(t *testing.T) {
 				t.Fatal("batch contract failed")
 			}
 		})
+	}
+}
+
+func TestSharedIssuerAndIdentifierCases(t *testing.T) {
+	data, err := os.ReadFile("../../../tests/fixtures/card_issuer_cases.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		Name, Prefix, Before, After string
+		Length                      int
+		Mask                        bool
+		PadToQuartet                bool    `json:"pad_to_quartet"`
+		ExpectedAfter               *string `json:"expected_after"`
+	}
+	if json.Unmarshal(data, &cases) != nil {
+		t.Fatal("invalid issuer fixtures")
+	}
+	for _, c := range cases {
+		t.Run(c.Name, func(t *testing.T) {
+			stem := (c.Prefix + strings.Repeat("1", c.Length))[:c.Length-1]
+			pan := ""
+			for i := 0; i < 10; i++ {
+				v := stem + string(rune('0'+i))
+				if validCard(v) {
+					pan = v
+					break
+				}
+			}
+			value := c.Before + pan + c.After
+			if c.PadToQuartet {
+				value += strings.Repeat("A", (4-len(value)%4)%4)
+				decoded, err := base64.StdEncoding.Strict().DecodeString(value)
+				if err != nil || base64.StdEncoding.EncodeToString(decoded) != value {
+					t.Fatal("noncanonical encoded fixture")
+				}
+			}
+			want := value
+			if c.Mask {
+				want = c.Before + "[card ****" + pan[len(pan)-4:] + "]" + c.After
+				if c.ExpectedAfter != nil {
+					want = c.Before + "[card ****" + pan[len(pan)-4:] + "]" + *c.ExpectedAfter
+				}
+			}
+			if redactCardText(value, false) != want || (cardCount(value) > 0) != c.Mask {
+				t.Fatal("issuer or token boundary differs")
+			}
+			body, _ := json.Marshal(map[string]string{"text": value})
+			cleaned, err := redactConversationBatch(conversationTestBatch(string(body)), 100000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, _ := gzip.NewReader(bytes.NewReader(cleaned))
+			raw, _ := io.ReadAll(r)
+			r.Close()
+			var got map[string]string
+			if json.Unmarshal(raw, &got) != nil || got["text"] != want {
+				t.Fatal("batch issuer boundary differs")
+			}
+		})
+	}
+}
+
+func TestPaymentLabelsAcrossPunctuation(t *testing.T) {
+	for _, spec := range []struct {
+		prefix string
+		length int
+	}{{"4", 13}, {"4", 16}, {"4", 19}, {"3095", 16}, {"3095", 19}} {
+		stem := (spec.prefix + strings.Repeat("1", spec.length))[:spec.length-1]
+		pan := ""
+		for i := 0; i < 10; i++ {
+			v := stem + string(rune('0'+i))
+			if validCard(v) {
+				pan = v
+				break
+			}
+		}
+		forms := []string{pan}
+		if spec.length == 16 {
+			for _, variant := range []string{"space", "dash", "mixed_runs"} {
+				forms = append(forms, propertyRenderGroups(pan, []int{4, 4, 4, 4}, variant))
+			}
+		}
+		for _, form := range forms {
+			for _, delimiter := range []string{"/", "|", ";", "#", "=", "&"} {
+				for _, label := range []string{"CVV", "CVC", "CVC2", "CVV2", "CID", "CSC", "security code", "card code", "exp", "expiry"} {
+					code := "[redacted]"
+					if label == "exp" || label == "expiry" {
+						code = "987"
+					}
+					value := "pan=" + form + delimiter + label + "=987"
+					want := "pan=[card ****" + pan[len(pan)-4:] + "]" + delimiter + label + "=" + code
+					if redactCardText(value, false) != want || cardCount(value) != 1 {
+						t.Fatalf("label/delimiter %s/%s failed", label, delimiter)
+					}
+					value = label + "=" + form + delimiter
+					want = label + "=[card ****" + pan[len(pan)-4:] + "]" + delimiter
+					if redactCardText(value, false) != want || cardCount(value) != 1 {
+						t.Fatalf("preceding label %s/%s failed", label, delimiter)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -133,7 +242,11 @@ func TestJSONScalarConversationBatchRemainsValid(t *testing.T) {
 
 func TestAllCardLengthsWithAdjacentCode(t *testing.T) {
 	for length := 13; length <= 19; length++ {
-		prefix := "4" + strings.Repeat("1", length-2)
+		issuer := "6"
+		if length == 13 || length == 16 || length == 19 {
+			issuer = "4"
+		}
+		prefix := issuer + strings.Repeat("1", length-2)
 		number := ""
 		for n := 0; n < 10; n++ {
 			candidate := prefix + string(rune('0'+n))
@@ -253,7 +366,30 @@ func TestOverlappingCodeAndCardEditsMergeWithoutLeaking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "4111 1111") || strings.Contains(string(raw), "004242 4242") || !json.Valid(bytes.TrimSpace(raw)) {
-		t.Fatalf("overlapping edits must stay redacted and valid JSON: %q", raw)
+	if cardCount(string(raw)) != 0 || !json.Valid(bytes.TrimSpace(raw)) {
+		t.Fatal("overlapping edits must stay redacted and valid JSON")
+	}
+}
+
+func TestAdjacentCodeChainFollowedByIssuerValidCard(t *testing.T) {
+	// Published sandbox Visa recipes, constructed at runtime.
+	first := "4" + strings.Repeat("1", 15)
+	second := strings.Repeat("42", 8)
+	groups := []string{}
+	for i := 0; i < len(second); i += 4 {
+		groups = append(groups, second[i:i+4])
+	}
+	text := first + " - 012 " + strings.Join(groups, " ") + " done"
+	for _, value := range []string{text, `{"text":"` + text + `"}`} {
+		edits := cardRedactionEdits(value, true)
+		for i := 1; i < len(edits); i++ {
+			if edits[i].start < edits[i-1].end {
+				t.Fatal("overlapping edits")
+			}
+		}
+		cleaned := applyCardEdits(value, edits)
+		if cardCount(cleaned) != 0 || !strings.Contains(cleaned, " done") {
+			t.Fatal("card edits must redact and preserve trailing text")
+		}
 	}
 }

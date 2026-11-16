@@ -1,5 +1,6 @@
 // Package notifications drains a transactional, insert-only timeline outbox.
-// The Python warehouse owns DDL. Transport acceptance is NOT device display.
+// Python owns outbox DDL; push owns registry initialization at service startup.
+// Transport acceptance is NOT device display.
 package notifications
 
 import (
@@ -16,6 +17,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/deeplink"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/push"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
@@ -120,12 +122,23 @@ type Service struct {
 }
 
 func New(databaseURL string, secret []byte, sender Sender, render func(map[string]any) Alert) (*Service, error) {
+	return newWithExpansion(databaseURL, secret, sender, render, nil)
+}
+
+// Tests supply their isolated schemas before initialization touches the registry.
+func newWithExpansion(databaseURL string, secret []byte, sender Sender, render func(map[string]any) Alert, expand func(string) string) (*Service, error) {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(3)
-	return &Service{DB: db, Secret: secret, Sender: sender, Render: render}, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := push.Ensure(ctx, db, expand); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Service{DB: db, Secret: secret, Sender: sender, Render: render, Expand: expand}, nil
 }
 func (s *Service) Close() error { return s.DB.Close() }
 func (s *Service) q(query string) string {
@@ -177,7 +190,12 @@ func (s *Service) Tick(ctx context.Context) error {
 	// Mutation alerts (MutationAdapter) are not part of the timeline
 	// experiment: the fan-out and claim below gate each row on the switch
 	// (timelineGate) unless it is one, so they run whether or not it is on.
+	// Device quieting runs every tick for the same reason: a mutation alert
+	// must not reach a dormant device either.
 	{
+		if err := s.quietDevices(ctx); err != nil {
+			return err
+		}
 		// A process can die after its final send but before storing the verdict.
 		// Bound crash recovery too; do not create an infinite retrying lease.
 		_, err := s.DB.ExecContext(ctx, s.q(`UPDATE @notification_deliveries SET status='unknown',error='send attempts exhausted after interrupted worker',updated_at=now() WHERE status='sending' AND lease_until<now() AND attempt_count>=6`))
@@ -206,6 +224,16 @@ func (s *Service) Tick(ctx context.Context) error {
 				return err
 			}
 			result := Result{Status: "cancelled", Error: "device disabled or experiment paused"}
+			if !active {
+				var status string
+				err := s.DB.QueryRowContext(ctx, s.q(devicesSQL+`SELECT status FROM devices WHERE id=$1`), d.DeviceID).Scan(&status)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if status == "dormant" || status == "stopped" {
+					result = Result{Status: "suppressed", Error: "device_" + status}
+				}
+			}
 			if active {
 				reason, err := s.suppressionReason(ctx, d)
 				unchecked := errors.Is(err, errWitnessUnchecked)
@@ -278,19 +306,19 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 	// capabilities is read through to_jsonb so a fan-out that runs before
 	// either ensure path has added the column sends ordinary alerts instead
 	// of failing (the Go app deploys before the Python ensure runs).
-	rows, err := tx.QueryContext(ctx, s.q(`SELECT 'expo', expo_push_token, jsonb_build_object('token',expo_push_token,'platform',platform,'capabilities',COALESCE(to_jsonb(d)->>'capabilities','')) FROM @push_devices d WHERE status='active'
- UNION ALL SELECT 'web', id, subscription FROM @web_push_devices WHERE status='active'`))
+	rows, err := tx.QueryContext(ctx, s.q(`SELECT 'expo', expo_push_token, jsonb_build_object('token',expo_push_token,'platform',platform,'capabilities',COALESCE(to_jsonb(d)->>'capabilities','')),status FROM @push_devices d WHERE status IN ('active','dormant','stopped')
+ UNION ALL SELECT 'web', id, subscription,status FROM @web_push_devices WHERE status IN ('active','dormant','stopped')`))
 	if err != nil {
 		return false, err
 	}
 	type target struct {
-		transport, id string
-		endpoint      []byte
+		transport, id, status string
+		endpoint              []byte
 	}
 	var targets []target
 	for rows.Next() {
 		var d target
-		if err = rows.Scan(&d.transport, &d.id, &d.endpoint); err != nil {
+		if err = rows.Scan(&d.transport, &d.id, &d.endpoint, &d.status); err != nil {
 			rows.Close()
 			return false, err
 		}
@@ -301,7 +329,11 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	activeTargets := 0
 	for _, d := range targets {
+		if d.status == "active" {
+			activeTargets++
+		}
 		var deliveryID string
 		if err = tx.QueryRowContext(ctx, `SELECT gen_random_uuid()::text`).Scan(&deliveryID); err != nil {
 			return false, err
@@ -312,10 +344,17 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
+		status, reason := "pending", ""
+		if d.status != "active" {
+			status, reason = "suppressed", "device_"+d.status
+			raw = []byte(`{}`)
+			d.endpoint = []byte(`{}`)
+		}
 		// An Android delivery waits for the phone's own apps to post and
 		// upload their notification for this event (see suppression.go).
+		// A quieted device's row is already settled, so it holds nothing.
 		var notBefore any
-		if isAndroid(d.endpoint) {
+		if status == "pending" && isAndroid(d.endpoint) {
 			// Hold only a device whose phone is known: with no phone there is
 			// no evidence to wait for. A failed lookup holds nothing either.
 			if _, known, err := s.phoneOf(ctx, deviceID(d.transport+":"+d.id)); err != nil {
@@ -324,13 +363,13 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 				notBefore = phoneHoldUntil
 			}
 		}
-		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,next_attempt_at) VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::timestamptz,now())) ON CONFLICT (notification_id,device_id) DO NOTHING`), deliveryID, id, deviceID(d.transport+":"+d.id), d.transport, d.endpoint, raw, notBefore)
+		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,status,error,next_attempt_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9::timestamptz,now())) ON CONFLICT (notification_id,device_id) DO NOTHING`), deliveryID, id, deviceID(d.transport+":"+d.id), d.transport, d.endpoint, raw, status, reason, notBefore)
 		if err != nil {
 			return false, err
 		}
 	}
 	status := "fanned_out"
-	if len(targets) == 0 {
+	if activeTargets == 0 {
 		status = "no_devices"
 	}
 	preview, err := json.Marshal(map[string]string{"title": alert.Title, "subtitle": alert.Subtitle, "body": alert.Body, "icon": alert.Icon, "route": alert.Route})
@@ -418,13 +457,24 @@ func (s *Service) finish(ctx context.Context, d Delivery, r Result, receipt bool
 	if n != 1 {
 		return errors.New("notification delivery lease lost")
 	}
+	if r.Status == "suppressed" && (r.Error == "device_dormant" || r.Error == "device_stopped") {
+		// A stop can land after fanout fixed its recipients. Once every delivery
+		// was skipped for device status, expose the same loss as an empty fanout.
+		_, err = tx.ExecContext(ctx, s.q(`UPDATE @notification_events n SET status='no_devices'
+ WHERE n.id=$1 AND n.status='fanned_out' AND NOT EXISTS (
+ SELECT 1 FROM @notification_deliveries d WHERE d.notification_id=n.id
+ AND (d.status<>'suppressed' OR d.error NOT IN ('device_dormant','device_stopped')))`), d.NotificationID)
+		if err != nil {
+			return err
+		}
+	}
 	if r.Disable {
 		if d.Transport == "expo" {
 			var e struct{ Token string }
 			_ = json.Unmarshal(d.Endpoint, &e)
-			_, err = tx.ExecContext(ctx, s.q(`UPDATE @push_devices SET status='disabled',error=$2,updated_at=now() WHERE expo_push_token=$1`), e.Token, r.Error)
+			_, err = tx.ExecContext(ctx, s.q(`UPDATE @push_devices SET status=CASE WHEN status='stopped' THEN status ELSE 'disabled' END,error=$2,updated_at=now() WHERE expo_push_token=$1`), e.Token, r.Error)
 		} else {
-			_, err = tx.ExecContext(ctx, s.q(`UPDATE @web_push_devices SET status='disabled',error=$2,updated_at=now() WHERE subscription->>'endpoint'=$1`), endpointURL(d.Endpoint), r.Error)
+			_, err = tx.ExecContext(ctx, s.q(`UPDATE @web_push_devices SET status=CASE WHEN status='stopped' THEN status ELSE 'disabled' END,error=$2,updated_at=now() WHERE subscription->>'endpoint'=$1`), endpointURL(d.Endpoint), r.Error)
 		}
 		if err != nil {
 			return err

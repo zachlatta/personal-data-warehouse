@@ -1,10 +1,74 @@
 """Payment data boundary for conversation storage. Never logs candidate values."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
+from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from typing import Any
+
+CARD_POLICY = json.loads(Path(__file__).with_name('card_policy.json').read_text())
+_LITERAL_ATTACHED_LABELS = frozenset(CARD_POLICY['literal_attached_labels'])
+_PAYMENT_LABELS = '(?:' + '|'.join(re.escape(label) for label in CARD_POLICY['attached_labels']) + '|' + CARD_POLICY['payment_label_pattern'] + ')'
+_FIELD_SEPARATOR = CARD_POLICY['payment_field_separator_pattern']
+_PAYMENT_AFTER = re.compile(r'(?i)^(?:[\s/|;#=&+,:\-\x22\x27]{1,24}|-[A-Za-z]{1,16}[ \t]+)'+_PAYMENT_LABELS+_FIELD_SEPARATOR+r'[0-9]')
+_PAYMENT_BEFORE = re.compile(r'(?i)(?:^|[^A-Za-z0-9_])'+_PAYMENT_LABELS+_FIELD_SEPARATOR+'$')
+
+
+def card_brands(digits):
+    return {rule['name'] for rule in CARD_POLICY['issuers'] if len(digits) in rule['lengths']
+            and any(low <= digits[:len(low)] <= high for low,high in rule['ranges'])}
+
+
+def _word_char(char):
+    return char.isascii() and (char.isalnum() or char == '_')
+
+
+def _encoded_char(char):
+    return _word_char(char) or char in '+/=-'
+
+
+def encoded_token(value):
+    """Require a canonical standard/URL-safe encoding, not just its alphabet.
+
+    A candidate spanning whitespace cannot belong to one encoded token. Strict
+    round trips also reject invalid padding and nonzero unused trailing bits.
+    """
+    if not (any(c.isascii() and c.isalpha() for c in value) and
+            any('0' <= c <= '9' for c in value)):
+        return False
+    urlsafe = '-' in value or '_' in value
+    if urlsafe and ('+' in value or '/' in value):
+        return False
+    try:
+        raw = base64.b64decode(value+'='*(-len(value)%4), altchars=b'-_' if urlsafe else None, validate=True)
+        canonical = (base64.urlsafe_b64encode(raw) if urlsafe else base64.b64encode(raw)).decode()
+        return value == (canonical if '=' in value else canonical.rstrip('='))
+    except (ValueError, binascii.Error):
+        return False
+
+
+def card_token_boundary(value,start,end):
+    # Payment fields establish context; path segments such as /pan/ do not.
+    left=start
+    while left and _encoded_char(value[left-1]):left-=1
+    right=end
+    while right<len(value) and _encoded_char(value[right]):right+=1
+    payment_after=bool(_PAYMENT_AFTER.search(value[end:end+128]))
+    prefix=value[left:start].lower()
+    attached=prefix in CARD_POLICY['attached_labels']
+    if prefix in _LITERAL_ATTACHED_LABELS and (right==end or payment_after):return True
+    if payment_after and (left==start or attached or prefix.rstrip('/-') in CARD_POLICY['attached_labels']):return True
+    if _PAYMENT_BEFORE.search(value[max(0,start-128):start]):return True
+    # Ordinary identifiers still need protection even when they are not base64.
+    # Only exact recognised labels may be attached to a card value.
+    if (attached and right==end or
+            left==start and value[end:right].lower() in CARD_POLICY['attached_labels']):
+        return not encoded_token(value[left:right])
+    if start and _word_char(value[start-1]) or end<len(value) and _word_char(value[end]):return False
+    return not encoded_token(value[left:right])
 
 _LABEL = r'(?:cvv2?|cvc2?|cid|csc|cvd|cvn|(?:security|card)[ _-]*code)'
 _CODE = re.compile(r'(?i)(\b' + _LABEL + r'\b(?:\s+is)?[\s\\\x22\x27:=,-]{0,24})([0-9]{3,4})(?![0-9])')
@@ -53,7 +117,8 @@ def card_spans(value: str):
             groups += (len(atoms[j][0]),)
             if len(digits)>19:
                 break
-            if groups in _CARD_LAYOUTS and is_card(digits):
+            if (groups in _CARD_LAYOUTS and is_card(digits) and card_brands(digits)
+                    and card_token_boundary(value,atom.start(),atoms[j].end())):
                 readings.add((atom.start(),atoms[j].end()))
     valid = sorted(readings)
     codes = []
@@ -106,9 +171,21 @@ def _text_edits(value):
             end = code.end()
     for match in _CODE.finditer(decoded):
         start, end = match.span(2)
+        if not card_token_boundary(decoded,start,end):continue
         if not any(start < b and end > a for a, b, _ in edits):
             edits.append((start, end, '[redacted]'))
-    return [(bounds[a], bounds[b], replacement) for a, b, replacement in sorted(edits)]
+    # Adjacent-code chains can reach a later card reading. Merge their spans
+    # before applying edits so covered bytes cannot reappear behind the cursor.
+    merged = []
+    for start, end, replacement in sorted(edits):
+        if merged and start < merged[-1][1]:
+            previous_start, previous_end, previous_replacement = merged[-1]
+            if not previous_replacement.startswith('[card ') and replacement.startswith('[card '):
+                previous_replacement = replacement
+            merged[-1] = (previous_start, max(end, previous_end), previous_replacement)
+        else:
+            merged.append((start, end, replacement))
+    return [(bounds[a], bounds[b], replacement) for a, b, replacement in merged]
 
 
 def _json_string_bounds(token):

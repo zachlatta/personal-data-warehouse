@@ -35,6 +35,49 @@ that content to the configured push provider. Set OS preview visibility to suit
 your privacy preferences. The experiment deliberately includes CC, which can be
 a high-volume tier.
 
+## Device controls and automatic dormancy
+
+`/notifications` and the phone Alerts tab list every registered device, including
+its name, platform, app version, original registration, last observed tap and last
+accepted send. **Stop alerts to this device** marks it `stopped`; **Resume this
+device** marks it `active`. Rows are retained. Manual stops survive app opens and
+registration refreshes; only an explicit resume clears them.
+
+The single-account registry uses `DeviceDormancyDays` (14) as its inactivity window.
+Before fanout, an active device becomes `dormant` only when its latest registration,
+reported foreground, or observed notification tap is older than 14 days AND a
+different active device has an observed tap within the last 14 days. A sole device,
+or devices with no recent taps anywhere, stays active. Provider acceptance is not
+activity. For pre-migration installs, original registration and existing tap history
+are used; historical send timestamps cannot prove app use. Opening a dormant app
+(foreground re-registration), re-registering it, tapping an alert, or choosing
+resume activates it again. No history is replayed. A resume grants a fresh 14-day
+grace period. A provider-invalid `disabled` device still needs registration or resume.
+Dormancy is re-evaluated on every worker tick, including while paused. A dormant
+device returns to active when no other active device has a tap within 14 days
+(including when the witness is stopped, disabled, or its tap ages out). This
+fallback does not count as app activity and never resumes a manually stopped device.
+
+Each captured notification retains one compact `suppressed` delivery per dormant
+or stopped device, with `error = device_dormant` or `device_stopped`. These rows omit
+transport endpoints and alert payloads and do not attempt delivery. Individual
+skips do not fail notification health, but if no device is active for a captured
+notification, its event is `no_devices` and health reports `attention`, even when
+suppressed skip rows exist (for example, all devices manually stopped).
+This deliberately retains per-notification skip evidence at
+the cost of one small ledger row per quiet device; it avoids duplicating content.
+Already queued work checks device status again immediately before sending.
+An in-flight provider request cannot be retracted. Registry changes log the safe
+hashed device ID, never its push token. Other apps' notifications are unaffected.
+
+Authenticated endpoints: `GET /api/notifications/devices` returns safe device
+metadata; `POST /api/notifications/devices/status` takes `{id, status}` with
+`status` equal to `stopped` or `active`. No endpoint deletes device rows. The app's
+shared push-registry ensure runs once when the notification service starts,
+adding `last_active_at` before requests or worker ticks. Python ensure uses the
+same column definition. Reads rely on startup having completed; no status change
+or dormancy transition runs DDL. No mart gains a required column.
+
 ## What a tap can do
 
 Both the phone and timeline use the same source-link builder, not competing URL

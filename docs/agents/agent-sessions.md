@@ -482,8 +482,9 @@ its phone data (contacts, calendar, health, media library) was empty for this ac
 
 The conversation batch HTTP endpoint redacts payment card data before object
 storage. The shared database writer applies the same policy for every AI event
-source, including direct backend polls: Luhn-valid 13–19 digit numbers (including
-spaced, dashed and JSON-escaped forms) become `[card ****1234]`; labelled security
+source, including direct backend polls: issuer-qualified, Luhn-valid 13–19 digit
+numbers in payment context (including spaced, dashed and JSON-escaped forms)
+become `[card ****1234]`; labelled security
 codes in the same event become `[redacted]`. This is an intentional exception to
 raw fidelity, including `raw_json`. Original host transcripts are separate copies.
 
@@ -545,7 +546,34 @@ are pending, never assumed zero.
 Reports contain counts only; repeat each dry-run afterward and require zero.
 Historical backups and WAL are not erased by these commands.
 
-The scrub SQL/archive prefilters bound both literal and decoded digit readings:
+PAN detection requires a checksum, a matching issuer IIN/length rule, and token
+boundaries. The single policy is `src/personal_data_warehouse/card_policy.json`;
+`scripts/generate_go_card_policy.py` generates the Go mirror and a test pins it.
+Contiguous alphanumeric/underscore identifiers are preserved. Payment labels
+need a field separator and a numeric value; bare path segments are opaque.
+The whole-token `menu<PAN>` compatibility exception remains supported.
+Non-brand numbers stay unchanged even near a CVV/expiry label. Group layouts,
+overlapping starts and adjacent-code handling are otherwise unchanged.
+The policy records its network/acquirer source URLs and conservatively includes
+their supported formats, including DGN's additional JCB allocations, Diners
+3095, UnionPay 81, and provider-supported Visa/Mir/Maestro lengths. Historical
+JCB formats remain covered for stored conversations. Network routing summaries
+are subsets, so a routing range does not narrow a network's general prefix rule.
+An encoding exclusion requires the entire reading to lie within one maximal
+token with a strict canonical standard/URL-safe base64 decode/re-encode round
+trip, including padding and unused-bit validation. Alphabet membership alone
+is insufficient; a grouped reading crossing whitespace cannot be one encoding.
+`/exp/`, `/pan/` and `/cvv/` segments do not create payment fields;
+`pan=<value>` and `<value>/CVV:<code>` do. Whitespace, quotes, commas, ampersands,
+semicolons and pipes break encoded tokens. Expiry/phone suffix protection is
+unchanged. Actual following code fields establish payment context even after a
+decorative `-end` suffix or an exact attached `card`, `pan`, `cc`, `number` or
+`num` label. Arbitrary identifier prefixes keep their identifier protection.
+Short canonical encoded tokens have the same preservation rule as long ones.
+
+The scrub SQL/archive prefilters use the policy's minimum card length and bound
+both literal and decoded digit readings. They deliberately defer issuer and
+token decisions to the confirming detector so escaped payloads remain covered:
 remove backslashes, replace every possible Unicode unit by **four** digit
 sentinels, then select 13 digits within a 49-character normalized window.
 Four preserves up to four literal digits after an ordinary word ending in `u`

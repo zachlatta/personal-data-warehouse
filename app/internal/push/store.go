@@ -110,6 +110,7 @@ var ensureStatements = []string{
 	)`,
 	// CREATE TABLE IF NOT EXISTS leaves a table created before the column alone.
 	`ALTER TABLE @push_devices ADD COLUMN IF NOT EXISTS capabilities text NOT NULL DEFAULT ''`,
+	`ALTER TABLE @push_devices ADD COLUMN IF NOT EXISTS last_active_at timestamptz NOT NULL DEFAULT 'epoch'`,
 	`CREATE INDEX IF NOT EXISTS push_devices_status_updated_idx ON @push_devices (status, updated_at)`,
 }
 
@@ -119,17 +120,28 @@ func (s *PostgresStore) ensure(ctx context.Context) error {
 	if s.ensured {
 		return nil
 	}
-	if s.Expand == nil {
-		if _, err := s.db.ExecContext(ctx, createSchemaSQL); err != nil {
+	if err := Ensure(ctx, s.db, s.Expand); err != nil {
+		return err
+	}
+	s.ensured = true
+	return nil
+}
+
+// Ensure provisions the push registry. Services sharing the registry call this
+// once at startup, before serving requests or running workers. A non-nil expand
+// maps the table into an already-created isolated schema for integration tests.
+func Ensure(ctx context.Context, db *sql.DB, expand func(string) string) error {
+	if expand == nil {
+		if _, err := db.ExecContext(ctx, createSchemaSQL); err != nil {
 			return fmt.Errorf("ensure private schema: %w", err)
 		}
+		expand = warehouse.ExpandRelations
 	}
 	for _, statement := range ensureStatements {
-		if _, err := s.db.ExecContext(ctx, s.q(statement)); err != nil {
+		if _, err := db.ExecContext(ctx, expand(statement)); err != nil {
 			return fmt.Errorf("ensure push_devices: %w", err)
 		}
 	}
-	s.ensured = true
 	return nil
 }
 
@@ -158,15 +170,16 @@ func (s *PostgresStore) Register(ctx context.Context, device Device, now time.Ti
 	}
 	now = now.UTC()
 	row := s.db.QueryRowContext(ctx, s.q(`
-		INSERT INTO @push_devices (expo_push_token, client_name, device_name, platform, app_version, capabilities, status, error, registered_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $7, 'active', '', $6, $6)
+		INSERT INTO @push_devices (expo_push_token, client_name, device_name, platform, app_version, capabilities, status, error, registered_at, updated_at,last_active_at)
+		VALUES ($1, $2, $3, $4, $5, $7, 'active', '', $6, $6,$6)
 		ON CONFLICT (expo_push_token) DO UPDATE SET
 			client_name = EXCLUDED.client_name,
 			device_name = EXCLUDED.device_name,
 			platform = EXCLUDED.platform,
 			app_version = EXCLUDED.app_version,
 			capabilities = EXCLUDED.capabilities,
-			status = 'active',
+			status = CASE WHEN @push_devices.status='stopped' THEN 'stopped' ELSE 'active' END,
+			last_active_at = EXCLUDED.last_active_at,
 			error = '',
 			updated_at = EXCLUDED.updated_at
 		RETURNING expo_push_token, client_name, device_name, platform, app_version, capabilities, status, error, registered_at, updated_at`),
@@ -215,7 +228,7 @@ func (s *PostgresStore) MarkFailed(ctx context.Context, token string, reason str
 		status = StatusDisabled
 	}
 	_, err := s.db.ExecContext(ctx, s.q(
-		`UPDATE @push_devices SET error = $2, status = $3, last_error_at = $4, updated_at = $4 WHERE expo_push_token = $1`),
+		`UPDATE @push_devices SET error = $2, status = CASE WHEN $3='disabled' AND status<>'stopped' THEN $3 ELSE status END, last_error_at = $4, updated_at = $4 WHERE expo_push_token = $1`),
 		token, reason, status, now.UTC())
 	return err
 }
@@ -259,6 +272,9 @@ func (m *MemoryStore) Register(_ context.Context, device Device, now time.Time) 
 		device.RegisteredAt = now
 	}
 	device.Status, device.Error, device.UpdatedAt = StatusActive, "", now
+	if ok && existing.Status == "stopped" {
+		device.Status = "stopped"
+	}
 	device.Capabilities = NormalizeCapabilities(device.Capabilities)
 	m.devices[device.ExpoPushToken] = device
 	return device, nil
@@ -296,7 +312,7 @@ func (m *MemoryStore) MarkFailed(_ context.Context, token string, reason string,
 	m.Failed[token] = reason
 	if d, ok := m.devices[token]; ok {
 		d.Error, d.UpdatedAt = reason, now
-		if disable {
+		if disable && d.Status != "stopped" {
 			d.Status = StatusDisabled
 		}
 		m.devices[token] = d

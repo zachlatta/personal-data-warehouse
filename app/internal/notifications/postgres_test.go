@@ -2,6 +2,9 @@ package notifications
 
 import (
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +12,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/push"
 )
 
 type fakeSender struct {
@@ -23,6 +29,20 @@ func (f *fakeSender) Send(_ context.Context, d Delivery) Result {
 }
 func (f *fakeSender) Receipt(_ context.Context, d Delivery) Result { return f.receipt }
 
+func notificationTestExpansion(t *testing.T) func(string) string {
+	t.Helper()
+	var relations map[string]string
+	if err := json.Unmarshal([]byte(os.Getenv("PDW_NOTIFICATION_TEST_RELATIONS")), &relations); err != nil {
+		t.Fatal(err)
+	}
+	return func(q string) string {
+		for k, v := range relations {
+			q = strings.ReplaceAll(q, "@"+k, v)
+		}
+		return q
+	}
+}
+
 // This is invoked by the canonical pytest run with a fresh isolated schema.
 func TestPostgresNotifications(t *testing.T) {
 	url := os.Getenv("PDW_NOTIFICATION_TEST_URL")
@@ -31,21 +51,12 @@ func TestPostgresNotifications(t *testing.T) {
 	}
 	ctx := context.Background()
 	sender := &fakeSender{result: Result{Status: "accepted", TicketID: "test-ticket"}, receipt: Result{Status: "provider_accepted"}}
-	s, err := New(url, []byte("test-secret"), sender, func(row map[string]any) Alert { return Alert{Title: "Hello", Route: "/timeline/test/one"} })
+	s, err := newWithExpansion(url, []byte("test-secret"), sender, func(row map[string]any) Alert { return Alert{Title: "Hello", Route: "/timeline/test/one"} }, notificationTestExpansion(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	var relations map[string]string
-	if err = json.Unmarshal([]byte(os.Getenv("PDW_NOTIFICATION_TEST_RELATIONS")), &relations); err != nil {
-		t.Fatal(err)
-	}
-	s.Expand = func(q string) string {
-		for k, v := range relations {
-			q = strings.ReplaceAll(q, "@"+k, v)
-		}
-		return q
-	}
+
 	exec := func(q string, args ...any) {
 		t.Helper()
 		if _, err := s.DB.ExecContext(ctx, s.q(q), args...); err != nil {
@@ -252,6 +263,282 @@ func TestPostgresNotifications(t *testing.T) {
 	if w.Code != 400 {
 		t.Fatalf("bad cursor accepted: %d", w.Code)
 	}
+	t.Run("device lifecycle", func(t *testing.T) {
+		exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices`)
+		exec(`INSERT INTO @push_devices (expo_push_token,registered_at,last_active_at) VALUES
+		 ('ExponentPushToken[old]',now()-interval '20 days','epoch'),
+		 ('ExponentPushToken[current]',now(),now())`)
+		// Only a recent tap on another device authorizes automatic dormancy.
+		exec(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,opened_at,status)
+		 VALUES ('recent','fixture',$1,'expo','{}','{}',now(),'provider_accepted')`, deviceID("expo:ExponentPushToken[current]"))
+		sender.result = Result{Status: "provider_accepted"}
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','dormant','test','direct')`)
+		before := len(sender.sent)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(sender.sent)-before != 1 || count(`SELECT count(*) FROM @push_devices WHERE status='dormant'`) != 1 || count(`SELECT count(*) FROM @notification_deliveries WHERE error='device_dormant' AND status='suppressed'`) != 1 {
+			t.Fatal("dormant device sent or skip missing")
+		}
+		if count(`SELECT count(*) FROM @marts_notification_health WHERE status='ok'`) != 1 {
+			t.Fatal("intentional skip failed health")
+		}
+		oldID := deviceID("expo:ExponentPushToken[old]")
+		if req(APIPath+"/devices/status", `{"id":"`+oldID+`","status":"active"}`) != 200 {
+			t.Fatal("resume failed")
+		}
+		if count(`SELECT count(*) FROM @push_devices WHERE status='active'`) != 2 {
+			t.Fatal("resume did not activate")
+		}
+		if req(APIPath+"/devices/status", `{"id":"`+oldID+`","status":"stopped"}`) != 200 {
+			t.Fatal("stop failed")
+		}
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','stopped','test','direct')`)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if count(`SELECT count(*) FROM @notification_deliveries WHERE error='device_stopped'`) != 1 {
+			t.Fatal("manual skip missing")
+		}
+		if req(APIPath+"/devices/status", `{"id":"`+oldID+`","status":"bad"}`) != 400 {
+			t.Fatal("invalid status accepted")
+		}
+		registry, err := push.NewPostgresStore(url, time.Second*10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer registry.Close()
+		registry.Expand = s.Expand
+		register := func() {
+			t.Helper()
+			if _, err := registry.Register(ctx, push.Device{ExpoPushToken: "ExponentPushToken[old]", Platform: "ios"}, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		register()
+		if count(`SELECT count(*) FROM @push_devices WHERE status='stopped'`) != 1 {
+			t.Fatal("registration undid manual stop")
+		}
+		exec(`UPDATE @push_devices SET status='dormant' WHERE expo_push_token='ExponentPushToken[old]'`)
+		register()
+		if count(`SELECT count(*) FROM @push_devices WHERE status='active'`) != 2 {
+			t.Fatal("registration did not reactivate")
+		}
+		exec(`UPDATE @push_devices SET status='dormant' WHERE expo_push_token='ExponentPushToken[old]'`)
+		exec(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,status) VALUES ('open-old','fixture',$1,'expo','{}','{}','provider_accepted')`, oldID)
+		body := `{"delivery_id":"open-old","open_proof":"` + s.openProof("open-old") + `"}`
+		if req(APIPath+"/opened", body) != 200 || count(`SELECT count(*) FROM @push_devices WHERE status='active'`) != 2 {
+			t.Fatal("open did not reactivate")
+		}
+		if req(APIPath+"/devices/status", `{"id":"`+oldID+`","status":"stopped"}`) != 200 || req(APIPath+"/opened", body) != 200 || count(`SELECT count(*) FROM @push_devices WHERE status='stopped'`) != 1 {
+			t.Fatal("open undid stop")
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, APIPath+"/devices", nil))
+		if w.Code != 200 || strings.Contains(w.Body.String(), "ExponentPushToken") || !strings.Contains(w.Body.String(), "last_open") {
+			t.Fatalf("unsafe or incomplete registry: %d %s", w.Code, w.Body)
+		}
+		// Neither an old device alone nor a fresh registration on another
+		// device is enough to declare a device dormant.
+		exec(`UPDATE @push_devices SET status='active',registered_at=now()-interval '30 days',last_active_at='epoch'`)
+		exec(`UPDATE @notification_deliveries SET opened_at='epoch'`)
+		if err := s.quietDevices(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if count(`SELECT count(*) FROM @push_devices WHERE status='active'`) != 2 {
+			t.Fatal("dormancy without another device's open")
+		}
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','reactivated','test','direct')`)
+		before = len(sender.sent)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(sender.sent)-before != 2 {
+			t.Fatal("reactivated devices did not receive new alerts")
+		}
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','queued-stop','test','direct')`)
+		if _, err := s.fanout(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if req(APIPath+"/devices/status", `{"id":"`+oldID+`","status":"stopped"}`) != 200 {
+			t.Fatal("queued stop failed")
+		}
+		before = len(sender.sent)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(sender.sent)-before != 1 {
+			t.Fatal("queued alert ignored manual stop")
+		}
+		if count(`SELECT count(*) FROM @notification_deliveries d JOIN @notification_events n ON n.id=d.notification_id WHERE n.event_id='queued-stop' AND d.error='device_stopped' AND d.status='suppressed'`) != 1 {
+			t.Fatal("queued stop reason missing")
+		}
+	})
+	for _, witness := range []string{"disabled", "stopped", "expired"} {
+		t.Run("dormancy loses witness/"+witness, func(t *testing.T) {
+			exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
+			exec(`INSERT INTO @push_devices (expo_push_token,status,registered_at) VALUES
+			 ('ExponentPushToken[dormant]','dormant',now()-interval '30 days'),
+			 ('ExponentPushToken[witness]','active',now())`)
+			exec(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,opened_at,status)
+			 VALUES ('witness','fixture',$1,'expo','{}','{}',now(),'provider_accepted')`, deviceID("expo:ExponentPushToken[witness]"))
+			if witness == "expired" {
+				exec(`UPDATE @notification_deliveries SET opened_at=now()-interval '15 days'`)
+			} else {
+				exec(`UPDATE @push_devices SET status=$1 WHERE expo_push_token='ExponentPushToken[witness]'`, witness)
+			}
+			sender.result = Result{Status: "provider_accepted"}
+			exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test',$1,'test','direct')`, "witness-gone-"+witness)
+			before := len(sender.sent)
+			if err := s.Tick(ctx); err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, d := range sender.sent[before:] {
+				if d.DeviceID == deviceID("expo:ExponentPushToken[dormant]") {
+					found = true
+				}
+			}
+			if !found || count(`SELECT count(*) FROM @push_devices WHERE expo_push_token='ExponentPushToken[dormant]' AND status='active'`) != 1 {
+				t.Fatal("formerly dormant device did not receive the next alert")
+			}
+		})
+	}
+	t.Run("all stopped reports no devices", func(t *testing.T) {
+		exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
+		exec(`INSERT INTO @push_devices (expo_push_token,status) VALUES ('ExponentPushToken[stopped]','stopped')`)
+		exec(`INSERT INTO @web_push_devices (id,subscription,status) VALUES ('browser','{}','stopped')`)
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','all-stopped','test','direct')`)
+		before := len(sender.sent)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(sender.sent) != before || count(`SELECT count(*) FROM @notification_events WHERE status='no_devices'`) != 1 || count(`SELECT count(*) FROM @notification_deliveries WHERE status='suppressed' AND error='device_stopped'`) != 2 || count(`SELECT count(*) FROM @marts_notification_health WHERE status='attention'`) != 1 {
+			t.Fatal("all-stopped loss was silent or skip evidence missing")
+		}
+	})
+	t.Run("browser dormancy lifts while paused", func(t *testing.T) {
+		exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
+		exec(`INSERT INTO @web_push_devices (id,subscription,status,registered_at,updated_at)
+		 VALUES ('fallback','{"endpoint":"https://push.example/fallback"}','dormant',now()-interval '30 days',now()-interval '30 days')`)
+		exec(`UPDATE @notification_state SET enabled=0 WHERE id='timeline'`)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if count(`SELECT count(*) FROM @web_push_devices WHERE status='active' AND updated_at<now()-interval '29 days'`) != 1 {
+			t.Fatal("paused fallback did not lift dormancy or invented foreground activity")
+		}
+		exec(`UPDATE @notification_state SET enabled=1 WHERE id='timeline'`)
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','browser-fallback','test','direct')`)
+		before := len(sender.sent)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(sender.sent)-before != 1 || sender.sent[before].Transport != "web" {
+			t.Fatal("reactivated browser did not receive the next alert")
+		}
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','browser-queued-stop','test','direct')`)
+		if _, err := s.fanout(ctx); err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE @web_push_devices SET status='stopped'`)
+		before = len(sender.sent)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(sender.sent) != before || count(`SELECT count(*) FROM @notification_events WHERE event_id='browser-queued-stop' AND status='no_devices'`) != 1 || count(`SELECT count(*) FROM @marts_notification_health WHERE status='attention'`) != 1 {
+			t.Fatal("all devices stopped after fanout without reporting loss")
+		}
+	})
+	t.Run("status changes do not require a schema lock", func(t *testing.T) {
+		exec(`INSERT INTO @push_devices (expo_push_token,registered_at) VALUES ('ExponentPushToken[reader-fixture]',now()-interval '30 days')`)
+		exec(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,opened_at,status)
+		 VALUES ('reader-witness','fixture',$1,'web','{}','{}',now(),'provider_accepted')`, deviceID("web:fallback"))
+		tx, err := s.DB.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err = tx.ExecContext(ctx, s.q(`LOCK TABLE @push_devices IN ACCESS SHARE MODE`)); err != nil {
+			t.Fatal(err)
+		}
+		bounded, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err = s.changeDevice(bounded, deviceID("web:fallback"), "active"); err != nil {
+			t.Fatalf("status change blocked by a reader: %v", err)
+		}
+		if err = s.quietDevices(bounded); err != nil {
+			t.Fatalf("dormancy change blocked by a reader: %v", err)
+		}
+		if count(`SELECT count(*) FROM @push_devices WHERE expo_push_token='ExponentPushToken[reader-fixture]' AND status='dormant'`) != 1 {
+			t.Fatal("reader-lock test did not exercise dormancy")
+		}
+	})
+	t.Run("startup upgrades an older registry", func(t *testing.T) {
+		exec(`ALTER TABLE @push_devices DROP COLUMN last_active_at`)
+		restarted, err := newWithExpansion(url, []byte("test-secret"), sender, s.Render, s.Expand)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restarted.Close()
+		if count(`SELECT count(*) FROM @push_devices WHERE expo_push_token='ExponentPushToken[reader-fixture]' AND last_active_at='epoch' AND status='dormant'`) != 1 {
+			t.Fatal("startup failed to migrate the old registry or lost its device")
+		}
+		if err = restarted.changeDevice(ctx, deviceID("expo:ExponentPushToken[reader-fixture]"), "active"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("manual stops survive registration and invalid provider results", func(t *testing.T) {
+		exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
+		key, err := ecdh.P256().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sub := subscription{Endpoint: "https://fcm.googleapis.com/stopped-fixture"}
+		sub.Keys.Auth = base64.RawURLEncoding.EncodeToString(make([]byte, 16))
+		sub.Keys.P256dh = base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes())
+		body, err := json.Marshal(map[string]any{"subscription": sub, "device_name": "Fixture browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.PublicKey = "fixture-configured"
+		webID := deviceID("web:" + deviceID(sub.Endpoint))
+		if req(APIPath+"/web/register", string(body)) != 200 {
+			t.Fatal("web registration failed")
+		}
+		if req(APIPath+"/devices/status", `{"id":"`+webID+`","status":"stopped"}`) != 200 {
+			t.Fatal("web stop failed")
+		}
+		if req(APIPath+"/web/register", string(body)) != 200 || count(`SELECT count(*) FROM @web_push_devices WHERE status='stopped'`) != 1 {
+			t.Fatal("web re-registration cleared manual stop")
+		}
+		if req(APIPath+"/devices/status", `{"id":"`+webID+`","status":"active"}`) != 200 {
+			t.Fatal("web resume failed")
+		}
+		exec(`INSERT INTO @push_devices (expo_push_token) VALUES ('ExponentPushToken[provider-fixture]')`)
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','provider-invalid-stopped','test','direct')`)
+		if _, err = s.fanout(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			d, err := s.claim(ctx, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req(APIPath+"/devices/status", `{"id":"`+d.DeviceID+`","status":"stopped"}`) != 200 {
+				t.Fatal("in-flight stop failed")
+			}
+			if err = s.finish(ctx, d, Result{Status: "failed", Error: "DeviceNotRegistered", Disable: true}, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if count(`SELECT count(*) FROM @push_devices WHERE status='stopped' AND error='DeviceNotRegistered'`) != 1 || count(`SELECT count(*) FROM @web_push_devices WHERE status='stopped' AND error='DeviceNotRegistered'`) != 1 || count(`SELECT count(*) FROM @notification_deliveries WHERE status='failed' AND error='DeviceNotRegistered'`) != 2 {
+			t.Fatal("provider invalid result replaced manual stop or lost failure evidence")
+		}
+	})
+	// The Go invocation also runs source-suppression tests against this schema.
+	// Keep this test's stopped fixtures out of those independent assertions.
+	exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
 }
 
 // A mutation alert (adapter mutation_policy: Undo after an automatic change,

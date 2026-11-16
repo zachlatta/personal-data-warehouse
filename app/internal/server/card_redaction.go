@@ -5,8 +5,10 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/cardpolicy"
 	"io"
 	"regexp"
 	"sort"
@@ -25,6 +27,105 @@ var cardEscape = regexp.MustCompile(`\\+u(003[0-9]|0020|002[dD])`)
 var cardDigits = regexp.MustCompile(`[0-9]+`)
 var cardSeparator = regexp.MustCompile(`^[ -]{1,3}$`)
 var adjacentCardCode = regexp.MustCompile(`^(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})`)
+var paymentCardLabels = `(?:` + strings.Join(cardpolicy.Rules.AttachedLabels, "|") + `|` + cardpolicy.Rules.PaymentLabelPattern + `)`
+var paymentCardAfter = regexp.MustCompile(`(?i)^(?:[\s/|;#=&+,:\-\x22\x27]{1,24}|-[A-Za-z]{1,16}[ \t]+)` + paymentCardLabels + cardpolicy.Rules.PaymentFieldSeparatorPattern + `[0-9]`)
+var paymentCardBefore = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_])` + paymentCardLabels + cardpolicy.Rules.PaymentFieldSeparatorPattern + `$`)
+
+func cardBrand(s string) bool {
+	for _, issuer := range cardpolicy.Rules.Issuers {
+		length := false
+		for _, n := range issuer.Lengths {
+			if n == len(s) {
+				length = true
+				break
+			}
+		}
+		if !length {
+			continue
+		}
+		for _, r := range issuer.Ranges {
+			if len(s) >= len(r[0]) && s[:len(r[0])] >= r[0] && s[:len(r[0])] <= r[1] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cardWordByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+func cardEncodedByte(c byte) bool { return cardWordByte(c) || strings.ContainsRune("+/=-", rune(c)) }
+func encodedCardToken(s string) bool {
+	letters, digits := false, false
+	for _, c := range []byte(s) {
+		letters = letters || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+		digits = digits || c >= '0' && c <= '9'
+	}
+	if !letters || !digits {
+		return false
+	}
+	codec := base64.StdEncoding.Strict()
+	if strings.ContainsAny(s, "-_") {
+		if strings.ContainsAny(s, "+/") {
+			return false
+		}
+		codec = base64.URLEncoding.Strict()
+	}
+	if !strings.Contains(s, "=") {
+		codec = codec.WithPadding(base64.NoPadding)
+	}
+	raw, err := codec.DecodeString(s)
+	return err == nil && codec.EncodeToString(raw) == s
+}
+func cardTokenBoundary(s string, start, end int) bool {
+	left, right := start, end
+	for left > 0 && cardEncodedByte(s[left-1]) {
+		left--
+	}
+	for right < len(s) && cardEncodedByte(s[right]) {
+		right++
+	}
+	after := end + 128
+	if after > len(s) {
+		after = len(s)
+	}
+	paymentAfter := paymentCardAfter.MatchString(s[end:after])
+	prefix := strings.ToLower(s[left:start])
+	if right == end || paymentAfter {
+		for _, label := range cardpolicy.Rules.LiteralAttachedLabels {
+			if strings.EqualFold(s[left:start], label) {
+				return true
+			}
+		}
+	}
+	attached := false
+	attachedSuffix := false
+	for _, label := range cardpolicy.Rules.AttachedLabels {
+		attached = attached || prefix == label
+		attachedSuffix = attachedSuffix || strings.EqualFold(s[end:right], label)
+		if paymentAfter && (prefix == label || strings.TrimRight(prefix, "/-") == label) {
+			return true
+		}
+	}
+	if paymentAfter && left == start {
+		return true
+	}
+	before := start - 128
+	if before < 0 {
+		before = 0
+	}
+	if paymentCardBefore.MatchString(s[before:start]) {
+		return true
+	}
+	if attached && right == end || attachedSuffix && left == start {
+		return !encodedCardToken(s[left:right])
+	}
+	if start > 0 && cardWordByte(s[start-1]) || end < len(s) && cardWordByte(s[end]) {
+		return false
+	}
+	return !encodedCardToken(s[left:right])
+}
 
 func standaloneCardTokenEnd(s string, end int) bool {
 	if end == len(s) {
@@ -77,7 +178,7 @@ func cardTokens(s string) [][2]int {
 			if len(digits) > 19 {
 				break
 			}
-			if cardLayout(groups) && validCard(digits) {
+			if cardLayout(groups) && validCard(digits) && cardBrand(digits) && cardTokenBoundary(s, a[0], atoms[j][1]) {
 				readings = append(readings, [2]int{a[0], atoms[j][1]})
 			}
 		}

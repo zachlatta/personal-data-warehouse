@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -62,7 +63,11 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 		return sum%10 == 0
 	}
 	number := func(n int) string {
-		prefix := "4" + digits(n-2)
+		issuer := "6"
+		if n == 13 || n == 16 || n == 19 {
+			issuer = "4"
+		}
+		prefix := issuer + digits(n-2)
 		for j := 0; j < 10; j++ {
 			s := prefix + string(rune('0'+j))
 			if valid(s) {
@@ -166,6 +171,14 @@ func TestGeneratedNumericProseAndInsertedCardProperties(t *testing.T) {
 		prefix := strings.Join(tokens[:at], joiner) + " | " + context
 		suffix := " | " + strings.Join(tokens[at:], joiner)
 		value, want := prefix+grouped+following.Input+suffix, prefix+replacement+following.Expected+suffix
+		if following.Input == "-end" {
+			// Independent codec proof, without changing the original input or
+			// consulting the production boundary detector.
+			codec := base64.RawURLEncoding.Strict()
+			if raw, err := codec.DecodeString(grouped + "-end"); err == nil && codec.EncodeToString(raw) == grouped+"-end" {
+				want = value
+			}
+		}
 		fmt.Fprintf(digest, "insert-%d\x00%s\x00%s\n", i, value, want)
 		if redactCardText(value, false) != want {
 			t.Fatalf("inserted card or surrounding prose changed at case %d, grouping %v, variant %s", i, f.groups, f.variant)

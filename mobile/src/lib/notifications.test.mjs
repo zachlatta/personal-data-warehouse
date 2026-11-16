@@ -20,6 +20,13 @@ test('a skip is named by its reason and is not a failure', () => {
   assert.deepEqual(notificationOutcome({ ...base, suppressed_notified: 1, accepted: 1 }), { label: 'delivered', tone: 'neutral' });
 });
 
+test('quiet device skips do not look like pending sends or failures', () => {
+  const event = { ...base, suppressed_device: 2 };
+  assert.deepEqual(notificationOutcome(event), { label: 'skipped: device quiet', tone: 'muted' });
+  assert.deepEqual(summarizeNotifications([event]), { total: 1, delivered: 0, opened: 0, skipped: 1, failed: 0, openRate: null });
+  assert.equal(notificationOutcome({ ...event, accepted: 1 }).label, 'delivered');
+});
+
 test('failures, no devices, cancellation and pending each read distinctly', () => {
   assert.deepEqual(notificationOutcome({ ...base, failed: 2 }), { label: 'failed', tone: 'bad' });
   assert.deepEqual(notificationOutcome({ ...base, status: 'no_devices', devices: 0 }), { label: 'no devices', tone: 'bad' });

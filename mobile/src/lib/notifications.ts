@@ -12,6 +12,7 @@ export function notificationOutcome(event: NotificationEvent): NotificationOutco
   if (event.suppressed_read > 0) return { label: 'skipped: already read', tone: 'muted' };
   // Another app on the Android phone already notified for this event.
   if (event.suppressed_notified > 0) return { label: 'skipped: already on phone', tone: 'muted' };
+  if (event.suppressed_device) return { label: 'skipped: device quiet', tone: 'muted' };
   if (event.failed > 0) return { label: 'failed', tone: 'bad' };
   if (event.status === 'no_devices') return { label: 'no devices', tone: 'bad' };
   if (event.status === 'cancelled') return { label: 'cancelled', tone: 'muted' };

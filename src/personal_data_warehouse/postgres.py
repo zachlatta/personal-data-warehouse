@@ -9927,6 +9927,7 @@ class PostgresWarehouse:
             # What the install's native code can render (comma-separated,
             # replaced on every registration); added to tables created before it.
             "ALTER TABLE @push_devices ADD COLUMN IF NOT EXISTS capabilities text NOT NULL DEFAULT ''",
+            "ALTER TABLE @push_devices ADD COLUMN IF NOT EXISTS last_active_at timestamptz NOT NULL DEFAULT 'epoch'",
             "CREATE INDEX IF NOT EXISTS push_devices_status_updated_idx ON @push_devices (status, updated_at)",
         ):
             self._command(sql)

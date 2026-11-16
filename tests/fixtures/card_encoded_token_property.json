@@ -1,0 +1,7 @@
+{
+  "seed": 24681357,
+  "iterations": 5000,
+  "alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+  "labels": ["exp", "pan", "cvv", "cc", "menu", "number", "CVC2", "CID", "expiry"],
+  "lengths": [13, 16, 18, 19]
+}

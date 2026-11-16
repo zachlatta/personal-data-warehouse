@@ -13,8 +13,9 @@ export function mount(container) {
   const toggle = node("button"); const register = node("button", "Enable this browser"); const disable = node("button", "Disable this browser");
   const feedback = node("p", "", "notification-feedback"); feedback.setAttribute("role", "status");
   const list = node("div", "", "notification-history");
+  const devices = node("section");
   const note = node("p", "Accepted means the push service accepted it, not that it appeared on screen. No observed open does not mean ignored. iOS keeps PDW’s header icon; source artwork is a thumbnail. Delivery includes the source’s sync delay.", "notification-note");
-  controls.append(toggle, register, disable); panel.append(heading, intro, health, controls, feedback, note, list);
+  controls.append(toggle, register, disable); panel.append(heading, intro, health, controls, feedback, devices, note, list);
   let state = null;
   async function load() {
     try {
@@ -24,6 +25,23 @@ export function mount(container) {
       toggle.textContent = state.enabled ? "Pause all timeline notifications" : "Start experiment";
       register.disabled = !state.web_public_key || !("serviceWorker" in navigator) || !("PushManager" in window);
       if (!state.web_public_key) register.title = "Server web push keys are not configured";
+      const registry = await request("/api/notifications/devices");
+      if (stopped) return;
+      devices.replaceChildren(node("h2", "Devices"));
+      for (const device of registry.devices) {
+        const row = node("article", "", "notification-card");
+        row.append(node("strong", `${device.device_name || "Unnamed device"} · ${device.status}`));
+        const when = value => value ? new Date(value).toLocaleString() : "not observed";
+        row.append(node("p", `${device.platform} ${device.app_version} · Registered ${when(device.registered_at)} · Last open ${when(device.last_open)} · Last sent ${when(device.last_sent)}`));
+        const button = node("button", device.status === "active" ? "Stop alerts to this device" : "Resume this device");
+        button.onclick = async () => {
+          button.disabled = true;
+          try { await request("/api/notifications/devices/status", {method: "POST", body: {id: device.id, status: device.status === "active" ? "stopped" : "active"}}); await load(); }
+          catch (e) { feedback.textContent = e.message; }
+          finally { button.disabled = false; }
+        };
+        row.append(button); devices.append(row);
+      }
       list.replaceChildren();
       if (!state.events.length) list.append(node("p", "No notifications yet. Start the experiment to capture new arrivals."));
       for (const item of state.events) {
@@ -40,7 +58,7 @@ export function mount(container) {
         if (preview.route) { const link = node("a", "View timeline item"); link.href = preview.route; words.append(link); }
         content.append(words);
         card.append(top, content);
-        card.append( node("small", `${item.status} · ${item.accepted}/${item.devices} accepted · ${item.opened} opened${item.suppressed_read ? " · " + item.suppressed_read + " skipped: already read" : ""}${item.suppressed_replied ? " · " + item.suppressed_replied + " skipped: already replied" : ""}${item.suppressed_notified ? " · " + item.suppressed_notified + " skipped: already on phone" : ""}${item.failed ? " · " + item.failed + " failed/unknown" : ""}`));
+        card.append( node("small", `${item.status} · ${item.accepted}/${item.devices} accepted · ${item.opened} opened${item.suppressed_read ? " · " + item.suppressed_read + " skipped: already read" : ""}${item.suppressed_replied ? " · " + item.suppressed_replied + " skipped: already replied" : ""}${item.suppressed_notified ? " · " + item.suppressed_notified + " skipped: already on phone" : ""}${item.suppressed_device ? " · " + item.suppressed_device + " skipped: device quiet" : ""}${item.failed ? " · " + item.failed + " failed/unknown" : ""}`));
         list.append(card);
       }
     } catch (e) { if (!stopped) feedback.textContent = e.message; }
@@ -73,7 +91,11 @@ export function mount(container) {
       feedback.textContent = "This browser is disabled. Other devices are unchanged.";
     } catch (e) { feedback.textContent = e.message; }
   };
-  const flush = () => { if ("serviceWorker" in navigator) void navigator.serviceWorker.getRegistration("/app/").then(sw => sw?.active?.postMessage("flush-opens")).catch(() => {}); };
+  const flush = () => { if ("serviceWorker" in navigator) void navigator.serviceWorker.getRegistration("/app/").then(async sw => {
+    sw?.active?.postMessage("flush-opens");
+    const sub = await sw?.pushManager.getSubscription();
+    if (sub) await request("/api/notifications/web/register", {method: "POST", body: {subscription: sub.toJSON(), device_name: navigator.platform || "Browser"}});
+  }).catch(() => {}); };
   window.addEventListener("online", flush); window.addEventListener("focus", flush); flush();
   void load(); const timer = setInterval(load, 15000);
   return { cleanup() { stopped = true; clearInterval(timer); window.removeEventListener("online", flush); window.removeEventListener("focus", flush); } };

@@ -16,21 +16,12 @@ func TestPostgresNotificationsSuppression(t *testing.T) {
 	}
 	ctx := context.Background()
 	sender := &fakeSender{result: Result{Status: "accepted", TicketID: "suppression-ticket"}}
-	s, err := New(url, []byte("test-secret"), sender, func(map[string]any) Alert { return Alert{Title: "Synthetic"} })
+	s, err := newWithExpansion(url, []byte("test-secret"), sender, func(map[string]any) Alert { return Alert{Title: "Synthetic"} }, notificationTestExpansion(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	var names map[string]string
-	if err = json.Unmarshal([]byte(os.Getenv("PDW_NOTIFICATION_TEST_RELATIONS")), &names); err != nil {
-		t.Fatal(err)
-	}
-	s.Expand = func(q string) string {
-		for k, v := range names {
-			q = strings.ReplaceAll(q, "@"+k, v)
-		}
-		return q
-	}
+
 	exec := func(q string) {
 		t.Helper()
 		if _, err := s.DB.ExecContext(ctx, s.q(q)); err != nil {

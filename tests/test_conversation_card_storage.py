@@ -199,8 +199,8 @@ def test_real_adapters_rebuild_rollups_and_truncated_copies(warehouse):
     row = event()
     row['occurred_at'] = datetime.now(UTC)
     row['cwd'] = '/workspace'
-    text = 'x' * 292 + '4111111111111111'
-    text += 'y' * (492 - len(text)) + '4111111111111111 CVV2: 987'
+    text = 'x' * 291 + ' ' + '4111111111111111' + ' '
+    text += 'y' * (491 - len(text)) + ' ' + '4111111111111111 CVV2: 987'
     row['text'] = text
     row['raw_json'] = json.dumps({'text': text})
     safe = dict(row, event_uuid='safe-event', seq=2, text='safe following turn', raw_json='{}')
