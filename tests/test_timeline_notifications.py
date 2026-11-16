@@ -100,6 +100,7 @@ def test_ensure_adds_capabilities_to_a_push_device_table_created_before_it(wareh
     wh._command("INSERT INTO @push_devices (expo_push_token, platform) VALUES ('ExponentPushToken[old]', 'android')")
     wh.ensure_upstream_mutation_tables()
     assert wh._query("SELECT capabilities FROM @push_devices") == [("",)]
+    assert wh._query("SELECT last_active_at = 'epoch'::timestamptz FROM @push_devices") == [(True,)]
 
 
 def test_go_push_registry_upgrades_and_replaces_capabilities(warehouse):
@@ -108,7 +109,7 @@ def test_go_push_registry_upgrades_and_replaces_capabilities(warehouse):
     wh._command(f"CREATE SCHEMA IF NOT EXISTS {table.rsplit('.', 1)[0]}")
     wh._command(PUSH_DEVICES_BEFORE_CAPABILITIES.format(table=table))
     env = dict(os.environ, PDW_PUSH_TEST_URL=os.environ["POSTGRES_DATABASE_URL"], PDW_PUSH_TEST_TABLE=table)
-    result = subprocess.run(["go", "test", "./internal/push", "-run", "TestPostgresStoreCapabilities", "-count=1", "-v"],
+    result = subprocess.run(["go", "test", "./internal/push", "-run", "TestPostgresStore", "-count=1", "-v"],
                             cwd=Path(__file__).resolve().parents[1] / "app", env=env, text=True, capture_output=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "--- SKIP" not in result.stdout

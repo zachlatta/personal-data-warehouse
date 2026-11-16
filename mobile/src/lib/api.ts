@@ -468,6 +468,7 @@ export type NotificationEvent = {
   accepted: number;
   opened: number;
   failed: number;
+  suppressed_device?: number;
   suppressed_read: number;
   suppressed_replied: number;
   // Android deliveries skipped because another app on the phone already
@@ -484,6 +485,17 @@ export type NotificationLedger = {
   has_more: boolean;
   next_cursor?: string;
 };
+
+export type NotificationDevice = {
+  id: string; transport: string; device_name: string; platform: string; app_version: string;
+  status: string; registered_at: string; last_open: string | null; last_sent: string | null;
+};
+export function fetchPushDevices(config: AppConfig): Promise<{devices: NotificationDevice[]}> {
+  return request(config, '/api/notifications/devices');
+}
+export function setPushDeviceStatus(config: AppConfig, id: string, status: 'active' | 'stopped'): Promise<{status: string}> {
+  return request(config, '/api/notifications/devices/status', {method: 'POST', body: JSON.stringify({id, status})});
+}
 
 export async function fetchNotificationLedger(config: AppConfig, params: { limit?: number; before?: string } = {}): Promise<NotificationLedger> {
   const query = new URLSearchParams();

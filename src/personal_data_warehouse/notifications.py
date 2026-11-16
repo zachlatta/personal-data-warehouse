@@ -155,6 +155,8 @@ STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS notification_deliveries_due_idx ON @notification_deliveries (status, next_attempt_at)",
     "CREATE INDEX IF NOT EXISTS notification_deliveries_notification_idx ON @notification_deliveries (notification_id)",
     "CREATE INDEX IF NOT EXISTS notification_deliveries_updated_idx ON @notification_deliveries (updated_at)",
+    "CREATE INDEX IF NOT EXISTS notification_deliveries_device_open_idx ON @notification_deliveries (device_id, opened_at DESC)",
+    "CREATE INDEX IF NOT EXISTS notification_deliveries_device_sent_idx ON @notification_deliveries (device_id, accepted_at DESC)",
     """CREATE TABLE IF NOT EXISTS @web_push_devices (
         id text PRIMARY KEY, subscription jsonb NOT NULL,
         device_name text NOT NULL DEFAULT '', status text NOT NULL DEFAULT 'active',

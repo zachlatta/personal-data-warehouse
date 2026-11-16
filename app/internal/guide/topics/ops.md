@@ -62,6 +62,13 @@ so a LaunchAgent that fires and fails reads `failing` rather than merely `late`;
 Join notification `id` to delivery `notification_id`. Use `/notifications` or the phone's
 Alerts tab to start/pause; read-only SQL cannot change the switch. Existing history and
 ordinary edits never replay. Device tokens and open capabilities are private.
+Both Alerts surfaces list devices and offer stop/resume. `dormant` means 14 days
+without a tap, foreground or registration refresh while another device has recent
+taps; app activity reactivates it. A manual `stopped` device needs explicit resume.
+Dormancy lifts each tick if no other active device has recent taps. If none can
+receive a captured alert, `no_devices` makes health `attention`, including all stopped.
+Delivery `suppressed` errors `device_dormant`/`device_stopped` are intentional skips,
+not health failures. No device rows are deleted. Desktop Slack overlap is separate.
 
 **Acceptance is not display, and a tap is not a read.** `accepted_at` means push-service
 acceptance; an Expo `provider_accepted` verdict means downstream handoff, not an OS

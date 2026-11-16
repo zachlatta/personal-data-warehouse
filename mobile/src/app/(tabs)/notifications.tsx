@@ -6,7 +6,7 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import { fetchNotificationLedger, setNotificationsEnabled, type NotificationEvent, type NotificationLedger } from '@/lib/api';
+import { fetchNotificationLedger, fetchPushDevices, setPushDeviceStatus, setNotificationsEnabled, type NotificationDevice, type NotificationEvent, type NotificationLedger } from '@/lib/api';
 import { formatWhen, humanSource } from '@/lib/format';
 import { notificationOutcome, summarizeNotifications, type NotificationOutcome } from '@/lib/notifications';
 import { useConfig } from '@/lib/session';
@@ -35,6 +35,7 @@ function deliveryLine(event: NotificationEvent): string {
   if (event.suppressed_read) parts.push(`${event.suppressed_read} skipped: read`);
   if (event.suppressed_replied) parts.push(`${event.suppressed_replied} skipped: replied`);
   if (event.suppressed_notified) parts.push(`${event.suppressed_notified} skipped: already on phone`);
+  if (event.suppressed_device) parts.push(`${event.suppressed_device} skipped: device quiet`);
   if (event.failed) parts.push(`${event.failed} failed`);
   return parts.join(' · ');
 }
@@ -44,6 +45,7 @@ export default function NotificationsScreen() {
   const config = useConfig();
   const theme = useTheme();
   const [ledger, setLedger] = useState<NotificationLedger | null>(null);
+  const [devices, setDevices] = useState<NotificationDevice[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -53,6 +55,7 @@ export default function NotificationsScreen() {
     setRefreshing(true);
     try {
       setLedger(await fetchNotificationLedger(config, { limit: PAGE }));
+      setDevices((await fetchPushDevices(config)).devices);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -102,6 +105,14 @@ export default function NotificationsScreen() {
   };
 
   const summary = summarizeNotifications(ledger?.events ?? []);
+  const changeDevice = async (device: NotificationDevice) => {
+    setSaving(true);
+    try {
+      await setPushDeviceStatus(config, device.id, device.status === 'active' ? 'stopped' : 'active');
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setSaving(false); }
+  };
   const card = [styles.card, { backgroundColor: theme.backgroundElement }];
 
   const header = (
@@ -140,6 +151,21 @@ export default function NotificationsScreen() {
         <ThemedText type="small" themeColor="textSecondary">
           Delivered means the push service accepted it, not that it appeared on screen. No observed open does not mean ignored.
         </ThemedText>
+      </View>
+      <View style={card}>
+        <ThemedText type="smallBold">Devices</ThemedText>
+        {devices.map(device => (
+          <View key={device.id} style={styles.switchWords}>
+            <ThemedText type="smallBold">{device.device_name || 'Unnamed device'} · {device.status}</ThemedText>
+            <ThemedText type="small" themeColor="textSecondary">
+              {device.platform} {device.app_version} · Registered {formatWhen(device.registered_at)}
+              {'\n'}Last open: {device.last_open ? formatWhen(device.last_open) : 'not observed'} · Last sent: {device.last_sent ? formatWhen(device.last_sent) : 'never'}
+            </ThemedText>
+            <Pressable accessibilityRole="button" disabled={saving} onPress={() => void changeDevice(device)}>
+              <ThemedText type="smallBold">{device.status === 'active' ? 'Stop alerts to this device' : 'Resume this device'}</ThemedText>
+            </Pressable>
+          </View>
+        ))}
       </View>
     </View>
   );

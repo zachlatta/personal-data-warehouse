@@ -342,3 +342,54 @@ func TestNestedEscapedConversationJSON(t *testing.T) {
 		t.Fatal("nested JSON not sanitized")
 	}
 }
+
+// An adjacent-code edit used to overlap the next card reading, which made
+// applyCardEdits slice behind its cursor and panic every upload that held it.
+func TestOverlappingCodeAndCardEditsMergeWithoutLeaking(t *testing.T) {
+	line := `{"text":"4111 1111 1111 1111 - 012 0000 004242 4242 4242 4242 done"}` + "\n"
+	edits := cardRedactionEdits(line, true)
+	for i := 1; i < len(edits); i++ {
+		if edits[i].start < edits[i-1].end {
+			t.Fatalf("edits overlap: %v then %v", edits[i-1], edits[i])
+		}
+	}
+	body, err := redactConversationBatch(conversationTestBatch(line), 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(r)
+	_ = r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cardCount(string(raw)) != 0 || !json.Valid(bytes.TrimSpace(raw)) {
+		t.Fatal("overlapping edits must stay redacted and valid JSON")
+	}
+}
+
+func TestAdjacentCodeChainFollowedByIssuerValidCard(t *testing.T) {
+	// Published sandbox Visa recipes, constructed at runtime.
+	first := "4" + strings.Repeat("1", 15)
+	second := strings.Repeat("42", 8)
+	groups := []string{}
+	for i := 0; i < len(second); i += 4 {
+		groups = append(groups, second[i:i+4])
+	}
+	text := first + " - 012 " + strings.Join(groups, " ") + " done"
+	for _, value := range []string{text, `{"text":"` + text + `"}`} {
+		edits := cardRedactionEdits(value, true)
+		for i := 1; i < len(edits); i++ {
+			if edits[i].start < edits[i-1].end {
+				t.Fatal("overlapping edits")
+			}
+		}
+		cleaned := applyCardEdits(value, edits)
+		if cardCount(cleaned) != 0 || !strings.Contains(cleaned, " done") {
+			t.Fatal("card edits must redact and preserve trailing text")
+		}
+	}
+}

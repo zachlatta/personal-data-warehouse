@@ -3850,6 +3850,7 @@
     },
     {
       "id": "push_devices",
+      "comment": "Private single-account push registry. last_active_at records registration/foreground, never provider acceptance. Dormant installs reactivate on activity; stopped installs require explicit resume.",
       "kind": "table",
       "layer": "private",
       "domain": "private",

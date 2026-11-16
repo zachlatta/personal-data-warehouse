@@ -174,7 +174,18 @@ def _text_edits(value):
         if not card_token_boundary(decoded,start,end):continue
         if not any(start < b and end > a for a, b, _ in edits):
             edits.append((start, end, '[redacted]'))
-    return [(bounds[a], bounds[b], replacement) for a, b, replacement in sorted(edits)]
+    # Adjacent-code chains can reach a later card reading. Merge their spans
+    # before applying edits so covered bytes cannot reappear behind the cursor.
+    merged = []
+    for start, end, replacement in sorted(edits):
+        if merged and start < merged[-1][1]:
+            previous_start, previous_end, previous_replacement = merged[-1]
+            if not previous_replacement.startswith('[card ') and replacement.startswith('[card '):
+                previous_replacement = replacement
+            merged[-1] = (previous_start, max(end, previous_end), previous_replacement)
+        else:
+            merged.append((start, end, replacement))
+    return [(bounds[a], bounds[b], replacement) for a, b, replacement in merged]
 
 
 def _json_string_bounds(token):

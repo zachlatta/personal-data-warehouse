@@ -64,7 +64,7 @@ async function ensureAndroidChannel(): Promise<void> {
 // `unsupported` there rather than failing; the rest of the app does not
 // depend on it. On Android the channel is created first: Android 13 shows the
 // permission prompt only once the app has a channel.
-export async function registerForPush(config: AppConfig): Promise<PushStatus> {
+export async function registerForPush(config: AppConfig, askPermission = true): Promise<PushStatus> {
   try {
     await ensureAndroidChannel();
   } catch (error) {
@@ -75,7 +75,7 @@ export async function registerForPush(config: AppConfig): Promise<PushStatus> {
   }
   try {
     let { status } = await Notifications.getPermissionsAsync();
-    if (status !== 'granted') {
+    if (status !== 'granted' && askPermission) {
       status = (await Notifications.requestPermissionsAsync()).status;
     }
     if (status !== 'granted') return { state: 'denied' };
