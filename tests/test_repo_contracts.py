@@ -351,6 +351,7 @@ def _fake_c11_sql(monkeypatch, pipelines: list[dict] | None, slas: list[dict] | 
             _c11_sla_row("hacker_news", exemption="every run re-lists the newest page of each list"),
         ],
         "source pipeline health": pipelines,
+        "android call recordings health": [{"device": "example-phone", "status": "ok"}],
     }
 
     def fake_pdw_sql(intent: str, sql: str, **_kwargs):

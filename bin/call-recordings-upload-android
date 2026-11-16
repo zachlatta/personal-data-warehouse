@@ -1,0 +1,87 @@
+#!/system/bin/sh
+# One run of the Pixel's Android call recordings uploader: the Android counterpart of
+# bin/voice-memos-upload-launchd.
+#
+# Run as root on the rooted Pixel by the pdw-call-recordings Magisk service
+# (ops/android/pdw-call-recordings/service.sh), seconds after BCR saves a
+# recording and every 5 minutes as the floor. The module carries this file,
+# _pdw-upload-lib.sh and the release linux/arm64 pdw binary side by side in
+# its bin/; the sysadmin repository's scripts/install-pixel-call-recordings-upload
+# assembles and deploys it. There is no checkout on the phone.
+#
+# State lives in $STATE_DIR (root 0700): pdw's own config file (URL, token,
+# client name) under config/pdw/, an optional .env (ANDROID_CALL_RECORDINGS_DEVICE,
+# ANDROID_CALL_RECORDINGS_ACCOUNT), the upload ledger, and logs/. It is in
+# credential-encrypted storage on purpose: the token is the warehouse's
+# master secret (ingest uploads are signed with it), and the bootloader is
+# unlocked, so it must not sit in /data/adb, which is readable before the PIN
+# is entered. BCR's own data is credential-encrypted too, so nothing
+# here can run before the first unlock anyway.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+STATE_DIR="${PDW_ANDROID_CALL_RECORDINGS_STATE_DIR:-/data/misc_ce/0/pdw-call-recordings}"
+# Magisk starts services with HOME=/ and no TMPDIR; pdw needs both writable.
+export HOME="$STATE_DIR/home"
+export TMPDIR="$STATE_DIR/tmp"
+export XDG_CONFIG_HOME="$STATE_DIR/config"
+export PDW_BIN="${PDW_BIN:-$SCRIPT_DIR/pdw}"
+# The uploader's own settings (device name, fallback account) come from here.
+export PDW_INGEST_PROJECT_DIR="$STATE_DIR"
+. "$SCRIPT_DIR/_pdw-upload-lib.sh"
+pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+LOG_DIR="$STATE_DIR/logs"
+LOG_FILE="$LOG_DIR/call-recordings-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/call-recordings-upload.heartbeat"
+
+mkdir -p "$LOG_DIR" "$HOME" "$TMPDIR"
+# The phone has no logrotate: keep the current log under 1 MiB and one old one.
+if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE")" -gt 1048576 ]; then
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+fi
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+
+echo "[$started_at_iso] starting call recordings upload" >> "$LOG_FILE"
+
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
+else
+  pdw_run_stoppable "$HEARTBEAT_FILE" "$LOG_FILE" "call recordings" \
+    "$PDW" ingest android-call-recordings --state-file "$STATE_DIR/call-recordings-upload-state.sqlite"
+  exit_code=$?
+fi
+
+# Save the uploader verdict before the reaper appends its own summary.
+summary="$(tail -n 1 "$LOG_FILE")"
+if [ "$exit_code" -eq 0 ] && [ -x "$SCRIPT_DIR/pixel-call-recordings-reap" ]; then
+  # Keep identifying filenames in a separate local log, out of heartbeat errors.
+  PDW="$PDW" TMPDIR="$TMPDIR" "$SCRIPT_DIR/pixel-call-recordings-reap" --apply > "$LOG_DIR/call-recordings-reap.run.log" 2>&1
+  exit_code=$?
+  [ "$exit_code" -ne 0 ] && echo "call recording reaper failed; see the phone's reaper log" >> "$LOG_FILE"
+fi
+
+# Read only this run's report; an empty folder must clear the old inventory.
+# The uploader resolves --device and its .env, so use the same name for health.
+PDW_HEARTBEAT_DEVICE="$(awk '/^\[[^]]*\] starting / { device = "" } /^heartbeat_device=/ { device = substr($0, 18) } END { print device }' "$LOG_FILE")"
+PDW_HEARTBEAT_NEWEST_FINISHED_AT="$(awk '/^\[[^]]*\] starting / { newest = "" } /^newest_finished_at=/ { newest = substr($0, 20) } END { print newest }' "$LOG_FILE")"
+export PDW_HEARTBEAT_DEVICE PDW_HEARTBEAT_NEWEST_FINISHED_AT
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+# Only a successful finished-recording summary can request a settle retry.
+# The supervisor consumed the triggering write before starting us; keep a new
+# marker so a just-finished file is checked again even without another write.
+if [ "$exit_code" -eq 0 ] && printf '%s\n' "$summary" | grep -q ' unsettled=[1-9][0-9]* '; then
+  : > "$STATE_DIR/due"
+fi
+# Exactly one current verdict per run, including runs after the reaper emptied it.
+pdw_post_heartbeat "android_call_recordings" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
+echo "[$finished_at_iso] finished call recordings upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

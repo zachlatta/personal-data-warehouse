@@ -159,8 +159,8 @@ that, not from this prose.
   names its detector (`sla_detector`, verdict in `sla_detector_status`):
   `marts_ops.source_upstream_health` compares what the provider or the device's own store
   reports as newest with `base_*`, judged on the oldest item PDW has not caught up with, for
-  every server poller and device uploader; Slack, Plaid, SimpleFIN and voice landing have
-  their own views. *Held up by* `tests/test_source_sla.py`. *Exceptions:* ten sources no
+  every server poller and device uploader; Slack, Plaid, SimpleFIN, voice landing and BCR
+  calls have their own views. *Held up by* `tests/test_source_sla.py`. *Exceptions:* ten sources no
   comparison can exist for (PDW is the source, nothing upstream keeps history, the source is
   retired, or each run is the whole comparison), each naming why in `sla_exemption`.
 - **C12 — future developers understand these contracts and honor them.** This file is

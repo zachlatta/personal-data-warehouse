@@ -235,4 +235,26 @@ func TestUploaderHeartbeatStoreStreakIntegration(t *testing.T) {
 	if reset := run("2026-09-30T17:34:00Z", 0); reset.ConsecutiveFailures != 0 || reset.FailingSince.Unix() != 0 {
 		t.Fatalf("reset = %+v", reset)
 	}
+	// Inventory describes this run's local pairs, not a lifetime watermark.
+	// A reaped folder must clear it while advancing the same device's heartbeat.
+	call := uploaderHeartbeat{Pipeline: "android_call_recordings", Device: "example-phone",
+		RanAt: "2026-11-16T12:10:00Z", NewestFinishedAt: "2026-11-16T12:00:00Z"}
+	if _, err := store.upsert(ctx, call); err != nil {
+		t.Fatal(err)
+	}
+	call.RanAt = "2026-11-16T12:15:00Z"
+	call.NewestFinishedAt = ""
+	if _, err := store.upsert(ctx, call); err != nil {
+		t.Fatal(err)
+	}
+	var newest, ran time.Time
+	var rows int
+	if err := store.db.QueryRowContext(ctx, `SELECT newest_finished_at, ran_at,
+		(SELECT count(*) FROM `+store.relation+` WHERE pipeline = 'android_call_recordings')
+		FROM `+store.relation+` WHERE pipeline = 'android_call_recordings' AND device = 'example-phone'`).Scan(&newest, &ran, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if newest.Unix() != 0 || ran.UTC().Format(time.RFC3339) != call.RanAt || rows != 1 {
+		t.Fatalf("empty call inventory = %v, ran_at = %v, device rows = %d", newest, ran, rows)
+	}
 }

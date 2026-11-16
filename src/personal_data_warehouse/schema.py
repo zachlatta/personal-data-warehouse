@@ -2995,6 +2995,7 @@ SOURCE_UPSTREAM_OBSERVATION_COLUMNS = (
 # laptop uploader has; without it a run that fires every five minutes and
 # fails every time is indistinguishable from a quiet source.
 UPLOADER_HEARTBEAT_COLUMNS = (
+    "newest_finished_at",
     "pipeline",
     "device",
     "ran_at",
@@ -4122,3 +4123,36 @@ SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS = (
 )
 
 ANDROID_LOCATION_SAMPLE_COLUMNS = ("account", "device", "sample_id", "latitude", "longitude", "accuracy_m", "provider", "measured_at", "received_at", "exported_at", "raw_json", "synced_at", "sync_version")
+
+ANDROID_CALL_RECORDINGS_RECORDING_COLUMNS = (
+    "account",
+    "recording_id",
+    "device",
+    "direction",
+    "sim_slot",
+    "phone_numbers",
+    "contact_names",
+    "caller_names",
+    "call_log_name",
+    "title",
+    "recorded_at",
+    "duration_seconds",
+    "filename",
+    "extension",
+    "content_type",
+    "size_bytes",
+    "content_sha256",
+    "file_modified_at",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "metadata_storage_key",
+    "metadata_storage_file_id",
+    "metadata_storage_url",
+    "metadata_content_sha256",
+    "is_deleted",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)

@@ -820,6 +820,26 @@ def test_c11_grades_failing_derived_or_enrichment_pipelines(monkeypatch: pytest.
     assert "pipeline:receipt_enrichment=stale" in verdict.evidence
 
 
+@pytest.mark.parametrize("status", ["ok", "attention", "failing"])
+def test_c11_grades_android_call_inventory(monkeypatch, status):
+    def fake_sql(intent, sql, **_kwargs):
+        if intent == "source slas":
+            return [{
+                "pipeline": "android_call_recordings",
+                "data_basis": "calls are recorded only when resumed",
+                "sla_detector": "marts_ops.android_call_recordings_health",
+                "sla_detector_status": status,
+                "sla_exemption": None,
+            }]
+        return []
+
+    monkeypatch.setattr(contract_audit, "pdw_sql", fake_sql)
+    verdict = contract_audit.c11_source_slas()
+    assert verdict.status == (contract_audit.GREEN if status == "ok" else contract_audit.YELLOW)
+    if status != "ok":
+        assert f"android_call_recordings:marts_ops.android_call_recordings_health={status}" in verdict.evidence
+
+
 def test_c10_is_not_green_when_the_newest_backup_copied_corrupt_pages(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         contract_audit, "pdw_sql", _integrity_sql(checksum="ok", integrity="errors_detected")

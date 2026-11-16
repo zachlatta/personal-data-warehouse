@@ -1,0 +1,8 @@
+#!/system/bin/sh
+# inotifyd handler for the pdw-call-recordings service: BCR wrote a finished
+# audio/JSON pair ($1 event, $2 directory, $3 file).
+# Marks an upload run due and keeps the phone awake for a minute so the
+# service's loop gets to it before the phone suspends (see service.sh).
+: > /data/misc_ce/0/pdw-call-recordings/due
+echo "pdw_android_call_recordings_due 60000000000" > /sys/power/wake_lock 2>/dev/null
+exit 0

@@ -8,6 +8,7 @@ import (
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/agentsessions"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidcallrecordings"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidlocation"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidmessages"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidnotifications"
@@ -45,24 +46,25 @@ type localCommand func(args []string, stdin io.Reader, stdout, stderr io.Writer,
 // (claudedesktop.go) and runIngestWithConfig dispatches it before this table.
 // (Its actual conversation polling runs serverside in Dagster.)
 var ingestSources = map[string]localCommand{
-	"agent-sessions":        agentsessions.Run,
-	"apple-contacts":        applecontacts.Run,
-	"apple-messages":        applemessages.Run,
-	"apple-notes":           applenotes.Run,
-	"apple-photos":          photos.Run,
-	"browser-history":       browserhistory.Run,
-	"android-notifications": androidnotifications.Run,
-	"android-messages":      androidmessages.Run,
-	"android-location":      androidlocation.Run,
-	"android-photos":        androidphotos.Run,
-	"android-screen-time":   androidscreentime.Run,
-	"google-recorder":       googlerecorder.Run,
-	"manual-finance":        manualfinance.Run,
-	"muse":                  muse.Run,
-	"plaid":                 plaid.Run,
-	"scanner":               scanner.Run,
-	"screen-timelapse":      screentimelapse.Run,
-	"voice-memos":           voicememos.Run,
+	"agent-sessions":          agentsessions.Run,
+	"apple-contacts":          applecontacts.Run,
+	"apple-messages":          applemessages.Run,
+	"apple-notes":             applenotes.Run,
+	"apple-photos":            photos.Run,
+	"browser-history":         browserhistory.Run,
+	"android-notifications":   androidnotifications.Run,
+	"android-messages":        androidmessages.Run,
+	"android-location":        androidlocation.Run,
+	"android-photos":          androidphotos.Run,
+	"android-screen-time":     androidscreentime.Run,
+	"google-recorder":         googlerecorder.Run,
+	"android-call-recordings": androidcallrecordings.Run,
+	"manual-finance":          manualfinance.Run,
+	"muse":                    muse.Run,
+	"plaid":                   plaid.Run,
+	"scanner":                 scanner.Run,
+	"screen-timelapse":        screentimelapse.Run,
+	"voice-memos":             voicememos.Run,
 }
 
 // resolveIngestSource returns the uploader for a source, or ok=false when the
@@ -96,6 +98,7 @@ source's own flags.
 
 SOURCES
   voice-memos      Upload local macOS Voice Memos recordings
+  android-call-recordings  Upload BCR call recordings (root on Android)
   google-recorder  Upload Google Recorder's recordings (run as root on the Pixel)
   android-notifications  Upload the notifications the Pixel receives (run as root on it)
   android-messages Upload the texts (SMS, MMS, RCS) the Pixel sends and receives (run as root on it)

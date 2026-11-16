@@ -96,6 +96,7 @@ VOICE_EVENT_SOURCE_RELATIONS: dict[str, str] = {
     "alice_voice_recordings": "alice_voice_recordings",
     # Google Recorder on the Pixel, uploaded from the phone itself.
     "google_recorder": "google_recorder_recordings",
+    "android_call_recordings": "android_call_recordings_recordings",
     # Audio saved inside Apple Notes (call recordings, voicemails, the app's
     # own recorder); the mart selects the audio rows of the attachment table.
     "apple_notes": "apple_note_attachments",

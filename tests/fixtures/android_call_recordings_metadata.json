@@ -1,0 +1,35 @@
+{
+  "account": "owner@example.com",
+  "bcr_raw_json": "{ \"timestamp_unix_ms\":1794787200000,\"direction\":\"out\",\"sim_slot\":1,\"calls\":[{\"phone_number_e164\":\"+15550100100\",\"contact_name\":\"Example Contact\"}],\"output\":{\"recording\":{\"duration_secs_total\":12.5,\"duration_secs_encoded\":4.25,\"duration_secs_wall\":12.5},\"format\":{\"mime_type_container\":\"audio/ogg\"}}}",
+  "device": "example-phone",
+  "recording": {
+    "call_log_name": null,
+    "caller_names": [],
+    "contact_names": [
+      "Example Contact"
+    ],
+    "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "content_type": "audio/ogg",
+    "direction": "out",
+    "duration_ms": 4250,
+    "duration_seconds": 4.25,
+    "ended_at": "2026-11-16T00:00:12.5Z",
+    "extension": ".oga",
+    "file_modified_at": "2026-11-16T00:00:13+00:00",
+    "filename": "example-call.oga",
+    "format": {
+      "mime_type_container": "audio/ogg"
+    },
+    "phone_numbers": [
+      "+15550100100"
+    ],
+    "recorded_at": "2026-11-16T00:00:00+00:00",
+    "recording_id": "example-call",
+    "sim_slot": 1,
+    "size_bytes": 18,
+    "title": "Call with Example Contact"
+  },
+  "schema_version": 1,
+  "source": "android_call_recordings",
+  "uploaded_at": "2026-11-16T00:01:00+00:00"
+}

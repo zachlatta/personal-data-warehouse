@@ -2600,6 +2600,7 @@ def test_voice_memo_mart_column_order_only_ever_grows_at_the_end(
         ("transcribed_at", "timestamp with time zone"),
         ("transcript_model", "text"),
         ("provider_transcript_id", "text"),
+        ("call_metadata_json", "text"),
     ]
 
 
