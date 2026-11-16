@@ -745,8 +745,7 @@ func ingestArtifacts() []ingestArtifact {
 			kind:       "android_call_recordings_metadata",
 			isJSON:     true,
 			// Deduped by the client's sha over the sidecar without its upload
-			// time: a rename in Recorder keeps the audio and changes the title,
-			// and must land, while a re-send of an unchanged sidecar must not.
+			// time: corrected metadata lands while unchanged sidecars deduplicate.
 			notifyChannel: voiceMemoLandingChannel,
 			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
 				audioSHA, err := required(q, "audio_content_sha256")

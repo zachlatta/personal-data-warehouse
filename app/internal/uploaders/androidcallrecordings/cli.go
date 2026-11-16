@@ -129,9 +129,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		BeforeUploadCheck: guard,
 	}).Sync()
 	fmt.Fprintf(stdout, "newest_finished_at=%s\n", summary.NewestFinishedAt)
-	fmt.Fprintf(stdout, "Android call recordings upload complete: seen=%d audio=%d sidecars=%d already_landed=%d in_progress=%d unsettled=%d missing_audio=%d remaining=%d deferred=%t dry_run=%t\n",
-		summary.Seen, summary.AudioUploaded, summary.MetadataUploaded, summary.Skipped, summary.InProgress,
-		summary.Unsettled, summary.Missing, summary.Remaining, summary.Deferred, *dryRun)
+	fmt.Fprintf(stdout, "Android call recordings upload complete: seen=%d audio=%d sidecars=%d already_landed=%d unsettled=%d invalid=%d remaining=%d deferred=%t dry_run=%t\n",
+		summary.Seen, summary.AudioUploaded, summary.MetadataUploaded, summary.Skipped,
+		summary.Unsettled, summary.Invalid, summary.Remaining, summary.Deferred, *dryRun)
 	if err != nil {
 		fmt.Fprintf(stderr, "pdw ingest android-call-recordings: %v\n", err)
 		return common.ExitFailure

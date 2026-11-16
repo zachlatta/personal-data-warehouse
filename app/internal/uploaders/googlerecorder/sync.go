@@ -9,6 +9,7 @@ import (
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/common"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/recordingupload"
 )
 
 // DefaultSettleAge is how long a finished recording's file must sit unchanged
@@ -33,17 +34,7 @@ type Uploader interface {
 }
 
 // Summary is one run's counts.
-type Summary struct {
-	Seen             int
-	AudioUploaded    int
-	MetadataUploaded int
-	Skipped          int // already landed, unchanged
-	InProgress       int // Recorder is still recording or saving it
-	Unsettled        int // finished, but its file changed seconds ago
-	Missing          int // finished, but no audio file on the phone
-	Remaining        int // waiting for a later run (the limit)
-	Deferred         bool
-}
+type Summary = recordingupload.Summary
 
 // Runner sends every finished recording the ledger has not seen land.
 type Runner struct {
@@ -60,18 +51,6 @@ type Runner struct {
 	BeforeUploadCheck func() string
 }
 
-type pending struct {
-	recording Recording
-	audioSHA  string
-	sendAudio bool
-	payload   map[string]any
-	dedupSHA  string
-}
-
-// Sync runs one pass. It stops at the first failed upload -- the network or
-// the app being down fails every recording alike -- and returns an error
-// naming the recording, so the run's heartbeat reads failing and the
-// recording is retried next run.
 func (r *Runner) Sync() (Summary, error) {
 	if r.Client == nil || r.State == nil {
 		return Summary{}, errors.New("client and state are required")
@@ -85,9 +64,6 @@ func (r *Runner) Sync() (Summary, error) {
 	if r.SettleAge <= 0 {
 		r.SettleAge = DefaultSettleAge
 	}
-	if r.Limit <= 0 {
-		r.Limit = DefaultLimit
-	}
 	scratch := r.ScratchDir
 	if scratch == "" {
 		dir, err := os.MkdirTemp("", "pdw-google-recorder-")
@@ -97,84 +73,38 @@ func (r *Runner) Sync() (Summary, error) {
 		defer os.RemoveAll(dir)
 		scratch = dir
 	}
-	recordings, err := ReadRecordings(r.RecorderDir, scratch)
-	if err != nil {
-		return Summary{}, err
-	}
-	summary := Summary{Seen: len(recordings)}
-	now := r.Now()
-	var queue []pending
-	for _, recording := range recordings {
-		switch {
-		case recording.State != CompletedState:
-			summary.InProgress++
-			continue
-		case !recording.FileExists || recording.SizeBytes == 0:
-			summary.Missing++
-			r.Logger.Warningf("Recorder lists %s (%q) as finished but its audio is not at %s", recording.UUID, recording.Title, recording.Path)
-			continue
-		case now.Sub(recording.ModifiedAt) < r.SettleAge:
-			summary.Unsettled++
-			continue
-		}
-		entry, known, err := r.State.entry(recording.UUID)
-		if err != nil {
-			return summary, err
-		}
-		audioSHA := entry.AudioSHA256
-		if !known || entry.SizeBytes != recording.SizeBytes || entry.ModifiedNS != recording.ModifiedAt.UnixNano() || audioSHA == "" {
-			if audioSHA, err = common.FileSHA256(recording.Path); err != nil {
-				return summary, fmt.Errorf("%s: hash audio: %w", recording.UUID, err)
+	shared := recordingupload.Runner[Recording]{State: r.State, Now: r.Now, SettleAge: r.SettleAge, Limit: r.Limit, BeforeUploadCheck: r.BeforeUploadCheck, Logger: r.Logger,
+		Read: func() ([]recordingupload.Item[Recording], int, error) {
+			records, err := ReadRecordings(r.RecorderDir, scratch)
+			items := make([]recordingupload.Item[Recording], 0, len(records))
+			for _, v := range records {
+				items = append(items, recordingupload.Item[Recording]{Key: v.UUID, Path: v.Path, SizeBytes: v.SizeBytes, ModifiedAt: v.ModifiedAt, SettleAt: v.ModifiedAt, Ready: v.State == CompletedState, Exists: v.FileExists, Value: v})
 			}
-		}
-		payload := BuildMetadata(r.accountFor(recording), r.Device, recording, audioSHA, now)
-		dedupSHA := MetadataDedupSHA256(payload)
-		if known && entry.AudioSHA256 == audioSHA && entry.MetadataSHA256 == dedupSHA {
-			summary.Skipped++
-			if entry.SizeBytes != recording.SizeBytes || entry.ModifiedNS != recording.ModifiedAt.UnixNano() {
-				// Touched but unchanged: remember the new stat so it is not re-hashed.
-				if err := r.State.record(recording, audioSHA, dedupSHA, now); err != nil {
-					return summary, err
-				}
-			}
-			continue
-		}
-		queue = append(queue, pending{
-			recording: recording, audioSHA: audioSHA, payload: payload, dedupSHA: dedupSHA,
-			sendAudio: !known || entry.AudioSHA256 != audioSHA,
-		})
+			return items, 0, err
+		},
+		BuildMetadata: func(v Recording, sha string, now time.Time) map[string]any {
+			return BuildMetadata(r.accountFor(v), r.Device, v, sha, now)
+		},
+		UploadAudio: func(v Recording, sha string) error {
+			_, err := r.Client.UploadGoogleRecorderAudio(v.Path, common.ISOFormat(v.CreatedAt), ".m4a", "audio/mp4", sha)
+			return err
+		},
+		UploadMetadata: func(v Recording, p map[string]any, sha, dedup string) error {
+			_, err := r.Client.UploadGoogleRecorderMetadata(p, common.ISOFormat(v.CreatedAt), sha, dedup)
+			return err
+		},
+		Error: func(v recordingupload.Item[Recording], stage string, err error) error {
+			return fmt.Errorf("%s: %s: %w", v.Key, stage, err)
+		},
+		LogMissing: func(v recordingupload.Item[Recording]) {
+			r.Logger.Warningf("Recorder lists %s (%q) as finished but its audio is not at %s", v.Key, v.Value.Title, v.Path)
+		},
+		LogUpload: func(i, n int, v recordingupload.Item[Recording], sha string) {
+			r.Logger.Infof("[%d/%d] upload %s %q (%s, sha256=%s) -> app", i, n, v.Key, v.Value.Title, common.FormatBytes(v.SizeBytes), common.ShortSHA256(sha))
+		},
+		LogDeferral: func(reason string) { r.Logger.Warningf("Skipping Google Recorder upload: %s", reason) },
 	}
-	if len(queue) > r.Limit {
-		summary.Remaining = len(queue) - r.Limit
-		queue = queue[:r.Limit]
-	}
-	if len(queue) > 0 && r.BeforeUploadCheck != nil {
-		if reason := r.BeforeUploadCheck(); reason != "" {
-			r.Logger.Warningf("Skipping Google Recorder upload: %s", reason)
-			summary.Deferred = true
-			summary.Remaining += len(queue)
-			return summary, nil
-		}
-	}
-	for i, p := range queue {
-		recordedAt := common.ISOFormat(p.recording.CreatedAt)
-		r.Logger.Infof("[%d/%d] upload %s %q (%s, sha256=%s) -> app", i+1, len(queue), p.recording.UUID, p.recording.Title,
-			common.FormatBytes(p.recording.SizeBytes), common.ShortSHA256(p.audioSHA))
-		if p.sendAudio {
-			if _, err := r.Client.UploadGoogleRecorderAudio(p.recording.Path, recordedAt, ".m4a", "audio/mp4", p.audioSHA); err != nil {
-				return summary, fmt.Errorf("%s: upload audio: %w", p.recording.UUID, err)
-			}
-			summary.AudioUploaded++
-		}
-		if _, err := r.Client.UploadGoogleRecorderMetadata(p.payload, recordedAt, p.audioSHA, p.dedupSHA); err != nil {
-			return summary, fmt.Errorf("%s: upload sidecar: %w", p.recording.UUID, err)
-		}
-		summary.MetadataUploaded++
-		if err := r.State.record(p.recording, p.audioSHA, p.dedupSHA, r.Now()); err != nil {
-			return summary, err
-		}
-	}
-	return summary, nil
+	return shared.Sync()
 }
 
 func (r *Runner) accountFor(recording Recording) string {
@@ -236,20 +166,4 @@ func BuildMetadata(account, device string, r Recording, audioSHA string, uploade
 	}
 }
 
-// MetadataDedupSHA256 is the sidecar's identity: its canonical JSON without
-// uploaded_at, so a re-send of an unchanged sidecar dedups at the app while a
-// renamed or edited recording lands.
-func MetadataDedupSHA256(payload map[string]any) string {
-	identity := make(map[string]any, len(payload))
-	for key, value := range payload {
-		if key != "uploaded_at" {
-			identity[key] = value
-		}
-	}
-	encoded, err := common.CanonicalJSON(identity)
-	if err != nil {
-		// Every value here is a string, number, bool or map of them.
-		panic(fmt.Sprintf("google recorder sidecar is not JSON: %v", err))
-	}
-	return common.BytesSHA256(encoded)
-}
+var MetadataDedupSHA256 = recordingupload.MetadataDedupSHA256
