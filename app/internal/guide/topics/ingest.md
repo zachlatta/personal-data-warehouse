@@ -65,3 +65,5 @@ one-shot grant), not a hung binary.
 - Uploaders write through the app, not to storage directly, so a device never holds the
   storage credential. Large files route over Tailscale directly to the app host when
   `PDW_INGEST_TAILSCALE_HOST` names it, lifting the public edge's 100 MiB body cap.
+
+`pdw ingest android-call-recordings` uploads settled BCR audio/JSON pairs on Android.

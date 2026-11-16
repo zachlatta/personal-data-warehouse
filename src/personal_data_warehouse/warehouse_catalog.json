@@ -645,6 +645,14 @@
       "discoverable": true,
       "query_access": "public",
       "comment": "Approximate Android location."
+    },
+    {
+      "name": "base_android_call_recordings",
+      "layer": "base",
+      "domain": "android_call_recordings",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "BCR phone calls."
     }
   ],
   "objects": [
@@ -4457,6 +4465,30 @@
       "query_access": "public",
       "secret": false,
       "comment": ""
+    },
+    {
+      "id": "android_call_recordings_recordings",
+      "kind": "table",
+      "layer": "base",
+      "domain": "android_call_recordings",
+      "schema": "base_android_call_recordings",
+      "name": "recordings",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "BCR calls; read marts_voice_memos.recordings."
+    },
+    {
+      "id": "marts_ops_android_call_recordings_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "android_call_recordings_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Call upload inventory compared with landed recordings."
     }
   ],
   "renamed_timeline_source_tables": {

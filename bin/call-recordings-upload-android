@@ -59,8 +59,10 @@ fi
 # Save the uploader verdict before the reaper appends its own summary.
 summary="$(tail -n 1 "$LOG_FILE")"
 if [ "$exit_code" -eq 0 ] && [ -x "$SCRIPT_DIR/pixel-call-recordings-reap" ]; then
-  PDW="$PDW" TMPDIR="$TMPDIR" "$SCRIPT_DIR/pixel-call-recordings-reap" --apply >> "$LOG_FILE" 2>&1
+  # Keep identifying filenames in a separate local log, out of heartbeat errors.
+  PDW="$PDW" TMPDIR="$TMPDIR" "$SCRIPT_DIR/pixel-call-recordings-reap" --apply > "$LOG_DIR/call-recordings-reap.run.log" 2>&1
   exit_code=$?
+  [ "$exit_code" -ne 0 ] && echo "call recording reaper failed; see the phone's reaper log" >> "$LOG_FILE"
 fi
 
 newest_finished="$(sed -n 's/^newest_finished_at=//p' "$LOG_FILE" | tail -n 1)"
@@ -85,8 +87,7 @@ fi
 last_posted="$(cat "$POSTED_FILE" 2>/dev/null || echo 0)"
 sent="$(printf '%s\n' "$summary" | grep -c ' audio=[1-9]\| sidecars=[1-9]')"
 if [ "$exit_code" -ne 0 ] || [ "$sent" -gt 0 ] || [ "$((finished_at_epoch - last_posted))" -ge 240 ]; then
-  # The reaper's local log can name contacts; send the verdict without log text.
-  pdw_post_heartbeat "android_call_recordings" "$finished_at_iso" "$exit_code" "$duration_seconds"
+  pdw_post_heartbeat "android_call_recordings" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
   echo "$finished_at_epoch" > "$POSTED_FILE"
 fi
 echo "[$finished_at_iso] finished call recordings upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"

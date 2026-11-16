@@ -34,6 +34,10 @@ from personal_data_warehouse.defs.google_recorder_drive_ingest import (
     google_recorder_inbox_has_metadata,
     ingest_google_recorder_inbox,
 )
+from personal_data_warehouse.defs.android_call_recordings_drive_ingest import (
+    android_call_recordings_inbox_has_metadata,
+    ingest_android_call_recordings_inbox,
+)
 from personal_data_warehouse.defs.apple_voice_memos_transcription import (
     transcribe_voice_recordings,
     voice_memos_transcription_batch_size,
@@ -93,6 +97,7 @@ class VoiceMemoLandingProcessor:
         for has_metadata, ingest in (
             (voice_memos_inbox_has_metadata, ingest_voice_memos_inbox),
             (google_recorder_inbox_has_metadata, ingest_google_recorder_inbox),
+            (android_call_recordings_inbox_has_metadata, ingest_android_call_recordings_inbox),
         ):
             if not has_metadata(self.settings):
                 continue

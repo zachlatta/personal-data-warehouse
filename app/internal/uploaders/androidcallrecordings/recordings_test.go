@@ -23,7 +23,7 @@ func TestPairsSettleAndDeletionIsNotATombstone(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "example.oga")
 	meta := filepath.Join(dir, "example.json")
-	raw := `{ "timestamp_unix_ms":1794787200000,"direction":"out","sim_slot":1,"calls":[{"phone_number_e164":"+15550100100","contact_name":"Example Contact"}],"output":{"recording":{"duration_secs_total":12.5},"format":{"mime_type":"audio/ogg"}}}`
+	raw := `{ "timestamp_unix_ms":1794787200000,"direction":"out","sim_slot":1,"calls":[{"phone_number_e164":"+15550100100","contact_name":"Example Contact"}],"output":{"recording":{"duration_secs_total":12.5,"duration_secs_encoded":4.25,"duration_secs_wall":12.5},"format":{"mime_type":"audio/ogg"}}}`
 	os.WriteFile(path, []byte("audio"), 0600)
 	records, err := ReadRecordings(dir, "")
 	if err != nil || len(records) != 0 {
@@ -50,8 +50,11 @@ func TestPairsSettleAndDeletionIsNotATombstone(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := BuildMetadata("owner@example.com", "example-phone", records[0], "abc", now)
-	if payload["bcr_raw_json"] != raw || records[0].DurationMS != 12500 || records[0].Title != "Call with Example Contact" {
+	if payload["bcr_raw_json"] != raw || records[0].DurationMS != 4250 || records[0].Title != "Call with Example Contact" {
 		t.Fatalf("metadata lost: %v", payload)
+	}
+	if records[0].Fields["ended_at"] != records[0].CreatedAt.Add(12500*time.Millisecond).Format(time.RFC3339Nano) {
+		t.Fatal("call end must use wall time, not saved audio length")
 	}
 	summary, err = runner.Sync()
 	if err != nil || client.audio != 1 || client.metadata != 1 {

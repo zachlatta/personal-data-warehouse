@@ -125,6 +125,7 @@ var Schemas = []CatalogSchema{
 	{Name: "marts_feed", Layer: "marts", Domain: "feed", Discoverable: true, Comment: "Feed tab engagement; start with marts_feed.item_engagement."},
 	{Name: "marts_android_screen_time", Layer: "marts", Domain: "android_screen_time", Discoverable: true, Comment: "Phone minutes; start with marts_android_screen_time.daily_usage."},
 	{Name: "base_android_location", Layer: "base", Domain: "android_location", Discoverable: true, Comment: "Approximate Android location."},
+	{Name: "base_android_call_recordings", Layer: "base", Domain: "android_call_recordings", Discoverable: true, Comment: "BCR phone calls."},
 }
 
 // Objects is every managed warehouse object keyed by its stable logical id.
@@ -422,6 +423,8 @@ var Objects = []CatalogObject{
 	{ID: "mcp_connections", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "mcp_connections", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "app_access_tokens", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "app_access_tokens", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "android_location_samples", Kind: "table", Layer: "base", Domain: "android_location", Schema: "base_android_location", Name: "samples", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
+	{ID: "android_call_recordings_recordings", Kind: "table", Layer: "base", Domain: "android_call_recordings", Schema: "base_android_call_recordings", Name: "recordings", Discoverable: true, QueryAccess: "public", Secret: false, Comment: "BCR calls; read marts_voice_memos.recordings."},
+	{ID: "marts_ops_android_call_recordings_health", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "android_call_recordings_health", Discoverable: true, QueryAccess: "public", Secret: false, Comment: "Call upload inventory compared with landed recordings."},
 }
 
 // PreviousLocations maps each object's pre-reorganization physical

@@ -196,7 +196,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # Android device's screen time.
         # +1 base: base_scans.documents, documents scanned from the scanner's panel.
         # +1 base: base_android_photos.files, the Pixel's gallery.
-        "base": 102,
+        "base": 103,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter
@@ -260,7 +260,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +1 marts: marts_ops.answer_benchmark, the C16 answer verdict.
             # +1 marts: marts_android_screen_time.daily_usage, one row per real
             # Android bucket, because the base table repeats a bucket per upload.
-            "marts": 74,
+            "marts": 75,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

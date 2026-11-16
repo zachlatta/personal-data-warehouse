@@ -399,6 +399,7 @@ def load_enrichment_candidates(
             r.content_sha256,
             COALESCE(f.recorded_at, f.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
             f.source_title,
+            f.call_metadata_json,
             r.transcript_text,
             r.provider_transcript_id
         FROM @marts_voice_memos_recordings AS f
@@ -437,6 +438,7 @@ def load_enrichment_candidates(
         "content_sha256",
         "recorded_at",
         "title",
+        "call_metadata_json",
         "transcript_text",
         "provider_transcript_id",
     )
@@ -2336,6 +2338,7 @@ def enrichment_task_input(
                 if hasattr(recording.get("recorded_at"), "isoformat")
                 else str(recording.get("recorded_at")),
                 "title": recording.get("title"),
+                "call_metadata": recording.get("call_metadata_json"),
                 "transcript_char_count": len(source_transcript),
                 "transcript_in_prompt_char_count": len(transcript),
                 "transcript_truncated": len(source_transcript) > len(transcript),
@@ -2353,6 +2356,7 @@ def enrichment_task_input(
 
 def enrichment_instructions() -> list[str]:
     return [
+        "For phone calls, use call_metadata as identity evidence: contact names are strong hints, caller names weaker, numbers alone weak. Verify speakers against the transcript; never invent a surname. Identify Zach and the other party only when supported. Title calls Call with <contact or number>, with incoming/outgoing direction when known. Keep transcript corrections evidence-based.",
         "Before final output, read input_data.path, then start with multiple focused `pdw search --priority self,direct,cc '<distinctive terms>'` calls across the timeline. Follow useful refs with timeline.context(ref, 5, 5); use `pdw schema`, `pdw columns`, and `pdw sql -q '<intent>' '<SQL>'` only for structured predicates, aggregates, or drill-down.",
         "Make separate warehouse checks for: the selected calendar event including attendee data, participant/person identity evidence, and suspicious domain terms or organizations that need spelling verification.",
         "Hard requirements: accurate date/time, accurate participant/name spellings, and accurate domain terms in transcript.",

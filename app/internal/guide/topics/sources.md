@@ -270,3 +270,9 @@ then drill into `base_android_location.samples`. `measured_at` is when the fix w
 `received_at` is server receipt, not evidence of a current fix. `accuracy_m` is the reported
 radius in metres. A roughly 15 minute cadence is a target, not a guarantee; missing samples
 and old measurements must not be treated as proof of presence or absence.
+
+Android BCR calls: `base_android_call_recordings.recordings`; read enriched calls in
+`marts_voice_memos.recordings` (`source = 'android_call_recordings'`). Search with
+`transcript`, priority `self`. Call metadata supplies identity hints; a number alone is weak
+evidence. Phone cleanup never deletes the warehouse copy. Check
+`marts_ops.android_call_recordings_health` for source inventory gaps.

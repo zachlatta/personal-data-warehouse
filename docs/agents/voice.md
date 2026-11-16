@@ -5,8 +5,9 @@ contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md
 
 ## Voice recordings (a multi-source domain, one pipeline)
 
-Voice has **four** sources — `base_apple_voice_memos.files` (the Mac uploader),
+Voice has **five** sources — `base_apple_voice_memos.files` (the Mac uploader),
 `base_google_recorder.recordings` (Google Recorder on the Pixel, from 2026-10-23),
+`base_android_call_recordings.recordings` (BCR phone calls),
 `base_alice_voice_recordings.recordings`, and the audio rows of
 `base_apple_notes.attachments` (call recordings, voicemails and the Notes app's own
 recorder; collapsed to one recording per attachment on its newest revision) — and exactly
@@ -482,3 +483,33 @@ binaries are signed with a stable identity; if it breaks anyway, `codesign -d --
 ~/.local/bin/pdw` must show `Identifier=com.zachlatta.pdw` (a local `go build` is ad-hoc signed
 and does NOT inherit the grant — install a release with `pdw update --force`). Then kickstart
 the LaunchAgent again.
+
+## Android call recordings
+
+`pdw ingest android-call-recordings` runs as root on Android and sends BCR audio/JSON
+pairs from `Recordings/Calls` after both files settle for ten seconds. OGG/Opus is sent
+unchanged; no codec switch or phone transcoding is needed. The signed resumable audio
+and metadata endpoints use `android-call-recordings/inbox/`. The inbox sensor and resident
+voice landing worker promote pairs into `base_android_call_recordings.recordings` only
+after both stored objects exist. The base row keeps the BCR JSON verbatim in
+`raw_metadata_json` under `bcr_raw_json`; parsed fields are copies.
+
+Calls enter `marts_voice_memos.recordings` as `android_call_recordings`. All shared passes
+apply: content-addressed AssemblyAI transcription, speaker segments, agent enrichment,
+calendar matching, continuity and the external voice feed. The mart exposes
+`call_metadata_json` to enrichment: direction, contacts, caller names and numbers are
+evidence, not permission to invent identities. The existing voice timeline adapter emits
+`self` events and `android_call_recordings` is a search alias for `transcript`.
+
+`marts_ops.voice_memo_landing_health` measures calls from their end against 30 s p50.
+`marts_ops.android_call_recordings_health` compares the uploader's newest finished call
+with the newest landed call per device and fails after a five-minute gap, or a stale
+uploader heartbeat. Before the first heartbeat there is no inventory verdict.
+
+`ops/android/pdw-call-recordings/service.sh` waits for first unlock, watches the directory
+with inotifyd (60 s event wakelock), and runs every five minutes as a floor. Credentials,
+ledger and logs stay in root-only `/data/misc_ce/0/pdw-call-recordings`.
+`bin/call-recordings-upload-android` invokes the sysadmin reaper after successful runs,
+when installed. Only that reaper deletes local files after querying stored hash and size.
+Neither uploader nor promotion tombstones missing files: `is_deleted` remains bigint 0
+and the stored object remains available after phone cleanup.

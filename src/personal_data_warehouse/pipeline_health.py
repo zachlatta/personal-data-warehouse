@@ -832,6 +832,24 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("google_recorder"),
     ),
     _source(
+        "android_call_recordings",
+        "Android call recordings (Pixel)",
+        cadence="uploader on every BCR directory change, every 5 min as the floor",
+        transport=(
+            "pichu Magisk service → pdw ingest android-call-recordings"
+            " → /ingest/android-call-recordings/* → Drive inbox → Dagster"
+        ),
+        data=7 * DAY,
+        basis=(
+            "calls are recorded only when resumed, so silence alone is not an outage;"
+            " the run heartbeat detects uploader failure and"
+            " marts_ops.android_call_recordings_health compares phone inventory with landed calls"
+        ),
+        note="run heartbeat posted by bin/call-recordings-upload-android on the phone",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("android_call_recordings"),
+    ),
+    _source(
         "android_photos",
         "Pixel photos",
         cadence="uploader on every camera or screenshot write, every 5 min as the floor; Wi-Fi only",
@@ -1896,6 +1914,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # Alice
     "alice_voice_recordings": _data("alice_voice_recordings", "ingested_at", "recorded_at"),
     "google_recorder_recordings": _data("google_recorder", "ingested_at", "recorded_at"),
+    "android_call_recordings_recordings": _data("android_call_recordings", "ingested_at", "recorded_at"),
     # Android notifications
     "android_notification_events": _data("android_notifications", "synced_at", "event_at"),
     # Android messages
