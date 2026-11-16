@@ -366,6 +366,85 @@ func TestPostgresNotifications(t *testing.T) {
 			t.Fatal("queued stop reason missing")
 		}
 	})
+	for _, witness := range []string{"disabled", "stopped", "expired"} {
+		t.Run("dormancy loses witness/"+witness, func(t *testing.T) {
+			exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
+			exec(`INSERT INTO @push_devices (expo_push_token,status,registered_at) VALUES
+			 ('ExponentPushToken[dormant]','dormant',now()-interval '30 days'),
+			 ('ExponentPushToken[witness]','active',now())`)
+			exec(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,opened_at,status)
+			 VALUES ('witness','fixture',$1,'expo','{}','{}',now(),'provider_accepted')`, deviceID("expo:ExponentPushToken[witness]"))
+			if witness == "expired" {
+				exec(`UPDATE @notification_deliveries SET opened_at=now()-interval '15 days'`)
+			} else {
+				exec(`UPDATE @push_devices SET status=$1 WHERE expo_push_token='ExponentPushToken[witness]'`, witness)
+			}
+			sender.result = Result{Status: "provider_accepted"}
+			exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test',$1,'test','direct')`, "witness-gone-"+witness)
+			before := len(sender.sent)
+			if err := s.Tick(ctx); err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, d := range sender.sent[before:] {
+				if d.DeviceID == deviceID("expo:ExponentPushToken[dormant]") {
+					found = true
+				}
+			}
+			if !found || count(`SELECT count(*) FROM @push_devices WHERE expo_push_token='ExponentPushToken[dormant]' AND status='active'`) != 1 {
+				t.Fatal("formerly dormant device did not receive the next alert")
+			}
+		})
+	}
+	t.Run("all stopped reports no devices", func(t *testing.T) {
+		exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
+		exec(`INSERT INTO @push_devices (expo_push_token,status) VALUES ('ExponentPushToken[stopped]','stopped')`)
+		exec(`INSERT INTO @web_push_devices (id,subscription,status) VALUES ('browser','{}','stopped')`)
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','all-stopped','test','direct')`)
+		before := len(sender.sent)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(sender.sent) != before || count(`SELECT count(*) FROM @notification_events WHERE status='no_devices'`) != 1 || count(`SELECT count(*) FROM @notification_deliveries WHERE status='suppressed' AND error='device_stopped'`) != 2 || count(`SELECT count(*) FROM @marts_notification_health WHERE status='attention'`) != 1 {
+			t.Fatal("all-stopped loss was silent or skip evidence missing")
+		}
+	})
+	t.Run("browser dormancy lifts while paused", func(t *testing.T) {
+		exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
+		exec(`INSERT INTO @web_push_devices (id,subscription,status,registered_at,updated_at)
+		 VALUES ('fallback','{"endpoint":"https://push.example/fallback"}','dormant',now()-interval '30 days',now()-interval '30 days')`)
+		exec(`UPDATE @notification_state SET enabled=0 WHERE id='timeline'`)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if count(`SELECT count(*) FROM @web_push_devices WHERE status='active' AND updated_at<now()-interval '29 days'`) != 1 {
+			t.Fatal("paused fallback did not lift dormancy or invented foreground activity")
+		}
+		exec(`UPDATE @notification_state SET enabled=1 WHERE id='timeline'`)
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','browser-fallback','test','direct')`)
+		before := len(sender.sent)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(sender.sent)-before != 1 || sender.sent[before].Transport != "web" {
+			t.Fatal("reactivated browser did not receive the next alert")
+		}
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','browser-queued-stop','test','direct')`)
+		if _, err := s.fanout(ctx); err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE @web_push_devices SET status='stopped'`)
+		before = len(sender.sent)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(sender.sent) != before || count(`SELECT count(*) FROM @notification_events WHERE event_id='browser-queued-stop' AND status='no_devices'`) != 1 || count(`SELECT count(*) FROM @marts_notification_health WHERE status='attention'`) != 1 {
+			t.Fatal("all devices stopped after fanout without reporting loss")
+		}
+	})
+	// The Go invocation also runs source-suppression tests against this schema.
+	// Keep this test's stopped fixtures out of those independent assertions.
+	exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
 }
 
 // A mutation alert (adapter mutation_policy: Undo after an automatic change,

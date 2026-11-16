@@ -65,6 +65,8 @@ ordinary edits never replay. Device tokens and open capabilities are private.
 Both Alerts surfaces list devices and offer stop/resume. `dormant` means 14 days
 without a tap, foreground or registration refresh while another device has recent
 taps; app activity reactivates it. A manual `stopped` device needs explicit resume.
+Dormancy lifts each tick if no other active device has recent taps. If none can
+receive a captured alert, `no_devices` makes health `attention`, including all stopped.
 Delivery `suppressed` errors `device_dormant`/`device_stopped` are intentional skips,
 not health failures. No device rows are deleted. Desktop Slack overlap is separate.
 

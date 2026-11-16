@@ -316,7 +316,11 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	activeTargets := 0
 	for _, d := range targets {
+		if d.status == "active" {
+			activeTargets++
+		}
 		var deliveryID string
 		if err = tx.QueryRowContext(ctx, `SELECT gen_random_uuid()::text`).Scan(&deliveryID); err != nil {
 			return false, err
@@ -352,7 +356,7 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 		}
 	}
 	status := "fanned_out"
-	if len(targets) == 0 {
+	if activeTargets == 0 {
 		status = "no_devices"
 	}
 	preview, err := json.Marshal(map[string]string{"title": alert.Title, "subtitle": alert.Subtitle, "body": alert.Body, "icon": alert.Icon, "route": alert.Route})
@@ -439,6 +443,17 @@ func (s *Service) finish(ctx context.Context, d Delivery, r Result, receipt bool
 	}
 	if n != 1 {
 		return errors.New("notification delivery lease lost")
+	}
+	if r.Status == "suppressed" && (r.Error == "device_dormant" || r.Error == "device_stopped") {
+		// A stop can land after fanout fixed its recipients. Once every delivery
+		// was skipped for device status, expose the same loss as an empty fanout.
+		_, err = tx.ExecContext(ctx, s.q(`UPDATE @notification_events n SET status='no_devices'
+ WHERE n.id=$1 AND n.status='fanned_out' AND NOT EXISTS (
+ SELECT 1 FROM @notification_deliveries d WHERE d.notification_id=n.id
+ AND (d.status<>'suppressed' OR d.error NOT IN ('device_dormant','device_stopped')))`), d.NotificationID)
+		if err != nil {
+			return err
+		}
 	}
 	if r.Disable {
 		if d.Transport == "expo" {

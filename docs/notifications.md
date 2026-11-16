@@ -53,11 +53,18 @@ are used; historical send timestamps cannot prove app use. Opening a dormant app
 (foreground re-registration), re-registering it, tapping an alert, or choosing
 resume activates it again. No history is replayed. A resume grants a fresh 14-day
 grace period. A provider-invalid `disabled` device still needs registration or resume.
+Dormancy is re-evaluated on every worker tick, including while paused. A dormant
+device returns to active when no other active device has a tap within 14 days
+(including when the witness is stopped, disabled, or its tap ages out). This
+fallback does not count as app activity and never resumes a manually stopped device.
 
 Each captured notification retains one compact `suppressed` delivery per dormant
 or stopped device, with `error = device_dormant` or `device_stopped`. These rows omit
-transport endpoints and alert payloads, do not attempt delivery, and do not fail
-notification health. This deliberately retains per-notification skip evidence at
+transport endpoints and alert payloads and do not attempt delivery. Individual
+skips do not fail notification health, but if no device is active for a captured
+notification, its event is `no_devices` and health reports `attention`, even when
+suppressed skip rows exist (for example, all devices manually stopped).
+This deliberately retains per-notification skip evidence at
 the cost of one small ledger row per quiet device; it avoids duplicating content.
 Already queued work checks device status again immediately before sending.
 An in-flight provider request cannot be retracted. Registry changes log the safe

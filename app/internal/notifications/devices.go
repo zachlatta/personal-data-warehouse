@@ -31,6 +31,35 @@ const devicesSQL = `WITH registry AS (
 ) `
 
 func (s *Service) quietDevices(ctx context.Context) error {
+	// Dormancy is conditional on another active installation's recent tap,
+	// not a permanent opt-out. Do not manufacture activity when that condition
+	// goes away, and never undo a manual stop or provider retirement.
+	for _, registry := range []struct{ table, key, transport string }{
+		{"@push_devices", "expo_push_token", "expo"},
+		{"@web_push_devices", "id", "web"},
+	} {
+		id := "encode(sha256(convert_to('" + registry.transport + ":'||p." + registry.key + ",'UTF8')),'hex')"
+		rows, err := s.DB.QueryContext(ctx, s.q(devicesSQL+`UPDATE `+registry.table+` p SET status='active'
+ WHERE p.status='dormant' AND NOT EXISTS (
+ SELECT 1 FROM devices other WHERE other.id<>`+id+` AND other.status='active'
+ AND other.last_open >= now()-make_interval(days => $1)) RETURNING `+id), DeviceDormancyDays)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var restored string
+			if err = rows.Scan(&restored); err != nil {
+				rows.Close()
+				return err
+			}
+			slog.InfoContext(ctx, "push device dormancy lifted", "device_id", restored, "reason", "no_recent_active_witness")
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+	}
 	// Only another device's recent observed tap warrants quieting an unused one.
 	// Registration/foreground grants a grace period, but is not the other-device witness.
 	rows, err := s.DB.QueryContext(ctx, s.q(devicesSQL+`SELECT id FROM devices d
