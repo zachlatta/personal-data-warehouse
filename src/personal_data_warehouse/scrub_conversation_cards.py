@@ -17,6 +17,7 @@ from pathlib import Path
 from psycopg2.extras import Json, execute_batch
 import psycopg2
 
+from personal_data_warehouse.card_scrub_selector import ScrubSelector, resolve_selector, add_selector_arguments
 from personal_data_warehouse.card_redaction import card_count, is_card, redact_row
 from personal_data_warehouse.postgres import PostgresWarehouse, POSTGRES_TABLES, _AI_CONVERSATION_EVENT_TABLES
 from personal_data_warehouse.card_prefilter import ConfirmationPool, available_cpus, count_row, sql_prefilter
@@ -107,14 +108,14 @@ def _attach_related(warehouse,candidates,connection):
     return list(indexed.values())
 
 
-def discover(warehouse, *, workers=1, page_size=500, connection=None, include_related=True):
+def discover(warehouse, *, workers=1, page_size=500, connection=None, include_related=True, selector=None):
     """One read-only discovery pass. CLI defaults to all available host CPUs.
 
     Table scans run concurrently and allow server-side parallel scans; only
     prefiltered rows cross memory-only IPC to spawned Python confirmations.
     Supplying the existing connection verifies uncommitted application changes.
     """
-    with ConfirmationPool(workers) as pool:
+    with ConfirmationPool(workers, selector) as pool:
         if connection is not None:
             watermarks=_watermarks(warehouse,connection)
             candidates = [item for table in TABLES for item in _scan_table(warehouse,table,pool,page_size,connection)]
@@ -151,7 +152,10 @@ def discover(warehouse, *, workers=1, page_size=500, connection=None, include_re
                     candidates=[item for group in groups for item in group]
                 if include_related:candidates=_attach_related(warehouse,candidates,coordinator)
             finally:coordinator.close()
-    return dict(version=2,scope=_scope(warehouse),watermarks=watermarks,candidates=candidates,counts=_details(candidates))
+    plan = dict(version=2,scope=_scope(warehouse),watermarks=watermarks,candidates=candidates,counts=_details(candidates))
+    if selector and selector.scope != "all":
+        plan.update(selector=selector.specification,left_alone=pool.left_alone)
+    return plan
 
 
 def write_plan(path, plan):
@@ -168,7 +172,11 @@ def read_plan(path):
 
 
 def _validate_plan(plan):
-    if set(plan) != {'version','scope','watermarks','candidates','counts'} or plan['version'] != 2:
+    if "selector" in plan:
+        from personal_data_warehouse.card_scrub_selector import validate_specification
+        validate_specification(plan["selector"])
+        if type(plan.get("left_alone")) is not int or plan["left_alone"] < 0: raise ValueError("invalid left-alone count")
+    if set(plan) - {"selector","left_alone"} != {'version','scope','watermarks','candidates','counts'} or plan['version'] != 2:
         raise ValueError('invalid discovery plan')
     if (set(plan['watermarks']) != set(DERIVED) or type(plan['watermarks']['timeline_events']) is not int or
             not isinstance(plan['watermarks']['search_chunks'],str)):
@@ -212,21 +220,23 @@ def _related_rows(warehouse, table, sessions, event_keys, *, connection=None,ids
         f"SELECT {columns} FROM @{table} WHERE adapter IN ('agent_session','agent_session_turn') AND (({identity}) = ANY(%s::jsonb[]) OR jsonb_build_array(adapter,event_id) = ANY(%s::jsonb[])){since}"+(' FOR UPDATE' if lock else ''),params)
 
 
-def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None):
-    plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size)
+def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, selector=None):
+    plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size,selector=selector)
     _validate_plan(plan)
+    if plan.get("selector", ScrubSelector().specification) != (selector or ScrubSelector()).specification:
+        raise ValueError("plan selector differs from current selector")
     if plan['scope'] != _scope(warehouse): raise ValueError('discovery plan belongs to another warehouse')
     if not apply: return plan['counts']
     with warehouse._connection:
-        _apply_plan(warehouse,plan,page_size,workers)
+        _apply_plan(warehouse,plan,page_size,workers,selector)
         # Fast full verification sees this transaction's sanitized rows. New
         # candidates outside the saved plan cause rollback, never a false zero.
-        if discover(warehouse,workers=workers,page_size=page_size,connection=warehouse._connection,include_related=False)['candidates']:
+        if discover(warehouse,workers=workers,page_size=page_size,connection=warehouse._connection,include_related=False,selector=selector)['candidates']:
             raise RuntimeError('new candidates require discovery; no changes committed')
     return plan['counts']
 
 
-def _apply_plan(warehouse, plan, page_size, workers):
+def _apply_plan(warehouse, plan, page_size, workers, selector=None):
     sessions = {tuple(c['session']) for c in plan['candidates'] if c['session']}
     current = {}
     for item in plan['candidates']:
@@ -251,7 +261,7 @@ def _apply_plan(warehouse, plan, page_size, workers):
             identity=session_identity(row)
             if identity in sessions:active.add(identity)
     updates={}
-    with ConfirmationPool(workers) as pool:
+    with ConfirmationPool(workers, selector) as pool:
         sources=[]
         for ((table,_),row),matches in zip(current.items(),pool.counts(list(current.values())),strict=True):
             if not matches: continue
@@ -282,7 +292,7 @@ def _apply_plan(warehouse, plan, page_size, workers):
         key = (row['adapter'],row['event_id'])
         if table == 'timeline_events': old_timeline.append((key,identity))
         else: chunks.append((row['chunk_id'],row['text_sha256'],key,identity))
-    new_keys, regenerated = rebuild_sessions(warehouse,active,page_size)
+    new_keys, regenerated = rebuild_sessions(warehouse,active,page_size,selector)
     if any((*key,identity) not in regenerated for key,identity in old_timeline) or any((*key,identity) not in regenerated for _,_,key,identity in chunks):
         raise RuntimeError('canonical event missing for derived copy; no changes committed')
     for (adapter,event_id),_ in old_timeline:
@@ -293,7 +303,7 @@ def _apply_plan(warehouse, plan, page_size, workers):
         warehouse._command('DELETE FROM @search_chunks WHERE chunk_id=%s',(chunk_id,))
 
 
-def rebuild_sessions(warehouse, sessions, page_size):
+def rebuild_sessions(warehouse, sessions, page_size, selector=None):
     from personal_data_warehouse.postgres import _AI_EVENT_TABLE_BY_SOURCE
     from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
 
@@ -333,7 +343,7 @@ def rebuild_sessions(warehouse, sessions, page_size):
                 identity = session_identity(dict(source_pk=row[9]))
                 if identity not in sessions:
                     continue
-                if any(card_count(str(row[i])) for i in (6, 7, 10, 11)):
+                if any((selector.count if selector else card_count)(str(row[i])) for i in (6, 7, 10, 11)):
                     raise RuntimeError('canonical regeneration still contains card data; no changes committed')
                 selected.append(row)
                 keys.add((name, row[0]))
@@ -421,6 +431,7 @@ def main():
     parser.add_argument('--plan', type=Path, help='private ID-only discovery plan; new file for discovery, existing file for apply')
     parser.add_argument('--workers', type=int, default=available_cpus(), help='Python confirmation processes and concurrent SQL scan budget')
     parser.add_argument('--report-html', type=Path, help='counts-only table for the private email body')
+    add_selector_arguments(parser)
     args = parser.parse_args()
     if args.workers < 1: parser.error('--workers must be positive')
     if args.apply and args.verify: parser.error('--apply and --verify are mutually exclusive')
@@ -428,21 +439,26 @@ def main():
     warehouse = PostgresWarehouse(os.environ['POSTGRES_DATABASE_URL'],initialize=False)
     warehouse._connection.set_session(readonly=not args.apply,autocommit=True)
     try:
+        selector = resolve_selector(warehouse,args.scope,args.seed_row)
         after = None
         if args.apply:
             plan = read_plan(args.plan)
             before = plan['counts']
-            scrub(warehouse,apply=True,plan=plan,workers=args.workers)
+            scrub(warehouse,apply=True,plan=plan,workers=args.workers,selector=selector)
             after = [] # Verified against this transaction before committing.
         elif args.verify:
-            after = discover(warehouse,workers=args.workers)['counts']
-            before = read_plan(args.plan)['counts'] if args.plan else after
+            if args.plan:
+                baseline = read_plan(args.plan)
+                if baseline.get('selector',ScrubSelector().specification) != selector.specification:
+                    raise ValueError('plan selector differs from current selector')
+            after = discover(warehouse,workers=args.workers,selector=selector)['counts']
+            before = baseline['counts'] if args.plan else after
         else:
-            plan = discover(warehouse,workers=args.workers)
+            plan = discover(warehouse,workers=args.workers,selector=selector)
             write_plan(args.plan,plan)
             before = plan['counts']
         table = month_source_report(before, after)
-        print(json.dumps({'counts_by_month_source': table, 'details_before': before, 'details_after': after}))
+        print(json.dumps({'counts_by_month_source': table, 'details_before': before, 'details_after': after, 'left_alone': plan.get('left_alone') if not args.verify else None}))
         if args.report_html:
             args.report_html.write_text(report_html(table))
     finally:

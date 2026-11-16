@@ -532,6 +532,25 @@ Only apply requires pausing writers, timeline sync and search workers. Archive
 discovery can be network-bound, so finish it before taking the fresh DB plan.
 After resume, use `--verify` for read-only DB/archive checks; the DB check may
 also take `--plan` to retain the baseline groups in `--report-html` output.
+Maintenance commands also accept `--scope labelled` and repeatable
+`--seed-row 'logical_table:{"source":"example","session_id":"example","event_uuid":"example"}'`.
+This scope selects only card readings with an immediate card/PAN/number field
+label or an adjacent security-code field, plus exact readings resolved from
+seed rows. Expiry alone does not select a reading. Other numbers in a selected
+row retain their original bytes. Discovery plans contain only identities,
+selector configuration and counts, including selected and left-alone readings;
+apply recomputes spans and refuses a different selector. This maintenance scope
+does not change ingest policy.
+
+Resolve seeds before sanitizing any seed row, and retain that selector object
+in memory through database, archive and JSONL apply and post-resume verification.
+Never save seed values or pass them as arguments. A fresh command refuses a
+seed with no remaining readings; that refusal is not a successful verification.
+Use the Python functions with the same resolved `selector` for coordinated
+maintenance across surfaces. Plans are not secret stores and cannot recover a
+sanitized seed. Keep discovery and full post-resume scans outside the paused
+window; record the selected baseline and the unselected count separately.
+
 The database scrub discovers
 affected sessions in sources AND derived copies by source session identity (a
 rollup's context is a directory/account, not its session id). In one transaction

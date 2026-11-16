@@ -50,16 +50,22 @@ def count_row(row):
 
 class ConfirmationPool:
     """Bounded in-memory IPC; spawned children never inherit DB connections."""
-    def __init__(self, workers):
+    def __init__(self, workers, selector=None):
         self.workers = max(1,workers)
+        self.selector = selector
+        self.left_alone = 0
         self._pool = None
         self._lock = threading.Lock()
 
     def counts(self, rows):
-        return self._map(count_row,rows)
+        counts = self._map(self.selector.count_row if self.selector else count_row,rows)
+        if self.selector and self.selector.scope != "all":
+            total = sum(self._map(count_row,rows))
+            with self._lock: self.left_alone += total - sum(counts)
+        return counts
 
     def redacted(self, rows):
-        return self._map(redact_row,rows)
+        return self._map(self.selector.redact_row if self.selector else redact_row,rows)
 
     def _map(self,function,rows):
         if self.workers == 1 or len(rows) < 64:
