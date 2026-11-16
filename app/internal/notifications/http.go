@@ -65,6 +65,8 @@ func ledgerPageParams(r *http.Request) (ledgerPage, bool) {
 }
 
 func (s *Service) Register(mux *http.ServeMux, auth func(http.Handler) http.Handler) {
+	mux.Handle("GET "+APIPath+"/devices", auth(bounded(s.listDevices)))
+	mux.Handle("POST "+APIPath+"/devices/status", auth(bounded(s.deviceStatus)))
 	mux.Handle("GET "+APIPath, auth(bounded(s.status)))
 	mux.Handle("POST "+APIPath+"/settings", auth(bounded(s.settings)))
 	mux.Handle("POST "+APIPath+"/web/register", auth(bounded(s.registerWeb)))
@@ -120,7 +122,8 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status IN ('failed','unknown')),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_read'),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_replied'),
- (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_notified')
+ (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_notified'),
+ (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error IN ('device_dormant','device_stopped'))
  FROM @notification_events n WHERE n.adapter <> '`+MutationAdapter+`' AND ($1::timestamptz IS NULL OR (n.created_at, n.id) < ($1, $2)) ORDER BY n.created_at DESC, n.id DESC LIMIT $3`), nullableTime(page.before), page.beforeID, page.limit+1)
 	if err != nil {
 		unavailable(w)
@@ -134,9 +137,9 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, source, priority, actor, title, body, state string
 		var created time.Time
-		var devices, accepted, opened, failed, suppressedRead, suppressedReplied, suppressedNotified int
+		var devices, accepted, opened, failed, suppressedRead, suppressedReplied, suppressedNotified, suppressedDevice int
 		var payload []byte
-		if rows.Scan(&id, &source, &priority, &created, &actor, &title, &body, &state, &payload, &devices, &accepted, &opened, &failed, &suppressedRead, &suppressedReplied, &suppressedNotified) != nil {
+		if rows.Scan(&id, &source, &priority, &created, &actor, &title, &body, &state, &payload, &devices, &accepted, &opened, &failed, &suppressedRead, &suppressedReplied, &suppressedNotified, &suppressedDevice) != nil {
 			unavailable(w)
 			return
 		}
@@ -150,7 +153,7 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(payload, &snapshot)
 		preview, _ := snapshot["presentation"].(map[string]any)
 
-		events = append(events, map[string]any{"preview": preview, "id": id, "source": source, "priority": priority, "created_at": created.UTC().Format(time.RFC3339Nano), "actor": actor, "title": title, "body": body, "status": state, "devices": devices, "accepted": accepted, "opened": opened, "failed": failed, "suppressed_read": suppressedRead, "suppressed_replied": suppressedReplied, "suppressed_notified": suppressedNotified})
+		events = append(events, map[string]any{"preview": preview, "id": id, "source": source, "priority": priority, "created_at": created.UTC().Format(time.RFC3339Nano), "actor": actor, "title": title, "body": body, "status": state, "devices": devices, "accepted": accepted, "opened": opened, "failed": failed, "suppressed_read": suppressedRead, "suppressed_replied": suppressedReplied, "suppressed_notified": suppressedNotified, "suppressed_device": suppressedDevice})
 	}
 	if rows.Err() != nil {
 		unavailable(w)
@@ -255,7 +258,7 @@ func (s *Service) registerWeb(w http.ResponseWriter, r *http.Request) {
 	raw, _ := json.Marshal(input.Subscription)
 	id := deviceID(input.Subscription.Endpoint)
 	_, err := s.DB.ExecContext(r.Context(), s.q(`INSERT INTO @web_push_devices (id,subscription,device_name) VALUES ($1,$2,$3)
- ON CONFLICT(id) DO UPDATE SET subscription=EXCLUDED.subscription,device_name=EXCLUDED.device_name,status='active',error='',updated_at=now()`), id, raw, string([]rune(input.DeviceName)[:min(120, len([]rune(input.DeviceName)))]))
+ ON CONFLICT(id) DO UPDATE SET subscription=EXCLUDED.subscription,device_name=EXCLUDED.device_name,status=CASE WHEN @web_push_devices.status='stopped' THEN 'stopped' ELSE 'active' END,error='',updated_at=now()`), id, raw, string([]rune(input.DeviceName)[:min(120, len([]rune(input.DeviceName)))]))
 	if err != nil {
 		unavailable(w)
 		return
@@ -296,6 +299,22 @@ func (s *Service) opened(w http.ResponseWriter, r *http.Request) {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		http.NotFound(w, r)
+		return
+	}
+	// A replay of an old open must not undo a manual stop. The open itself
+	// remains idempotent; only automatic dormancy is cleared here.
+	_, err = s.DB.ExecContext(r.Context(), s.q(`UPDATE @push_devices p SET status='active'
+ WHERE status='dormant' AND EXISTS (SELECT 1 FROM @notification_deliveries d WHERE d.id=$1
+ AND d.device_id=encode(sha256(convert_to('expo:'||p.expo_push_token,'UTF8')),'hex'))`), input.ID)
+	if err != nil {
+		unavailable(w)
+		return
+	}
+	_, err = s.DB.ExecContext(r.Context(), s.q(`UPDATE @web_push_devices p SET status='active'
+ WHERE status='dormant' AND EXISTS (SELECT 1 FROM @notification_deliveries d WHERE d.id=$1
+ AND d.device_id=encode(sha256(convert_to('web:'||p.id,'UTF8')),'hex'))`), input.ID)
+	if err != nil {
+		unavailable(w)
 		return
 	}
 	writeJSON(w, map[string]bool{"recorded": true})

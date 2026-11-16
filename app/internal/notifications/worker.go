@@ -177,7 +177,12 @@ func (s *Service) Tick(ctx context.Context) error {
 	// Mutation alerts (MutationAdapter) are not part of the timeline
 	// experiment: the fan-out and claim below gate each row on the switch
 	// (timelineGate) unless it is one, so they run whether or not it is on.
+	// Device quieting runs every tick for the same reason: a mutation alert
+	// must not reach a dormant device either.
 	{
+		if err := s.quietDevices(ctx); err != nil {
+			return err
+		}
 		// A process can die after its final send but before storing the verdict.
 		// Bound crash recovery too; do not create an infinite retrying lease.
 		_, err := s.DB.ExecContext(ctx, s.q(`UPDATE @notification_deliveries SET status='unknown',error='send attempts exhausted after interrupted worker',updated_at=now() WHERE status='sending' AND lease_until<now() AND attempt_count>=6`))
@@ -206,6 +211,16 @@ func (s *Service) Tick(ctx context.Context) error {
 				return err
 			}
 			result := Result{Status: "cancelled", Error: "device disabled or experiment paused"}
+			if !active {
+				var status string
+				err := s.DB.QueryRowContext(ctx, s.q(devicesSQL+`SELECT status FROM devices WHERE id=$1`), d.DeviceID).Scan(&status)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if status == "dormant" || status == "stopped" {
+					result = Result{Status: "suppressed", Error: "device_" + status}
+				}
+			}
 			if active {
 				reason, err := s.suppressionReason(ctx, d)
 				unchecked := errors.Is(err, errWitnessUnchecked)
@@ -278,19 +293,19 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 	// capabilities is read through to_jsonb so a fan-out that runs before
 	// either ensure path has added the column sends ordinary alerts instead
 	// of failing (the Go app deploys before the Python ensure runs).
-	rows, err := tx.QueryContext(ctx, s.q(`SELECT 'expo', expo_push_token, jsonb_build_object('token',expo_push_token,'platform',platform,'capabilities',COALESCE(to_jsonb(d)->>'capabilities','')) FROM @push_devices d WHERE status='active'
- UNION ALL SELECT 'web', id, subscription FROM @web_push_devices WHERE status='active'`))
+	rows, err := tx.QueryContext(ctx, s.q(`SELECT 'expo', expo_push_token, jsonb_build_object('token',expo_push_token,'platform',platform,'capabilities',COALESCE(to_jsonb(d)->>'capabilities','')),status FROM @push_devices d WHERE status IN ('active','dormant','stopped')
+ UNION ALL SELECT 'web', id, subscription,status FROM @web_push_devices WHERE status IN ('active','dormant','stopped')`))
 	if err != nil {
 		return false, err
 	}
 	type target struct {
-		transport, id string
-		endpoint      []byte
+		transport, id, status string
+		endpoint              []byte
 	}
 	var targets []target
 	for rows.Next() {
 		var d target
-		if err = rows.Scan(&d.transport, &d.id, &d.endpoint); err != nil {
+		if err = rows.Scan(&d.transport, &d.id, &d.endpoint, &d.status); err != nil {
 			rows.Close()
 			return false, err
 		}
@@ -312,10 +327,17 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
+		status, reason := "pending", ""
+		if d.status != "active" {
+			status, reason = "suppressed", "device_"+d.status
+			raw = []byte(`{}`)
+			d.endpoint = []byte(`{}`)
+		}
 		// An Android delivery waits for the phone's own apps to post and
 		// upload their notification for this event (see suppression.go).
+		// A quieted device's row is already settled, so it holds nothing.
 		var notBefore any
-		if isAndroid(d.endpoint) {
+		if status == "pending" && isAndroid(d.endpoint) {
 			// Hold only a device whose phone is known: with no phone there is
 			// no evidence to wait for. A failed lookup holds nothing either.
 			if _, known, err := s.phoneOf(ctx, deviceID(d.transport+":"+d.id)); err != nil {
@@ -324,7 +346,7 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 				notBefore = phoneHoldUntil
 			}
 		}
-		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,next_attempt_at) VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::timestamptz,now())) ON CONFLICT (notification_id,device_id) DO NOTHING`), deliveryID, id, deviceID(d.transport+":"+d.id), d.transport, d.endpoint, raw, notBefore)
+		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,status,error,next_attempt_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9::timestamptz,now())) ON CONFLICT (notification_id,device_id) DO NOTHING`), deliveryID, id, deviceID(d.transport+":"+d.id), d.transport, d.endpoint, raw, status, reason, notBefore)
 		if err != nil {
 			return false, err
 		}
@@ -422,9 +444,9 @@ func (s *Service) finish(ctx context.Context, d Delivery, r Result, receipt bool
 		if d.Transport == "expo" {
 			var e struct{ Token string }
 			_ = json.Unmarshal(d.Endpoint, &e)
-			_, err = tx.ExecContext(ctx, s.q(`UPDATE @push_devices SET status='disabled',error=$2,updated_at=now() WHERE expo_push_token=$1`), e.Token, r.Error)
+			_, err = tx.ExecContext(ctx, s.q(`UPDATE @push_devices SET status=CASE WHEN status='stopped' THEN status ELSE 'disabled' END,error=$2,updated_at=now() WHERE expo_push_token=$1`), e.Token, r.Error)
 		} else {
-			_, err = tx.ExecContext(ctx, s.q(`UPDATE @web_push_devices SET status='disabled',error=$2,updated_at=now() WHERE subscription->>'endpoint'=$1`), endpointURL(d.Endpoint), r.Error)
+			_, err = tx.ExecContext(ctx, s.q(`UPDATE @web_push_devices SET status=CASE WHEN status='stopped' THEN status ELSE 'disabled' END,error=$2,updated_at=now() WHERE subscription->>'endpoint'=$1`), endpointURL(d.Endpoint), r.Error)
 		}
 		if err != nil {
 			return err

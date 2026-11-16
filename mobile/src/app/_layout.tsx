@@ -8,7 +8,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { Colors } from '@/constants/theme';
 import { getMutationRequest } from '@/lib/api';
-import { handleNotificationResponse, seedFromNotification, syncNotificationCategories, flushNotificationOpens } from '@/lib/push';
+import { handleNotificationResponse, seedFromNotification, syncNotificationCategories, flushNotificationOpens, registerForPush } from '@/lib/push';
 import { markReviewOpen } from '@/lib/review-paint';
 import { prefetchMutationRequest } from '@/lib/review-prefetch';
 import { decisions } from '@/lib/undo-decision';
@@ -55,8 +55,12 @@ function Root() {
   useEffect(() => {
     if (!ready || !config) return;
     void syncNotificationCategories(config);
+    void registerForPush(config, false);
     void flushNotificationOpens().catch(error => console.warn('notification open will retry', error));
-    const sub = AppState.addEventListener('change', (state) => { if (state === 'active') void flushNotificationOpens().catch(error => console.warn('notification open will retry', error)); });
+    const sub = AppState.addEventListener('change', (state) => { if (state === 'active') {
+      void registerForPush(config, false);
+      void flushNotificationOpens().catch(error => console.warn('notification open will retry', error));
+    } });
     return () => sub.remove();
   }, [ready, config]);
 

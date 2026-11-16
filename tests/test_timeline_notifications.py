@@ -100,6 +100,7 @@ def test_ensure_adds_capabilities_to_a_push_device_table_created_before_it(wareh
     wh._command("INSERT INTO @push_devices (expo_push_token, platform) VALUES ('ExponentPushToken[old]', 'android')")
     wh.ensure_upstream_mutation_tables()
     assert wh._query("SELECT capabilities FROM @push_devices") == [("",)]
+    assert wh._query("SELECT last_active_at = 'epoch'::timestamptz FROM @push_devices") == [(True,)]
 
 
 def test_go_push_registry_upgrades_and_replaces_capabilities(warehouse):
