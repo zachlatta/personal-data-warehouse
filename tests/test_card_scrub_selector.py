@@ -12,6 +12,128 @@ SEED = synthetic_pan(15)
 GROUPED = SEED[:4]+"-"+SEED[4:10]+"-"+SEED[10:]
 
 
+@pytest.mark.parametrize('depth',range(4))
+def test_container_context_is_not_inherited(depth,tmp_path):
+    from personal_data_warehouse.card_scrub_selector import ScrubSelector
+    inner={'id':'4111111111111111','other':'4111111111111111'}
+    for _ in range(depth): inner=json.dumps(inner)
+    value=json.dumps({'card':inner})
+    selector=ScrubSelector('labelled')
+    assert selector.redact(value)==value
+    from personal_data_warehouse.scrub_conversation_jsonl import scrub_jsonl
+    from personal_data_warehouse.scrub_conversation_objects import discover_objects,scrub_objects
+    path=tmp_path/'session.jsonl';path.write_text(value+'\n')
+    assert scrub_jsonl(tmp_path,'session',apply=True,selector=selector)['matches']==0
+    assert path.read_text()==value+'\n'
+    store=MemoryArchive([value]);before=dict(store.objects)
+    plan=discover_objects(store,selector=selector)
+    scrub_objects(store,apply=True,plan=plan,selector=selector)
+    assert store.objects==before
+
+
+@pytest.mark.parametrize('before',[False,True])
+def test_code_field_context_selects_nearest_reading_after_prose(before):
+    from personal_data_warehouse.card_scrub_selector import ScrubSelector
+    text='Here is '+SEED+' and another 4111111111111111'
+    value=json.dumps({'cvv':987,'text':text} if before else {'text':text,'cvv':987})
+    selector=ScrubSelector('labelled')
+    clean=selector.redact(value)
+    assert selector.count(value)==1 and selector.count(clean)==0
+    assert (SEED in clean) == (not before)
+    assert ('4111111111111111' in clean)==before
+    assert '987' not in clean
+    wrapped=value
+    for _ in range(3):
+        wrapped=json.dumps(wrapped)
+        assert selector.count(wrapped)==1
+        cleaned=selector.redact(wrapped)
+        assert selector.count(cleaned)==0 and '987' not in cleaned
+
+
+def test_seed_revision_is_bound_to_discovery(warehouse):
+    from personal_data_warehouse.card_scrub_selector import resolve_selector
+    from personal_data_warehouse.scrub_conversation_cards import discover,scrub
+    row=dict(event(),text=SEED,raw_json='{}')
+    warehouse._insert_rows('claude_code_events',[row,dict(row,event_uuid='copy')],AGENT_SESSION_EVENT_COLUMNS)
+    identity='claude_code_events:'+json.dumps({k:row[k] for k in ('source','session_id','event_uuid')})
+    original=resolve_selector(warehouse,'labelled',[identity])
+    plan=discover(warehouse,selector=original)
+    assert resolve_selector(warehouse,'labelled',[identity],expected=plan['selector']).specification==original.specification
+    warehouse._command('UPDATE @claude_code_events SET text=%s WHERE event_uuid=%s',('4111111111111111',row['event_uuid']))
+    with pytest.raises(ValueError,match='seed revision changed'):
+        resolve_selector(warehouse,'labelled',[identity],expected=plan['selector'])
+    changed=resolve_selector(warehouse,'labelled',[identity])
+    with pytest.raises(ValueError,match='selector differs'):
+        scrub(warehouse,apply=True,plan=plan,selector=changed)
+    assert warehouse._query("SELECT text FROM @claude_code_events WHERE event_uuid='copy'")[0][0]==SEED
+
+
+def test_apply_is_bounded_and_never_runs_full_discovery(warehouse,monkeypatch):
+    import personal_data_warehouse.scrub_conversation_cards as module
+    row=event()
+    warehouse._insert_rows('claude_code_events',[row],AGENT_SESSION_EVENT_COLUMNS)
+    plan=module.discover(warehouse)
+    monkeypatch.setattr(module,'discover',lambda *a,**k:pytest.fail('full scan during apply'))
+    with pytest.raises(ValueError,match='candidate gate'):
+        module.scrub(warehouse,apply=True,plan=plan,max_source_rows=0)
+    module.scrub(warehouse,apply=True,plan=plan,max_source_rows=1)
+    assert '[card ' in warehouse._query('SELECT text FROM @claude_code_events')[0][0]
+
+
+def test_delta_limit_and_writer_lock_fail_before_mutation(warehouse):
+    import psycopg2
+    from personal_data_warehouse.scrub_conversation_cards import discover,scrub
+    row=event()
+    warehouse._insert_rows('claude_code_events',[row],AGENT_SESSION_EVENT_COLUMNS)
+    plan=discover(warehouse)
+    warehouse._insert_rows('claude_code_events',[dict(row,event_uuid='new',text='safe')],AGENT_SESSION_EVENT_COLUMNS)
+    with pytest.raises(RuntimeError,match='delta limit'):
+        scrub(warehouse,apply=True,plan=plan,max_delta_rows=0)
+    conn=psycopg2.connect(warehouse._database_url)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(warehouse._expand_relations('UPDATE @claude_code_events SET text=text WHERE event_uuid=%s'),(row['event_uuid'],))
+        with pytest.raises(psycopg2.errors.LockNotAvailable):
+            scrub(warehouse,apply=True,plan=plan)
+    finally: conn.rollback();conn.close()
+
+
+def test_worker_budget_preserves_connection_headroom():
+    from types import SimpleNamespace
+    from personal_data_warehouse.scrub_conversation_cards import connection_workers
+    w=SimpleNamespace(_query=lambda sql:[(60,5,40)])
+    assert connection_workers(w,28)==7
+    assert connection_workers(w,2)==2
+    w._query=lambda sql:[(60,5,50)]
+    with pytest.raises(RuntimeError,match='headroom'): connection_workers(w,8)
+
+
+def test_maintenance_deadline_rolls_back(warehouse,monkeypatch):
+    import time
+    import personal_data_warehouse.scrub_conversation_cards as module
+    row=event();warehouse._insert_rows('claude_code_events',[row],AGENT_SESSION_EVENT_COLUMNS)
+    plan=module.discover(warehouse)
+    actual=module._apply_plan
+    def stall(*args):
+        actual(*args)
+        time.sleep(.1)
+    monkeypatch.setattr(module,'_apply_plan',stall)
+    with pytest.raises(TimeoutError,match='budget exhausted'):
+        module.scrub(warehouse,apply=True,plan=plan,window_seconds=.05)
+    assert warehouse._query('SELECT text FROM @claude_code_events')[0][0]==row['text']
+
+
+def test_deadline_does_not_wait_for_confirmation_children():
+    import time
+    from personal_data_warehouse.card_prefilter import ConfirmationPool
+    from personal_data_warehouse.scrub_conversation_cards import maintenance_deadline
+    start=time.monotonic()
+    with pytest.raises(TimeoutError):
+        with maintenance_deadline(.1),ConfirmationPool(2) as pool:
+            pool._map(time.sleep,[.2]*64)
+    assert time.monotonic()-start<2
+
+
 def test_selector_preserves_unselected_bytes_and_json_lexemes():
     from personal_data_warehouse.card_scrub_selector import ScrubSelector
     selector = ScrubSelector('labelled', seeds=(SEED,))

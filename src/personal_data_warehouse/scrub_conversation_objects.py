@@ -109,7 +109,8 @@ def main():
     parser.add_argument('--workers',type=int,default=available_cpus())
     add_selector_arguments(parser)
     args = parser.parse_args()
-    selector = selector_from_args(args)
+    baseline=json.loads(args.plan.read_text()) if args.plan and (args.apply or args.verify) else None
+    selector = selector_from_args(args,expected=baseline.get('selector') if baseline else None)
     if args.workers<1:parser.error('--workers must be positive')
     if args.apply and args.verify:parser.error('--apply and --verify are mutually exclusive')
     if not args.verify and args.plan is None:parser.error('--plan is required')

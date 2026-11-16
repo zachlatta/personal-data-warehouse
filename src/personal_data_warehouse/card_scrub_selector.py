@@ -5,6 +5,8 @@ Resolving a scrubbed seed is an error, not evidence that its copies are gone.
 """
 import json
 import re
+import hashlib
+import secrets
 from dataclasses import dataclass, field
 
 from personal_data_warehouse import card_redaction as cr
@@ -22,6 +24,7 @@ class ScrubSelector:
     scope: str = 'all'
     seed_rows: tuple = ()
     seeds: tuple = field(default=(), repr=False)
+    seed_revision: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
         if self.scope not in ('all', 'labelled'):
@@ -29,9 +32,9 @@ class ScrubSelector:
 
     @property
     def specification(self):
-        return {'scope': self.scope, 'seed_rows': list(self.seed_rows)}
+        return {'scope': self.scope, 'seed_rows': list(self.seed_rows), 'seed_revision': self.seed_revision}
 
-    def _edits(self, value, labelled=False, collect=None):
+    def _edits(self, value, labelled=False, collect=None, code_side=None):
         tokens = cr._json_tokens(value)
         if tokens is not None:
             # Only immediate scalar fields can establish adjacency. Nested
@@ -47,9 +50,13 @@ class ScrubSelector:
                 key = fields.get(i, '')
                 neighbours = [j for j in (i-4, i+4) if j in fields and cr._CODE_KEY.fullmatch(fields[j]) and cr._code_token(tokens[j][0])
                               and tokens[min(i,j)+1][0] == ',']
-                context = labelled or bool(FIELD_KEY.fullmatch(key)) or bool(neighbours)
+                context = labelled if len(tokens)==1 else bool(FIELD_KEY.fullmatch(key))
+                side = ('both' if len(neighbours)==2 else 'first' if neighbours and neighbours[0]<i else 'last' if neighbours else None)
+                if len(tokens)==1: side=code_side
                 inner_value = json.loads(raw) if raw.startswith('"') else raw
-                inner = self._edits(inner_value, context, collect) if raw.startswith('"') else self._text(inner_value, context, collect)
+                # A decoded container consumes its wrapper's field context.
+                # String wrappers may unwrap to another scalar, never to fields.
+                inner = self._edits(inner_value, context, collect, side) if raw.startswith('"') else self._text(inner_value, context, collect, side)
                 if not inner: continue
                 selected.update(neighbours)
                 if raw.startswith('"'):
@@ -61,9 +68,9 @@ class ScrubSelector:
                 token=tokens[i]
                 edits.append((token.start(),token.end(),'"[redacted]"'))
             return sorted(edits)
-        return self._text(value, labelled, collect)
+        return self._text(value, labelled, collect, code_side)
 
-    def _text(self, value, labelled, collect):
+    def _text(self, value, labelled, collect, code_side=None):
         chars=[]; bounds=[0]; pos=0
         while pos<len(value):
             match=cr._ESCAPE.match(value,pos) if value[pos]=='\\' else None
@@ -78,7 +85,9 @@ class ScrubSelector:
             if collect is not None: collect.add(digits)
             nearby=[m for m in codes if (b<=m.start()<=b+80 and (GAP.fullmatch(decoded[b:m.start()]) or EXPIRY_GAP.fullmatch(decoded[b:m.start()]))) or
                     (m.end()<=a and GAP.fullmatch(decoded[m.end():a]))]
-            if not (labelled and not decoded[:a].strip() or digits in self.seeds or FIELD_BEFORE.search(decoded[max(0,a-128):a]) or CODE_AFTER.search(decoded[b:b+128]) or nearby): continue
+            adjacent = (code_side in ('first','both') and a==readings[0][0] or
+                        code_side in ('last','both') and b==readings[-1][1])
+            if not (adjacent or labelled and not decoded[:a].strip() or digits in self.seeds or FIELD_BEFORE.search(decoded[max(0,a-128):a]) or CODE_AFTER.search(decoded[b:b+128]) or nearby): continue
             edits.append((a,b,'[card ****'+digits[-4:]+']'))
             end=b
             while (code:=cr._ADJACENT_CODE.match(decoded,end)) and cr.standalone_end(decoded,code.end()):
@@ -111,10 +120,12 @@ class ScrubSelector:
         return {k:self.redact(v) if isinstance(v,str) else json.loads(self.redact(json.dumps(v))) if isinstance(v,(dict,list)) else v for k,v in row.items()}
 
 
-def resolve_selector(warehouse, scope='all', seed_rows=()):
+def resolve_selector(warehouse, scope='all', seed_rows=(), *, expected=None):
     from personal_data_warehouse.postgres import POSTGRES_TABLES, _AI_CONVERSATION_EVENT_TABLES
     selector=ScrubSelector(scope,tuple(seed_rows))
     seeds=set()
+    salt = expected['seed_revision']['salt'] if expected and seed_rows else secrets.token_hex(32)
+    revisions=[]
     for identity in seed_rows:
         table,sep,pk=identity.partition(':')
         if not sep or table not in _AI_CONVERSATION_EVENT_TABLES: raise ValueError('invalid seed table')
@@ -123,6 +134,7 @@ def resolve_selector(warehouse, scope='all', seed_rows=()):
         keys=POSTGRES_TABLES[table].primary_key
         if not isinstance(key,dict) or set(key)!=set(keys): raise ValueError('invalid seed primary key')
         rows=warehouse._query_dicts(f'SELECT * FROM @{table} WHERE '+' AND '.join(f'{k}=%s' for k in keys),tuple(key[k] for k in keys))
+        revisions.append(rows)
         found=set()
         for row in rows:
             for v in row.values():
@@ -130,6 +142,11 @@ def resolve_selector(warehouse, scope='all', seed_rows=()):
         if not found: raise ValueError('seed unavailable or already sanitized; retain the original selector in memory')
         seeds.update(found)
     selector.seeds=tuple(sorted(seeds))
+    if seed_rows:
+        digest=hashlib.sha256((salt+json.dumps(revisions,sort_keys=True,default=str)).encode()).hexdigest()
+        selector.seed_revision={'salt':salt,'digest':digest}
+    if expected is not None and selector.specification != expected:
+        raise ValueError('seed revision changed; rediscovery required before any mutation')
     return selector
 
 
@@ -138,21 +155,24 @@ def add_selector_arguments(parser):
     parser.add_argument('--seed-row',action='append',default=[],help='logical_table:JSON primary-key object; repeatable, IDs only')
 
 
-def selector_from_args(args):
+def selector_from_args(args, expected=None):
     if not args.seed_row: return ScrubSelector(args.scope)
     import os
     from personal_data_warehouse.postgres import PostgresWarehouse
     warehouse=PostgresWarehouse(os.environ['POSTGRES_DATABASE_URL'],initialize=False)
     try:
         warehouse._connection.set_session(readonly=True,autocommit=True)
-        return resolve_selector(warehouse,args.scope,args.seed_row)
+        return resolve_selector(warehouse,args.scope,args.seed_row,expected=expected)
     finally: warehouse.close()
 
 
 def validate_specification(spec):
     from personal_data_warehouse.postgres import POSTGRES_TABLES, _AI_CONVERSATION_EVENT_TABLES
-    if not isinstance(spec,dict) or set(spec)!={'scope','seed_rows'} or spec['scope'] not in ('all','labelled') or not isinstance(spec['seed_rows'],list):
+    if not isinstance(spec,dict) or set(spec)!={'scope','seed_rows','seed_revision'} or spec['scope'] not in ('all','labelled') or not isinstance(spec['seed_rows'],list):
         raise ValueError('invalid selector specification')
+    revision=spec['seed_revision']
+    if spec['seed_rows'] and (not isinstance(revision,dict) or set(revision)!={'salt','digest'} or any(not isinstance(v,str) or not re.fullmatch('[a-f0-9]{64}',v) for v in revision.values())):
+        raise ValueError('invalid seed revision')
     for identity in spec['seed_rows']:
         if not isinstance(identity,str): raise ValueError('invalid seed identity')
         table,_,raw=identity.partition(':')

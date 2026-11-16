@@ -81,7 +81,9 @@ def test_payment_labels_through_writer_archive_and_legacy_repair(warehouse,tmp_p
     plan=discover(warehouse,workers=2)
     assert sum(c['matches']>0 for c in plan['candidates'])==len(values)
     path=tmp_path/'labels-plan.json';write_plan(path,plan)
-    scrub(warehouse,apply=True,plan=read_plan(path),workers=2)
+    # This exhaustive synthetic cross product deliberately exceeds the
+    # operator default. Pin its known fixture size instead of lifting the gate.
+    scrub(warehouse,apply=True,plan=read_plan(path),workers=2,max_source_rows=len(values))
     assert not discover(warehouse,workers=2)['candidates']
     for table in _AI_EVENT_TABLE_BY_SOURCE.values():
         assert all(not card_count(v) for row in warehouse._query(f'SELECT text,raw_json,tool_input_json,tool_result_json FROM @{table}') for v in row)

@@ -75,10 +75,20 @@ class ConfirmationPool:
                 self._pool = ProcessPoolExecutor(max_workers=self.workers,mp_context=multiprocessing.get_context('spawn'))
         try:
             return list(self._pool.map(function,rows,chunksize=8))
+        except TimeoutError:
+            raise
         except Exception:
             raise RuntimeError('candidate confirmation worker failed') from None
 
     def __enter__(self): return self
 
-    def __exit__(self,*args):
-        if self._pool is not None: self._pool.shutdown(cancel_futures=True)
+    def __exit__(self,exc_type,*args):
+        if self._pool is None: return
+        if exc_type is not None:
+            # Python 3.12 has no public terminate_workers API. An aborted
+            # maintenance deadline must not wait for queued confirmations.
+            for process in (self._pool._processes or {}).values():
+                process.terminate()
+            self._pool.shutdown(wait=False,cancel_futures=True)
+        else:
+            self._pool.shutdown(cancel_futures=True)

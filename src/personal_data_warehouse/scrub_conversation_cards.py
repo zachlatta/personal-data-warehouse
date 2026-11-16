@@ -13,6 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import html
+import signal
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from psycopg2.extras import Json, execute_batch
 import psycopg2
@@ -26,6 +29,27 @@ from personal_data_warehouse.card_prefilter import ConfirmationPool, available_c
 TABLES = (*_AI_CONVERSATION_EVENT_TABLES, 'timeline_events', 'search_chunks')
 DERIVED = ('timeline_events', 'search_chunks')
 row_matches = count_row
+
+
+def connection_workers(warehouse,requested,headroom=6):
+    maximum,reserved,used=warehouse._query("SELECT current_setting('max_connections')::int,current_setting('superuser_reserved_connections')::int,(SELECT count(*) FROM pg_stat_activity)")[0]
+    spare=maximum-reserved-used-headroom
+    if spare<3: raise RuntimeError('insufficient connection headroom; no maintenance started')
+    return max(1,min(requested,spare-2))
+
+
+@contextmanager
+def maintenance_deadline(seconds):
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError('bounded maintenance must run on the main thread')
+    if seconds<=0: raise ValueError('maintenance budget must be positive')
+    def expired(*_): raise TimeoutError('maintenance budget exhausted; rollback required')
+    previous=signal.signal(signal.SIGALRM,expired)
+    timer=signal.setitimer(signal.ITIMER_REAL,seconds)
+    try: yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL,*timer)
+        signal.signal(signal.SIGALRM,previous)
 
 
 def _scope(warehouse):
@@ -90,7 +114,8 @@ def _read_on(warehouse,connection,sql,params=None):
 def _watermarks(warehouse,connection):
     timeline=_read_on(warehouse,connection,'SELECT COALESCE(max(seq),0) AS value FROM @timeline_events')[0]['value']
     chunks=_read_on(warehouse,connection,"SELECT COALESCE(max(built_at),'1970-01-01'::timestamptz)::text AS value FROM @search_chunks")[0]['value']
-    return {'timeline_events':timeline,'search_chunks':chunks}
+    snapshot=_read_on(warehouse,connection,'SELECT pg_current_snapshot()::text AS value')[0]['value']
+    return {'timeline_events':timeline,'search_chunks':chunks,'snapshot':snapshot}
 
 
 def _attach_related(warehouse,candidates,connection):
@@ -178,7 +203,7 @@ def _validate_plan(plan):
         if type(plan.get("left_alone")) is not int or plan["left_alone"] < 0: raise ValueError("invalid left-alone count")
     if set(plan) - {"selector","left_alone"} != {'version','scope','watermarks','candidates','counts'} or plan['version'] != 2:
         raise ValueError('invalid discovery plan')
-    if (set(plan['watermarks']) != set(DERIVED) or type(plan['watermarks']['timeline_events']) is not int or
+    if (set(plan['watermarks']) != set(DERIVED)|{'snapshot'} or type(plan['watermarks']['timeline_events']) is not int or
             not isinstance(plan['watermarks']['search_chunks'],str)):
         raise ValueError('invalid discovery cursors')
     for item in plan['candidates']:
@@ -220,20 +245,58 @@ def _related_rows(warehouse, table, sessions, event_keys, *, connection=None,ids
         f"SELECT {columns} FROM @{table} WHERE adapter IN ('agent_session','agent_session_turn') AND (({identity}) = ANY(%s::jsonb[]) OR jsonb_build_array(adapter,event_id) = ANY(%s::jsonb[])){since}"+(' FOR UPDATE' if lock else ''),params)
 
 
-def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, selector=None):
+def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, selector=None,
+          max_source_rows=500, max_delta_rows=10000, window_seconds=60, max_plan_rows=20000):
     plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size,selector=selector)
     _validate_plan(plan)
     if plan.get("selector", ScrubSelector().specification) != (selector or ScrubSelector()).specification:
         raise ValueError("plan selector differs from current selector")
     if plan['scope'] != _scope(warehouse): raise ValueError('discovery plan belongs to another warehouse')
     if not apply: return plan['counts']
-    with warehouse._connection:
+    source_rows=sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])
+    if source_rows>max_source_rows: raise ValueError('candidate gate exceeded; no changes committed')
+    if len(plan['candidates'])>max_plan_rows: raise ValueError('total candidate gate exceeded; no changes committed')
+    with maintenance_deadline(window_seconds), warehouse._connection:
+        warehouse._command('SET LOCAL statement_timeout = %s',(int(window_seconds*1000),))
+        # Fail immediately on a live writer. Hold every lock until commit so
+        # nothing can appear between delta confirmation and verification.
+        warehouse._command('LOCK TABLE '+','.join('@'+t for t in (*TABLES,'search_chunk_embeddings'))+' IN SHARE ROW EXCLUSIVE MODE NOWAIT')
+        delta=_delta_rows(warehouse,plan,max_delta_rows)
+        planned={(c['table'],tuple(c['key'])) for c in plan['candidates']}
+        with ConfirmationPool(workers,selector) as pool:
+            for (table,row),matches in zip(delta,pool.counts([r for _,r in delta]),strict=True):
+                key=tuple(row[k] for k in POSTGRES_TABLES[table].primary_key)
+                if matches and (table,key) not in planned:
+                    raise RuntimeError('new candidates require discovery; no changes committed')
         _apply_plan(warehouse,plan,page_size,workers,selector)
-        # Fast full verification sees this transaction's sanitized rows. New
-        # candidates outside the saved plan cause rollback, never a false zero.
-        if discover(warehouse,workers=workers,page_size=page_size,connection=warehouse._connection,include_related=False,selector=selector)['candidates']:
-            raise RuntimeError('new candidates require discovery; no changes committed')
+        # Canonical new keys are checked before upsert by rebuild_sessions.
+        # Recheck saved keys without running whole-corpus detection in-window.
+        rows=[]
+        for item in plan['candidates']:
+            keys=POSTGRES_TABLES[item['table']].primary_key
+            rows.extend(warehouse._query_dicts(f'SELECT * FROM @{item["table"]} WHERE '+' AND '.join(f'{k}=%s' for k in keys),item['key']))
+        with ConfirmationPool(workers,selector) as pool:
+            if any(pool.counts(rows)): raise RuntimeError('planned row verification failed; no changes committed')
     return plan['counts']
+
+
+def _delta_rows(warehouse,plan,limit):
+    result=[]
+    for table in TABLES:
+        keys=POSTGRES_TABLES[table].primary_key
+        scope="adapter IN ('agent_session','agent_session_turn') AND " if table in DERIVED else ''
+        # MVCC metadata catches changed timestamps and transactions that were
+        # in flight at discovery. The heap metadata filter does no text/JSON
+        # detection; at most limit+1 identities leave SQL.
+        ids=warehouse._query('SELECT '+','.join(keys)+f' FROM @{table} WHERE '+scope+
+            'NOT pg_visible_in_snapshot(xmin::text::xid8,%s::pg_snapshot) LIMIT %s',
+            (plan['watermarks']['snapshot'],limit-len(result)+1))
+        if len(result)+len(ids)>limit: raise RuntimeError('delta limit exceeded; rediscovery required')
+        if not ids: continue
+        slots=','.join('('+','.join('%s' for _ in keys)+')' for _ in ids)
+        rows=warehouse._query_dicts(f'SELECT * FROM @{table} WHERE ('+','.join(keys)+') IN ('+slots+')',tuple(v for key in ids for v in key))
+        result.extend((table,row) for row in rows)
+    return result
 
 
 def _apply_plan(warehouse, plan, page_size, workers, selector=None):
@@ -430,6 +493,10 @@ def main():
     parser.add_argument('--verify', action='store_true', help='read-only fast verification without writing a plan')
     parser.add_argument('--plan', type=Path, help='private ID-only discovery plan; new file for discovery, existing file for apply')
     parser.add_argument('--workers', type=int, default=available_cpus(), help='Python confirmation processes and concurrent SQL scan budget')
+    parser.add_argument('--max-source-rows',type=int,default=500)
+    parser.add_argument('--max-delta-rows',type=int,default=10000)
+    parser.add_argument('--max-plan-rows',type=int,default=20000)
+    parser.add_argument('--window-seconds',type=int,default=60)
     parser.add_argument('--report-html', type=Path, help='counts-only table for the private email body')
     add_selector_arguments(parser)
     args = parser.parse_args()
@@ -439,13 +506,17 @@ def main():
     warehouse = PostgresWarehouse(os.environ['POSTGRES_DATABASE_URL'],initialize=False)
     warehouse._connection.set_session(readonly=not args.apply,autocommit=True)
     try:
-        selector = resolve_selector(warehouse,args.scope,args.seed_row)
+        args.workers=connection_workers(warehouse,args.workers)
+        baseline = read_plan(args.plan) if args.plan and (args.apply or args.verify) else None
+        selector = resolve_selector(warehouse,args.scope,args.seed_row,expected=baseline.get('selector') if baseline else None)
         after = None
         if args.apply:
             plan = read_plan(args.plan)
             before = plan['counts']
-            scrub(warehouse,apply=True,plan=plan,workers=args.workers,selector=selector)
-            after = [] # Verified against this transaction before committing.
+            scrub(warehouse,apply=True,plan=plan,workers=args.workers,selector=selector,max_source_rows=args.max_source_rows,max_delta_rows=args.max_delta_rows,window_seconds=args.window_seconds,max_plan_rows=args.max_plan_rows)
+            # Only planned/delta rows were checked in-window. A full read-only
+            # post-resume scan must establish corpus-wide after counts.
+            after = None
         elif args.verify:
             if args.plan:
                 baseline = read_plan(args.plan)
@@ -458,7 +529,7 @@ def main():
             write_plan(args.plan,plan)
             before = plan['counts']
         table = month_source_report(before, after)
-        print(json.dumps({'counts_by_month_source': table, 'details_before': before, 'details_after': after, 'left_alone': plan.get('left_alone') if not args.verify else None}))
+        print(json.dumps({'counts_by_month_source': table, 'details_before': before, 'details_after': after, 'verification_pending':args.apply, 'left_alone': plan.get('left_alone') if not args.verify else None}))
         if args.report_html:
             args.report_html.write_text(report_html(table))
     finally:

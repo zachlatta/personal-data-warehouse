@@ -538,18 +538,36 @@ This scope selects only card readings with an immediate card/PAN/number field
 label or an adjacent security-code field, plus exact readings resolved from
 seed rows. Expiry alone does not select a reading. Other numbers in a selected
 row retain their original bytes. Discovery plans contain only identities,
-selector configuration and counts, including selected and left-alone readings;
+selector configuration, a salted seed-revision digest and counts, including selected and left-alone readings;
 apply recomputes spans and refuses a different selector. This maintenance scope
 does not change ingest policy.
+
+Field labels apply only to the immediate scalar, never to the contents of an
+encoded object or array. An adjacent JSON security-code field selects the
+nearest reading in the neighbouring scalar (first when the code precedes it,
+last when it follows it), including after prose; unrelated readings remain.
 
 Resolve seeds before sanitizing any seed row, and retain that selector object
 in memory through database, archive and JSONL apply and post-resume verification.
 Never save seed values or pass them as arguments. A fresh command refuses a
 seed with no remaining readings; that refusal is not a successful verification.
 Use the Python functions with the same resolved `selector` for coordinated
-maintenance across surfaces. Plans are not secret stores and cannot recover a
+maintenance across surfaces. Re-resolving for apply requires the plan's salted
+revision and rejects changed seed rows before mutation. All keepers use the
+same plan revision. Plans contain no seed values and cannot recover a
 sanitized seed. Keep discovery and full post-resume scans outside the paused
 window; record the selected baseline and the unselected count separately.
+
+Database apply refuses more than 500 selected source rows or 20,000 planned
+rows by default; landing pins the actual discovered count with
+`--max-source-rows`. `--workers` is capped by current connection headroom.
+Apply takes NOWAIT writer locks and confirms only planned identities plus a
+bounded MVCC revision delta; a new selected identity requires rediscovery.
+The MVCC metadata filter may read heap pages but does no corpus text/JSON
+detection. A wall-clock deadline rolls back over-budget repairs. Full scans
+run after restore. Archive replacement runs live: new ingest is already
+masked, objects have immutable IDs, and replacements are verified before
+old objects are deleted.
 
 The database scrub discovers
 affected sessions in sources AND derived copies by source session identity (a
@@ -602,9 +620,11 @@ Only prefiltered IDs are fetched and confirmed in bounded memory batches by
 spawned processes. The CLI defaults `--workers` to available CPUs. Large heaps
 use disjoint block ranges under one exported read-only snapshot so live tuple
 updates cannot escape discovery; ordinary scans allow parallel PostgreSQL plans.
-Apply rechecks saved identities, checks indexed timeline/chunk changes since the
-discovery cursors, and verifies the repaired transaction with the fast filter.
-New candidates outside its plan roll back the repair and require fresh discovery.
+Apply rechecks saved identities, checks timeline/chunk changes since the
+discovery cursors and confirms a bounded MVCC delta under writer locks.
+New selected candidates outside its plan roll back the repair and require fresh discovery.
+Planned keys and canonical regenerated rows are verified transactionally;
+whole-corpus verification follows restoration of workers.
 
 ## Claude Desktop Sessions (claude.ai)
 
