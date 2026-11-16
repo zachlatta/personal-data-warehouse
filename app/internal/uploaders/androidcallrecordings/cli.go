@@ -68,6 +68,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	dir := common.FirstNonEmpty(*recorderDir, env.Env("ANDROID_CALL_RECORDINGS_DIR"), DefaultRecorderDir)
 	deviceName := common.FirstNonEmpty(*device, env.Env("ANDROID_CALL_RECORDINGS_DEVICE"), "pichu")
 	fallbackAccount := common.FirstNonEmpty(*account, env.Env("ANDROID_CALL_RECORDINGS_ACCOUNT"), "zach@zachlatta.com")
+	fmt.Fprintf(stdout, "heartbeat_device=%s\n", deviceName)
 	logger := common.NewWriterLogger(stdout)
 
 	lockPath := *lockFile

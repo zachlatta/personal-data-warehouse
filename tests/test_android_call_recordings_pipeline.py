@@ -46,3 +46,10 @@ def test_call_reaches_mart_with_hints_and_inventory_detects_missing_call(warehou
     assert warehouse._query("SELECT status FROM @marts_ops_android_call_recordings_health") == [("failing",)]
     warehouse._command("UPDATE @uploader_heartbeats SET newest_finished_at = (SELECT max(recorded_at + make_interval(secs=>duration_seconds::float8)) FROM @android_call_recordings_recordings)")
     assert warehouse._query("SELECT status FROM @marts_ops_android_call_recordings_health") == [("ok",)]
+    # After reaping, the uploader has no finished local pairs. A current empty
+    # inventory is healthy, even when its previous inventory was ahead of PDW.
+    warehouse._command("UPDATE @uploader_heartbeats SET newest_finished_at = TIMESTAMPTZ '1970-01-01', ran_at = now()")
+    assert warehouse._query("SELECT newest_finished_at, status FROM @marts_ops_android_call_recordings_health") == [(None, "ok")]
+    # Heartbeat freshness is the pipeline detector's job when nothing is pending.
+    warehouse._command("UPDATE @uploader_heartbeats SET ran_at = now() - interval '1 hour'")
+    assert warehouse._query("SELECT status FROM @marts_ops_android_call_recordings_health") == [("ok",)]

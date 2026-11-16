@@ -344,6 +344,7 @@ def _fake_c11_sql(monkeypatch, pipelines: list[dict] | None) -> dict[str, str]:
         "plaid health": [{"institution_name": "Bank", "status": "ok"}],
         "simplefin health": [{"org_name": "Org", "name": "Checking", "status": "ok", "shared_with_plaid": 0}],
         "source pipeline health": pipelines,
+        "android call recordings health": [{"device": "example-phone", "status": "ok"}],
     }
 
     def fake_pdw_sql(intent: str, sql: str, **_kwargs):

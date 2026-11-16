@@ -151,7 +151,8 @@ that, not from this prose.
   `~/dev/zachlatta/sysadmin` (`backup-health.md`, `slowking/`).
 - **C11 — a source's own SLA is stated and detected, not inferred from the pipeline being
   green.** *Held up by* per-source detectors: `marts_ops.slack_conversation_health`,
-  `marts_ops.plaid_item_health`, `marts_ops.simplefin_account_health`, and
+  `marts_ops.plaid_item_health`, `marts_ops.simplefin_account_health`,
+  `marts_ops.android_call_recordings_health`, and
   `marts_finance.net_worth.staleness`. *Gap:* every other source rides aggregate freshness.
 - **C12 — future developers understand these contracts and honor them.** This file is
   loaded into every session in this repository, so it holds only the contracts and the

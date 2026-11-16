@@ -179,6 +179,9 @@ pdw_run_error() {
 # Runs `pdw heartbeat` (native Go; resolves the URL/token the way every other
 # pdw command does). Best effort: never changes the uploader's own exit code,
 # and a host with no pdw binary just skips.
+# PDW_HEARTBEAT_DEVICE optionally pins the uploader's resolved device name.
+# If PDW_HEARTBEAT_NEWEST_FINISHED_AT is set, send that inventory timestamp;
+# an explicitly empty value means no finished local recordings remain.
 pdw_post_heartbeat() {
   _pipelines="$1"
   _iso="$2"
@@ -194,16 +197,18 @@ pdw_post_heartbeat() {
   if [ "$_code" != "0" ] && [ -n "$_run_log" ]; then
     _error="$(pdw_run_error "$_run_log")"
   fi
-  if [ -n "$_error" ]; then
-    "$_pdw" heartbeat \
-      --pipeline "$_pipelines" --ran-at "$_iso" --exit-code "$_code" --duration-seconds "$_duration" \
-      --error "$_error" \
-      >/dev/null 2>&1 || echo "[$_iso] heartbeat post failed for $_pipelines (ignored)" >&2
-  else
-    "$_pdw" heartbeat \
-      --pipeline "$_pipelines" --ran-at "$_iso" --exit-code "$_code" --duration-seconds "$_duration" \
-      >/dev/null 2>&1 || echo "[$_iso] heartbeat post failed for $_pipelines (ignored)" >&2
+  set -- --pipeline "$_pipelines" --ran-at "$_iso" --exit-code "$_code" --duration-seconds "$_duration"
+  if [ -n "${PDW_HEARTBEAT_DEVICE:-}" ]; then
+    set -- "$@" --device "$PDW_HEARTBEAT_DEVICE"
   fi
+  if [ "${PDW_HEARTBEAT_NEWEST_FINISHED_AT+x}" = x ]; then
+    set -- "$@" --newest-finished-at "$PDW_HEARTBEAT_NEWEST_FINISHED_AT"
+  fi
+  if [ -n "$_error" ]; then
+    set -- "$@" --error "$_error"
+  fi
+  "$_pdw" heartbeat "$@" \
+    >/dev/null 2>&1 || echo "[$_iso] heartbeat post failed for $_pipelines (ignored)" >&2
   return 0
 }
 

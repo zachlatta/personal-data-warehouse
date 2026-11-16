@@ -34,7 +34,6 @@ PDW="$(pdw_resolve_bin)"
 LOG_DIR="$STATE_DIR/logs"
 LOG_FILE="$LOG_DIR/call-recordings-upload.run.log"
 HEARTBEAT_FILE="$LOG_DIR/call-recordings-upload.heartbeat"
-POSTED_FILE="$LOG_DIR/call-recordings-upload.heartbeat-posted"
 
 mkdir -p "$LOG_DIR" "$HOME" "$TMPDIR"
 # The phone has no logrotate: keep the current log under 1 MiB and one old one.
@@ -65,31 +64,24 @@ if [ "$exit_code" -eq 0 ] && [ -x "$SCRIPT_DIR/pixel-call-recordings-reap" ]; th
   [ "$exit_code" -ne 0 ] && echo "call recording reaper failed; see the phone's reaper log" >> "$LOG_FILE"
 fi
 
-newest_finished="$(sed -n 's/^newest_finished_at=//p' "$LOG_FILE" | tail -n 1)"
-if [ -n "$newest_finished" ]; then
-  "$PDW" heartbeat --pipeline android_call_recordings --device pichu --exit-code "$exit_code" --newest-finished-at "$newest_finished" >/dev/null 2>&1 || true
-fi
+# Read only this run's report; an empty folder must clear the old inventory.
+# The uploader resolves --device and its .env, so use the same name for health.
+PDW_HEARTBEAT_DEVICE="$(awk '/^\[[^]]*\] starting / { device = "" } /^heartbeat_device=/ { device = substr($0, 18) } END { print device }' "$LOG_FILE")"
+PDW_HEARTBEAT_NEWEST_FINISHED_AT="$(awk '/^\[[^]]*\] starting / { newest = "" } /^newest_finished_at=/ { newest = substr($0, 20) } END { print newest }' "$LOG_FILE")"
+export PDW_HEARTBEAT_DEVICE PDW_HEARTBEAT_NEWEST_FINISHED_AT
 finished_at_epoch="$(date +%s)"
 finished_at_iso="$(date -Iseconds)"
 duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
-# The service runs this on every write BCR makes, so a long recording can
-# mean a run every two seconds. Post the verdict when it matters -- a failure,
-# a run that sent something -- and otherwise at most every four minutes, which
-# is still well inside the pipeline's 30-minute run interval.
 # Only a successful finished-recording summary can request a settle retry.
 # The supervisor consumed the triggering write before starting us; keep a new
 # marker so a just-finished file is checked again even without another write.
 if [ "$exit_code" -eq 0 ] && printf '%s\n' "$summary" | grep -q ' unsettled=[1-9][0-9]* '; then
   : > "$STATE_DIR/due"
 fi
-last_posted="$(cat "$POSTED_FILE" 2>/dev/null || echo 0)"
-sent="$(printf '%s\n' "$summary" | grep -c ' audio=[1-9]\| sidecars=[1-9]')"
-if [ "$exit_code" -ne 0 ] || [ "$sent" -gt 0 ] || [ "$((finished_at_epoch - last_posted))" -ge 240 ]; then
-  pdw_post_heartbeat "android_call_recordings" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
-  echo "$finished_at_epoch" > "$POSTED_FILE"
-fi
+# Exactly one current verdict per run, including runs after the reaper emptied it.
+pdw_post_heartbeat "android_call_recordings" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
 echo "[$finished_at_iso] finished call recordings upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
 
 exit "$exit_code"

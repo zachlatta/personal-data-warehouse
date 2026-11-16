@@ -6586,7 +6586,8 @@ class PostgresWarehouse:
             CREATE OR REPLACE VIEW @marts_ops_android_call_recordings_health AS
             SELECT h.device, NULLIF(h.newest_finished_at, TIMESTAMPTZ '1970-01-01') AS newest_finished_at,
                    b.newest_landed_at,
-                   CASE WHEN h.ran_at < now() - interval '30 minutes' THEN 'failing'
+                   CASE WHEN h.newest_finished_at = TIMESTAMPTZ '1970-01-01 00:00:00+00' THEN 'ok'
+                        WHEN h.ran_at < now() - interval '30 minutes' THEN 'failing'
                         WHEN h.newest_finished_at > COALESCE(b.newest_landed_at, TIMESTAMPTZ '1970-01-01')
                          AND h.newest_finished_at < now() - interval '5 minutes' THEN 'failing'
                         ELSE 'ok' END AS status

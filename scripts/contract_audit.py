@@ -719,6 +719,7 @@ def c11_source_slas() -> Verdict:
     title = "a source's own SLA is stated and detected"
     slack = pdw_sql("slack health", "SELECT conversation_type, status FROM marts_ops.slack_conversation_health")
     plaid = pdw_sql("plaid health", "SELECT institution_name, status FROM marts_ops.plaid_item_health")
+    calls = pdw_sql("android call recordings health", "SELECT device, status FROM marts_ops.android_call_recordings_health")
     # Every other source, derived or enrichment pipeline has no dedicated
     # detector of its own yet, so its pipeline status is its SLA:
     # browser_history failed for nine days in October 2026 with C7 (which defers
@@ -729,13 +730,14 @@ def c11_source_slas() -> Verdict:
         SELECT pipeline, status FROM marts_ops.pipeline_health
         WHERE kind IN ('source', 'derived', 'enrichment') AND status NOT IN ('ok', 'manual', 'unknown')
         ORDER BY pipeline""")
-    if slack is None or plaid is None or pipelines is None:
-        return _unavailable("C11", title, "slack_conversation_health / plaid_item_health / pipeline_health")
+    if slack is None or plaid is None or pipelines is None or calls is None:
+        return _unavailable("C11", title, "slack_conversation_health / plaid_item_health / android_call_recordings_health / pipeline_health")
     simplefin = pdw_sql("simplefin health", "SELECT org_name, name, status, shared_with_plaid FROM marts_ops.simplefin_account_health") or []
     bad_simplefin = [f"simplefin:{r['org_name']}/{r['name']}={r['status']}" for r in simplefin if r["status"] != "ok"]
     bad = [f"slack:{r['conversation_type']}={r['status']}" for r in slack if r["status"] != "ok"]
     bad += [f"plaid:{r['institution_name']}={r['status']}" for r in plaid if r["status"] not in ("ok",)]
     bad += bad_simplefin
+    bad += [f"android_call_recordings:{r['device']}={r['status']}" for r in calls if r["status"] != "ok"]
     bad += [f"pipeline:{r['pipeline']}={r['status']}" for r in pipelines]
     return Verdict("C11", title, YELLOW if bad else GREEN, f"slack types {len(slack)}, plaid items {len(plaid)}, simplefin accounts {len(simplefin)} ({sum(int(r['shared_with_plaid'] or 0) for r in simplefin)} shared with plaid), pipelines down {len(pipelines)}; not ok: {bad or 'none'}")
 

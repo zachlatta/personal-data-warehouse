@@ -751,6 +751,7 @@ def test_c11_grades_failing_derived_or_enrichment_pipelines(monkeypatch: pytest.
     rows = {
         "slack health": [{"conversation_type": "im", "status": "ok"}],
         "plaid health": [{"institution_name": "Bank", "status": "ok"}],
+        "android call recordings health": [{"device": "example-phone", "status": "ok"}],
         "simplefin health": [{"org_name": "Org", "name": "Checking", "status": "ok", "shared_with_plaid": 0}],
         "source pipeline health": [
             {"pipeline": "finance_ledger", "status": "failing"},
@@ -769,6 +770,21 @@ def test_c11_grades_failing_derived_or_enrichment_pipelines(monkeypatch: pytest.
     assert "pipelines down 2" in verdict.evidence
     assert "pipeline:finance_ledger=failing" in verdict.evidence
     assert "pipeline:receipt_enrichment=stale" in verdict.evidence
+
+
+@pytest.mark.parametrize("status", ["ok", "attention", "failing"])
+def test_c11_grades_android_call_inventory(monkeypatch, status):
+    def fake_sql(intent, sql, **_kwargs):
+        if intent == "android call recordings health":
+            assert "marts_ops.android_call_recordings_health" in sql
+            return [{"device": "example-phone", "status": status}]
+        return []
+
+    monkeypatch.setattr(contract_audit, "pdw_sql", fake_sql)
+    verdict = contract_audit.c11_source_slas()
+    assert verdict.status == (contract_audit.GREEN if status == "ok" else contract_audit.YELLOW)
+    if status != "ok":
+        assert f"android_call_recordings:example-phone={status}" in verdict.evidence
 
 
 def test_c10_is_not_green_when_the_newest_backup_copied_corrupt_pages(monkeypatch: pytest.MonkeyPatch) -> None:

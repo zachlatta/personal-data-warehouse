@@ -504,7 +504,10 @@ evidence, not permission to invent identities. The existing voice timeline adapt
 `marts_ops.voice_memo_landing_health` measures calls from their end against 30 s p50.
 `marts_ops.android_call_recordings_health` compares the uploader's newest finished call
 with the newest landed call per device and fails after a five-minute gap, or a stale
-uploader heartbeat. Before the first heartbeat there is no inventory verdict.
+uploader heartbeat while calls are pending. An empty local inventory means nothing is
+pending; pipeline health still detects a stale or failed uploader. Each run posts one
+heartbeat with the uploader's resolved device and current inventory, including an empty
+inventory after reaping. Before the first heartbeat there is no inventory verdict.
 
 `ops/android/pdw-call-recordings/service.sh` waits for first unlock, watches the directory
 with inotifyd (60 s event wakelock), and runs every five minutes as a floor. Credentials,

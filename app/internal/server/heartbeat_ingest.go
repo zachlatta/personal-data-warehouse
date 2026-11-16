@@ -171,7 +171,7 @@ func (s *uploaderHeartbeatStore) upsert(ctx context.Context, hb uploaderHeartbea
 		INSERT INTO `+s.relation+` AS hb
 			(pipeline, device, ran_at, status, error, exit_code, duration_seconds, newest_finished_at,
 			 consecutive_failures, failing_since, updated_at, sync_version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE(NULLIF($9, '')::timestamptz, '1970-01-01'::timestamptz),
+		VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE(NULLIF($9, '')::timestamptz, '1970-01-01 00:00:00+00'::timestamptz),
 			CASE WHEN $6::bigint <> 0 THEN 1 ELSE 0 END,
 			CASE WHEN $6::bigint <> 0 THEN $3::timestamptz ELSE '1970-01-01 00:00:00+00'::timestamptz END,
 			now(), $8)
@@ -181,7 +181,7 @@ func (s *uploaderHeartbeatStore) upsert(ctx context.Context, hb uploaderHeartbea
 			error = EXCLUDED.error,
 			exit_code = EXCLUDED.exit_code,
 			duration_seconds = EXCLUDED.duration_seconds,
-	newest_finished_at = GREATEST(hb.newest_finished_at, EXCLUDED.newest_finished_at),
+	newest_finished_at = EXCLUDED.newest_finished_at,
 			consecutive_failures = CASE WHEN EXCLUDED.exit_code <> 0 THEN hb.consecutive_failures + 1 ELSE 0 END,
 			failing_since = CASE
 				WHEN EXCLUDED.exit_code = 0 THEN '1970-01-01 00:00:00+00'::timestamptz
