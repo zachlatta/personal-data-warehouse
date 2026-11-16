@@ -353,7 +353,7 @@ func TestOverlappingCodeAndCardEditsMergeWithoutLeaking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "4111 1111") || strings.Contains(string(raw), "004242 4242") || !json.Valid(bytes.TrimSpace(raw)) {
-		t.Fatalf("overlapping edits must stay redacted and valid JSON: %q", raw)
+	if cardCount(string(raw)) != 0 || !json.Valid(bytes.TrimSpace(raw)) {
+		t.Fatal("overlapping edits must stay redacted and valid JSON")
 	}
 }
