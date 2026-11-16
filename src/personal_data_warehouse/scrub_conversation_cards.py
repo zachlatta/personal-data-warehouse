@@ -281,16 +281,25 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
 
 
 def _delta_rows(warehouse,plan,limit):
+    snapshot=plan['watermarks']['snapshot']
+    # Full xid8 distance rejects plans too old for unambiguous modular xid
+    # comparison. Never truncate the epoch before this check.
+    horizon=warehouse._query("SELECT pg_current_xact_id()::text::numeric - pg_snapshot_xmin(%s::pg_snapshot)::text::numeric",(snapshot,))[0][0]
+    if not 0<=horizon<2**31:
+        raise RuntimeError('discovery transaction horizon expired; rediscovery required')
     result=[]
     for table in TABLES:
         keys=POSTGRES_TABLES[table].primary_key
         scope="adapter IN ('agent_session','agent_session_turn') AND " if table in DERIVED else ''
-        # MVCC metadata catches changed timestamps and transactions that were
-        # in flight at discovery. The heap metadata filter does no text/JSON
-        # detection; at most limit+1 identities leave SQL.
+        # A snapshot lists top-level xids, not every subtransaction xmin.
+        # Include ALL tuple revisions at/after its oldest active transaction,
+        # even revisions committed and already scanned before discovery.
+        # age() compares modular 32-bit xid distances across wraparound; the
+        # full-epoch check above bounds the comparison to its valid half-range.
+        # Only metadata is scanned; at most limit+1 identities leave SQL.
         ids=warehouse._query('SELECT '+','.join(keys)+f' FROM @{table} WHERE '+scope+
-            'NOT pg_visible_in_snapshot(xmin::text::xid8,%s::pg_snapshot) LIMIT %s',
-            (plan['watermarks']['snapshot'],limit-len(result)+1))
+            'age(xmin) <= age(pg_snapshot_xmin(%s::pg_snapshot)::xid) LIMIT %s',
+            (snapshot,limit-len(result)+1))
         if len(result)+len(ids)>limit: raise RuntimeError('delta limit exceeded; rediscovery required')
         if not ids: continue
         slots=','.join('('+','.join('%s' for _ in keys)+')' for _ in ids)

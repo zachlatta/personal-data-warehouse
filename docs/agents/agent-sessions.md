@@ -562,7 +562,12 @@ Database apply refuses more than 500 selected source rows or 20,000 planned
 rows by default; landing pins the actual discovered count with
 `--max-source-rows`. `--workers` is capped by current connection headroom.
 Apply takes NOWAIT writer locks and confirms only planned identities plus a
-bounded MVCC revision delta; a new selected identity requires rediscovery.
+bounded conservative transaction-age delta; a new selected identity requires rediscovery.
+The delta includes every tuple revision at or after the discovery snapshot's
+oldest active transaction, including child transactions created under savepoints.
+Direct snapshot-visibility tests on tuple transaction IDs are not safe for
+subtransactions. Comparisons retain modular xid ordering across wraparound;
+plans outside the unambiguous half-range of transaction IDs fail closed.
 The MVCC metadata filter may read heap pages but does no corpus text/JSON
 detection. A wall-clock deadline rolls back over-budget repairs. Full scans
 run after restore. Archive replacement runs live: new ingest is already

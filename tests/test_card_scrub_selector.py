@@ -98,6 +98,50 @@ def test_delta_limit_and_writer_lock_fail_before_mutation(warehouse):
     finally: conn.rollback();conn.close()
 
 
+@pytest.mark.parametrize('savepoints',[1,3])
+def test_inflight_subtransaction_delta_rolls_back_planned_changes(warehouse,savepoints):
+    import psycopg2
+    from personal_data_warehouse.card_scrub_selector import ScrubSelector
+    from personal_data_warehouse.scrub_conversation_cards import discover,scrub
+    row=event()
+    warehouse._insert_rows('claude_code_events',[row],AGENT_SESSION_EVENT_COLUMNS)
+    writer=psycopg2.connect(warehouse._database_url)
+    try:
+        with writer.cursor() as cursor:
+            for i in range(savepoints): cursor.execute(f'SAVEPOINT child_{i}')
+            cursor.execute(warehouse._expand_relations("INSERT INTO @claude_code_events (source,session_id,event_uuid,text) VALUES ('claude_code','unseen-session','unseen-event',%s)"),('card: 4111111111111111 CVV: 987',))
+            for i in reversed(range(savepoints)): cursor.execute(f'RELEASE SAVEPOINT child_{i}')
+        warehouse._command('UPDATE @claude_code_events SET text=text')
+        selector=ScrubSelector('labelled')
+        plan=discover(warehouse,selector=selector)
+        assert all(c['key'][-1]!='unseen-event' for c in plan['candidates'])
+        writer.commit()
+        with pytest.raises(RuntimeError,match='new candidates'):
+            scrub(warehouse,apply=True,plan=plan,selector=selector)
+        assert warehouse._query('SELECT text FROM @claude_code_events WHERE event_uuid=%s',(row['event_uuid'],))[0][0]==row['text']
+        assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0]==0
+    finally: writer.close()
+
+
+def test_delta_horizon_refuses_expired_epoch_before_confirmation(warehouse):
+    from personal_data_warehouse.scrub_conversation_cards import discover,scrub
+    plan=discover(warehouse)
+    current=int(warehouse._query('SELECT pg_current_xact_id()::text')[0][0])
+    # An otherwise well-shaped private plan with a future epoch cannot be
+    # interpreted safely by truncating to a 32-bit xid.
+    future=current+2**32
+    plan['watermarks']['snapshot']=f'{future}:{future}:'
+    with pytest.raises(RuntimeError,match='horizon expired'):
+        scrub(warehouse,apply=True,plan=plan)
+
+
+def test_modular_xid_comparison_retains_wraparound_order(warehouse):
+    # xid8->xid conversion keeps low bits; age uses the same modular origin
+    # for both sides, unlike converting tuple xmin directly to xid8.
+    result=warehouse._query("SELECT age('3'::xid) <= age('4294967294'::xid), age('4294967293'::xid) <= age('4294967294'::xid), '4294967299'::xid8::xid::text")[0]
+    assert result==(True,False,'3')
+
+
 def test_worker_budget_preserves_connection_headroom():
     from types import SimpleNamespace
     from personal_data_warehouse.scrub_conversation_cards import connection_workers
