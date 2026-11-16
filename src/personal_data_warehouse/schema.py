@@ -4094,7 +4094,6 @@ ANDROID_CALL_RECORDINGS_RECORDING_COLUMNS = (
     "title",
     "recorded_at",
     "duration_seconds",
-    "location_name",
     "filename",
     "extension",
     "content_type",
