@@ -44,12 +44,13 @@ const uploaderFailureAlertRuns = 6
 const uploaderHeartbeatEndpoint = "/ingest/heartbeat"
 
 type uploaderHeartbeat struct {
-	Pipeline        string `json:"pipeline"`
-	Device          string `json:"device"`
-	RanAt           string `json:"ran_at"`
-	ExitCode        int64  `json:"exit_code"`
-	DurationSeconds int64  `json:"duration_seconds"`
-	Error           string `json:"error"`
+	NewestFinishedAt string `json:"newest_finished_at"`
+	Pipeline         string `json:"pipeline"`
+	Device           string `json:"device"`
+	RanAt            string `json:"ran_at"`
+	ExitCode         int64  `json:"exit_code"`
+	DurationSeconds  int64  `json:"duration_seconds"`
+	Error            string `json:"error"`
 }
 
 // uploaderHeartbeatStreak is the (pipeline, device) row's failure streak after
@@ -119,12 +120,14 @@ func uploaderHeartbeatDDL(schema, relation string) []string {
 	error text NOT NULL DEFAULT '',
 	exit_code bigint NOT NULL DEFAULT 0,
 	duration_seconds bigint NOT NULL DEFAULT 0,
+	newest_finished_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00',
 	consecutive_failures bigint NOT NULL DEFAULT 0,
 	failing_since timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
 	updated_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
 	sync_version bigint NOT NULL DEFAULT 0,
 	PRIMARY KEY (pipeline, device)
 )`,
+		`ALTER TABLE ` + relation + ` ADD COLUMN IF NOT EXISTS newest_finished_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'`,
 		`ALTER TABLE ` + relation + ` ADD COLUMN IF NOT EXISTS consecutive_failures bigint NOT NULL DEFAULT 0`,
 		`ALTER TABLE ` + relation + ` ADD COLUMN IF NOT EXISTS failing_since timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz`,
 	}
@@ -166,9 +169,9 @@ func (s *uploaderHeartbeatStore) upsert(ctx context.Context, hb uploaderHeartbea
 	var streak uploaderHeartbeatStreak
 	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO `+s.relation+` AS hb
-			(pipeline, device, ran_at, status, error, exit_code, duration_seconds,
+			(pipeline, device, ran_at, status, error, exit_code, duration_seconds, newest_finished_at,
 			 consecutive_failures, failing_since, updated_at, sync_version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE(NULLIF($9, '')::timestamptz, '1970-01-01'::timestamptz),
 			CASE WHEN $6::bigint <> 0 THEN 1 ELSE 0 END,
 			CASE WHEN $6::bigint <> 0 THEN $3::timestamptz ELSE '1970-01-01 00:00:00+00'::timestamptz END,
 			now(), $8)
@@ -178,6 +181,7 @@ func (s *uploaderHeartbeatStore) upsert(ctx context.Context, hb uploaderHeartbea
 			error = EXCLUDED.error,
 			exit_code = EXCLUDED.exit_code,
 			duration_seconds = EXCLUDED.duration_seconds,
+	newest_finished_at = GREATEST(hb.newest_finished_at, EXCLUDED.newest_finished_at),
 			consecutive_failures = CASE WHEN EXCLUDED.exit_code <> 0 THEN hb.consecutive_failures + 1 ELSE 0 END,
 			failing_since = CASE
 				WHEN EXCLUDED.exit_code = 0 THEN '1970-01-01 00:00:00+00'::timestamptz
@@ -188,7 +192,7 @@ func (s *uploaderHeartbeatStore) upsert(ctx context.Context, hb uploaderHeartbea
 			sync_version = EXCLUDED.sync_version
 		WHERE hb.sync_version <= EXCLUDED.sync_version
 		RETURNING consecutive_failures, failing_since
-	`, hb.Pipeline, hb.Device, ranAt, status, hb.Error, hb.ExitCode, hb.DurationSeconds, ranAt.UnixMicro()).Scan(&streak.ConsecutiveFailures, &streak.FailingSince)
+	`, hb.Pipeline, hb.Device, ranAt, status, hb.Error, hb.ExitCode, hb.DurationSeconds, ranAt.UnixMicro(), hb.NewestFinishedAt).Scan(&streak.ConsecutiveFailures, &streak.FailingSince)
 	if err == sql.ErrNoRows {
 		// A stale replay: the stored row is newer and was left alone.
 		return uploaderHeartbeatStreak{}, nil

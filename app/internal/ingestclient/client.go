@@ -686,12 +686,13 @@ func (c *Client) PublishSlackSession(s SlackSession) (map[string]any, error) {
 
 // Heartbeat is one uploader run's verdict.
 type Heartbeat struct {
-	Pipeline        string
-	Device          string
-	RanAt           string
-	ExitCode        int
-	DurationSeconds int
-	Error           string
+	NewestFinishedAt string
+	Pipeline         string
+	Device           string
+	RanAt            string
+	ExitCode         int
+	DurationSeconds  int
+	Error            string
 }
 
 // PostHeartbeat records one uploader run in ops.uploader_heartbeats.
@@ -701,12 +702,13 @@ func (c *Client) PostHeartbeat(h Heartbeat) (map[string]any, error) {
 		errText = errText[:500]
 	}
 	body, err := common.CanonicalJSON(map[string]any{
-		"pipeline":         h.Pipeline,
-		"device":           h.Device,
-		"ran_at":           h.RanAt,
-		"exit_code":        int64(h.ExitCode),
-		"duration_seconds": int64(h.DurationSeconds),
-		"error":            errText,
+		"pipeline":           h.Pipeline,
+		"device":             h.Device,
+		"ran_at":             h.RanAt,
+		"exit_code":          int64(h.ExitCode),
+		"duration_seconds":   int64(h.DurationSeconds),
+		"newest_finished_at": h.NewestFinishedAt,
+		"error":              errText,
 	})
 	if err != nil {
 		return nil, err
@@ -722,4 +724,11 @@ func (c *Client) SignObjectUpload(endpoint, contentSHA256 string, exp time.Time)
 // UploadAndroidLocationBatch posts queued approximate location samples.
 func (c *Client) UploadAndroidLocationBatch(body []byte, exportedAt string) (StoredObject, error) {
 	return c.post("/ingest/android-location/batch", body, "application/gzip", map[string]string{"exported_at": exportedAt})
+}
+
+func (c *Client) UploadAndroidCallRecordingsMetadata(payload map[string]any, recordedAt, audioContentSHA256, metadataDedupSHA256 string) (StoredObject, error) {
+	return c.postJSON("/ingest/android-call-recordings/metadata", payload, map[string]string{
+		"recorded_at": recordedAt, "audio_content_sha256": audioContentSHA256,
+		"metadata_dedup_sha256": metadataDedupSHA256,
+	})
 }

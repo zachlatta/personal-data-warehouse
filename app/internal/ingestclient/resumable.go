@@ -316,3 +316,9 @@ func resumableNextOffset(rangeHeader string, sizeBytes int64) (int64, error) {
 	}
 	return offset, nil
 }
+
+func (c *Client) UploadAndroidCallRecordingsAudio(path, recordedAt, extension, contentType, contentSHA256 string) (StoredObject, error) {
+	return c.uploadResumableFile(androidCallRecordingsResumableEndpoint, "BCR call recording", "recorded_at", recordedAt, path, extension, contentType, contentSHA256)
+}
+
+const androidCallRecordingsResumableEndpoint = "/ingest/android-call-recordings/audio/resumable"

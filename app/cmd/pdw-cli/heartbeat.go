@@ -76,6 +76,7 @@ func runHeartbeat(args []string, stdout, stderr io.Writer, getenv func(string) s
 	pipeline := fs.String("pipeline", "", "")
 	device := fs.String("device", "", "")
 	exitCode := fs.Int("exit-code", 0, "")
+	newestFinished := fs.String("newest-finished-at", "", "")
 	duration := fs.Float64("duration-seconds", 0, "")
 	ranAt := fs.String("ran-at", "", "")
 	errText := fs.String("error", "", "")
@@ -141,12 +142,13 @@ func runHeartbeat(args []string, stdout, stderr io.Writer, getenv func(string) s
 	failures := 0
 	for _, p := range pipelines {
 		_, err := client.PostHeartbeat(ingestclient.Heartbeat{
-			Pipeline:        p,
-			Device:          *device,
-			RanAt:           *ranAt,
-			ExitCode:        *exitCode,
-			DurationSeconds: int(math.Round(*duration)),
-			Error:           *errText,
+			Pipeline:         p,
+			Device:           *device,
+			RanAt:            *ranAt,
+			ExitCode:         *exitCode,
+			DurationSeconds:  int(math.Round(*duration)),
+			NewestFinishedAt: *newestFinished,
+			Error:            *errText,
 		})
 		if err != nil {
 			failures++

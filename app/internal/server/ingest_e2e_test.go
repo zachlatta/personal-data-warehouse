@@ -350,6 +350,18 @@ func e2eCases() []e2eCase {
 			wantProps: map[string]string{"pdw_kind": "google_recorder_metadata", "pdw_source": "google_recorder", "audio_content_sha256": recorderDedupSHA},
 		},
 		{
+			name: "android-call-recordings/metadata", endpoint: "/ingest/android-call-recordings/metadata", body: meta,
+			extra: url.Values{
+				"recorded_at":           {"2026-10-23T21:56:24.803Z"},
+				"audio_content_sha256":  {audioSHA},
+				"metadata_dedup_sha256": {recorderDedupSHA},
+			},
+			wantName: "2026-10-23-" + audioSHA + ".json", wantMime: "application/json",
+			// The store files a sidecar's dedup sha under its one historical
+			// property name, whatever the source.
+			wantProps: map[string]string{"pdw_kind": "android_call_recordings_metadata", "pdw_source": "android_call_recordings", "audio_content_sha256": recorderDedupSHA},
+		},
+		{
 			name: "photos/metadata", endpoint: "/ingest/photos/metadata", body: photoMeta,
 			extra: url.Values{
 				"captured_at":           {"2026-06-01T14:30:00"},
@@ -612,6 +624,12 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 		{"google-recorder/metadata", func() (ingestclient.StoredObject, error) {
 			return client.UploadGoogleRecorderMetadata(map[string]any{"schema_version": 1}, "2026-10-23T21:56:24.803Z", audioSHA, recorderDedupSHA)
 		}},
+		{"android-call-recordings/audio", func() (ingestclient.StoredObject, error) {
+			return client.UploadAndroidCallRecordingsAudio(audioPath, "2026-10-23T21:56:24.803Z", ".oga", "audio/ogg", audioSHA)
+		}},
+		{"android-call-recordings/metadata", func() (ingestclient.StoredObject, error) {
+			return client.UploadAndroidCallRecordingsMetadata(map[string]any{"schema_version": 1}, "2026-10-23T21:56:24.803Z", audioSHA, recorderDedupSHA)
+		}},
 		{"apple-notes/body", func() (ingestclient.StoredObject, error) {
 			return client.UploadAppleNotesBody([]byte("<html>x</html>"), "N1", "R1", "2026-01-02T03:04:05+00:00")
 		}},
@@ -642,9 +660,10 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 		name, kind string
 		media      []byte
 	}{
-		"photos/file":           {"2026-06-01-" + photoSHA + ".heic", "photo_file", photo},
-		"voice-memos/audio":     {"2025-07-15-" + audioSHA + ".m4a", "voice_memo_audio", audio},
-		"google-recorder/audio": {"2026-10-23-" + audioSHA + ".m4a", "google_recorder_audio", audio},
+		"photos/file":                   {"2026-06-01-" + photoSHA + ".heic", "photo_file", photo},
+		"voice-memos/audio":             {"2025-07-15-" + audioSHA + ".m4a", "voice_memo_audio", audio},
+		"google-recorder/audio":         {"2026-10-23-" + audioSHA + ".m4a", "google_recorder_audio", audio},
+		"android-call-recordings/audio": {"2026-10-23-" + audioSHA + ".oga", "android_call_recordings_audio", audio},
 		// Dated by the scanning computer's own day, not UTC's.
 		"scans/document": {"2026-11-01-" + scanSHA + ".pdf", "scan_document", scanPDF},
 	}
