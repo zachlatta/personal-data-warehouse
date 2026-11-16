@@ -42,7 +42,9 @@ MIN_GAP=2
 
 umask 077
 
-until [ "$(getprop sys.boot_completed)" = 1 ] && [ -d /data/misc_ce/0/pdw-call-recordings ] && [ "$(cmd user is-user-unlocked 0)" = true ]; do
+# The phone's Android 17 build has no `cmd user` unlock query, so the wait
+# reads the platform's sys.user.0.ce_available property instead.
+until [ "$(getprop sys.boot_completed)" = 1 ] && [ "$(getprop sys.user.0.ce_available)" = true ] && [ -d "$STATE" ]; do
   sleep 5
 done
 mkdir -p "$STATE/logs" "$REC"
