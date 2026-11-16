@@ -1,5 +1,6 @@
 // Package notifications drains a transactional, insert-only timeline outbox.
-// The Python warehouse owns DDL. Transport acceptance is NOT device display.
+// Python owns outbox DDL; push owns registry initialization at service startup.
+// Transport acceptance is NOT device display.
 package notifications
 
 import (
@@ -16,6 +17,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/deeplink"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/push"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
@@ -120,12 +122,23 @@ type Service struct {
 }
 
 func New(databaseURL string, secret []byte, sender Sender, render func(map[string]any) Alert) (*Service, error) {
+	return newWithExpansion(databaseURL, secret, sender, render, nil)
+}
+
+// Tests supply their isolated schemas before initialization touches the registry.
+func newWithExpansion(databaseURL string, secret []byte, sender Sender, render func(map[string]any) Alert, expand func(string) string) (*Service, error) {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(3)
-	return &Service{DB: db, Secret: secret, Sender: sender, Render: render}, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := push.Ensure(ctx, db, expand); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Service{DB: db, Secret: secret, Sender: sender, Render: render, Expand: expand}, nil
 }
 func (s *Service) Close() error { return s.DB.Close() }
 func (s *Service) q(query string) string {

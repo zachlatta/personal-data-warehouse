@@ -2,6 +2,9 @@ package notifications
 
 import (
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +29,20 @@ func (f *fakeSender) Send(_ context.Context, d Delivery) Result {
 }
 func (f *fakeSender) Receipt(_ context.Context, d Delivery) Result { return f.receipt }
 
+func notificationTestExpansion(t *testing.T) func(string) string {
+	t.Helper()
+	var relations map[string]string
+	if err := json.Unmarshal([]byte(os.Getenv("PDW_NOTIFICATION_TEST_RELATIONS")), &relations); err != nil {
+		t.Fatal(err)
+	}
+	return func(q string) string {
+		for k, v := range relations {
+			q = strings.ReplaceAll(q, "@"+k, v)
+		}
+		return q
+	}
+}
+
 // This is invoked by the canonical pytest run with a fresh isolated schema.
 func TestPostgresNotifications(t *testing.T) {
 	url := os.Getenv("PDW_NOTIFICATION_TEST_URL")
@@ -34,21 +51,12 @@ func TestPostgresNotifications(t *testing.T) {
 	}
 	ctx := context.Background()
 	sender := &fakeSender{result: Result{Status: "accepted", TicketID: "test-ticket"}, receipt: Result{Status: "provider_accepted"}}
-	s, err := New(url, []byte("test-secret"), sender, func(row map[string]any) Alert { return Alert{Title: "Hello", Route: "/timeline/test/one"} })
+	s, err := newWithExpansion(url, []byte("test-secret"), sender, func(row map[string]any) Alert { return Alert{Title: "Hello", Route: "/timeline/test/one"} }, notificationTestExpansion(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	var relations map[string]string
-	if err = json.Unmarshal([]byte(os.Getenv("PDW_NOTIFICATION_TEST_RELATIONS")), &relations); err != nil {
-		t.Fatal(err)
-	}
-	s.Expand = func(q string) string {
-		for k, v := range relations {
-			q = strings.ReplaceAll(q, "@"+k, v)
-		}
-		return q
-	}
+
 	exec := func(q string, args ...any) {
 		t.Helper()
 		if _, err := s.DB.ExecContext(ctx, s.q(q), args...); err != nil {
@@ -440,6 +448,92 @@ func TestPostgresNotifications(t *testing.T) {
 		}
 		if len(sender.sent) != before || count(`SELECT count(*) FROM @notification_events WHERE event_id='browser-queued-stop' AND status='no_devices'`) != 1 || count(`SELECT count(*) FROM @marts_notification_health WHERE status='attention'`) != 1 {
 			t.Fatal("all devices stopped after fanout without reporting loss")
+		}
+	})
+	t.Run("status changes do not require a schema lock", func(t *testing.T) {
+		exec(`INSERT INTO @push_devices (expo_push_token,registered_at) VALUES ('ExponentPushToken[reader-fixture]',now()-interval '30 days')`)
+		exec(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,opened_at,status)
+		 VALUES ('reader-witness','fixture',$1,'web','{}','{}',now(),'provider_accepted')`, deviceID("web:fallback"))
+		tx, err := s.DB.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err = tx.ExecContext(ctx, s.q(`LOCK TABLE @push_devices IN ACCESS SHARE MODE`)); err != nil {
+			t.Fatal(err)
+		}
+		bounded, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err = s.changeDevice(bounded, deviceID("web:fallback"), "active"); err != nil {
+			t.Fatalf("status change blocked by a reader: %v", err)
+		}
+		if err = s.quietDevices(bounded); err != nil {
+			t.Fatalf("dormancy change blocked by a reader: %v", err)
+		}
+		if count(`SELECT count(*) FROM @push_devices WHERE expo_push_token='ExponentPushToken[reader-fixture]' AND status='dormant'`) != 1 {
+			t.Fatal("reader-lock test did not exercise dormancy")
+		}
+	})
+	t.Run("startup upgrades an older registry", func(t *testing.T) {
+		exec(`ALTER TABLE @push_devices DROP COLUMN last_active_at`)
+		restarted, err := newWithExpansion(url, []byte("test-secret"), sender, s.Render, s.Expand)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restarted.Close()
+		if count(`SELECT count(*) FROM @push_devices WHERE expo_push_token='ExponentPushToken[reader-fixture]' AND last_active_at='epoch' AND status='dormant'`) != 1 {
+			t.Fatal("startup failed to migrate the old registry or lost its device")
+		}
+		if err = restarted.changeDevice(ctx, deviceID("expo:ExponentPushToken[reader-fixture]"), "active"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("manual stops survive registration and invalid provider results", func(t *testing.T) {
+		exec(`TRUNCATE @notification_deliveries, @notification_events, @push_devices, @web_push_devices`)
+		key, err := ecdh.P256().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sub := subscription{Endpoint: "https://fcm.googleapis.com/stopped-fixture"}
+		sub.Keys.Auth = base64.RawURLEncoding.EncodeToString(make([]byte, 16))
+		sub.Keys.P256dh = base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes())
+		body, err := json.Marshal(map[string]any{"subscription": sub, "device_name": "Fixture browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.PublicKey = "fixture-configured"
+		webID := deviceID("web:" + deviceID(sub.Endpoint))
+		if req(APIPath+"/web/register", string(body)) != 200 {
+			t.Fatal("web registration failed")
+		}
+		if req(APIPath+"/devices/status", `{"id":"`+webID+`","status":"stopped"}`) != 200 {
+			t.Fatal("web stop failed")
+		}
+		if req(APIPath+"/web/register", string(body)) != 200 || count(`SELECT count(*) FROM @web_push_devices WHERE status='stopped'`) != 1 {
+			t.Fatal("web re-registration cleared manual stop")
+		}
+		if req(APIPath+"/devices/status", `{"id":"`+webID+`","status":"active"}`) != 200 {
+			t.Fatal("web resume failed")
+		}
+		exec(`INSERT INTO @push_devices (expo_push_token) VALUES ('ExponentPushToken[provider-fixture]')`)
+		exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','provider-invalid-stopped','test','direct')`)
+		if _, err = s.fanout(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			d, err := s.claim(ctx, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req(APIPath+"/devices/status", `{"id":"`+d.DeviceID+`","status":"stopped"}`) != 200 {
+				t.Fatal("in-flight stop failed")
+			}
+			if err = s.finish(ctx, d, Result{Status: "failed", Error: "DeviceNotRegistered", Disable: true}, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if count(`SELECT count(*) FROM @push_devices WHERE status='stopped' AND error='DeviceNotRegistered'`) != 1 || count(`SELECT count(*) FROM @web_push_devices WHERE status='stopped' AND error='DeviceNotRegistered'`) != 1 || count(`SELECT count(*) FROM @notification_deliveries WHERE status='failed' AND error='DeviceNotRegistered'`) != 2 {
+			t.Fatal("provider invalid result replaced manual stop or lost failure evidence")
 		}
 	})
 	// The Go invocation also runs source-suppression tests against this schema.

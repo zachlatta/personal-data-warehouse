@@ -73,8 +73,10 @@ hashed device ID, never its push token. Other apps' notifications are unaffected
 Authenticated endpoints: `GET /api/notifications/devices` returns safe device
 metadata; `POST /api/notifications/devices/status` takes `{id, status}` with
 `status` equal to `stopped` or `active`. No endpoint deletes device rows. The app's
-registration ensure and Python ensure both add `last_active_at`; reads tolerate
-its absence during rollout. No mart gains a required column.
+shared push-registry ensure runs once when the notification service starts,
+adding `last_active_at` before requests or worker ticks. Python ensure uses the
+same column definition. Reads rely on startup having completed; no status change
+or dormancy transition runs DDL. No mart gains a required column.
 
 ## What a tap can do
 

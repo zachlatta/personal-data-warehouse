@@ -10,12 +10,12 @@ import (
 const DeviceDormancyDays = 14
 
 // Never treat provider acceptance or updated_at on Expo (also written on send)
-// as evidence that a person still uses an installation. to_jsonb tolerates the
-// brief deployment interval before either registry ensure adds last_active_at.
+// as evidence that a person still uses an installation. The shared push registry
+// ensure adds last_active_at at service startup, before requests or worker ticks.
 const devicesSQL = `WITH registry AS (
  SELECT encode(sha256(convert_to('expo:'||expo_push_token,'UTF8')),'hex') AS id,
  'expo' AS transport, device_name, platform, app_version, status, registered_at,
- GREATEST(registered_at, COALESCE((to_jsonb(p)->>'last_active_at')::timestamptz,'epoch')) AS active_at,
+ GREATEST(registered_at, p.last_active_at) AS active_at,
  last_sent_at AS sent_at FROM @push_devices p
  UNION ALL
  SELECT encode(sha256(convert_to('web:'||id,'UTF8')),'hex'), 'web', device_name,
@@ -93,11 +93,8 @@ func (s *Service) quietDevices(ctx context.Context) error {
 }
 
 func (s *Service) changeDevice(ctx context.Context, id, status string) error {
-	// A resume needs a fresh inactivity grace period. This is the same additive
-	// migration as both registry ensure paths, so the UI works before Dagster runs.
-	if _, err := s.DB.ExecContext(ctx, s.q(`ALTER TABLE @push_devices ADD COLUMN IF NOT EXISTS last_active_at timestamptz NOT NULL DEFAULT 'epoch'`)); err != nil {
-		return err
-	}
+	// A resume needs a fresh inactivity grace period. Schema setup belongs to
+	// the shared push registry ensure at service startup, never to this write.
 	_, err := s.DB.ExecContext(ctx, s.q(`UPDATE @push_devices SET status=$2,
  last_active_at=CASE WHEN $2='active' THEN now() ELSE last_active_at END
  WHERE encode(sha256(convert_to('expo:'||expo_push_token,'UTF8')),'hex')=$1

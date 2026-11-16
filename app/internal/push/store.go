@@ -120,17 +120,28 @@ func (s *PostgresStore) ensure(ctx context.Context) error {
 	if s.ensured {
 		return nil
 	}
-	if s.Expand == nil {
-		if _, err := s.db.ExecContext(ctx, createSchemaSQL); err != nil {
+	if err := Ensure(ctx, s.db, s.Expand); err != nil {
+		return err
+	}
+	s.ensured = true
+	return nil
+}
+
+// Ensure provisions the push registry. Services sharing the registry call this
+// once at startup, before serving requests or running workers. A non-nil expand
+// maps the table into an already-created isolated schema for integration tests.
+func Ensure(ctx context.Context, db *sql.DB, expand func(string) string) error {
+	if expand == nil {
+		if _, err := db.ExecContext(ctx, createSchemaSQL); err != nil {
 			return fmt.Errorf("ensure private schema: %w", err)
 		}
+		expand = warehouse.ExpandRelations
 	}
 	for _, statement := range ensureStatements {
-		if _, err := s.db.ExecContext(ctx, s.q(statement)); err != nil {
+		if _, err := db.ExecContext(ctx, expand(statement)); err != nil {
 			return fmt.Errorf("ensure push_devices: %w", err)
 		}
 	}
-	s.ensured = true
 	return nil
 }
 
