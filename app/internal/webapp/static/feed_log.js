@@ -4,6 +4,8 @@
 // from viewability.ts, EventQueue from event-queue.ts, FeedLog from engagement.ts,
 // the taps' rules from refresh.ts and saved-queue.ts.
 // Change the rule in both places; the tests reuse the phone's numbers.
+// currentIndex alone is the page's own (the phone has no outlined card or keys);
+// it is here to judge "on screen" with the same visibleFraction and threshold.
 
 // Active time: the part of wall time Zach is actually using the page. Time
 // counts while the tab is visible and he touched it in the last IDLE_MS, or
@@ -96,6 +98,22 @@ export function visibleFraction(layout, viewport) {
   const overlap = Math.min(layout.y + layout.height, viewport.top + viewport.height) - Math.max(layout.y, viewport.top);
   if (overlap <= 0) return 0;
   return Math.min(1, overlap / Math.min(layout.height, viewport.height));
+}
+
+// The web page's current card (its outline, and the card its keys act on): the
+// topmost card an impression would count as in view, so what is outlined is
+// always on screen. When none is, as a gap between two tall cards can leave
+// it, the most visible, the upper on a tie; with none on screen (scrolled
+// past the end), the last. -1 for no cards.
+export function currentIndex(layouts, viewport, threshold = VIEWABLE_THRESHOLD) {
+  let best = -1;
+  let bestFraction = 0;
+  for (let i = 0; i < layouts.length; i++) {
+    const fraction = visibleFraction(layouts[i], viewport);
+    if (fraction >= threshold) return i;
+    if (fraction > bestFraction) { best = i; bestFraction = fraction; }
+  }
+  return best === -1 && layouts.length ? layouts.length - 1 : best;
 }
 
 export class ViewabilityTracker {

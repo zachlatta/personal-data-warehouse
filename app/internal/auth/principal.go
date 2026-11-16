@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/externalfeeds"
 	"net/http"
 	"strings"
 )
@@ -16,12 +17,18 @@ const (
 	// including token administration.
 	ScopeRoot Scope = "root"
 	// ScopeFull is an issued token: every bearer surface except token
-	// administration, so a leaked token cannot mint its own successor.
+	// administration, so a leaked token cannot mint its own successor. It
+	// cannot decide a mutation request (see CanReview): host CLIs hold one,
+	// and an agent there must not approve its own proposal.
 	ScopeFull Scope = "full"
 	// ScopeAgent is a token minted by the cli_authorize flow: the warehouse
-	// tools API only, which is everything the pdw CLI calls. It cannot reach
-	// mutation review, so an agent cannot approve its own proposal.
+	// tools API only, which is everything the pdw CLI calls.
 	ScopeAgent Scope = "agent"
+	// ScopeReviewer is an issued token for Zach's own review surfaces (the
+	// phone app): every surface full reaches, plus the mutation review
+	// decisions (approve, deny, edit, undo). A host CLI never holds one, so an
+	// agent on a host cannot approve its own proposal.
+	ScopeReviewer Scope = "reviewer"
 	// ScopeOAuthQuery is an OAuth MCP connector grant (/mcp only). It is
 	// never a static bearer: the token store refuses it there.
 	ScopeOAuthQuery Scope = "query"
@@ -29,7 +36,9 @@ const (
 
 // Issuable reports whether s is one of the scopes an issued token may carry.
 // Root is never issued: it is the master secret.
-func (s Scope) Issuable() bool { return s == ScopeFull || s == ScopeAgent }
+func (s Scope) Issuable() bool {
+	return s == ScopeFull || s == ScopeAgent || s == ScopeReviewer || externalfeeds.IsScope(string(s))
+}
 
 // agentToolsPath is the whole surface an agent-scoped token reaches.
 const agentToolsPath = "/api/tools"
@@ -43,11 +52,26 @@ type Principal struct {
 
 // Allows reports whether this principal may reach path.
 func (p Principal) Allows(path string) bool {
+	if feed, ok := externalfeeds.Lookup(string(p.Scope)); ok {
+		return path == feed.Path
+	}
 	switch p.Scope {
-	case ScopeRoot, ScopeFull:
+	case ScopeRoot, ScopeFull, ScopeReviewer:
 		return true
 	case ScopeAgent:
 		return path == agentToolsPath || strings.HasPrefix(path, agentToolsPath+"/")
+	}
+	return false
+}
+
+// CanReview reports whether this principal may decide a mutation request:
+// approve, deny, supersede, undo, or edit one before it runs. Only the master
+// secret (the web app) and a reviewer token (the phone app) may; a full,
+// agent or feed token may propose and withdraw, never decide.
+func (p Principal) CanReview() bool {
+	switch p.Scope {
+	case ScopeRoot, ScopeReviewer:
+		return true
 	}
 	return false
 }
@@ -91,6 +115,16 @@ func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 		return *h.principal, true
 	}
 	return Principal{}, false
+}
+
+// WithPrincipal returns ctx carrying p as the static-bearer principal, as
+// RequireStaticBearer would set it. Handlers under test use it.
+func WithPrincipal(ctx context.Context, p Principal) context.Context {
+	if !hasClientNameHolder(ctx) {
+		ctx = WithClientNameHolder(ctx)
+	}
+	setPrincipal(ctx, p)
+	return ctx
 }
 
 func setPrincipal(ctx context.Context, p Principal) {

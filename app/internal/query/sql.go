@@ -16,21 +16,26 @@ var allowedFirstKeywords = map[string]bool{
 }
 
 var forbiddenKeywords = map[string]bool{
-	"ALTER":    true,
-	"ATTACH":   true,
-	"CREATE":   true,
-	"DELETE":   true,
-	"DETACH":   true,
-	"DROP":     true,
-	"GRANT":    true,
-	"INSERT":   true,
-	"INTO":     true,
-	"KILL":     true,
-	"OPTIMIZE": true,
-	"RENAME":   true,
-	"REVOKE":   true,
-	"TRUNCATE": true,
-	"UPDATE":   true,
+	"SET":           true,
+	"RESET":         true,
+	"AUTHORIZATION": true,
+	"SET_CONFIG":    true,
+	"SET_ROLE":      true,
+	"ALTER":         true,
+	"ATTACH":        true,
+	"CREATE":        true,
+	"DELETE":        true,
+	"DETACH":        true,
+	"DROP":          true,
+	"GRANT":         true,
+	"INSERT":        true,
+	"INTO":          true,
+	"KILL":          true,
+	"OPTIMIZE":      true,
+	"RENAME":        true,
+	"REVOKE":        true,
+	"TRUNCATE":      true,
+	"UPDATE":        true,
 }
 
 // clickHouseCatalogRe matches a read of ClickHouse's system catalog
@@ -38,6 +43,7 @@ var forbiddenKeywords = map[string]bool{
 // SYSTEM keyword guard answered "SYSTEM statements are not allowed", which
 // reads as a permissions problem instead of "wrong database".
 var clickHouseCatalogRe = regexp.MustCompile(`(?i)\bsystem\s*\.\s*[a-z_]+`)
+var unicodeIdentifierRe = regexp.MustCompile(`(?i)\bU&"`)
 
 func ValidateReadOnlySQL(sql string) error {
 	trimmed := strings.TrimSpace(sql)
@@ -46,6 +52,19 @@ func ValidateReadOnlySQL(sql string) error {
 	}
 	if err := rejectMultipleStatements(trimmed); err != nil {
 		return err
+	}
+	// Preserve quoted names for this defense; sqlWords deliberately erases
+	// them for ordinary keyword checks. Refuse escaped identifiers rather than
+	// try to reproduce PostgreSQL's Unicode/UESCAPE name parser here. The login
+	// privilege check remains the security boundary, including dynamic SQL.
+	identifiers := sqlCodeIdentifiers(trimmed, true)
+	if unicodeIdentifierRe.MatchString(identifiers) {
+		return errors.New("Unicode-escaped identifiers are not supported; use ordinary identifiers")
+	}
+	for _, word := range strings.FieldsFunc(strings.ToUpper(identifiers), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' }) {
+		if word == "SET_CONFIG" || word == "SET_ROLE" {
+			return fmt.Errorf("query tool is read-only; %s is not allowed", word)
+		}
 	}
 
 	if match := clickHouseCatalogRe.FindString(sqlCode(trimmed)); match != "" {
@@ -85,6 +104,10 @@ func rejectMultipleStatements(sql string) error {
 // nested /* */ comments, ” and "" doubling, E” backslash escapes, and
 // $tag$...$tag$ bodies.
 func sqlCode(sql string) string {
+	return sqlCodeIdentifiers(sql, false)
+}
+
+func sqlCodeIdentifiers(sql string, keepIdentifiers bool) string {
 	var b strings.Builder
 	n := len(sql)
 	for i := 0; i < n; {
@@ -119,8 +142,13 @@ func sqlCode(sql string) string {
 			i = skipQuoted(sql, i, '\'', escapes)
 			b.WriteString("''")
 		case c == '"' || c == '`':
-			i = skipQuoted(sql, i, c, false)
-			b.WriteString(`""`)
+			end := skipQuoted(sql, i, c, false)
+			if keepIdentifiers {
+				b.WriteString(sql[i:end])
+			} else {
+				b.WriteString(`""`)
+			}
+			i = end
 		case c == '$':
 			if tag, ok := dollarTag(sql[i:]); ok && (i == 0 || !isIdentByte(sql[i-1])) {
 				end := strings.Index(sql[i+len(tag):], tag)

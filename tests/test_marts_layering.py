@@ -18,6 +18,7 @@ API, sat in prod uncataloged. The same shape (a stale duplicate of
 
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import UTC, datetime, timedelta
 
@@ -532,6 +533,48 @@ def test_voice_memo_mart_keeps_the_first_copy_of_identical_audio_whatever_its_so
         ("google_recorder", "pixel-1"),
         ("google_recorder", "pixel-first-copy-of-rec-2"),
         ("google_recorder", "pixel-unhashed"),
+    ]
+
+
+def test_voice_memo_mart_never_collapses_two_empty_recordings(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Empty bytes are not an identity: the SHA-256 of nothing is one value.
+
+    Zero-byte memos (iCloud stubs) shared that hash and read as one recording
+    in the mart.
+    """
+    _seed_voice_memos(warehouse)
+    empty_sha = hashlib.sha256(b"").hexdigest()
+    warehouse.insert_google_recorder_recordings(
+        [
+            _row(
+                GOOGLE_RECORDER_RECORDING_COLUMNS,
+                table="google_recorder_recordings",
+                account="zach",
+                recording_id=recording_id,
+                device="pichu",
+                title="Empty",
+                recorded_at=TS,
+                duration_seconds=0,
+                filename=f"{recording_id}.m4a",
+                extension=".m4a",
+                content_type="audio/mp4",
+                size_bytes=0,
+                content_sha256=empty_sha,
+                raw_metadata_json="{}",
+                ingested_at=TS,
+                sync_version=1,
+            )
+            for recording_id in ("empty-a", "empty-b")
+        ]
+    )
+    rows = _dicts(warehouse, "marts_voice_memos_recordings", "source, recording_id")
+
+    assert [(row["source"], row["recording_id"]) for row in rows if row["source"] == "google_recorder"] == [
+        ("google_recorder", "empty-a"),
+        ("google_recorder", "empty-b"),
+        ("google_recorder", "pixel-1"),
     ]
 
 

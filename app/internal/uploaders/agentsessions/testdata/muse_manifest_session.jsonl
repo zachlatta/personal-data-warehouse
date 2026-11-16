@@ -1,0 +1,16 @@
+{"type":"session_header","version":1,"session_id":"0b5e8c1a-1111-4a2b-9c3d-000000000001","created_at":"2026-11-10T10:00:00Z"}
+{"type":"item","seq":0,"source":"runtime","item":{"type":"message","role":"user","text":"hello"},"created_at":"2026-11-10T10:00:01Z"}
+{"type":"item","seq":1,"source":"runtime","item":{"type":"message","role":"assistant","text":"hi"},"created_at":"2026-11-10T10:00:02Z"}
+{"type":"item","seq":1,"source":"runtime","item":{"type":"message","role":"assistant","text":"hi again"},"created_at":"2026-11-10T10:00:03Z"}
+   
+not json at all
+null
+[1, 2]
+{"type":"compaction_checkpoint","compaction_id":3,"summary":"so far","created_at":"2026-11-10T10:00:04Z"}
+{"type":"compaction_checkpoint","compaction_id":3,"summary":"so far, again"}
+{"type":"turn_context","created_at":"2026-11-10T10:00:05Z"}
+{"type":"item","seq":"2","source":"runtime","item":{"type":"thinking"}}
+{"type":"item","seq":2.0,"source":"runtime","item":{"type":"thinking"}}
+{"type":"item","source":"runtime","item":{"type":"thinking"}}
+{"type":"item","seq":3,"source":"runtime","item":{"type":"thinking"},"created_at":1790624108.5}
+{"type":"item","seq":4,"source":"runtime","item":{"type":"thinking"},"created_at":"2026-11-10T10:00:09Z"}

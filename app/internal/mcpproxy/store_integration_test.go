@@ -105,4 +105,5 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	if rows[0].Version != versionBefore {
 		t.Fatalf("re-encryption bumped the connection version %d -> %d", versionBefore, rows[0].Version)
 	}
+	testDiscoveryPreservesAdminVersion(t, after)
 }

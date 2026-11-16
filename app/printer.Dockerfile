@@ -3,7 +3,7 @@
 # poppler-utils counts a PDF's pages, Ghostscript renders them and ipptool
 # (cups-ipp-utils) sends the job. No CUPS daemon, so no spool that could
 # hold or resend a job behind the worker's back.
-FROM golang:1.26.10-bookworm AS build
+FROM golang:1.26.11-bookworm AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./

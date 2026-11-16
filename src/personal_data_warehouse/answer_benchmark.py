@@ -420,10 +420,24 @@ def is_invented_call(call: ToolCall) -> bool:
 
 
 def is_sql_error(call: ToolCall) -> bool:
+    if call.name == "pdw run":
+        return any(op.get("method") == "sql" and op.get("error") for op in script_operations(call))
     if call.name != "pdw sql":
         return False
     failed = call.exit_code not in (None, 0, "0")
     return failed or "pdw sql: ERROR" in call.output or "SQLSTATE" in call.output
+
+
+def script_operations(call: ToolCall) -> list[dict[str, Any]]:
+    """Keep inner reads visible beside the outer model round-trip count."""
+    if call.name != "pdw run":
+        return []
+    try:
+        result = json.loads(call.output)
+    except (ValueError, TypeError):
+        return []
+    operations = result.get("operations", []) if isinstance(result, dict) else []
+    return [op for op in operations if isinstance(op, dict)] if isinstance(operations, list) else []
 
 
 def _normalize(text: str) -> str:
@@ -528,7 +542,13 @@ def grade(question: AnswerQuestion, attempt: AgentAttempt, resolver: RefResolver
         )
 
     counts = {str(key): int(value) for key, value in (attempt.exclusion_counts or {}).items()}
-    trace = tuple(call.command[:300] for call in pdw)
+    trace = tuple(
+        call.command[:300] + (
+            f" [inner_reads={len(script_operations(call))}, inner_sql_errors="
+            f"{sum(1 for op in script_operations(call) if op.get('method') == 'sql' and op.get('error'))}]"
+            if call.name == "pdw run" else ""
+        ) for call in pdw
+    )
     return GradedAnswer(
         question_id=question.question_id,
         agent_run_id=attempt.run_id,
@@ -546,7 +566,10 @@ def grade(question: AnswerQuestion, attempt: AgentAttempt, resolver: RefResolver
         contamination_reason="; ".join(reasons),
         pdw_calls=len(pdw),
         invented_calls=sum(1 for call in pdw if is_invented_call(call)),
-        sql_errors=sum(1 for call in pdw if is_sql_error(call)),
+        sql_errors=sum(
+            sum(1 for op in script_operations(call) if op.get("method") == "sql" and op.get("error"))
+            if call.name == "pdw run" else int(is_sql_error(call)) for call in pdw
+        ),
         proxy_drops=sum(counts.values()),
         exclusion_counts=counts,
         elapsed_ms=max(0, int((attempt.completed_at - attempt.started_at).total_seconds() * 1000)),

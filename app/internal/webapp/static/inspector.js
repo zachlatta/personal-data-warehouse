@@ -176,7 +176,7 @@ export function openItem(item, options = {}) {
   drawer.classList.add("open");
   const kindNode = el("dkind");
   kindNode.textContent = item.source + " / " + item.kind;
-  kindNode.style.background = hue(item.source);
+  el("drawer").style.setProperty("--src", hue(item.source));
   el("dtitle").textContent = item.title || item.snippet || item.event_id;
   const body = clear(el("dbody"));
 

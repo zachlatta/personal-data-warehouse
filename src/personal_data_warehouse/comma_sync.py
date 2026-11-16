@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import logging
 from typing import Any
 
 from personal_data_warehouse.comma_api import (
@@ -21,6 +22,9 @@ from personal_data_warehouse.comma_api import (
     token_expires_at,
     token_identity,
 )
+from personal_data_warehouse.source_sla import record_upstream_observation
+
+logger = logging.getLogger(__name__)
 
 #: The warehouse's "never" (AGENTS.md: absence is the epoch, not NULL).
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -222,6 +226,17 @@ class CommaSyncRunner:
             )
             routes = self._client.routes(dongle_id, start_ms=0, end_ms=int(now.timestamp() * 1000))
             rows = [route_row(route, account=self._account, synced_at=now) for route in routes]
+            # C11: comma's own newest uploaded drive, recorded before writing.
+            newest = max(rows, key=lambda row: row["start_at"], default=None)
+            record_upstream_observation(
+                self._warehouse,
+                logger,
+                pipeline="comma",
+                scope=f"{self._account}/{dongle_id}",
+                upstream_newest_at=newest["start_at"] if newest else None,
+                upstream_newest_id=newest["route_name"] if newest else "",
+                detail=f"routes_segments: newest start of {len(rows)} routes",
+            )
             seen += len(rows)
             written += self._warehouse.upsert_comma_routes(rows)
             tracked_segments, tracked_points = self._track(dongle_id, routes, now)

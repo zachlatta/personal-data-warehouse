@@ -125,10 +125,11 @@ def test_catalog_layers_and_schema_names_are_consistent() -> None:
 
 
 def test_public_schemas_sort_base_then_derived_then_marts_then_timeline() -> None:
-    """Plain alphabetical order is the intended reading order.
+    """Plain alphabetical order is the intended listing order.
 
     A bare ``\\dn`` in psql, an ORDER BY table_schema, and the schema overview
-    all agree without anyone hand-sorting them.
+    all agree without anyone hand-sorting them. It is not the reading order:
+    consumers read timeline → marts_*/derived_* → base_* (AGENTS.md C5).
     """
     ordered = list(DISCOVERABLE_SCHEMAS)
     assert ordered == sorted(ordered)
@@ -260,7 +261,12 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +1 marts: marts_ops.answer_benchmark, the C16 answer verdict.
             # +1 marts: marts_android_screen_time.daily_usage, one row per real
             # Android bucket, because the base table repeats a bucket per upload.
-            "marts": 75,
+            # +1 marts: marts_ops.source_upstream_health, each source's own
+            # newest item against base_* (C11).
+            # +1 marts: marts_ops.timeline_priority_correctness, the C2 verdict.
+            # +1 marts: marts_ops.android_call_recordings_health, BCR upload
+            # inventory against landed calls.
+            "marts": 78,  # daily script pilot usage
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -288,7 +294,12 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +2 ops: ops.search_request_timings (one row per real search, C6) and
         # ops.search_request_timing_state (its writer's heartbeat).
         # +1 ops: ops.answer_benchmark_runs, one row of counts per C16 run.
-            "ops": 46,
+        # +1 ops: ops.priority_benchmark_results, the daily C2 measurement.
+        # +1 ops: ops.source_upstream_observations, what each source itself
+        # says is its newest item (C11).
+        # +4 ops: mutation auto-approval policies, their grants, every policy
+        # decision, and the kill switch (app/internal/mutations/policy_store.go).
+        "ops": 55,  # outgoing feed projection and script-run telemetry
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).
@@ -296,12 +307,17 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # master secret and the single-use cli_authorize codes.
         # +2 private: private.answer_benchmark_questions and _results, C16's
         # real questions, gold answers and the agent's graded answers.
-        "private": 17,  # encrypted MCP connections, HN session
+        # +1 private: private.priority_benchmark_labels, the C2 label mirror.
+        "private": 18,  # encrypted MCP connections, HN session
         # +2 internal: the row-trigger functions that keep
         # derived_search.chunk_vectors in step with chunks and embeddings.
         # +2 internal: the Feed tab's card-versioning trigger and the guard
         # that keeps base_feed.item_versions append-only.
-        "internal": 7,
+        # +1 internal: internal.search_hybrid_semantic_walk, one partition's
+        # graph walk as a PARALLEL SAFE function so the walks share workers.
+        # +2 internal: internal.search_text_pool and its PARALLEL SAFE
+        # search_text_pool_partition, the lexical pool's partitions on workers.
+        "internal": 10,
     }
 
 
@@ -438,6 +454,10 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
         "upstream_mutation_requests",
         "upstream_mutation_events",
         "upstream_mutation_request_events",
+        "mutation_policies",
+        "mutation_policy_grants",
+        "mutation_policy_evaluations",
+        "mutation_policy_settings",
         "agent_runs",
         "agent_run_events",
         "agent_run_tool_calls",
@@ -445,6 +465,9 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
     assert {obj.id for obj in CATALOG.objects if obj.query_access == "execute_only"} == {
         "utf8_byte_prefix",
         "search_text_preview",
+        "search_hybrid_semantic_walk",
+        "search_text_pool",
+        "search_text_pool_partition",
     }
     assert set(CATALOG.denied_schemas()) == {"private"}
 

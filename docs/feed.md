@@ -302,7 +302,12 @@ video does: desktop Chrome's `<video>` cannot play it) and `less_like_this`.
 - **Keys:** `j`/`k` next and previous (`k` goes to the top of a part-read card first), `o` or Enter
   the reader, `v` the main link, `1`-`9` the card's numbered links, `p` play or stop, `l` like, `s` save,
   `x` hide, `z` undo, `r` reload, Esc close the reader or stop the video. They act on the current
-  card, the one under a line near the top of the column, outlined. `j`/`k` set `scrollTop` with no
+  card, outlined: the topmost card an impression would count as on screen (at least half of it, or
+  half the screen for a taller card; `currentIndex` in `feed_log.js`), else the most visible one.
+  Until 2026-11-12 it was the first card whose bottom was below a line 24 px from the top, so a
+  tall card scrolled away until only its buttons showed stayed outlined, and `l`, `s`, `x`, `o`,
+  `v`, `p` and `1`-`9` acted on it, while the next card filled the screen. Impressions never used
+  that rule. `j`/`k` set `scrollTop` with no
   animation. A held key does not repeat (`event.repeat` is ignored): a held `j` would mark a card seen
   on every repeat that reached a frame. Keys are also ignored with Ctrl, Meta or Alt, in an input and
   while the token gate is open; Enter on a focused link or button stays native, and so do PageDown,

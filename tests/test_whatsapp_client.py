@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import gzip
 import importlib.util
@@ -426,6 +426,52 @@ def test_session_status_callback_failure_never_kills_the_client(tmp_path) -> Non
         session_status_callback=boom,
     )
     runner._on_connected(None, None)  # must not raise
+
+
+def test_the_connected_client_records_the_newest_message_whatsapp_delivered(tmp_path) -> None:
+    """C11: the linked device's own newest message is what the detector compares with."""
+    observed: list[object] = []
+    clock = [datetime(2026, 11, 11, 12, 0, tzinfo=UTC)]
+    runner = WhatsAppClientRunner(
+        account="zach@example.com",
+        session_path=tmp_path / "session.sqlite",
+        object_store=FakeObjectStore(),
+        upload_state=None,
+        logger=FakeLogger(),
+        upstream_observation_callback=observed.append,
+        observation_interval_seconds=300,
+        now=lambda: clock[0],
+    )
+    runner._maybe_observe()
+    assert observed == [], "a client that never connected has not looked at WhatsApp"
+
+    runner._on_connected(None, None)
+    runner._maybe_observe()
+    assert observed == [None], "connected with nothing delivered: a fresh look, nothing newer"
+
+    runner._on_message(FakeClient(), message_event(message=E.Message(conversation="hi")))
+    runner._maybe_observe()
+    assert observed == [None], "observations are paced, not one per flush"
+
+    clock[0] += timedelta(minutes=5)
+    runner._maybe_observe()
+    assert observed[-1] == datetime.fromtimestamp(UNIX_TS, tz=UTC)
+
+
+def test_an_observation_failure_never_kills_the_client(tmp_path) -> None:
+    def boom(_newest) -> None:
+        raise RuntimeError("postgres away")
+
+    runner = WhatsAppClientRunner(
+        account="zach@example.com",
+        session_path=tmp_path / "session.sqlite",
+        object_store=FakeObjectStore(),
+        upload_state=None,
+        logger=FakeLogger(),
+        upstream_observation_callback=boom,
+    )
+    runner._on_connected(None, None)
+    runner._maybe_observe()  # must not raise
 
 
 def test_postgres_session_store_records_status_on_the_session_row() -> None:

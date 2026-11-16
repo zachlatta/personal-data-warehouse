@@ -362,7 +362,10 @@ lands in `base_android_notifications.events`, from 2026-10-24.
   summaries and empty shells stay in `base_*`), tiered by SQL: ongoing or posted by PDW's own
   app (`com.zachlatta.pdw*`) `background`, a `msg`/`call` notification `direct` (`cc` for a group
   conversation), the rest `noise`. These rows never page, even `direct` ones: the phone already
-  showed the notification, and most mirror a source that pages itself. The
+  showed the notification, and most mirror a source that pages itself. The same rows also
+  stop the mirrored source's PDW alert on the phone: an Android delivery is skipped as
+  `already_notified` when another app already posted a notification for that event
+  ([docs/notifications.md](../notifications.md#already-shown-on-the-android-phone)). The
   `android_notification_opened` adapter is a tap: a system-log `clicked`, or a listener
   `removed` with reason 1 when no `clicked` row precedes it within 10 s (before the tail ran).
   `android_notification_action` is the rest of what Zach did: an action button pressed, an

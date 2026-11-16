@@ -22,8 +22,9 @@ type Config struct {
 	Token   string
 }
 
-// ResolveConfig returns the warehouse base URL and token with the precedence
-// pdw uses everywhere else: root flags, PDW_API_URL / PDW_SECRET_TOKEN (and
+// ResolveConfig returns the warehouse base URL and signing key with the
+// precedence pdw uses everywhere else: root flags, PDW_INGEST_SECRET (the
+// upload-only key a host should hold), PDW_API_URL / PDW_SECRET_TOKEN (and
 // their MCP_* aliases), then the `pdw login` config file. Either value may be
 // empty when nothing is configured.
 func ResolveConfig(getenv func(string) string, flagBaseURL, flagToken string) Config {
@@ -34,7 +35,7 @@ func ResolveConfig(getenv func(string) string, flagBaseURL, flagToken string) Co
 	env := common.Getenv(getenv)
 	return Config{
 		BaseURL: common.FirstNonEmpty(flagBaseURL, env.Env("PDW_API_URL", "MCP_BASE_URL"), fileCfg.BaseURL),
-		Token:   common.FirstNonEmpty(flagToken, env.Env("PDW_SECRET_TOKEN", "MCP_SECRET_TOKEN"), fileCfg.Token),
+		Token:   common.FirstNonEmpty(flagToken, env.Env("PDW_INGEST_SECRET"), env.Env("PDW_SECRET_TOKEN", "MCP_SECRET_TOKEN"), fileCfg.Token),
 	}
 }
 
@@ -47,7 +48,7 @@ func (c Config) WithEnvFallback(getenv func(string) string) Config {
 	env := common.Getenv(getenv)
 	return Config{
 		BaseURL: common.FirstNonEmpty(c.BaseURL, env.Env("PDW_API_URL", "MCP_BASE_URL")),
-		Token:   common.FirstNonEmpty(c.Token, env.Env("PDW_SECRET_TOKEN", "MCP_SECRET_TOKEN")),
+		Token:   common.FirstNonEmpty(c.Token, env.Env("PDW_INGEST_SECRET"), env.Env("PDW_SECRET_TOKEN", "MCP_SECRET_TOKEN")),
 	}
 }
 
@@ -57,7 +58,7 @@ func (c Config) Problem() string {
 		return "PDW_API_URL (or MCP_BASE_URL) must be set for uploads; run `pdw login`"
 	}
 	if strings.TrimSpace(c.Token) == "" {
-		return "PDW_SECRET_TOKEN (or MCP_SECRET_TOKEN) must be set for uploads; run `pdw login`"
+		return "PDW_INGEST_SECRET (or PDW_SECRET_TOKEN / MCP_SECRET_TOKEN) must be set for uploads; run `pdw login`"
 	}
 	return ""
 }

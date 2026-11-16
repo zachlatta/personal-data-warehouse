@@ -30,8 +30,8 @@
       },
       {
         "name": "noise",
-        "meaning": "bulk or automated traffic",
-        "typical_rows": "newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created plus deleted or declined calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member"
+        "meaning": "bulk or automated traffic, including the untargeted public community firehose",
+        "typical_rows": "newsletters, bots, CI/system notices, auto-created/deleted/declined calendar events, health telemetry, and public community chatter not aimed at him, member or not"
       },
       {
         "name": "background",
@@ -2675,6 +2675,17 @@
       "secret": false
     },
     {
+      "id": "source_upstream_observations",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "source_upstream_observations",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "uploader_heartbeats",
       "kind": "table",
       "layer": "ops",
@@ -2848,7 +2859,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "How the last seven days of timeline.events split across the five priority tiers, per source: events_7d, events_1d, share_7d and newest_event_at for every (source, priority) the collector saw. A row whose priority is 'unclassified' is a classification outage and reads failing; a source whose mix collapses into one tier is visible here before anyone notices a search full of newsletters. Snapshot taken by the pipeline_health collector; older than COLLECTOR_STALE_SECONDS reads unknown."
+      "comment": "Seven-day timeline priority mix per source. Counts: events_7d, events_1d, share_7d and newest_event_at per (source, priority). A row whose priority is 'unclassified' is a classification outage and reads failing; a source whose mix collapses into one tier is visible here before anyone notices a search full of newsletters. Snapshot taken by the pipeline_health collector; older than COLLECTOR_STALE_SECONDS reads unknown."
     },
     {
       "id": "marts_search_health",
@@ -2885,6 +2896,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "Per SimpleFIN account: bridge balance age, sync verdict (`action_required` = claim a new setup token), and which ledger account it reconciled onto (`shared_with_plaid = 0` at a Plaid institution = possible double count)."
+    },
+    {
+      "id": "marts_ops_source_upstream_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "source_upstream_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Source vs PDW. C11: per (pipeline, scope), the source's own newest item against the newest in base_*; status ok, late, failing, unknown (not observed lately)."
     },
     {
       "id": "marts_ops_voice_memo_landing_health",
@@ -3039,6 +3062,39 @@
       "domain": "internal",
       "schema": "internal",
       "name": "search_text_preview",
+      "discoverable": false,
+      "query_access": "execute_only",
+      "secret": false
+    },
+    {
+      "id": "search_hybrid_semantic_walk",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "search_hybrid_semantic_walk",
+      "discoverable": false,
+      "query_access": "execute_only",
+      "secret": false
+    },
+    {
+      "id": "search_text_pool",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "search_text_pool",
+      "discoverable": false,
+      "query_access": "execute_only",
+      "secret": false
+    },
+    {
+      "id": "search_text_pool_partition",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "search_text_pool_partition",
       "discoverable": false,
       "query_access": "execute_only",
       "secret": false
@@ -3551,6 +3607,50 @@
         "schema": "upstream_mutations",
         "name": "request_events"
       }
+    },
+    {
+      "id": "mutation_policies",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "mutation_policies",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
+      "id": "mutation_policy_grants",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "mutation_policy_grants",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
+      "id": "mutation_policy_evaluations",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "mutation_policy_evaluations",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
+      "id": "mutation_policy_settings",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "mutation_policy_settings",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
     },
     {
       "id": "search_benchmark_labels",
@@ -4444,6 +4544,29 @@
       "secret": true
     },
     {
+      "id": "external_feed_items",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "external_feed_items",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false,
+      "comment": "Bounded current-ready projections for outgoing feeds, read through their scoped HTTP endpoints; not source events."
+    },
+    {
+      "id": "external_feed_seq",
+      "kind": "sequence",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "external_feed_seq",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "app_access_tokens",
       "kind": "table",
       "layer": "private",
@@ -4489,6 +4612,62 @@
       "query_access": "public",
       "secret": false,
       "comment": "Call upload inventory compared with landed recordings."
+    },
+    {
+      "id": "script_runs",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "script_runs",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "marts_script_runs",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "script_runs",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "marts_timeline_priority_correctness",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "timeline_priority_correctness",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "C2 labeled priority samples. Private labels and coverage join aggregate ops measurements. At least 90% accuracy, self precision and gold-self recall per adapter; missing, unpublished, unmeasured, incomplete, changed or stale evidence fails."
+    },
+    {
+      "id": "priority_benchmark_labels",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "priority_benchmark_labels",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
+    },
+    {
+      "id": "priority_benchmark_results",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "priority_benchmark_results",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
     }
   ],
   "renamed_timeline_source_tables": {

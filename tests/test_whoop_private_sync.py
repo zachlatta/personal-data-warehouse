@@ -84,6 +84,7 @@ class FakeWhoopPrivateWarehouse:
         self.session_row = session
         self.ensure_called = False
         self.cycles: list[dict] = []
+        self.observations: list[dict] = []
         self.sleeps: list[dict] = []
         self.recoveries: list[dict] = []
         self.workouts: list[dict] = []
@@ -147,6 +148,9 @@ class FakeWhoopPrivateWarehouse:
                 "updated_at": updated_at,
             }
         )
+
+    def record_source_upstream_observation(self, **observation):
+        self.observations.append(observation)
 
     def insert_whoop_private_cycles(self, rows):
         self.cycles.extend(rows)
@@ -1097,6 +1101,22 @@ def test_a_second_run_resumes_the_backfill_from_the_stored_watermark(monkeypatch
     assert any(call["end"] == cursor for call in cycle_calls), "the older slice resumes at the watermark"
     cycles_state = next(row for row in warehouse.state_rows if row["collection"] == "cycles")
     assert cycles_state["watermark_updated_at"] == NOW - timedelta(days=14)
+
+
+def test_the_cycles_pass_records_whoops_own_newest_cycle(monkeypatch) -> None:
+    """C11: asked over the last three days, independent of the plan's windows."""
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    [observation] = warehouse.observations
+    assert observation["pipeline"] == "whoop_private"
+    assert observation["scope"] == ACCOUNT
+    assert observation["upstream_newest_at"] == datetime(2026, 8, 22, 11, 30, tzinfo=UTC)
+    assert observation["upstream_newest_id"] == "1234"
+    probe = next(params for endpoint, params in client.calls if endpoint == "cycles_details")
+    assert (probe["start"], probe["end"]) == (NOW - timedelta(days=3), NOW)
 
 
 def test_a_rejected_session_records_action_required_once_and_is_then_skippable(monkeypatch) -> None:

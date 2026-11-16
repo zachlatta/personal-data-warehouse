@@ -121,6 +121,9 @@ type Runner struct {
 	Mode              string
 	Limit             int
 	BeforeUploadCheck func() string
+	// Observe posts the address book's own newest edit (contract C11); nil
+	// disables it.
+	Observe ingestclient.ObservationPoster
 }
 
 type selectedContact struct {
@@ -146,6 +149,7 @@ func (r *Runner) Sync() (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
+	r.observeNewest(contacts)
 	currentKeys := map[[2]string]bool{}
 	var selected []selectedContact
 	skipped := 0
@@ -348,4 +352,18 @@ func Envelope(account string, exportedAt time.Time, record map[string]any) map[s
 		"record_type":    "contact",
 		"record":         record,
 	}
+}
+
+// observeNewest posts the newest modification date among the cards this Mac's
+// AddressBook holds, the same field the warehouse stores as source_updated_at,
+// before anything is uploaded (contract C11).
+func (r *Runner) observeNewest(contacts []Contact) {
+	var newest Contact
+	for _, contact := range contacts {
+		if contact.ModifiedAt.After(newest.ModifiedAt) {
+			newest = contact
+		}
+	}
+	ingestclient.Observe(r.Observe, r.Logger, "apple_contacts", r.Account, newest.ModifiedAt, newest.ContactID,
+		fmt.Sprintf("AddressBook: the newest modification of %d cards", len(contacts)), r.Now())
 }

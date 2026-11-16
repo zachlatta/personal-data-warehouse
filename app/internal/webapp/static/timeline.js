@@ -8,13 +8,13 @@ export function mount(container, ctx) {
   container.innerHTML = `
     <div id="tl">
       <div id="rail">
-        <div class="rail-h">priority <span class="clear" id="clearsrc">reset</span></div>
+        <div class="rail-h">Priority <span class="clear" id="clearsrc">Reset</span></div>
         <div id="prioritylist"></div>
-        <div class="rail-h">sources</div>
+        <div class="rail-h">Sources</div>
         <div id="srclist"></div>
-        <div class="rail-h">kinds</div>
+        <div class="rail-h">Kinds</div>
         <div id="kindlist"></div>
-        <div class="rail-h">sync horizon</div>
+        <div class="rail-h">Sync horizon</div>
         <div id="synclist"></div>
       </div>
       <div id="main">
@@ -27,31 +27,36 @@ export function mount(container, ctx) {
     </div>`;
 
   const controls = h("div", "ctl");
-  const jumpLabel = h("label", "", "jump");
+  const jumpLabel = h("label", "", "Jump to");
   const jump = h("input"); jump.type = "date"; jump.id = "jump";
-  const latest = h("button", "", "latest"); latest.type = "button";
+  const latest = h("button", "", "Latest"); latest.type = "button";
   controls.appendChild(jumpLabel); controls.appendChild(jump); controls.appendChild(latest);
   ctx.setControls(controls);
 
   const state = {
     cursor: "", exhausted: false, loading: false,
-    sources: {}, kinds: {}, priorities: {}, haveCounts: false,
+    sources: {}, kinds: {}, priorities: {},
     lastDay: "", selected: null, count: 0, jump: "", dead: false,
-    sourcesTimer: null, retryTimer: null,
+    sourcesTimer: null,
   };
 
   /* ---- filters ---- */
   function activeCSV(map) { return Object.keys(map).filter((key) => map[key]).join(","); }
-  function countLabel(count) { return (typeof count === "number" && isFinite(count)) ? count.toLocaleString() : "…"; }
+  function countLabel(count, estimated) {
+    if (!(typeof count === "number" && isFinite(count))) return "…";
+    return (estimated ? "≈" : "") + count.toLocaleString();
+  }
   function renderChips(listNode, catalog, map, colorize) {
     clear(listNode);
     catalog.forEach((entry) => {
       const chip = h("div", "chip" + (map[entry.name] ? " on" : ""));
       const dot = h("span", "dot");
-      dot.style.background = colorize ? hue(entry.name) : "var(--line2)";
+      dot.style.background = colorize ? hue(entry.name) : "var(--border-strong)";
       chip.appendChild(dot);
       chip.appendChild(h("span", "nm", entry.label || entry.name));
-      chip.appendChild(h("span", "ct", countLabel(entry.count)));
+      const ct = h("span", "ct", countLabel(entry.count, entry.estimated));
+      if (entry.estimated) ct.title = "estimated from Postgres statistics";
+      chip.appendChild(ct);
       chip.addEventListener("click", () => {
         map[entry.name] = !map[entry.name];
         chip.classList.toggle("on");
@@ -64,34 +69,21 @@ export function mount(container, ctx) {
   function loadSources() {
     return timeline.sources().then((body) => {
       if (state.dead) return;
-      // Counts are aggregated in the background server-side; retry until the
-      // first aggregate lands, rendering the sync panel in the meantime.
-      if (body.warming && !state.retryTimer) {
-        state.retryTimer = setTimeout(() => { state.retryTimer = null; loadSources().catch(() => {}); }, 8000);
-      }
-      if (!body.warming || !state.haveCounts) renderCounts(body);
+      renderCounts(body);
       renderSync(body);
     });
   }
 
+  // Counts of common values are Postgres's statistics estimates (estimated:
+  // true); rare values are exact. A null count is one the server would not
+  // walk the table to find.
   function renderCounts(body) {
-    const bySource = {}, byKind = {};
-    let total = 0, oldest = "", newest = "";
-    function addBucket(buckets, key, rowCount, known) {
-      if (!buckets[key]) buckets[key] = { count: 0, known: false };
-      if (known) { buckets[key].count += rowCount; buckets[key].known = true; }
-    }
-    (body.sources || []).forEach((row) => {
-      const known = typeof row.count === "number" && isFinite(row.count);
-      const rowCount = known ? row.count : 0;
-      if (known) total += rowCount;
-      addBucket(bySource, row.source, rowCount, known);
-      addBucket(byKind, row.kind, rowCount, known);
-      if (row.oldest && (!oldest || row.oldest < oldest)) oldest = row.oldest;
-      if (row.newest && (!newest || row.newest > newest)) newest = row.newest;
-    });
-    function toCatalog(counts) {
-      const list = Object.keys(counts).map((key) => ({ name: key, count: counts[key].known ? counts[key].count : null }));
+    function toCatalog(rows, key) {
+      const list = (rows || []).map((row) => ({
+        name: row[key],
+        count: (typeof row.count === "number" && isFinite(row.count)) ? row.count : null,
+        estimated: row.estimated === true,
+      }));
       list.sort((a, b) => {
         const ak = typeof a.count === "number", bk = typeof b.count === "number";
         if (ak && bk && a.count !== b.count) return b.count - a.count;
@@ -100,19 +92,16 @@ export function mount(container, ctx) {
       });
       return list;
     }
-    renderChips(el("srclist"), toCatalog(bySource), state.sources, true);
-    renderChips(el("kindlist"), toCatalog(byKind), state.kinds, false);
-    const priorityCatalog = (body.priorities || []).map((row) => ({ name: row.priority, label: row.priority, count: row.count }));
+    renderChips(el("srclist"), toCatalog(body.sources, "source"), state.sources, true);
+    renderChips(el("kindlist"), toCatalog(body.kinds, "kind"), state.kinds, false);
+    const priorityCatalog = (body.priorities || []).map((row) => ({ name: row.priority, label: row.priority, count: row.count, estimated: row.estimated === true }));
     renderChips(el("prioritylist"), priorityCatalog, state.priorities, false);
-    if (body.warming) {
-      ctx.setStats("warming filter counts…");
-    } else {
-      state.haveCounts = true;
-      const stats = h("span");
-      stats.appendChild(h("b", "", total.toLocaleString()));
-      stats.appendChild(document.createTextNode(" events · " + (oldest ? oldest.slice(0, 10) : "—") + " → " + (newest ? newest.slice(0, 10) : "—")));
-      ctx.setStats(stats);
-    }
+    const total = typeof body.total === "number" ? body.total : 0;
+    const oldest = body.oldest || "", newest = body.newest || "";
+    const stats = h("span");
+    stats.appendChild(h("b", "", "≈" + total.toLocaleString()));
+    stats.appendChild(document.createTextNode(" events · " + (oldest ? oldest.slice(0, 10) : "—") + " → " + (newest ? newest.slice(0, 10) : "—")));
+    ctx.setStats(stats);
   }
 
   function renderSync(body) {
@@ -141,7 +130,7 @@ export function mount(container, ctx) {
   /* ---- ledger ---- */
   function appendItems(items) {
     const rowsNode = el("rows");
-    items.forEach((item, index) => {
+    items.forEach((item) => {
       const day = dayOf(item.occurred_at);
       if (day !== state.lastDay) {
         state.lastDay = day;
@@ -150,10 +139,9 @@ export function mount(container, ctx) {
         let weekday = "";
         try { weekday = WEEKDAYS[new Date(item.occurred_at).getDay()]; } catch (e) { /* unknown day */ }
         head.appendChild(h("span", "w", weekday));
-        head.appendChild(h("span", "rule"));
         rowsNode.appendChild(head);
       }
-      rowsNode.appendChild(rowNode(item, index, (row) => {
+      rowsNode.appendChild(rowNode(item, (row) => {
         if (state.selected) state.selected.classList.remove("sel");
         state.selected = row;
         row.classList.add("sel");
@@ -256,24 +244,19 @@ export function mount(container, ctx) {
       state.dead = true;
       observer.disconnect();
       clearInterval(state.sourcesTimer);
-      if (state.retryTimer) clearTimeout(state.retryTimer);
     },
   };
 }
 
 // rowNode renders one ledger row; shared with the search results list.
-export function rowNode(item, index, onClick) {
+export function rowNode(item, onClick) {
   const row = h("div", "row p-" + (item.priority || "unclassified"));
-  row.style.animationDelay = Math.min(index, 12) * 12 + "ms";
+  row.style.setProperty("--src", hue(item.source));
   row.appendChild(h("div", "t", fmtTime(item.occurred_at)));
-  const tick = h("div", "tick");
-  tick.style.background = hue(item.source);
-  row.appendChild(tick);
+  row.appendChild(h("div", "tick"));
 
   const who = h("div", "who");
-  const src = h("div", "src", item.source);
-  src.style.color = hue(item.source);
-  who.appendChild(src);
+  who.appendChild(h("div", "src", item.source));
   who.appendChild(h("div", "actor", item.actor || "—"));
   row.appendChild(who);
 

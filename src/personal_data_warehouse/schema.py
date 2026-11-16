@@ -2648,6 +2648,12 @@ PIPELINE_HEALTH_COLUMNS = (
     "last_error",
     "last_error_at",
     "collected_at",
+    # C11: the catalog id of the marts_ops view that compares this source with
+    # the source itself, its worst status at collection, or (for a source with
+    # no such comparison can exist) the stated reason why.
+    "sla_detector",
+    "sla_detector_status",
+    "sla_exemption",
 )
 
 PIPELINE_TABLE_FRESHNESS_COLUMNS = (
@@ -2792,6 +2798,22 @@ SEARCH_BENCHMARK_LABEL_COLUMNS = (
     "since",
     "note",
     "updated_at",
+    "sync_version",
+)
+
+# Contract C2: private label manifest and the latest aggregate measurement.
+PRIORITY_BENCHMARK_LABEL_COLUMNS = (
+    "label_set",
+    "payload_json",
+    "label_sha256",
+    "updated_at",
+    "sync_version",
+)
+PRIORITY_BENCHMARK_RESULT_COLUMNS = (
+    "label_set",
+    "results_json",
+    "label_sha256",
+    "collected_at",
     "sync_version",
 )
 
@@ -2944,6 +2966,27 @@ TIMELINE_PRIORITY_MIX_COLUMNS = (
     "events_1d",
     "newest_event_at",
     "collected_at",
+)
+
+# What a source itself says is its newest item, recorded by the collector that
+# talks to it (C11): Gmail's newest message, a calendar's last modification,
+# Drive's newest modified file, the WhatsApp linked device's newest message,
+# the Mac's own chat.db. One row per (pipeline, scope), upserted on every look.
+# marts_ops.source_upstream_health compares it with what landed in base_*.
+SOURCE_UPSTREAM_OBSERVATION_COLUMNS = (
+    "pipeline",
+    "scope",
+    "upstream_newest_at",
+    "upstream_newest_id",
+    "detail",
+    "observed_at",
+    # The oldest upstream item PDW has not caught up with, carried by the
+    # pipeline_health collector until PDW passes it (epoch when none). Writers
+    # never set it: without it a busy source reads ok through a days-long
+    # stall, because every look names a fresher newest item.
+    "pending_since",
+    "updated_at",
+    "sync_version",
 )
 
 # One row per (pipeline, device) from the machines that push data through the

@@ -11,6 +11,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/webapp"
 )
 
 var errFakeQuery = errors.New("snapshot query exploded")
@@ -183,7 +184,7 @@ func TestPipelinesPageIsServedUnauthenticated(t *testing.T) {
 		t.Fatalf("expected the page shell to render without a bearer token, got %d", resp.StatusCode)
 	}
 	page := string(body)
-	for _, needle := range []string{"PDW/PIPELINES", "/api/pipelines", "marts_ops.pipeline_health"} {
+	for _, needle := range []string{"<title>Pipelines · PDW</title>", "/api/pipelines", "marts_ops.pipeline_health"} {
 		if !strings.Contains(page, needle) {
 			t.Fatalf("page is missing %q", needle)
 		}
@@ -202,6 +203,26 @@ func TestTimelinePageLinksToPipelines(t *testing.T) {
 	}
 	if !strings.Contains(pipelinesPageHTML, `href="/timeline"`) {
 		t.Fatal("the pipelines page must link back to the timeline")
+	}
+}
+
+// The dashboard is a page of the web app, not a separate tool: it links the
+// app's stylesheet rather than carrying its own palette, and its header is the
+// app's header, with a tab for every page and its own tab marked current.
+func TestPipelinesPageSharesTheAppDesign(t *testing.T) {
+	if !strings.Contains(pipelinesPageHTML, `href="/app/app.css"`) {
+		t.Fatal("the pipelines page must link the shared /app/app.css")
+	}
+	if strings.Contains(pipelinesPageHTML, ":root") {
+		t.Fatal("the pipelines page declares its own palette; tokens belong in app.css")
+	}
+	for _, route := range webapp.Routes {
+		if !strings.Contains(pipelinesPageHTML, `href="`+route+`"`) {
+			t.Fatalf("the pipelines header has no tab for %s", route)
+		}
+	}
+	if !strings.Contains(pipelinesPageHTML, `href="/pipelines" class="on" aria-current="page"`) {
+		t.Fatal("the pipelines tab must be marked current")
 	}
 }
 
@@ -553,6 +574,7 @@ func TestPipelinesPageCoversEveryOpsHealthView(t *testing.T) {
 		{"marts_search_request_latency", "search_latency"},
 		{"marts_ops_slack_conversation_health", "slack"},
 		{"marts_ops_plaid_item_health", "plaid"},
+		{"marts_ops_source_upstream_health", "sources"},
 		{"marts_pgbackrest_health", "backups"},
 		{"marts_notification_health", "notifications"},
 	} {
@@ -572,7 +594,9 @@ func TestPipelinesPageCoversEveryOpsHealthView(t *testing.T) {
 func TestPipelinesPageTreatsPausedAsIntentional(t *testing.T) {
 	for _, fragment := range []string{
 		`"manual", "paused", "ok"`,
-		`paused: "var(--manual)"`,
+		// paused reads like manual: a calm, expected state, not an alarm.
+		`manual: "var(--info)"`,
+		`paused: "var(--info)"`,
 		`paused: "intentionally paused`,
 		`["ok", "manual", "paused", "unmonitored", "unmeasured"]`,
 	} {
@@ -683,5 +707,89 @@ func TestPipelinesNotificationHealthCarriesAndroidDeliveryCheck(t *testing.T) {
 	}
 	if strings.Contains(pipelinesPageHTML, "direct/CC") {
 		t.Fatal("pipelines page still carries stale direct/CC notification copy")
+	}
+}
+
+// The SPA hides its header controls (#topctl) on a phone, as it always has.
+// The dashboard's own filter and reload must not live there: on a phone they
+// are the only way to narrow a long list to what needs attention.
+func TestPipelinesControlsStayReachableOnAPhone(t *testing.T) {
+	head := pipelinesPageHTML[strings.Index(pipelinesPageHTML, `<div class="page-head">`):]
+	head = head[:strings.Index(head, `<div id="tiles">`)]
+	for _, id := range []string{`id="attention"`, `id="reload"`} {
+		if !strings.Contains(head, id) {
+			t.Fatalf("the pipelines page head must carry %s, where a phone can reach it", id)
+		}
+	}
+	if strings.Contains(pipelinesPageHTML, `id="topctl"`) {
+		t.Fatal("the pipelines page must not put controls in #topctl, which phones hide")
+	}
+}
+
+// Contract C11 on the web: the source-vs-PDW rows and every source's stated SLA
+// reach the page, and a deploy where the app runs before the Python ensure path
+// has created the view or the sla_* columns degrades to empty sections.
+func TestPipelinesAPIReturnsSourceSLAsAndToleratesTheirAbsence(t *testing.T) {
+	runner := newFullPipelinesTestRunner()
+	runner.argResults[warehouse.SQLRelation("marts_ops_source_upstream_health")] = query.RawResult{
+		Columns: []string{"pipeline"},
+		Rows: []map[string]any{{
+			"pipeline": "gmail", "scope": "a@x.test", "status": "late", "landed": int64(0),
+			"upstream_newest_at": "2026-11-11T12:00:00Z", "pdw_newest_at": "2026-11-11T11:00:00Z",
+			"missing_seconds": int64(1800), "tolerance_seconds": int64(900),
+		}},
+	}
+	srv := newTimelineTestServer(t, runner)
+	resp, body := timelineGET(t, srv, "/api/pipelines", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var payload struct {
+		Sources    []map[string]any `json:"sources"`
+		SourceSLAs []map[string]any `json:"source_slas"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Sources) != 1 || payload.Sources[0]["status"] != "late" {
+		t.Fatalf("sources = %v", payload.Sources)
+	}
+	if payload.SourceSLAs == nil {
+		t.Fatalf("source_slas must be a list: %s", body)
+	}
+	if !strings.Contains(pipelineSourceSLASQL, "kind = 'source'") {
+		t.Fatal("source SLAs are read for sources only")
+	}
+
+	for _, missing := range []string{
+		warehouse.SQLRelation("marts_ops_source_upstream_health"),
+		"sla_exemption",
+	} {
+		runner := newFullPipelinesTestRunner()
+		runner.argErrs = map[string]error{missing: errors.New(`ERROR: does not exist (SQLSTATE 42703)`)}
+		srv := newTimelineTestServer(t, runner)
+		resp, body := timelineGET(t, srv, "/api/pipelines", true)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s missing must not fail the page: %d %s", missing, resp.StatusCode, body)
+		}
+		var degraded struct {
+			Pipelines  []map[string]any `json:"pipelines"`
+			Sources    []map[string]any `json:"sources"`
+			SourceSLAs []map[string]any `json:"source_slas"`
+		}
+		if err := json.Unmarshal(body, &degraded); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(degraded.Pipelines) != 2 || degraded.Sources == nil || degraded.SourceSLAs == nil {
+			t.Fatalf("%s missing: %s", missing, body)
+		}
+	}
+}
+
+func TestPipelinesPageExplainsAnExemptSource(t *testing.T) {
+	for _, needle := range []string{"exempt: \"", "marts_ops.source_upstream_health", "sla_exemption"} {
+		if !strings.Contains(pipelinesPageHTML, needle) {
+			t.Fatalf("pipelines page is missing %q", needle)
+		}
 	}
 }

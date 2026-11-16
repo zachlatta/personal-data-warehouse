@@ -56,13 +56,13 @@ export function truncate(value, max) {
 }
 
 const HUES = {
-  gmail: "#e06c5f", slack: "#5fb0e0", apple_messages: "#62c98d", whatsapp: "#45c07a",
-  apple_notes: "#e8975a", voice_memos: "#e05f9a", calendar: "#e8b45a",
-  google_drive: "#d9c95f", contacts: "#7fd0c4", whoop: "#b8d84e", whoop_private: "#a3c93f",
-  mutations: "#c46be0", warehouse: "#8b94a1",
-  alice_voice_recordings: "#de7eb6", finance: "#6fcf97",
-  photos: "#e8a06b",
-  claude_code: "#b78ae8", codex: "#9a8ae8", openclaw: "#8aa6e8", pi: "#7b93df", muse_code: "#df7ba6", argon: "#7bc7df", claude_desktop: "#cf8ae8", chatgpt: "#8ae8c9", muse: "#e88ab4",
-  agent_sessions: "#b78ae8", agent_session: "#b78ae8",
+  gmail: "#e5484d", slack: "#7c5cc4", apple_messages: "#2f9e5b", whatsapp: "#22a39a",
+  apple_notes: "#d9a21b", voice_memos: "#d6409f", calendar: "#3b63d4",
+  google_drive: "#c98a10", contacts: "#0f8a8a", whoop: "#5f9a1c", whoop_private: "#4d7d17",
+  mutations: "#8a5bd6", warehouse: "#8f8b86",
+  alice_voice_recordings: "#c2477f", finance: "#1f9d55",
+  photos: "#e2702a",
+  claude_code: "#d0743f", codex: "#2d7f86", openclaw: "#3d7be0", pi: "#5458d6", muse_code: "#b8457a", argon: "#1690b8", claude_desktop: "#b85f2c", chatgpt: "#139a7b", muse: "#d6456a",
+  agent_sessions: "#d0743f", agent_session: "#d0743f",
 };
-export function hue(src) { return HUES[src] || "#8b94a1"; }
+export function hue(src) { return HUES[src] || "#8f8b86"; }

@@ -1329,3 +1329,41 @@ test('an unchecked Pixel text warns, and a sent one names its protocol', () => {
   assert.deepEqual(review.sent, { protocol: 'RCS', alreadySent: false, state: 'delivered' });
   assert.equal(isTextMessageSendMutation({ provider: 'apple_messages', operation: 'apple_messages.send_message' }), false);
 });
+
+test('policyBadge shows a dry run as would auto-approve and says why a policy did not cover a request', async () => {
+  const { policyBadge } = await import('./mutation-review.ts');
+  assert.equal(policyBadge({}), null);
+  assert.equal(policyBadge(null), null);
+  const would = policyBadge({ policy: { decision: 'would_approve', label: 'Would auto-approve (policy heating-winter v1, dry run)', reasons: ['inside'] } });
+  assert.equal(would.tone, 'info');
+  assert.match(would.label, /Would auto-approve/);
+  const review = policyBadge({ policy: { decision: 'review', reasons: ['heat_setpoint 74 is above this policy\'s 72', 7] } });
+  assert.equal(review.tone, 'muted');
+  assert.deepEqual(review.reasons, ['heat_setpoint 74 is above this policy\'s 72']);
+});
+
+test('requestSchedule reads a scheduled request runs-at and deadline', async () => {
+  const { requestSchedule } = await import('./mutation-review.ts');
+  assert.deepEqual(requestSchedule({ not_before: '2026-12-04T12:30:00Z', not_after: null }), { runsAt: '2026-12-04T12:30:00Z', deadline: '' });
+  assert.deepEqual(requestSchedule(null), { runsAt: '', deadline: '' });
+});
+
+test('mutationSchedule shows each step its own runs-at, deadline and precondition', async () => {
+  const { mutationSchedule } = await import('./mutation-review.ts');
+  const step = mutationSchedule({ not_before: '2026-12-04T12:30:00Z', not_after: null, precondition: { kind: 'not_home', within_minutes: 120 } });
+  assert.equal(step.runsAt, '2026-12-04T12:30:00Z');
+  assert.equal(step.deadline, '');
+  assert.match(step.precondition, /at home .*120 minutes/);
+  assert.deepEqual(mutationSchedule({}), { runsAt: '', deadline: '', precondition: '' });
+});
+
+test('policyChangeReview shows the verdict and the diff of a policy change', async () => {
+  const { policyChangeReview } = await import('./mutation-review.ts');
+  assert.equal(policyChangeReview({ operation: 'gmail.send_email' }), null);
+  const review = policyChangeReview({ operation: 'pdw.mutation_policy', preview: { policy_change: {
+    narrowing: false, widens: ['match.heat_setpoint: a lower or removed minimum'],
+    diff: [{ field: 'match.heat_setpoint', before: 'min 55, max 72', after: 'min 50, max 72', verdict: 'widens' }],
+  } } });
+  assert.equal(review.narrowing, false);
+  assert.equal(review.diff[0].verdict, 'widens');
+});

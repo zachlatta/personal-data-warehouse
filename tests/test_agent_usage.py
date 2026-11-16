@@ -224,6 +224,131 @@ def test_codex_item_completed_is_not_double_counted_with_its_call_row(
     assert snapshot.search_calls == 1
 
 
+def test_codex_output_and_prose_that_name_pdw_are_not_pdw_calls(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Only a Codex item's command is the call, never what it printed.
+
+    A session that printed a skill or a README naming `pdw sql` / `pdw search`
+    at a line start, or wrote a message naming a command in backticks, ran
+    nothing.
+    """
+
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    printed = (
+        '{"payload":{"item":{'
+        '"aggregated_output":"# Guide\\npdw sql -q x \\"SELECT 1\\"\\npdw readme full` is the long form",'
+        '"command":["/bin/zsh","-lc","cat README.md"]}}}'
+    )
+    prose = '{"payload":{"item":{"type":"Text","text":"Next I will run `pdw sql` and `pdw query`."}}}'
+    warehouse.insert_agent_session_events(
+        [
+            _event("codex-printed", 1, source="codex", subtype="item_completed", raw=printed),
+            _event("codex-printed", 2, source="codex", subtype="item_completed", raw=prose),
+        ]
+    )
+
+    snapshot = {
+        row.source: row for row in AgentUsageCollector(warehouse, window_days=14).run()
+    }["codex"]
+    assert snapshot.pdw_sessions == 0
+    assert snapshot.first_invented == 0
+    assert snapshot.invented_calls == 0
+
+
+def test_tool_discovery_and_actions_are_not_where_a_question_starts(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """`pdw list` / `pdw describe x__y` look up another system's tools, the
+    same thing the MCP `connections` tool does; tool help, the MCP readme and
+    reviewed writes act rather than ask. None of them is a session's opener."""
+
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    mcp = "mcp__claude_ai_Personal_Data_Warehouse__"
+    warehouse.insert_agent_session_events(
+        [
+            _event("k", 1, tool="Bash", inp='{"command":"pdw list | grep file_share"}'),
+            _event("k", 2, tool="Bash", inp='{"command":"pdw describe file_share__create_upload_url 2>&1 | head -30"}'),
+            _event("k", 3, tool="Bash", inp='{"command":"pdw describe propose_mutation"}'),
+            _event("k", 4, tool="Bash", inp='{"command":"pdw call --help"}'),
+            _event("k", 5, tool="Bash", inp='{"command":"pdw call propose_mutation_help --data \'{}\'"}'),
+            _event("k", 6, tool="Bash", inp='{"command":"pdw call propose_mutation < proposal.json"}'),
+            _event("k", 7, tool="Bash", inp='{"command":"pdw sql -q x \\"SELECT status FROM marts_ops.agent_usage\\""}'),
+            _event("m", 1, tool=mcp + "readme", inp="{}"),
+            _event("m", 2, tool=mcp + "notify", inp='{"title":"x"}'),
+            _event("m", 3, tool=mcp + "search", inp='{"query":"lease","priorities":["self"]}'),
+        ]
+    )
+
+    snapshot = {
+        row.source: row for row in AgentUsageCollector(warehouse, window_days=14).run()
+    }["all"]
+    assert snapshot.pdw_sessions == 2
+    assert (snapshot.first_search, snapshot.first_sql) == (1, 1)
+    assert snapshot.connection_calls == 2
+    assert snapshot.admin_calls == 6
+
+
+def test_feed_and_mutation_reads_stay_reads(warehouse: PostgresWarehouse) -> None:
+    """Only writes and help leave the denominator. A session that opens by
+    reading the Feed or a mutation's status asked PDW something, so it is a
+    PDW session whose opener was not a search."""
+
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    mcp = "mcp__claude_ai_Personal_Data_Warehouse__"
+    warehouse.insert_agent_session_events(
+        [
+            _event("r1", 1, tool="Bash", inp='{"command":"pdw feed stats --output json"}'),
+            _event("r2", 1, tool="Bash", inp='{"command":"pdw call get_mutation --data \'{\\"id\\":\\"req_x\\"}\'"}'),
+            _event("r3", 1, tool=mcp + "feed_list", inp='{"view":"feed"}'),
+            _event("r4", 1, tool=mcp + "feed_history", inp='{"item_id":"x"}'),
+            # Writes are admin: these sessions never asked a question.
+            _event("w1", 1, tool="Bash", inp='{"command":"pdw feed push --source x < cards.json"}'),
+            _event("w2", 1, tool=mcp + "feed_push", inp='{"items":[]}'),
+            _event("w3", 1, tool=mcp + "withdraw_mutation", inp='{"request_id":"x"}'),
+        ]
+    )
+
+    snapshot = {
+        row.source: row for row in AgentUsageCollector(warehouse, window_days=14).run()
+    }["all"]
+    assert snapshot.pdw_sessions == 4
+    assert snapshot.first_search == 0
+    assert snapshot.admin_calls == 3
+
+
+def test_sql_over_the_timeline_is_a_timeline_start(warehouse: PostgresWarehouse) -> None:
+    """C3: "the search tool or `timeline.events` in SQL first". SQL that opens
+    on the event stream or its search functions counts with search; SQL that
+    never names the timeline is still `first_sql`."""
+
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    mcp = "mcp__claude_ai_Personal_Data_Warehouse__query"
+    warehouse.insert_agent_session_events(
+        [
+            _event("t1", 1, tool="Bash",
+                   inp='{"command":"pdw sql -q x \\"SELECT occurred_at FROM timeline.events WHERE priority IN (\'self\') LIMIT 5\\""}'),
+            _event("t2", 1, tool=mcp,
+                   inp='{"queries":[{"sql":"SELECT * FROM timeline.search_text(\'lease\', 10, priorities => ARRAY[\'self\'])"}]}'),
+            _event("t3", 1, tool="Bash",
+                   inp='{"command":"pdw sql -q x \\"SELECT * FROM marts_ai_conversations.sessions LIMIT 5\\""}'),
+            # A relation whose name merely starts with "events" in another schema is not the timeline.
+            _event("t4", 1, tool="Bash",
+                   inp='{"command":"pdw sql -q x \\"SELECT * FROM base_feed.events LIMIT 5\\""}'),
+        ]
+    )
+
+    snapshot = {
+        row.source: row for row in AgentUsageCollector(warehouse, window_days=14).run()
+    }["all"]
+    assert snapshot.pdw_sessions == 4
+    assert (snapshot.first_search, snapshot.first_sql) == (2, 2)
+
+
 def test_agent_usage_view_judges_against_the_targets(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_pipeline_health_tables()
     now = datetime.now(tz=UTC)

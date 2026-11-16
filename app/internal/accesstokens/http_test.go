@@ -13,6 +13,25 @@ import (
 
 const httpMaster = "test-secret-token-at-least-32-chars-long"
 
+func TestAbsoluteFeedExpiryIsExactAcrossClockTicks(t *testing.T) {
+	svc, c, h := newHTTPFixture(t)
+	svc.now = func() time.Time { c.Advance(time.Microsecond); return c.Now() }
+	rec := do(t, h, http.MethodPost, TokensPath, "web:"+httpMaster, `{"client_name":"consumer","scope":"feed:voice-memos","expires_at":"2030-01-02T03:04:00Z"}`)
+	if rec.Code != 201 {
+		t.Fatalf("issue: %d %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Info TokenView `json:"info"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := time.Parse(time.RFC3339, "2030-01-02T03:04:00Z")
+	if body.Info.ExpiresAt == nil || !body.Info.ExpiresAt.Equal(want) {
+		t.Fatalf("expiry drifted: %v", body.Info.ExpiresAt)
+	}
+}
+
 func newHTTPFixture(t *testing.T) (*Service, *clock, http.Handler) {
 	t.Helper()
 	svc, c := newTestService(t)

@@ -1,0 +1,29 @@
+{
+  "description": "A request's status from its mutations' statuses: the one ladder Python (derive_request_status, postgres.py) and Go (mutations.DeriveRequestStatus) both apply. A rejected, withdrawn or cancelled step is not live work. 'current' is the request's status before the rollup.",
+  "cases": [
+    {"statuses": [], "want": "current"},
+    {"statuses": ["rejected"], "want": "rejected"},
+    {"statuses": ["withdrawn", "withdrawn"], "want": "withdrawn"},
+    {"statuses": ["cancelled", "cancelled"], "want": "cancelled"},
+    {"statuses": ["cancelled", "withdrawn"], "want": "rejected"},
+    {"statuses": ["succeeded", "pending_review"], "want": "pending_review"},
+    {"statuses": ["succeeded", "executing"], "want": "executing"},
+    {"statuses": ["failed_terminal", "approved"], "want": "approved"},
+    {"statuses": ["failed_terminal", "failed_retryable"], "want": "failed_retryable"},
+    {"statuses": ["failed_terminal", "blocked_missing_credentials"], "want": "blocked_missing_credentials"},
+    {"statuses": ["succeeded", "failed_terminal"], "want": "failed_terminal"},
+    {"statuses": ["observed", "observed"], "want": "observed"},
+    {"statuses": ["succeeded", "observed"], "want": "succeeded"},
+    {"statuses": ["failed_terminal", "cancelled"], "want": "failed_terminal"},
+    {"statuses": ["blocked_missing_credentials", "cancelled"], "want": "blocked_missing_credentials"},
+    {"statuses": ["succeeded", "cancelled"], "want": "succeeded"},
+    {"statuses": ["observed", "cancelled"], "want": "observed"},
+    {"statuses": ["skipped_precondition", "cancelled"], "want": "skipped_precondition"},
+    {"statuses": ["skipped_precondition", "skipped_precondition"], "want": "skipped_precondition"},
+    {"statuses": ["skipped_precondition", "succeeded"], "want": "succeeded"},
+    {"statuses": ["skipped_precondition", "failed_terminal"], "want": "failed_terminal"},
+    {"statuses": ["withdrawn", "succeeded"], "want": "succeeded"},
+    {"statuses": ["approved", "cancelled"], "want": "approved"},
+    {"statuses": ["something_new"], "want": "current"}
+  ]
+}

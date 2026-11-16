@@ -15,7 +15,7 @@ including this page. This is the brief; {{if .CLI}}`pdw readme full`{{else}}`rea
    neighbouring agent turns):
 {{if .CLI}}   `pdw context '<ref>'` (`--full` for whole texts); a hit's `sql:` line reads its source row verbatim{{else}}   `context` `{"ref": "<ref>"}` (`before`/`after` default 5, `full: true` for whole texts); a hit's `drill_sql` reads its source row verbatim{{end}}
 3. **SQL** only for aggregates, joins, predicates and drill-down, walking
-   `timeline.events` (bounded, priority-filtered) → `marts_*` → `base_*`.
+   `timeline.events` (bounded, priority-filtered) → `marts_*`/`derived_*` → `base_*`.
 4. **Columns before SQL, every time, and wait for them:** {{if .CLI}}`pdw columns <schema.relation>`; `pdw schema` only to find a relation you do not know.{{else}}`describe_table` `{"relation": "<schema.relation>"}`; `schema_overview` only to find a relation you do not know.{{end}}
    Read the output before writing the query: a columns call run in parallel with the SQL, or
    as a fallback after it, is still a guess.
@@ -81,7 +81,10 @@ Not commands: `pdw query` (it is `pdw sql`), `pdw tools` / `pdw connections` (`p
 - Read mail bodies from `body_markdown_clean`, not `body_text` (tracking URLs). JSON is `text` on
   older sources — cast before `->>`; `jsonb` needs `::text` before `LIKE`. 60s statement budget;
   a timeout means narrow, not retry.
-- Keys are `<thing>_id` (`message_id`, `item_id`, `session_id`), almost never a bare `id`.
+- Keys are `<thing>_id`, almost never a bare `id`: `base_gmail.messages.message_id`, `base_feed.items.item_id`.
+  Slack: `conversation_id` (not `channel_id`), `user_id`/`username` (not `user_name`), channel names in
+  `base_slack.conversations`. `search_text()` rows name the sender `who` (not `actor`); agent `events`
+  have `role`, `occurred_at` (no `actor`, `created_at`). Regex repeats max 255: `.{0,255}`.
 - `ops.*` is unreadable by the query role; `marts_ops.*` is the health surface (topic `ops`).
 
 ## Where things live
@@ -96,6 +99,8 @@ Not commands: `pdw query` (it is `pdw sql`), `pdw tools` / `pdw connections` (`p
 Absence is not evidence: check freshness before reporting a negative, and state the window.
 
 ## Topics
+
+{{if .CLI}}`pdw run script.js`{{else}}`run`{{end}} composes dependent reads in server-side JavaScript; topic `scripts` has the API and limits.
 
 {{range .Topics}}- `{{.Name}}` — {{.Summary}}
 {{end}}

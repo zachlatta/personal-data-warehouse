@@ -322,6 +322,23 @@ Claude/Codex/pi scans on (it only sets `AGENT_SESSIONS_ACCOUNT=zach@zachlatta.co
 0600 `EnvironmentFile`, so the interactive `pdw` CLI there keeps its own issued token. `device`
 resolves to `mew-dev`.
 
+### mew (the hypervisor) and other runtime-only Linux hosts
+
+`mew` runs Claude Code and Codex but is not a development host, so it has no checkout. Like
+porygon's LaunchAgents, its uploader runs from a runtime directory,
+`~/.local/share/personal-data-warehouse/` (`bin/` holds `_pdw-upload-lib.sh` and the
+`*-systemd` wrappers; an optional 0600 `.env` beside it), installed and refreshed from
+mew-dev with `bin/sync-linux-device-runtime mew [--enable]`. That writes the checked-in
+unit with its paths pointed at the runtime, reloads, and restarts the service when the unit
+changed; it refuses a host whose unit runs a checkout (mew-dev, openclaw). A
+`10-host.conf` drop-in holds what is per-host: `EnvironmentFile=%h/.config/pdw/ingest.env`
+(0600, `PDW_SECRET_TOKEN`, the same signing secret mew-dev uses), `PDW_API_URL`,
+`PDW_INGEST_TAILSCALE_HOST=mew-coolify`, `PDW_INGEST_MAX_OBJECT_BYTES` (mew-dev's value),
+`AGENT_SESSIONS_ACCOUNT`,
+`AGENT_SESSIONS_DEVICE=mew` and `AGENT_SESSIONS_HEARTBEAT_PIPELINES=claude_code,codex`.
+The user needs `Linger=yes` so the unit runs without a login. `pdw` is a release binary at
+`~/.local/bin/pdw`, kept current by its own auto-update.
+
 ### Muse Code (the Muse models' coding CLI)
 
 Muse Code (`muse`, source `muse_code`, `base_muse_code.events`) is a local coding CLI like
@@ -428,10 +445,119 @@ usage at all, so `input_tokens`/`output_tokens` are 0 by fact, not by a mapping 
 only, as for every provider; Meta's own `muse.db` tool withholds them, but they are in
 the transcript files on Zach's VM.
 
+**The session manifest makes hosted Muse checkable.** Nothing outside the VM can list its
+transcripts, so each `pdw ingest muse` run also publishes a metadata-only manifest as
+generated `base_muse.files` rows, `.pdw/session-manifest/<first hex digit of the session
+id>.json`: `{"format": "pdw.muse.session_manifest.v1", "shard", "sessions": [{session_id,
+agent_id, event_count, last_timestamp, size_bytes, modified_at}]}`. No transcript text, and
+no new files on the VM: the shards are built in memory (`.pdw/` is a dot directory the walk
+never enters), and the only VM-side change is new rows in the uploader's existing state file
+(`~/.local/state/pdw/muse-workspace-state.sqlite`, table `manifest_files`), which caches
+each transcript's count by size and mtime so an unchanged transcript is not read again
+(`manifestCacheRuleVersion` in `state.go` names the counting rule; bump it with the rule and
+the next run drops that table alone and recounts). A run that cannot build the manifest logs
+a warning and syncs the workspace without it, leaving the shards already uploaded in place. A
+shard whose JSON would pass the 1 MiB inline cap is split by the next character of the
+session id (`0a.json`, `0b.json`, ...), so the files under `.pdw/session-manifest/` together
+are the manifest whatever their names. The `muse_file` timeline adapter skips `.pdw/` paths:
+they are bookkeeping, not the agent's workspace.
+`event_count` is the number of `base_muse.events` rows the warehouse keeps for the session:
+lines are read with the uploader's own rule (`parseLine`: complete, non-blank, a JSON
+object) and keyed as `muse_event_row` keys them, so a repeated `seq` or compaction is one
+row. `tests/test_agent_sessions_drive_ingest.py` and `muse_manifest_test.go` share a
+fixture to hold the two sides together. A shard is re-sent only when its content changed,
+at most once an hour (`DefaultManifestInterval`); `modified_at` on its row is that upload's
+time. Reconcile a session whose file's `modified_at` is at least 15 minutes older than its
+shard's: it must be in `marts_ai_conversations.sessions` (`source = 'muse'`) with the same
+`event_count`, unless the session has grown since (`ended_at` after the shard's
+`modified_at`). The VM's `pdw` does not self-update (the hook sets `PDW_NO_AUTO_UPDATE=1`):
+ask Muse to run `PDW_NO_AUTO_UPDATE=1 ~/.local/bin/pdw update` after a release.
+
 What PDW does **not** get: Muse's Postgres (feed, goals, ideas, device and health tables)
 is reachable only through the agent's own read-only `muse.db` tool, not from a shell, and
 its phone data (contacts, calendar, health, media library) was empty for this account on
 2026-09-28. Its connectors read other systems PDW already syncs.
+
+## Payment data in conversations
+
+The conversation batch HTTP endpoint redacts payment card data before object
+storage. The shared database writer applies the same policy for every AI event
+source, including direct backend polls: Luhn-valid 13–19 digit numbers (including
+spaced, dashed and JSON-escaped forms) become `[card ****1234]`; labelled security
+codes in the same event become `[redacted]`. This is an intentional exception to
+raw fidelity, including `raw_json`. Original host transcripts are separate copies.
+
+Discovery evaluates every complete digit-run start, including overlaps. A
+candidate is one contiguous 13–19 digit run or an explicit grouped layout:
+`4-4-4-4`, `4-4-4-4-(1..3)`, `4-6-5`, `4-6-4`, `4-4-4-(1..3)`, `4-4-5`,
+or `5-5-(5..6)`. Groups may use any mixture of 1–3 spaces/dashes. Runs are
+never split; independent identifiers such as `16+2` or `12+4+2` are not joined
+by length/checksum alone. A layout-conformant Luhn-valid card wins over any
+overlapping interpretation of neighbouring digits as phones, dates or times.
+Overlapping valid card readings are masked together. After a confirmed card,
+labelled security codes are masked; bare 3–4 digit codes must be standalone
+tokens so following date/time/phone prefixes are preserved. Possible codes never
+become a retained card suffix.
+The shared fixture and fixed-seed corpus in `tests/fixtures/card_redaction_cases.json`
+exercise identical generated corpora in Python and Go. The exact-preservation
+insertion corpus uses an independent checksum oracle to construct unambiguous
+ground truth across formatting and preceding/following numeric contexts;
+ambiguous readings have explicit conservative fixtures. Separate checks cover
+unfiltered numeric prose, including valid checksums in non-layout groups,
+writer storage and existing-row repair.
+
+JSON redaction validates the input and edits sensitive token spans directly.
+Untouched numeric lexemes (including large exponents), key order, duplicate
+keys, whitespace and Unicode escapes survive byte-for-byte, including nested
+JSON strings. Numeric card/code tokens become quoted masks. Unchanged batches
+retain their original compressed bytes, and local JSONL scrubs retain line endings.
+Discovery and scan counts traverse decoded JSON string tokens at every nesting
+level, including Unicode-encoded backslashes. Counting and masking share the
+same token traversal; a raw-byte negative filter must never suppress it.
+Committed constructed examples declare a reproducible `synthetic_provenance`
+recipe checked by `tests/test_card_fixture_provenance.py`. Use published sandbox
+numbers or generate additional examples at test time; never copy live credentials.
+
+Explicit maintenance modules (dry-run unless `--apply` is passed):
+`personal_data_warehouse.scrub_conversation_cards` reports source/month counts
+and cleans source rows, timeline text and search chunks/embeddings;
+`personal_data_warehouse.scrub_conversation_objects` replaces inbox/library
+batches after verifying sanitized uploads; `personal_data_warehouse.scrub_conversation_jsonl`
+accepts `--root` and `--session` to clean host JSONL copies. First run DB/archive
+discovery with `--plan <private-new-file>` while workers remain live. Plans hold
+IDs, cursors and counts only, are created exclusively with mode 0600, and are
+reused with `--apply --plan <file>`; apply never repeats baseline discovery.
+Only apply requires pausing writers, timeline sync and search workers. Archive
+discovery can be network-bound, so finish it before taking the fresh DB plan.
+After resume, use `--verify` for read-only DB/archive checks; the DB check may
+also take `--plan` to retain the baseline groups in `--report-html` output.
+The database scrub discovers
+affected sessions in sources AND derived copies by source session identity (a
+rollup's context is a directory/account, not its session id). In one transaction
+it sanitizes sources, runs the canonical timeline adapters, rewrites current keys
+in place, and only then removes stale keys, chunks and embeddings. Missing source
+data or failed regeneration rolls back all repairs. Fresh sequence numbers
+enqueue chunk regeneration even when only a chunk was dirty. This also replaces
+partial card numbers in truncated titles and snippets without losing timeline rows. The
+`--report-html` option writes a source/month before-and-after counts table for
+delivery; baseline groups retain explicit zero-after rows. Dry-run after counts
+are pending, never assumed zero.
+Reports contain counts only; repeat each dry-run afterward and require zero.
+Historical backups and WAL are not erased by these commands.
+
+The scrub SQL/archive prefilters bound both literal and decoded digit readings:
+remove backslashes, replace every possible Unicode unit by **four** digit
+sentinels, then select 13 digits within a 49-character normalized window.
+Four preserves up to four literal digits after an ordinary word ending in `u`
+as well as the possible decoded character; this deliberately permits false
+positives and never makes a checksum decision. Nested escaping only adds digits.
+Only prefiltered IDs are fetched and confirmed in bounded memory batches by
+spawned processes. The CLI defaults `--workers` to available CPUs. Large heaps
+use disjoint block ranges under one exported read-only snapshot so live tuple
+updates cannot escape discovery; ordinary scans allow parallel PostgreSQL plans.
+Apply rechecks saved identities, checks indexed timeline/chunk changes since the
+discovery cursors, and verifies the repaired transaction with the fast filter.
+New candidates outside its plan roll back the repair and require fresh discovery.
 
 ## Claude Desktop Sessions (claude.ai)
 

@@ -85,29 +85,6 @@ func TestTheFileLockIsANonBlockingTryLock(t *testing.T) {
 	}
 }
 
-func TestDeriveRequestStatusFollowsThePrecedenceLadder(t *testing.T) {
-	cases := []struct {
-		active []string
-		want   string
-	}{
-		{nil, "rejected"},
-		{[]string{"succeeded", "pending_review"}, "pending_review"},
-		{[]string{"succeeded", "executing"}, "executing"},
-		{[]string{"failed_terminal", "approved"}, "approved"},
-		{[]string{"failed_terminal", "failed_retryable"}, "failed_retryable"},
-		{[]string{"failed_terminal", "blocked_missing_credentials"}, "blocked_missing_credentials"},
-		{[]string{"succeeded", "failed_terminal"}, "failed_terminal"},
-		{[]string{"observed", "observed"}, "observed"},
-		{[]string{"succeeded", "observed"}, "succeeded"},
-		{[]string{"something_new"}, "current"},
-	}
-	for _, c := range cases {
-		if got := DeriveRequestStatus(c.active, "current"); got != c.want {
-			t.Fatalf("%v: got %q want %q", c.active, got, c.want)
-		}
-	}
-}
-
 func TestRunHelpAndUnknownFlags(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if code := testSpec.Run([]string{"--help"}, strings.NewReader(""), &out, &errOut, envOf(nil), ingestclient.Config{}); code != 0 {

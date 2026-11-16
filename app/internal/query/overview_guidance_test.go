@@ -239,9 +239,14 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// 2026-11-08: photos from the Pixel added the base_android_photos schema
 	// line ("Pixel photos.") and its raw table ("Pixel photo files."): 10555.
 	// 10555 is those two lines and no more.
-	// BCR call recordings add a base schema, raw recording table and inventory health view.
-	if guidance > 10668 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10668)", guidance)
+	//
+	// 2026-11-11: contract C11's marts_ops.source_upstream_health, each
+	// source's own newest item against base_*, added one relation line
+	// ("Source vs PDW."): 10576. 10576 is that line and no more.
+	// BCR call recordings add a base schema, raw recording table and
+	// inventory health view: 10662. 10662 is those lines and no more.
+	if guidance > 10662 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10662)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)
@@ -305,5 +310,29 @@ func TestOverviewRelationCommentIsCappedAndPointsAtDescribeTable(t *testing.T) {
 	dashes := strings.Repeat("a—b ", 60)
 	if !strings.ContainsRune(capRunes(dashes, 40), '—') {
 		t.Fatal("capRunes must not split multi-byte runes")
+	}
+}
+
+// TestOverviewLayerListGivesTheTimelineFirstReadingOrder pins the SCHEMA
+// LAYERS header to the same reading order every other surface teaches. The
+// layers sort base → derived → marts → timeline, and until 2026-11-11 the header
+// said that sort order "is also the order to reach for them" — base first, the
+// opposite of the brief, the MCP instructions and the START HERE comments.
+func TestOverviewLayerListGivesTheTimelineFirstReadingOrder(t *testing.T) {
+	overview := renderTestOverview(t)
+	start := strings.Index(overview, "SCHEMA LAYERS")
+	end := strings.Index(overview, "HOW TO USE THIS")
+	if start < 0 || end < start {
+		t.Fatalf("overview has no SCHEMA LAYERS block:\n%s", overview)
+	}
+	block := strings.ToLower(overview[start:end])
+	for _, wrong := range []string{"order to reach for them", "also the order to"} {
+		if strings.Contains(block, wrong) {
+			t.Fatalf("SCHEMA LAYERS must not call the base-first sort order the reading order (%q):\n%s", wrong, block)
+		}
+	}
+	const order = "read them timeline → marts_*/derived_* → base_*"
+	if !strings.Contains(block, order) {
+		t.Fatalf("SCHEMA LAYERS must state the reading order %q:\n%s", order, block)
 	}
 }

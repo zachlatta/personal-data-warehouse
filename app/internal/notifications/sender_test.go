@@ -243,3 +243,45 @@ func TestAlertWireShapeFollowsTheDevice(t *testing.T) {
 		}
 	}
 }
+
+// An outbox alert for a mutation outcome keeps its action category, its kind
+// and request id (what the phone's Undo and Approve buttons read), and a
+// quiet one makes no sound.
+func TestAMutationOutcomeAlertKeepsItsActionsAndQuietness(t *testing.T) {
+	d := Delivery{ID: "d1", NotificationID: "n1", Alert: Alert{Title: "Heat set to 55°", Body: "Tap Undo", Route: "/mutations/req-1", Category: "mutation_applied", Kind: "mutation_applied", RequestID: "req-1", Quiet: true}}
+	m := expoMessage("ExponentPushToken[x]", "ios", "", d)
+	if m.CategoryID != "mutation_applied" || m.Data["kind"] != "mutation_applied" || m.Data["request_id"] != "req-1" || m.Sound != "" || m.InterruptionLevel != "passive" {
+		t.Fatalf("message %+v", m)
+	}
+	plain := expoMessage("ExponentPushToken[x]", "ios", "", Delivery{ID: "d2", Alert: Alert{Title: "x"}})
+	if plain.CategoryID != "link" || plain.Data["kind"] != "timeline_notification" || plain.Sound != "default" {
+		t.Fatalf("an ordinary timeline alert changed: %+v", plain)
+	}
+}
+
+// A mutation alert from the outbox is one alert per request, like the direct
+// review and withdrawal alerts (push.MutationCollapseID): a request sent back
+// for review and then withdrawn leaves no stale Approve button. A sent-back
+// review alert waits on Zach, so it is time-sensitive like the first one.
+func TestAMutationAlertCollapsesWithTheRequestsOtherAlerts(t *testing.T) {
+	sentBack := expoMessage("ExponentPushToken[x]", "ios", "", Delivery{ID: "d1", NotificationID: "n1", Alert: Alert{Title: "Back for your review", Category: push.CategoryMutationReview, Kind: "mutation_request", RequestID: "req-1"}})
+	if sentBack.CollapseID != push.MutationCollapseID("req-1") || sentBack.InterruptionLevel != push.InterruptionTimeSensitive {
+		t.Fatalf("sent back: %+v", sentBack)
+	}
+	timeline := expoMessage("ExponentPushToken[x]", "ios", "", Delivery{ID: "d2", NotificationID: "n2", Alert: Alert{Title: "x"}})
+	if timeline.CollapseID != "n2" || timeline.InterruptionLevel != "" {
+		t.Fatalf("a timeline alert changed: %+v", timeline)
+	}
+}
+
+// A web push for a mutation alert opens the web review, not the phone's
+// /mutations/<id> route, which the web app does not serve.
+func TestAMutationAlertOpensTheWebReviewInABrowser(t *testing.T) {
+	alert := webAlert(Alert{Title: "x", Route: "/mutations/req-1", Kind: "mutation_applied", RequestID: "req-1"})
+	if alert.Route != "/mutation-review/requests/req-1" {
+		t.Fatalf("route %q", alert.Route)
+	}
+	if plain := webAlert(Alert{Route: "/timeline/gmail/1"}); plain.Route != "/timeline/gmail/1" {
+		t.Fatalf("a timeline alert's route changed: %q", plain.Route)
+	}
+}

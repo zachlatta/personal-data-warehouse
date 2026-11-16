@@ -1,6 +1,7 @@
 package applecontacts
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -144,5 +145,34 @@ func TestStateWipesWhenStorePathChanges(t *testing.T) {
 	entries, _ := state.Entries()
 	if len(entries) != 0 {
 		t.Fatalf("entries survived a store change: %+v", entries)
+	}
+}
+
+// C11: the observation is the newest modification on the Mac, in the same
+// field the upload carries as source_updated_at, so a healthy source lands.
+func TestRunnerObservesTheAddressBooksNewestEdit(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "Sources", "src"), 0o755)
+	testfixtures.CopyFile(t, filepath.Join("testdata", "synthetic.abcddb"), filepath.Join(root, "Sources", "src", StoreFilename))
+	client := &fakeClient{}
+	var observed []ingestclient.SourceObservation
+	runner := &Runner{Account: "zach@example.com", StorePath: root, Client: client, Logger: &common.RecordingLogger{},
+		Now: func() time.Time { return time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC) },
+		Observe: func(o ingestclient.SourceObservation) (map[string]any, error) {
+			observed = append(observed, o)
+			return nil, errors.New("a failed post never fails the upload")
+		}}
+	if summary, err := runner.Sync(); err != nil || summary.BatchesUploaded != 1 {
+		t.Fatalf("summary = %+v, err = %v", summary, err)
+	}
+	newest := ""
+	for _, record := range client.batches[0] {
+		if at := record["record"].(map[string]any)["source_updated_at"].(string); at > newest {
+			newest = at
+		}
+	}
+	if len(observed) != 1 || observed[0].Pipeline != "apple_contacts" || observed[0].Scope != "zach@example.com" ||
+		observed[0].NewestAt != newest || observed[0].NewestID == "" {
+		t.Fatalf("observed = %+v, newest uploaded = %s", observed, newest)
 	}
 }

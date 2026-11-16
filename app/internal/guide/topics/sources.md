@@ -276,3 +276,10 @@ Android BCR calls: `base_android_call_recordings.recordings`; read enriched call
 `transcript`, priority `self`. Call metadata supplies identity hints; a number alone is weak
 evidence. Phone cleanup never deletes the warehouse copy. Check
 `marts_ops.android_call_recordings_health` for source inventory gaps.
+
+External consumers: the web app's `/external-feeds` page issues scoped voice-memo
+keys. `GET /api/external-feeds/voice-memos` exposes only the last 48 hours after
+transcription and current recording enrichment, including unmatched calendar outcomes.
+Pass `next_cursor` as `?since=` to poll new arrivals. Session joining does not hold
+memos back: parts of a stopped-and-restarted memo may arrive separately.
+Feed keys cannot access warehouse tools.

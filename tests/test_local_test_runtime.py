@@ -23,6 +23,7 @@ from tests.local_test_runtime import (
     POSTGRES_EXTENSIONS,
     LocalTestStartupError,
     PostgresTestRuntime,
+    SuiteSlots,
     callable_requires_postgres,
     direct_postgres_url,
     preflight_subscription_auth,
@@ -81,8 +82,21 @@ class FakeDocker:
         raise AssertionError(f"unexpected command: {command}")
 
 
+class FakeSlots:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def acquire(self) -> None:
+        self.events.append("acquire")
+
+    def release(self) -> None:
+        self.events.append("release")
+
+
 def runtime(env: dict[str, str], docker: FakeDocker, **kwargs) -> PostgresTestRuntime:
     kwargs.setdefault("probe_configured_url", lambda _url: None)
+    # Never a real host slot: these tests must not queue behind real suites.
+    kwargs.setdefault("suite_slots", FakeSlots())
     return PostgresTestRuntime(
         env=env,
         runner=docker,
@@ -878,3 +892,47 @@ def test_a_full_template_is_built_once_by_its_own_helper() -> None:
         databases.drop(clone)
     finally:
         databases.close()
+
+
+def test_only_so_many_suites_own_a_postgres_on_one_host_at_once(tmp_path) -> None:
+    """2026-11-11 on mew-dev: about ten agents' suites ran at once, load hit
+    190, a single `docker run` took 69 s, every suite's Postgres missed its
+    readiness timeout, and their ~7 GB of writes each landed on the disk the
+    production warehouse reads from. A suite now takes one of a few host-wide
+    slots before it starts its Postgres, and waits for one when all are held.
+    """
+    clock = [0.0]
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    first = SuiteSlots(tmp_path, slots=1, sleep=sleep, monotonic=lambda: clock[0], wait_seconds=60)
+    second = SuiteSlots(tmp_path, slots=1, sleep=sleep, monotonic=lambda: clock[0], wait_seconds=60)
+    first.acquire()
+    with pytest.raises(LocalTestStartupError, match="PDW_TEST_MAX_SUITES"):
+        second.acquire()
+    assert clock[0] >= 60, "the second suite waited for a slot before giving up"
+
+    first.release()
+    second.acquire()  # the freed slot is taken at once
+    second.release()
+
+
+def test_a_suite_holds_its_slot_from_before_docker_run_until_close() -> None:
+    docker = FakeDocker()
+    slots = FakeSlots()
+    env: dict[str, str] = {}
+    postgres = runtime(env, docker, suite_slots=slots)
+
+    postgres.start()
+    assert slots.events == ["acquire"]
+    postgres.close()
+    assert slots.events == ["acquire", "release"]
+
+
+def test_a_configured_database_url_takes_no_slot() -> None:
+    slots = FakeSlots()
+    postgres = runtime({"POSTGRES_DATABASE_URL": "postgresql://configured.example/pdw"}, FakeDocker(), suite_slots=slots)
+    postgres.start()
+    postgres.close()
+    assert slots.events == []

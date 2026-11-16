@@ -34,9 +34,16 @@ RESIDEO_SET_THERMOSTAT_OPERATION = "resideo.set_thermostat"
 
 _SETPOINT_STATUS = {"temporary": "TemporaryHold", "permanent": "PermanentHold"}
 _MAX_APPROVAL_AGE = timedelta(hours=1)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _READ_BACK_ATTEMPTS = 10
 _READ_BACK_INTERVAL_SECONDS = 3
 _RESULT_COLUMNS = ("indoor_temperature", "heat_setpoint", "cool_setpoint", "system_mode", "setpoint_status")
+# A fixed cap on what a mutation policy may approve, whatever the policy says:
+# a second check, in another file and language than the Go policy engine, so
+# one bad change to the policy code is not enough to overheat or freeze the
+# house. Only Zach's own approval reaches past it.
+POLICY_APPROVED_HEAT_RANGE = (50.0, 72.0)
+_POLICY_ACTOR_PREFIX = "policy:"
 
 
 @dataclass(frozen=True)
@@ -75,10 +82,11 @@ class ResideoMutationExecutor:
     def _execute(self, mutation: Mapping[str, Any]) -> ResideoMutationResult:
         if mutation.get("operation") != RESIDEO_SET_THERMOSTAT_OPERATION:
             raise ResideoRequestError(f"unsupported Resideo operation {mutation.get('operation')!r}")
-        approved_at = mutation.get("approved_at")
-        if isinstance(approved_at, datetime) and self._now() - approved_at > _MAX_APPROVAL_AGE:
+        deadline = _deadline(mutation)
+        if deadline is not None and self._now() > deadline:
             raise ResideoRequestError(
-                "the approval is over an hour old, so this was not applied; propose it again if it is still wanted"
+                "the approval is past its deadline (one hour after approval, or after its scheduled time, "
+                "unless the request set not_after), so this was not applied; propose it again if it is still wanted"
             )
         payload = mutation.get("payload_json") or {}
         device_id = str(payload.get("device_id") or "")
@@ -93,6 +101,15 @@ class ResideoMutationExecutor:
         if not targets:
             raise ResideoRequestError("the mutation names no setpoint")
 
+        if str(mutation.get("approved_by") or "").startswith(_POLICY_ACTOR_PREFIX):
+            low, high = POLICY_APPROVED_HEAT_RANGE
+            if COOL in targets:
+                raise ResideoRequestError("a mutation policy may not set a cool setpoint; this needs Zach's own approval")
+            heat = targets.get(HEAT)
+            if heat is not None and not low <= heat <= high:
+                raise ResideoRequestError(
+                    f"a policy-approved heat setpoint must be {low:g} to {high:g}, not {heat:g}; this needs Zach's own approval"
+                )
         client = self._client_factory()
         configuration = client.get_configuration(device_id)
         before = thermostat_state(client.get_device(device_id), configuration)
@@ -142,6 +159,24 @@ class ResideoMutationExecutor:
             if attempt < _READ_BACK_ATTEMPTS - 1:
                 self._sleep(_READ_BACK_INTERVAL_SECONDS)
         return device, state, False
+
+
+def _deadline(mutation: Mapping[str, Any]) -> datetime | None:
+    """When a thermostat change stops meaning now: the request's not_after
+    when it set one, otherwise an hour after the later of approval and its
+    scheduled not_before, so a retry never changes the heat at a time nobody
+    chose."""
+    not_after = mutation.get("not_after")
+    if isinstance(not_after, datetime) and not_after > _EPOCH:
+        return not_after
+    starts = [
+        value
+        for value in (mutation.get("approved_at"), mutation.get("not_before"))
+        if isinstance(value, datetime) and value > _EPOCH
+    ]
+    if not starts:
+        return None
+    return max(starts) + _MAX_APPROVAL_AGE
 
 
 def _holds(state: Mapping[str, Any], kind: str, value: float, status: str) -> bool:

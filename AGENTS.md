@@ -79,13 +79,15 @@ that, not from this prose.
   `marts_ops.timeline_adapter_health` judges ingest lag against the source's own interval.
 - **C2 — five priority tiers, and everything is properly categorized.** `self` (Zach did
   it), `direct` (a real person reached him), `cc` (real people, he is peripheral), `noise`
-  (bulk or automated, including his own health telemetry), `background` (machinery — the
-  warehouse's own or other people's). *Held up by* the `timeline.timeline_priority` enum,
-  required per-adapter priority SQL validated before a batch is written, and
-  `marts_ops.timeline_priority_mix`. *Gap:* which valid tier an adapter assigns is a
-  judgement no test makes. See [Timeline priority tiers](#timeline-priority-tiers).
+  (bulk/automation, health telemetry and untargeted public community chatter),
+  `background` (machinery, including automated agent prompts). *Held up by* the enum,
+  required per-adapter SQL, `marts_ops.timeline_priority_mix` and
+  `marts_ops.timeline_priority_correctness` (≥90% accuracy, self precision and recall per
+  adapter; measured daily; unpublished or missing evidence fails). Labels stay
+  private. See [the benchmark](docs/priority-benchmark.md) and
+  [Timeline priority tiers](#timeline-priority-tiers).
 - **C3 — agents start at the timeline and filter by priority.** The `search` tool or
-  `timeline.events` in SQL first, then `marts_*`, then `base_*`; every search entry point
+  `timeline.events` in SQL first, then `marts_*`/`derived_*`, then `base_*`; every search entry point
   takes `priorities`, and every hit names its tier. The manual is `pdw readme` / the MCP
   `readme` tool, rendered from `app/internal/guide/` (see [The agent guide](#the-agent-guide)).
   *Held up by* the guide tests, `test_schema_comments_publish_the_start_here_guidance`, and
@@ -94,11 +96,13 @@ that, not from this prose.
   list is pinned to the Go dispatcher by
   `test_the_python_subcommand_lists_are_the_go_dispatchers_commands`.
 - **C4 — raw source data for every source is queryable via SQL.** `base_<source>` is a
-  faithful copy readable by the `pdw_query` role. *Held up by*
-  `test_query_role_reads_public_relations_and_is_denied_private` and the catalog's
-  per-layer query-access policy.
+  faithful copy readable by the `pdw_query` role, which every agent read assumes from the
+  unprivileged `pdw_query_login` (`PDW_QUERY_POSTGRES_URL`), never a superuser session.
+  *Held up by* `test_query_role_reads_public_relations_and_is_denied_private`,
+  `test_python_untrusted_reader_refuses_superuser_url`, the Go runner's per-transaction
+  login check, and the catalog's per-layer query-access policy.
 - **C5 — multi-source concepts layer `base_* → derived_*/marts_* → timeline`; consumers read
-  `timeline → marts_* → base_*`.** **An intelligent transformation must READ from the
+  `timeline → marts_*/derived_* → base_*`.** **An intelligent transformation must READ from the
   intermediate layer, not one source's raw table**, so a second source is covered the day
   it lands: `base_alice_voice_recordings` sat at 53 recordings and 0 transcripts while every
   registry passed, because transcription scanned the Apple table by name. *Held up by*
@@ -132,7 +136,8 @@ that, not from this prose.
 - **C9 — one obvious way to do a thing, on both surfaces.** One hybrid search, one SQL
   entry point per surface, one schema-discovery call, one way to read a hit's
   conversation (the `context` tool / `pdw context`). *Held up by* `tool.Surface`, the
-  `runCall` fence that refuses `pdw call sql|query|search|context|schema_overview|describe_table`
+  one composition entry point (`run` / `pdw run`) over those same reads, and the
+  `runCall` fence that refuses `pdw call sql|query|search|context|schema_overview|describe_table|run`
   with the real command, and `app/cmd/pdw-cli/usage_test.go`.
 - **C10 — the database is healthy, backed up, and a restore has actually been performed.**
   pgBackRest ships WAL continuously to SFTP on `slowking`, takes periodic backups, and
@@ -150,15 +155,19 @@ that, not from this prose.
   `XX001`/`XX002`, reads `failing`). Runbook:
   `~/dev/zachlatta/sysadmin` (`backup-health.md`, `slowking/`).
 - **C11 — a source's own SLA is stated and detected, not inferred from the pipeline being
-  green.** *Held up by* per-source detectors: `marts_ops.slack_conversation_health`,
-  `marts_ops.plaid_item_health`, `marts_ops.simplefin_account_health`,
-  `marts_ops.android_call_recordings_health`, and
-  `marts_finance.net_worth.staleness`. *Gap:* every other source rides aggregate freshness.
+  green.** Each source row of `marts_ops.pipeline_health` states its SLA (`data_basis`) and
+  names its detector (`sla_detector`, verdict in `sla_detector_status`):
+  `marts_ops.source_upstream_health` compares what the provider or the device's own store
+  reports as newest with `base_*`, judged on the oldest item PDW has not caught up with, for
+  every server poller and device uploader; Slack, Plaid, SimpleFIN, voice landing and BCR
+  calls have their own views. *Held up by* `tests/test_source_sla.py`. *Exceptions:* ten sources no
+  comparison can exist for (PDW is the source, nothing upstream keeps history, the source is
+  retired, or each run is the whole comparison), each naming why in `sla_exemption`.
 - **C12 — future developers understand these contracts and honor them.** This file is
   loaded into every session in this repository, so it holds only the contracts and the
   rules every change needs; per-source and incident detail lives in `docs/agents/` and is
-  linked below. *Held up by* `tests/test_contracts_doc.py` (every test a contract names
-  exists), `test_agents_md_fits_one_sitting` (a byte cap on this file), and
+  linked below. *Held up by* `tests/test_contracts_doc.py` (every test this file names,
+  in any section, exists), `test_agents_md_fits_one_sitting` (a byte cap on this file), and
   `test_every_stated_contract_has_a_living_audit_check`.
 - **C16 — an agent with only PDW answers Zach's real questions right.** Past questions with
   checked gold answers, asked by a fresh agent, graded on answer, cited source, PDW calls and
@@ -324,8 +333,9 @@ Two rules follow, and the second is the one that bites:
   inherit an inconsistency — it *manufactures* one, and every downstream `ORDER BY`,
   `MIN()`, `COALESCE` and `IS NULL` then disagrees depending on which column was asked.
 - **Test it per column.** Seed a row carrying the sentinel, read it back through the view,
-  and assert `NULL`. `test_whoop_cycles_view_reports_an_unfinished_cycle_as_null_not_the_epoch`
-  is the shape to copy; it is cheap to repeat once per exposed timestamp.
+  and assert `NULL`. `test_health_mart_reports_a_running_cycle_as_null_not_the_epoch`
+  (`tests/test_marts_layering.py`) is the shape to copy; it is cheap to repeat once per
+  exposed timestamp.
 
 Booleans are the sibling trap: they are `bigint` 0/1 here, not `boolean` (`is_from_me = 1`,
 never `= true`). A conforming view over several sources should make the conformed column's
@@ -347,7 +357,7 @@ The following contract is generated from `warehouse_catalog.json`:
 | `self` | Zach initiated it | his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, his workouts, even WHOOP-detected ones, and his card purchases and payments |
 | `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, big group chats for the week he takes part in them, a real `<@id>` ping, and replies in a thread of his that are conversation rather than announcements |
 | `cc` | real-people activity he is peripheral to | cc'd mail, private team channels he sits in, big group chats he is not taking part in that week, replies under his channel-wide broadcasts, people talking about him in public, and others editing a file he owns |
-| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created plus deleted or declined calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member |
+| `noise` | bulk or automated traffic, including the untargeted public community firehose | newsletters, bots, CI/system notices, auto-created/deleted/declined calendar events, health telemetry, and public community chatter not aimed at him, member or not |
 | `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, contact-card churn, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change |
 
 **Scope selection guide** — use the single `priorities` mechanism; do not add a competing scope flag:
@@ -501,10 +511,10 @@ someone notices a gap in an answer).
     `(event_ts, event_id)`, `incremental_sql` oldest-first by `(ingest_ts, event_id)`, both
     returning exactly `TIMELINE_NORMALIZED_COLUMNS`, plus `max_ingest_sql`. **ENFORCED**
     (`test_adapter_sql_carries_the_pagination_contract`).
-12. **Assign a priority tier** in the adapter's SELECT. **ENFORCED for presence, SILENT for
+12. **Assign a priority tier** in the adapter's SELECT. **ENFORCED for presence, sampled for
     correctness** — an adapter with no priority expression raises at registration, and a
     NULL or unknown label fails the batch before it is written (`TimelinePriorityError`);
-    which of the five valid tiers you chose is a judgement no test makes. See
+    labeled samples measure the audited adapters, not every possible event. See
     [Timeline priority tiers](#timeline-priority-tiers).
 13. **Seed the adapter in the end-to-end timeline tests** (`_seed_sources` +
     `EXPECTED_SEEDED_EVENTS` in `tests/test_timeline.py`). **ENFORCED** —

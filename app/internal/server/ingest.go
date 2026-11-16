@@ -283,6 +283,15 @@ func (svc *ingestService) handler() http.Handler {
 			return
 		}
 		q := r.URL.Query()
+		if endpoint == "/ingest/agent-sessions/batch" {
+			var err error
+			body, err = redactConversationBatch(body, svc.maxBytes)
+			if err != nil {
+				http.Error(w, "invalid conversation batch", http.StatusBadRequest)
+				return
+			}
+			actualSHA = hex.EncodeToString(sha256Sum(body))
+		}
 		built, err := artifact.build(q, actualSHA, svc.now().UTC())
 		if err != nil {
 			svc.logger.WarnContext(r.Context(), "ingest request rejected", "endpoint", endpoint, "error", err)

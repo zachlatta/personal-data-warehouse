@@ -25,6 +25,7 @@ from personal_data_warehouse.mutation_notifications import (
     PostgresMutationNotificationListener,
     run_notification_loop,
 )
+from personal_data_warehouse.resideo_mutations import resideo_mutation_executor
 from personal_data_warehouse.slack_mutations import SlackMutationExecutor
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
@@ -44,6 +45,7 @@ class CloudMutationProcessor:
         self.calendar_executor = CalendarMutationExecutor(settings=self.settings)
         self.slack_executor = SlackMutationExecutor(warehouse=self.warehouse)
         self.screen_timelapse_executor = screen_timelapse_purge_executor(settings=self.settings, warehouse=self.warehouse)
+        self.resideo_executor = resideo_mutation_executor(settings=self.settings, warehouse=self.warehouse)
         self.claimed_by = f"resident:{socket.gethostname()}:upstream_mutation_worker"
 
     @property
@@ -68,6 +70,7 @@ class CloudMutationProcessor:
                 calendar_executor=self.calendar_executor,
                 slack_executor=self.slack_executor,
                 screen_timelapse_executor=self.screen_timelapse_executor,
+                resideo_executor=self.resideo_executor,
                 limit=_upstream_mutation_batch_size(),
                 claimed_by=self.claimed_by,
                 reclaim_after=_upstream_mutation_reclaim_after(),

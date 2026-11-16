@@ -11,6 +11,7 @@ from personal_data_warehouse_alice_voice_recordings.sync import (
     build_metadata,
     download_recording,
     media_url_from_recording,
+    newest_upload_request,
     recording_id_from_upload_request,
 )
 from personal_data_warehouse.objectstore import ObjectPresence
@@ -129,6 +130,17 @@ def api_recording() -> dict[str, object]:
         "created_at": "2026-04-27T15:53:37.391Z",
         "updated_at": "2026-04-27T15:55:17.763Z",
     }
+
+
+def test_the_newest_upload_request_is_alices_own_newest_recording() -> None:
+    """C11: the poller records Alice's newest created_at before archiving anything."""
+    older = api_recording()
+    newer = {**upload_request(), "created_at": "2026-05-12T02:00:00Z"}
+    undated = {**upload_request(), "id": "alice-undated", "created_at": ""}
+    newest_at, newest_id = newest_upload_request([older, newer, undated])
+    assert newest_at == datetime(2026, 5, 12, 2, tzinfo=UTC)
+    assert newest_id == recording_id_from_upload_request(newer, recording_url=media_url_from_recording(newer))
+    assert newest_upload_request([]) == (None, "")
 
 
 def test_alice_archive_source_uses_canonical_schema_source_name() -> None:

@@ -93,7 +93,7 @@ uses of the single scope parameter are generated from the warehouse catalog:
 | `self` | Zach initiated it | his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, his workouts, even WHOOP-detected ones, and his card purchases and payments |
 | `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, big group chats for the week he takes part in them, a real `<@id>` ping, and replies in a thread of his that are conversation rather than announcements |
 | `cc` | real-people activity he is peripheral to | cc'd mail, private team channels he sits in, big group chats he is not taking part in that week, replies under his channel-wide broadcasts, people talking about him in public, and others editing a file he owns |
-| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created plus deleted or declined calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member |
+| `noise` | bulk or automated traffic, including the untargeted public community firehose | newsletters, bots, CI/system notices, auto-created/deleted/declined calendar events, health telemetry, and public community chatter not aimed at him, member or not |
 | `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, contact-card churn, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change |
 
 **Scope selection guide** — use the single `priorities` mechanism; do not add a competing scope flag:
@@ -257,6 +257,23 @@ cannot disagree about what a request or an event looks like. Sign in by pasting
 see [docs/feed.md](docs/feed.md)), the same credential the CLI and the phone use. There is no
 separate review password any more: `PDW_MUTATION_UI_PASSWORD`, `PDW_MUTATION_UI_SESSION_SECRET`
 and `PDW_MUTATION_UI_SESSION_TTL_SECONDS` are ignored and reported as deprecated at startup.
+
+Every browser page shares one stylesheet, `app/internal/webapp/static/app.css`: the SPA, the
+server-rendered `/pipelines` dashboard and the `/oauth/authorize` consent page all link it, and
+`/pipelines` carries the same header and tabs as the SPA. The SPA's mutation review adds
+`mutations.css` for its own layout, which reads only `app.css`'s tokens. The look is a calm
+admin console — a neutral palette, one blue accent, colour kept for status, white cards,
+sentence-case labels, monospace only for identifiers — with a dark variant from `prefers-color-scheme`. Every UI
+colour, radius and shadow is a token in its `:root`. The Feed reader's sandboxed frame cannot read
+those tokens, so `feed.js` resolves them and passes the values in. Two colour sets live elsewhere on
+purpose: the per-source identity dots in `format.js`, and the white frame that shows a sender's own
+HTML email in mutation review. In `app/internal/webapp/webapp_test.go`:
+
+- `TestDesignTokensAreDefinedOnceInAppCSS` fails if another file declares a `:root` palette or reads
+  a token that `app.css` does not define.
+- `TestNoColourLiteralsOutsideAppCSS` fails on a colour literal anywhere else.
+- `TestDesignTokensMeetWCAGAAContrast` holds every text/surface pair, in both themes, to WCAG AA
+  4.5:1.
 
 Approval URLs returned by MCP tools point at `/mutation-review/requests/<request_id>`, which
 opens that request directly. The review view shows each mutation the way it will be applied —

@@ -14,6 +14,7 @@ from googleapiclient.errors import HttpError
 
 from personal_data_warehouse.config import ContactGoogleAccount, Settings, load_settings
 from personal_data_warehouse.google_auth import load_google_credentials
+from personal_data_warehouse.source_sla import record_upstream_observation
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 SOURCE = "google_people"
@@ -171,6 +172,23 @@ class ContactsSyncRunner:
                 sync_token=None,
             )
 
+    def _observe_newest(self, *, account: ContactGoogleAccount, service) -> None:
+        """C11: the address book's own newest contact edit, before this run writes."""
+        try:
+            newest_at, newest_id, total = newest_contact_edit(service, page_size=self._settings.contact_page_size)
+        except Exception as exc:  # noqa: BLE001 - the probe must not fail the sync
+            self._logger.warning("Google Contacts newest-edit probe failed for %s: %s", account.email_address, exc)
+            return
+        record_upstream_observation(
+            self._warehouse,
+            self._logger,
+            pipeline="google_contacts",
+            scope=account.email_address,
+            upstream_newest_at=newest_at,
+            upstream_newest_id=newest_id,
+            detail=f"connections.list(personFields=metadata): newest CONTACT updateTime of {total}",
+        )
+
     def _sync_google_contacts(
         self,
         *,
@@ -187,6 +205,7 @@ class ContactsSyncRunner:
         pending_rows: list[dict[str, Any]] = []
 
         self._logger.info("Starting %s Google Contacts sync for %s", sync_type, account.email_address)
+        self._observe_newest(account=account, service=service)
         for people, page_sync_token in iter_google_contact_pages(
             service=service,
             page_size=self._settings.contact_page_size,
@@ -289,6 +308,39 @@ def execute_contacts_request(operation: Callable[[], Any], *, max_attempts: int 
                 raise
             time.sleep(min(60, attempt))
     raise RuntimeError("unreachable Google Contacts retry state")
+
+
+def newest_contact_edit(service, *, page_size: int = 1000) -> tuple[datetime | None, str, int]:
+    """The newest CONTACT-source updateTime in the address book, and whose.
+
+    LAST_MODIFIED_DESCENDING ranks by the newest of ANY source, and a contact's
+    Google PROFILE changes constantly without being an edit PDW records
+    (source_updated_at is the CONTACT source's), so the top of that order is
+    not the newest edit: on 2026-11-11 the first 50 rows missed it on one
+    account. The whole metadata listing is a few pages, and its maximum
+    matched PDW's exactly on both accounts.
+    """
+    newest_at: datetime | None = None
+    newest_id = ""
+    total = 0
+    page_token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {
+            "resourceName": ADDRESS_BOOK_ID,
+            "pageSize": max(1, min(page_size, 1000)),
+            "personFields": "metadata",
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = execute_contacts_request(lambda: service.people().connections().list(**kwargs).execute())
+        for person in mapping_list(response.get("connections")):
+            total += 1
+            updated = parse_rfc3339(str(primary_source_metadata(person).get("updateTime", "")))
+            if updated is not None and (newest_at is None or updated > newest_at):
+                newest_at, newest_id = updated, str(person.get("resourceName", ""))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return newest_at, newest_id, total
 
 
 def person_to_contact_card_row(

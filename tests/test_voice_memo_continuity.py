@@ -198,6 +198,71 @@ def test_the_agent_verdict_joins_a_restarted_event_and_keeps_a_task_memo_apart(
     assert task["summary"] == "Summary task"
 
 
+def _seed_silent_clip(wh: PostgresWarehouse, recording_id: str, recorded_at: datetime, duration: float) -> None:
+    """A recording transcribed to no words (a pocket clip): no enrichment."""
+    wh.insert_apple_voice_memos_files(
+        [
+            _row(
+                VOICE_MEMO_FILE_COLUMNS,
+                account="zach",
+                recording_id=recording_id,
+                title=recording_id,
+                filename=f"{recording_id}.m4a",
+                content_type="audio/mp4",
+                content_sha256=f"sha-{recording_id}",
+                recorded_at=recorded_at,
+                raw_metadata_json=json.dumps({"recording": {"duration_seconds": duration}}),
+                ingested_at=recorded_at,
+                sync_version=1,
+            )
+        ]
+    )
+    completed_at = recorded_at + timedelta(minutes=1)
+    wh.insert_apple_voice_memos_transcription_runs(
+        [
+            _row(
+                VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                source="apple_voice_memos",
+                account="zach",
+                recording_id=recording_id,
+                content_sha256=f"sha-{recording_id}",
+                provider="assemblyai",
+                provider_transcript_id=f"tid-{recording_id}",
+                status="completed",
+                transcript_text="  ",
+                requested_at=completed_at,
+                completed_at=completed_at,
+                sync_version=1,
+            )
+        ]
+    )
+
+
+def test_a_silent_clip_between_two_halves_does_not_hide_the_pair(warehouse: PostgresWarehouse) -> None:
+    """Until 2026-11-11 transcribed back-to-back pairs could go unjudged.
+
+    LAG() ran over every recording before the empty-transcript filter, so a
+    silent clip between two halves of one event became each half's neighbour
+    and the pair that mattered was never a candidate. The session view pairs
+    the same way, so the judgment also has to join the two halves there.
+    """
+    _seed(warehouse, [("half-1", START, 600.0, "the first half of the call")])
+    _seed_silent_clip(warehouse, "pocket", START + timedelta(seconds=602), 2.0)
+    _seed(warehouse, [("half-2", START + timedelta(seconds=610), 300.0, "the second half of the call")])
+
+    pairs = load_continuity_pair_candidates(warehouse, limit=None)
+    assert [(p["previous_recording_id"], p["recording_id"]) for p in pairs] == [("half-1", "half-2")]
+
+    client = FakeClient({("half-1", "half-2")})
+    summary = _runner(warehouse, client).sync(limit=None)
+    assert (summary.pairs_judged, summary.pairs_same_event, summary.sessions_merged) == (1, 1, 1)
+
+    sessions = _sessions(warehouse)
+    assert [s["recording_ids"] for s in sessions] == [["half-1", "half-2"], ["pocket"]]
+    assert sessions[0]["merge_status"] == "merged"
+    assert sessions[1]["merge_status"] == "single"
+
+
 def test_a_second_pass_redoes_nothing_until_a_transcript_changes(warehouse: PostgresWarehouse) -> None:
     _seed(warehouse, LECTURE)
     _runner(warehouse, FakeClient({("lecture-1", "lecture-2")})).sync(limit=None)
@@ -270,3 +335,69 @@ def test_the_judge_reads_the_seam_end_of_one_and_start_of_the_next() -> None:
     assert payload["earlier_recording"]["transcript_end"].endswith("END_OF_FIRST")
     assert payload["later_recording"]["transcript_start"].startswith("START_OF_SECOND")
     assert len(payload["later_recording"]["transcript_start"]) == JUDGMENT_TRANSCRIPT_EDGE_CHARS + 3
+
+
+def _heartbeat(wh: PostgresWarehouse) -> dict:
+    (row,) = wh._query_dicts(
+        "SELECT status, error, exit_code, consecutive_failures FROM @uploader_heartbeats"
+        " WHERE pipeline = 'voice_memo_continuity' AND device = 'dagster'"
+    )
+    return row
+
+
+def test_a_quiet_run_with_nothing_back_to_back_posts_an_ok_heartbeat(warehouse: PostgresWarehouse) -> None:
+    """Health is the run, not the output: no new pair for weeks is Zach, not a fault."""
+    _seed(warehouse, [("alone", START, 60.0, "a single thought")])
+
+    summary = _runner(warehouse, FakeClient(set())).sync(limit=20)
+
+    assert (summary.pairs_seen, summary.pairs_stuck) == (0, 0)
+    assert _heartbeat(warehouse) == {"status": "ok", "error": "", "exit_code": 0, "consecutive_failures": 0}
+
+
+def test_failing_judgments_then_an_abandoned_pair_read_as_broken(warehouse: PostgresWarehouse) -> None:
+    """A failing agent is an error; a pair it gave up on is a stuck backlog, never quiet."""
+    _seed(warehouse, LECTURE[:2])
+
+    class Failing(FakeClient):
+        def create_agentic_structured(self, **kwargs):
+            raise RuntimeError("agent exploded")
+
+    for attempt in range(1, 4):
+        _runner(warehouse, Failing(set())).sync(limit=20)
+        heartbeat = _heartbeat(warehouse)
+        assert (heartbeat["status"], heartbeat["consecutive_failures"]) == ("error", attempt)
+        assert "1 pair judgment(s) failed" in heartbeat["error"]
+
+    # The loader has given up on the pair; the independent backlog check has not.
+    assert load_continuity_pair_candidates(warehouse, limit=None) == []
+    summary = _runner(warehouse, Failing(set())).sync(limit=20)
+    assert (summary.pairs_seen, summary.pairs_failed, summary.pairs_stuck) == (0, 0, 1)
+    heartbeat = _heartbeat(warehouse)
+    assert heartbeat["status"] == "error"
+    assert "1 eligible pair(s) unjudged for over 120 min" in heartbeat["error"]
+
+
+def test_a_backlog_hidden_from_the_candidate_query_reads_as_stuck(
+    warehouse: PostgresWarehouse, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check does not trust the loader it checks: the 2026-11-11 LAG() bug hid
+    pairs while the pass ran clean."""
+    import personal_data_warehouse.voice_memo_continuity as continuity
+
+    _seed(warehouse, LECTURE[:2])
+    monkeypatch.setattr(continuity, "load_continuity_pair_candidates", lambda *_args, **_kwargs: [])
+
+    summary = _runner(warehouse, FakeClient(set())).sync(limit=20)
+
+    assert summary.pairs_stuck == 1
+    assert _heartbeat(warehouse)["status"] == "error"
+
+
+def test_a_run_that_used_its_whole_batch_is_draining_not_stuck(warehouse: PostgresWarehouse) -> None:
+    _seed(warehouse, LECTURE)
+
+    summary = _runner(warehouse, FakeClient(set())).sync(limit=1)
+
+    assert (summary.pairs_seen, summary.pairs_stuck) == (1, 0)
+    assert _heartbeat(warehouse)["status"] == "ok"

@@ -120,6 +120,11 @@ export type MutationRequestStatus =
   | 'withdrawn';
 
 export type Mutation = {
+  // A step's own schedule: when it may run, its deadline, and what is
+  // checked right before it runs (thermostat steps only).
+  not_before?: string | null;
+  not_after?: string | null;
+  precondition?: Record<string, unknown> | null;
   id: string;
   request_id: string;
   request_index: number;
@@ -174,6 +179,16 @@ export type MutationRequest = {
   // mutations_page says which, and where the next one starts.
   mutations?: Mutation[];
   mutations_page?: { offset: number; limit: number; total: number; next_offset: number | null };
+  // The mutation policy's decision (decision, label, reasons, policy_id,
+  // mode); null when no policy could touch the request.
+  policy?: Record<string, unknown> | null;
+  // The detail read says whether Undo applies: a thermostat change that ran.
+  can_undo?: boolean;
+  // ...and whether Cancel does: an approved request with steps still waiting.
+  can_cancel?: boolean;
+  // Approve now, run later: the earliest a step runs and its deadline.
+  not_before?: string | null;
+  not_after?: string | null;
   // true on the copy a push alert carries when the request was too big for
   // the 4 KB notification: the header is real, the mutations still need a read.
   partial?: boolean;
@@ -197,6 +212,52 @@ export async function getMutationRequest(config: AppConfig, id: string, page?: {
 
 export async function approveMutationRequest(config: AppConfig, id: string): Promise<MutationRequest> {
   const body = await request<{ request: MutationRequest }>(config, `/api/mutations/requests/${encodeURIComponent(id)}/approve`, {
+    method: 'POST',
+  });
+  return body.request;
+}
+
+// Mutation policies (automatic approvals): the kill switch and each policy's
+// mode. Reading is open; both writes need this reviewer token.
+export type MutationPolicyOverview = {
+  auto_approve: boolean;
+  auto_approve_forced_off: boolean;
+  policies: { id: string; version: number; operation: string; mode: 'off' | 'dry_run' | 'enforce'; unreadable: string }[];
+  grants: { id: string; policy_id: string; token_id: string; label: string; active: boolean; expires_at: string | null }[];
+};
+
+export async function getMutationPolicies(config: AppConfig): Promise<MutationPolicyOverview> {
+  return request<MutationPolicyOverview>(config, '/api/mutations/policies');
+}
+
+export async function setMutationPolicyMode(config: AppConfig, id: string, mode: string): Promise<MutationPolicyOverview> {
+  return request<MutationPolicyOverview>(config, `/api/mutations/policies/${encodeURIComponent(id)}/mode`, {
+    method: 'POST',
+    body: JSON.stringify({ mode }),
+  });
+}
+
+export async function setAutoApprove(config: AppConfig, enabled: boolean): Promise<MutationPolicyOverview> {
+  return request<MutationPolicyOverview>(config, '/api/mutations/policies/settings', {
+    method: 'POST',
+    body: JSON.stringify({ auto_approve: enabled }),
+  });
+}
+
+// Cancel an approved request before it runs: what has not run never will.
+export async function cancelMutationRequest(config: AppConfig, id: string, reason: string): Promise<MutationRequest> {
+  const body = await request<{ request: MutationRequest }>(config, `/api/mutations/requests/${encodeURIComponent(id)}/cancel`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
+  return body.request;
+}
+
+// Undo puts back what a thermostat request changed: the server proposes the
+// inverse from the device state the worker recorded and approves it as this
+// reviewer. The answer is the new request.
+export async function undoMutationRequest(config: AppConfig, id: string): Promise<MutationRequest> {
+  const body = await request<{ request: MutationRequest }>(config, `/api/mutations/requests/${encodeURIComponent(id)}/undo`, {
     method: 'POST',
   });
   return body.request;
@@ -409,6 +470,9 @@ export type NotificationEvent = {
   failed: number;
   suppressed_read: number;
   suppressed_replied: number;
+  // Android deliveries skipped because another app on the phone already
+  // posted a notification for the same event.
+  suppressed_notified: number;
 };
 
 export type NotificationLedger = {
@@ -433,6 +497,7 @@ export async function fetchNotificationLedger(config: AppConfig, params: { limit
       ...event,
       suppressed_read: event.suppressed_read ?? 0,
       suppressed_replied: event.suppressed_replied ?? 0,
+      suppressed_notified: event.suppressed_notified ?? 0,
     })),
     has_more: body.has_more ?? false,
   };

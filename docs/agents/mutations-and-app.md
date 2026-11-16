@@ -10,7 +10,9 @@ review queue, and push notifications; see `mobile/README.md`. Three server piece
 back it, all behind the static bearer the CLI uses:
 
 - `GET|POST /api/mutations/requests…` (`app/internal/mutations/api.go`) is THE review
-  surface: list/get, approve, deny, drop one email, edit an email before approval
+  surface. Every `POST` there decides or edits a request and needs a reviewer principal:
+  the master secret (web) or a `reviewer`-scope token (phone); a host's `full` token gets
+  403 (see [access tokens](access-tokens.md#who-may-decide-a-mutation-request)). It offers list/get, approve, deny, drop one email, edit an email before approval
   (`…/mutations/<id>/update-email`), and mark a dead request superseded
   (`…/supersede`, offered when `can_supersede`). Every `gmail.send_email` mutation
   carries an `email` view-model (delivery mode, variants with the selected one marked,
@@ -276,6 +278,17 @@ worker's `Render` under a one-second bound (`withAvatar`); a slow or failed look
 initial, never a late or lost alert. The phone side is `mobile/plugins/with-messaging-notifications.js`;
 see `mobile/README.md`.
 
+- **PDW does not repeat what another app on the phone already showed (2026-11-11).** An
+  Android delivery to a device whose phone is known waits 90 s from the event
+  (`PhoneWitnessHold`) and is then skipped as
+  `already_notified` when `base_android_notifications.events` holds another app's
+  notification for the same event (posted up to ten minutes after it): a MessagingStyle
+  message at the event's millisecond from the same sender or with the same opening text, or
+  the alert's title plus at least 10 characters of its text's opening. Only the recipient's
+  own phone counts: the app stamps each alert with `pdw.delivery_id`, and the listener row
+  carrying it names the phone. An unknown phone or a failed check sends. iOS still gets it.
+  See
+  [docs/notifications.md](../notifications.md#already-shown-on-the-android-phone).
 - **Android's 50-notification package cap and burst pacing (2026-11-05).** Joining the 861
   `provider_accepted` Android chat pushes (`857` through `2026-11-06 02:05Z`) and 715 non-chat
   pushes from `2026-10-28` to `2026-11-06` against `base_android_notifications.events` showed that
@@ -742,3 +755,200 @@ moment of one device; a general warehouse-row purge would be its own design.
   race with enrichment on two connections, and the Go proposal half run against an
   isolated database through `TestScreenTimelapsePurgeProposalReviewApproval`), and
   `app/internal/mutations/screen_timelapse_purge_test.go` for validation.
+
+## Mutation policies (auto-approval)
+
+A **policy** is a named, versioned rule for one mutation type that only Zach can create,
+widen or extend; a **grant** gives one authenticated token (one workflow's identity,
+`requested_by_token_id`, see [access tokens](access-tokens.md#workflow-identities-and-requested_by_token_id))
+the right to use it until the grant expires. PDW decides, inside the proposal's own
+transaction (`PostgresStore.CreateRequest` → `evaluateRequestPolicy`, `app/internal/mutations/policy*.go`):
+
+1. **Type rules** (`typeRules`, in code). A type is proposable and never auto-approved
+   unless listed; only `resideo.set_thermostat` is auto-approvable today. No policy can
+   approve a type the table does not mark auto-approvable.
+2. **Deny rules** (`deny_json`: `below`, `above`, `in` per field). An enforced policy's deny
+   rule refuses the proposal with the rule named; a dry-run one records `would_refuse`.
+3. **Grant match.** The proposer's token holds an active grant (not revoked, not past its
+   required `expires_at`), the policy is inside `valid_from`..`valid_until`, every field of
+   `match_json` (`min`/`max`, `in`, `absent`) passes on the type's facts
+   (`policyFactsFor`; for the thermostat `thermostatPolicyFacts`: `device_id`,
+   `heat_setpoint`, `cool_setpoint`, `hold`), and every limit in `limits_json` passes:
+   `max_per_day`, `max_per_hour`, `min_interval_minutes`, `input_max_age_minutes` (the
+   thermostat poll the proposal was judged against) and `pause_after_manual_change_hours`
+   (any setpoint change in `base_resideo.thermostat_readings` that no mutation this policy
+   approved explains). Limits are counted under the policy's advisory lock, over the policy's
+   `approved` **and** dry-run `would_approve` decisions: a dry run exercises the limits, and
+   switching a policy to `enforce` never lets more changes through in the next hour or day
+   than the limits allow.
+4. **Otherwise review**, with the closest policy's reasons ("heat_setpoint 74 is above this
+   policy's 72"). A policy approves **one change per request**: its limits count
+   changes, so a batch of several changes, even one wholly inside the policy, goes to
+   review whole.
+
+The policy JSON is parsed strictly: an unknown rule, limit or field never matches, because
+ignoring it would widen the policy. Policy rows are never updated; a change is a new
+version, and every decision names `policy:<id>@<version>`.
+
+Each decision is stored three ways: a row of `ops.mutation_policy_evaluations` (phase
+`propose`), `context.policy` on the request (served as `request.policy`), and a
+`policy_evaluated` request event with `actor_type = 'policy'`. A policy's `mode` is `off`,
+`dry_run` or `enforce`; in `dry_run` the review shows a **"Would auto-approve"** badge (web
+`policyBadge`, phone `policyBadge` in `mobile/src/lib/mutation-review.ts`) and the request
+still waits for Zach. A request no policy could touch carries no note.
+
+Tables (ops schema, app-only; Go `mutationPolicySchemaStatements`, Python twin in
+`ensure_upstream_mutation_tables`, held equal by `tests/test_mutation_policies.py`):
+`mutation_policies` (`id`, `version`, `operation`, `account`, `match_json`, `deny_json`,
+`limits_json`, `mode`, `valid_from`, `valid_until`, who created and approved it),
+`mutation_policy_grants`, `mutation_policy_evaluations`, `mutation_policy_settings` (the
+kill switch).
+
+### Enforcement
+
+When the decision is `approved` (an `enforce` policy, every check passed),
+`approveByPolicy` approves the request **in the proposal's transaction**: status
+`approved`, `approved_by = policy:<id>@<version>`, `approved` events with
+`actor_type = 'policy'` carrying the evaluation, and the `pg_notify` that wakes the
+resident worker. The agent's `propose_mutation` answer then says `status: approved`. No
+review alert is pushed for it (`server.go` sends one only for `pending_review`).
+
+**Kill switches.** One global switch: the `auto_approve` row of
+`ops.mutation_policy_settings` (`{"enabled": false}`), with `PDW_MUTATION_AUTO_APPROVE=0`
+in the environment winning over it. The environment variable is read by the Go app (at
+proposal) and by the Dagster/resident worker (at claim); set it on **both** Coolify apps.
+Each policy also has its `mode`. Reviewers flip both from the web review list
+("Automatic approvals") or the phone's Mutations tab, over the reviewer-only
+`POST /api/mutations/policies/settings {auto_approve}` and
+`POST /api/mutations/policies/<id>/mode {mode}`; a mode change writes a new version.
+
+**One lock.** Every writer of a policy (a new version, a mode change, the auto-off), of
+its grants, and of the kill switch takes the policy's transaction-scoped advisory lock
+(`hashtextextended('pdw_mutation_policy:' || <id>)`, and `pdw_mutation_policy:*settings`
+for the switch: settings first, then policy ids sorted), and so does the claim below
+(`lock_policy_state`). A switch-off, revoke or new version either commits before a claim
+reads it, or waits for that claim to commit; `FOR SHARE` alone could not stop a new
+version row or a first settings row from being inserted.
+
+**Claim-time re-check.** `claim_approved_upstream_mutations` (Python) picks rows, takes the
+locks above, re-checks every policy-approved one
+(`upstream_mutation_policy.policy_recheck_failure`) and claims each as it passes, in
+**one transaction**, so the next candidate's limits count it (a delayed queue of several
+changes under a one-per-hour policy runs one). It reads the settings, policy and grant rows:
+kill switch, policy still `enforce` at the version that approved it and inside its dates,
+the proposing token's grant still active, the rate limits over what other requests under
+the policy have claimed, that the request holds one change, and no hand change inside the
+pause window (the same SQL as the
+Go `thermostatManualChangeSQL`). A failure sends the whole request back to
+`pending_review` with the reason in `error` and a `policy_recheck_failed` event; a switch
+or revoke that commits before the claim always wins, one that commits after waits on the
+locks and does not stop that one write (Undo and the next run correct it). A request Zach
+approved by hand is never re-checked; to stop one, cancel it. Only the Python cloud worker
+claims auto-approvable types; the Go device workers claim types no policy may approve.
+
+**After it runs.** The app's policy outcome loop (`Service.RunPolicyOutcomes`, every 10 s)
+selects only requests with something to report (so reported or still-waiting rows never
+fill a page) and, in one transaction, marks each report with a request event and queues it
+as a row of the timeline notification outbox (`ops.notification_events`, adapter
+`mutation_policy`, priority `self`). The outbox worker (`internal/notifications`) delivers
+it with its fan-out per device, leases, retries with backoff and receipts, so a crash or a
+push failure loses nothing; `renderTimelineNotification` draws the row with its action
+category and request id. A mutation alert is **not part of the timeline-notification
+experiment** (`notifications.MutationAdapter`): it is fanned out and delivered whether or
+not `ops.notification_state` (id `timeline`) is on, switching that off never cancels it,
+and the timeline notifications page (`GET /api/notifications`) does not list it. On the
+phone a tap opens `/mutations/<id>`; a Web Push click opens
+`/mutation-review/requests/<id>`. Every alert about one request shares
+`push.MutationCollapseID`, whichever path sent it, so a withdrawal replaces a sent-back
+review alert as it does the first one. The Go app creates the outbox table itself when the
+Python ensure path has not yet (`notificationOutboxStatements`). The reports are:
+a quiet alert (passive, no sound, category `mutation_applied` with **Undo**) when a change
+ran; an ordinary alert when it failed; the review alert again when the claim sent it back;
+and "Policy … turned off" when the policy's last three finished runs all failed, which
+writes a new version with mode `off` (`created_by = pdw:auto-off`). **Undo**
+(`POST /api/mutations/requests/<id>/undo`, reviewer-only, also a button on the web and
+phone review of any thermostat request that ran) proposes the inverse from the
+`result.previous` the worker recorded and approves it as the reviewer; a second Undo
+returns the same request. Android draws no action buttons, so there a tap on the alert
+opens the review, which has the Undo button.
+
+**Executor cap.** `resideo_mutations.py` refuses any policy-approved thermostat write with
+heat outside 50 to 72°F, or any cool setpoint, whatever the policy says
+(`POLICY_APPROVED_HEAT_RANGE`); only Zach's own approval reaches past it. It is a second
+check in another language, so one bad change to the Go policy code is not enough.
+
+### Approve now, run later; cancel; preconditions
+
+Any mutation entry may carry `not_before` and `not_after` (RFC 3339 with a zone), and a
+`resideo.set_thermostat` entry a `precondition` (only the cloud worker's thermostat path
+checks one, so other types refuse it at proposal rather than ignore it); `scheduleFromMap` lifts them off before the type parses the entry, so no
+type knows them. They are stored on `ops.upstream_mutation_operations` (`not_before`, `not_after`,
+`precondition_json`) and summarized on the request: the earliest `not_before` only when
+every step has one (a step without one runs once approved, so the request starts then),
+the latest `not_after` only when every step has one. The review shows the request's **Runs
+at** and deadline, and on each step card that step's own run time, deadline and
+precondition. The Dagster sensor counts only rows the worker can act on now (due, or past
+their deadline), so a plan approved days ahead does not start an empty run every 10 s.
+Every request-status rollup (Python `derive_request_status`, Go `DeriveRequestStatus`, used
+by cancel and the device queue) applies one ladder, held equal by
+`tests/contracts/request_status_ladder.json`: cancelled, withdrawn and rejected steps are not
+live work, and `skipped_precondition` counts as finished. Workers (the Python claim and
+the Go device queue) never claim a row before its `not_before` and fail a claimable row
+past its `not_after` as `failed_terminal` ("the approval expired"). Those two are the only
+claim paths (the resident worker and the Dagster fallback share the Python one). Only the
+Python one re-checks a policy approval, so the Go device queue never claims a row a policy
+approved (device types are never auto-approvable). The Resideo executor's
+one-hour rule now counts from the later of approval and `not_before`, unless `not_after`
+is set.
+
+**Cancel** stops an approved request whose remaining mutations have not been claimed:
+each waiting one ends `cancelled` (terminal) and never runs, and a request with nothing
+left that ran reads `cancelled`. A reviewer cancels from the web or phone review
+(`POST /api/mutations/requests/<id>/cancel`, reviewer-only); the token that proposed the
+request cancels it with the `cancel_mutation` tool. Cancel takes the rows `FOR UPDATE`,
+so it and a claim serialize; a running step is refused ("Undo it after it finishes").
+**One row-lock order** for a request, in every Go path and in the Python worker: its
+mutations first (`lockRequestMutations`, by request_index), then the request row. The
+worker's claim, send-back and status rollup already take that order; cancel, approve, deny,
+withdraw, supersede and the edit routes do too, so none deadlocks against the worker.
+
+**Preconditions** are checked by the worker right before the step runs
+(`upstream_mutation_schedule.precondition_failure`); a failed one ends the mutation as
+`skipped_precondition` (never a write) and the app pushes "Skipped: …". The one kind today
+is `{"kind": "not_home", "within_minutes": N}`: skip when phone location
+(`base_android_location.samples`) in the window puts the phone within the home radius,
+and also when there is no location in the window, because missing data must never send
+the house to away. Home is `PDW_HOME_LATITUDE` / `PDW_HOME_LONGITUDE` /
+`PDW_HOME_RADIUS_METERS` (default 1000) on the Dagster deployment, never in Git; with none
+set the step is skipped.
+
+### Forbidden types and policy changes
+
+**Forbidden.** `TypeRuleFor` marks some kinds of change not agent-proposable whatever
+type name a later commit gives them: door locks (`lock.*`, `door_lock.*`), garage doors
+(`garage.*`, `garage_door.*`) and payments (`payment.*`, `payments.*`, `bank.*`,
+`money.*`). `ProposeMutation` refuses them before anything else ("…is forbidden: agents may
+never propose …"). No such type exists; the rule is there so adding one cannot make it
+agent-proposable by accident.
+
+**`pdw.mutation_policy`** is how a policy changes (`policy_change.go`). Agents may
+propose it; it is never auto-approvable. Actions: `put_policy` (a new policy or a new
+version; strict spec, and a live policy needs match rules, both rate limits and valid
+dates), `set_mode`, `grant` (to an issued token id, with a required `expires_at`),
+`revoke_grant`, `set_auto_approve`. A request that changes policies holds nothing else.
+At proposal PDW compares the change with the current state field by field
+(`policyNarrowing`) and stores the diff in the preview; the web and
+phone review show it with PDW's verdict. A change is a narrowing only when every action
+the new version allows was allowed before: a range only shrinks (so lowering the minimum
+from 55 to 50 widens), allowed values only shrink, deny rules only grow, limits only
+tighten (0 is "no limit"), dates only shrink, mode only moves enforce → dry_run → off, a
+grant is revoked or expires earlier, or the kill switch goes off. Anything not comparable
+is not a narrowing. A request of narrowings only is approved at once as `pdw:narrowing`
+and applied in the proposal's transaction: it takes every lock its changes touch (kill
+switch, then policy ids sorted, the same locks as the claim) and judges each change again
+against the state as it is under them, so two agents shortening one grant at once never
+lengthen it (the second is applied only if it still narrows, otherwise it waits for Zach);
+Zach still gets a quiet "Policy narrowed" push. Everything else waits for him, and an
+approval applies the change in the approving transaction (no worker claims it); one
+whose policy, grant or switch has changed since Zach read its diff is refused ("propose it
+again").

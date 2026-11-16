@@ -121,6 +121,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 
 	var client Uploader
+	var observe ingestclient.ObservationPoster // a dry run posts nothing
 	var files AttachmentUploader
 	guard := func() string { return "" }
 	if *dryRun {
@@ -132,6 +133,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			return common.ExitFailure
 		}
 		client = ingest
+		observe = ingest.PostSourceObservation
 		files = ingest
 		// Not UploadGuard: this runs on the phone (see common.PreflightGuard).
 		guard = common.PreflightGuard(env, "ANDROID_MESSAGES", cfg.BaseURL)
@@ -147,6 +149,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Logger:            logger,
 		DryRun:            *dryRun,
 		BeforeUploadCheck: guard,
+		Observe:           observe,
 	}).Sync()
 	fmt.Fprintf(stdout, "Android messages upload complete: read=%d unchanged=%d messages=%d batches=%d attachments=%d attachment_bytes=%d deferred=%t dry_run=%t\n",
 		summary.Read, summary.Unchanged, summary.Uploaded, summary.Batches, summary.AttachmentsUploaded, summary.AttachmentBytes, summary.Deferred, *dryRun)

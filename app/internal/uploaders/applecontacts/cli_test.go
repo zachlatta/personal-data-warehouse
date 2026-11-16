@@ -80,13 +80,14 @@ func TestRunUploadsCardsThroughTheApp(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code=%d stderr=%q out=%q", code, errOut, out)
 	}
-	if paths := app.Paths(); len(paths) != 1 || paths[0] != "/ingest/apple-contacts/batch" {
+	// C11: the address book's newest edit is posted before the batch.
+	if paths := app.Paths(); len(paths) != 2 || paths[0] != "/ingest/source-observation" || paths[1] != "/ingest/apple-contacts/batch" {
 		t.Fatalf("app calls = %v", paths)
 	}
 	if !strings.Contains(out, "Apple Contacts upload complete: seen=") || !strings.Contains(out, "batches=1") {
 		t.Fatalf("summary missing: %q", out)
 	}
-	records := testfixtures.DecodeGzipJSONL(app.Calls()[0].Body)
+	records := testfixtures.DecodeGzipJSONL(app.Calls()[1].Body)
 	if len(records) == 0 || records[0]["account"] != "zach@example.com" {
 		t.Fatalf("records = %v", records)
 	}
@@ -121,7 +122,7 @@ func TestRunAppliesMutationsBeforeTheUploadAndNoMutationsSkipsTheStage(t *testin
 	env, root := cliEnv(t)
 	app := testfixtures.NewFakeApp(t)
 	code, out, _ := runCLI(t, stateArgs(root), env, ingestclient.Config{BaseURL: app.URL(), Token: "secret"})
-	if code != 0 || len(app.Calls()) != 1 {
+	if code != 0 || len(app.Calls()) != 2 { // the C11 observation, then the batch
 		t.Fatalf("code=%d out=%q calls=%d", code, out, len(app.Calls()))
 	}
 	stage, upload := strings.Index(out, "Apple Contacts mutations skipped: warehouse unavailable"), strings.Index(out, "Apple Contacts upload complete")
@@ -130,7 +131,7 @@ func TestRunAppliesMutationsBeforeTheUploadAndNoMutationsSkipsTheStage(t *testin
 	}
 	env2, root2 := cliEnv(t)
 	code, out, _ = runCLI(t, append([]string{"--no-mutations"}, stateArgs(root2)...), env2, ingestclient.Config{BaseURL: app.URL(), Token: "secret"})
-	if code != 0 || strings.Contains(out, "mutations") || len(app.Calls()) != 2 {
+	if code != 0 || strings.Contains(out, "mutations") || len(app.Calls()) != 4 {
 		t.Fatalf("--no-mutations: code=%d out=%q calls=%d", code, out, len(app.Calls()))
 	}
 }

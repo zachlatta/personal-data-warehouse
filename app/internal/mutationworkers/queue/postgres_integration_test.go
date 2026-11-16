@@ -516,3 +516,56 @@ func TestIntegrationARetryableFailureWaitsOutItsBackoffBeforeItIsClaimedAgain(t 
 		t.Fatalf("after the backoff the row must be claimed again: %+v", ours)
 	}
 }
+
+// Device types are never auto-approvable, and the device queue cannot re-check
+// a policy at claim the way the cloud worker does, so a row a policy approved
+// is never claimed here, whatever wrote it.
+func TestIntegrationADeviceWorkerNeverClaimsAPolicyApprovedRow(t *testing.T) {
+	app, worker := testStores(t)
+	ctx := context.Background()
+	note := approvedRequest(t, app, "policy note", mutations.MutationInput{Type: mutations.AppleNotesCreateNoteOperation, Body: "hello", Folder: "PDW Agent"})
+	if _, err := worker.db.ExecContext(ctx, expand(`UPDATE @upstream_mutations SET approved_by = 'policy:anything@1' WHERE request_id = $1`), note.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := worker.ClaimApproved(ctx, 500, "mac:test:apple_notes_mutation_worker", []string{"apple_notes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range claimed {
+		if m.RequestID == note.ID {
+			t.Fatal("the device queue claimed a policy-approved row")
+		}
+	}
+}
+
+// A device request whose other step was cancelled finishes as succeeded when
+// its last live step completes, instead of staying "executing".
+func TestIntegrationADeviceRequestWithACancelledStepFinishes(t *testing.T) {
+	app, worker := testStores(t)
+	ctx := context.Background()
+	request := approvedRequest(t, app, "two notes",
+		mutations.MutationInput{Type: mutations.AppleNotesCreateNoteOperation, Body: "one", Folder: "PDW Agent"},
+		mutations.MutationInput{Type: mutations.AppleNotesCreateNoteOperation, Body: "two", Folder: "PDW Agent"})
+	if _, err := worker.db.ExecContext(ctx, expand(`UPDATE @upstream_mutations SET status = 'cancelled' WHERE request_id = $1 AND request_index = 1`), request.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := worker.ClaimApproved(ctx, 500, "mac:test:apple_notes_mutation_worker", []string{"apple_notes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mine string
+	for _, m := range claimed {
+		if m.RequestID == request.ID {
+			mine = m.ID
+		}
+	}
+	if mine == "" {
+		t.Fatal("the live step was not claimed")
+	}
+	if err := worker.Complete(ctx, mine, map[string]any{"ok": true}, "mac:test"); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := requestStatus(t, worker, request.ID); status != "succeeded" {
+		t.Fatalf("request status %q, want succeeded", status)
+	}
+}

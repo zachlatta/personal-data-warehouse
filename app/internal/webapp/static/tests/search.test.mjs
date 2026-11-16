@@ -5,7 +5,7 @@ import { search, PRIORITIES } from "../api.js";
 // Only the DOM operations used by the search view; requests never use the network.
 class Node {
   constructor() {
-    this.children = []; this.value = ""; this.style = {}; this.events = {};
+    this.children = []; this.value = ""; this.style = { setProperty(name, value) { this[name] = value; } }; this.events = {};
     this.className = "";
     this.classList = {
       contains: (name) => this.className.split(" ").includes(name),

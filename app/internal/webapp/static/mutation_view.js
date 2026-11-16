@@ -60,6 +60,72 @@ export function requestListStatus(request) {
   return status + (request.status === "withdrawn" ? " (replaced)" : " (superseded)");
 }
 
+// preconditionText says what a step's precondition checks, in plain words.
+export function preconditionText(precondition) {
+  const p = asMap(precondition);
+  const kind = trimStr(p.kind);
+  if (!kind) return "";
+  if (kind === "not_home") {
+    const minutes = Number(p.within_minutes);
+    return "Skipped if the phone was at home (or had no location) in the " + (Number.isFinite(minutes) ? minutes : "?") + " minutes before it runs";
+  }
+  return "Precondition " + kind;
+}
+
+// mutationSchedule is one step's own "Runs at", deadline and precondition,
+// which a plan's steps each carry (a trip's away step and its return step).
+export function mutationSchedule(mutation) {
+  const m = asMap(mutation);
+  return { runsAt: trimStr(m.not_before), deadline: trimStr(m.not_after), precondition: preconditionText(m.precondition) };
+}
+
+// requestSchedule is a scheduled request's "Runs at" and deadline (the
+// API's not_before / not_after), empty strings when it runs once approved.
+export function requestSchedule(request) {
+  const r = asMap(request);
+  return { runsAt: trimStr(r.not_before), deadline: trimStr(r.not_after) };
+}
+
+// policyChangeView is a pdw.mutation_policy change as the reviewer reads it:
+// PDW's verdict (narrowing or not), why not, and the field-by-field diff.
+export function policyChangeView(mutation) {
+  if (!mutation || mutation.operation !== "pdw.mutation_policy") return null;
+  const change = asMap(asMap(mutation.preview).policy_change);
+  const show = (value) => (value === null || value === undefined) ? "none" : (typeof value === "string" ? value : JSON.stringify(value));
+  return {
+    narrowing: change.narrowing === true,
+    summary: trimStr(change.summary),
+    widens: stringSlice(change.widens).map((line) => line.trim()).filter(Boolean),
+    diff: mapSlice(change.diff).map((line) => ({ field: trimStr(line.field), before: show(line.before), after: show(line.after), verdict: trimStr(line.verdict) })),
+  };
+}
+
+// policyChangeTable is the diff of a policy change as a table: one header per
+// column and the same four cells in every row. Its own class: the request
+// list's "rtable" right-aligns its 3rd column and hides the 3rd and 4th on a
+// phone, which shifted "After" over the verdict.
+export function policyChangeTable(view) {
+  return {
+    className: "policy-diff",
+    headers: ["Field", "Before", "After", "Verdict"],
+    rows: (view ? view.diff : []).map((line) => ({ cells: [line.field, line.before, line.after, line.verdict], widens: line.verdict === "widens" })),
+  };
+}
+
+// policyBadge is the mutation policy's decision as a badge: "would
+// auto-approve" for a dry run, who approved it for an enforced policy, and
+// why a policy did not cover it. Null when no policy could touch the request.
+export function policyBadge(request) {
+  const policy = asMap(request && request.policy);
+  const decision = trimStr(policy.decision);
+  if (!decision) return null;
+  const tone = {
+    approved: "ok", would_approve: "info", review: "muted", would_refuse: "warn", refused: "bad",
+  }[decision] || "muted";
+  const reasons = stringSlice(policy.reasons).map((line) => line.trim()).filter(Boolean);
+  return { decision, tone, label: trimStr(policy.label) || decision.replace(/_/g, " "), reasons, policyId: trimStr(policy.policy_id), mode: trimStr(policy.mode) };
+}
+
 // requestLifecycle is what happened to a request after it was proposed, for
 // the header: an agent withdrawal (who, why, and the request that stands in
 // for it), a human's supersede link on a dead request, and the request this
@@ -737,7 +803,8 @@ export function splitRequestContext(ctx) {
   ctx = asMap(ctx);
   const source = trimStr(ctx.source); const note = trimStr(ctx.note);
   const identifications = mapSlice(ctx.identifications);
-  const handled = new Set();
+  // The policy decision has its own badge in the header.
+  const handled = new Set(["policy"]);
   if (source) handled.add("source");
   if (note) handled.add("note");
   if (identifications.length) handled.add("identifications");
@@ -1310,7 +1377,7 @@ export function mutationReviewContext(value) {
     counts.push({ key, label: humanContextCountLabel(key), icon: "•", count: intFromAny(rawCounts[key]) });
   }
   const leftover = { ...context };
-  for (const key of ["source", "snapshot_utc", "total_conversations", "candidate_counts", "selection", "preserved"]) delete leftover[key];
+  for (const key of ["source", "snapshot_utc", "total_conversations", "candidate_counts", "selection", "preserved", "policy"]) delete leftover[key];
   return {
     source: trimStr(context.source),
     snapshotAt: trimStr(context.snapshot_utc),

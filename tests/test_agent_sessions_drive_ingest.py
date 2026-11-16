@@ -1330,3 +1330,46 @@ def test_argon_malformed_shapes_degrade_to_meta_rows() -> None:
         row = _argon_row(line, seq=3)
         assert row["source"] == "argon"
         assert row["event_uuid"] == f"{ARGON_SESSION}#3"
+
+
+def test_muse_rows_for_the_manifest_fixture_match_the_manifest_event_count() -> None:
+    """`pdw ingest muse` publishes a session manifest whose event_count is the
+    number of base_muse.events rows the warehouse keeps for a transcript.
+
+    The Go side (app/internal/uploaders/agentsessions/muse_manifest_test.go)
+    asserts this same fixture ships 11 lines and lists event_count 7; this
+    test runs those 11 lines through the warehouse's own row builder and
+    checks they key onto exactly 7 primary keys. If muse_event_row's
+    event_uuid rule changes, both sides must change together.
+    """
+    from pathlib import Path
+
+    fixture = (
+        Path(__file__).resolve().parents[1]
+        / "app/internal/uploaders/agentsessions/testdata/muse_manifest_session.jsonl"
+    )
+    data = fixture.read_text()
+    complete = data.split("\n")[:-1]  # the trailing partial line waits for its newline
+    session_id = "0b5e8c1a-1111-4a2b-9c3d-000000000001"
+    shipped = []
+    for index, text in enumerate(complete):
+        text = text.strip()
+        if not text:
+            continue
+        try:
+            line = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(line, dict):
+            continue
+        shipped.append(
+            {
+                "account": "z@x",
+                "device": "muse",
+                "record_type": "muse_event",
+                "record": {"tool": "muse", "session_id": session_id, "seq": index, "line": line, "session": {}},
+            }
+        )
+    rows = [record_to_event_row(record, ingested_at=datetime(2026, 11, 11, tzinfo=UTC)) for record in shipped]
+    assert len(shipped) == 11
+    assert len({(row["source"], row["session_id"], row["event_uuid"]) for row in rows}) == 7

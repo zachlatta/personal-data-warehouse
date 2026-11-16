@@ -63,6 +63,8 @@ class WhatsAppClientRunner:
         client_id: str = "",
         session_snapshot_callback: Callable[[], Any] | None = None,
         session_status_callback: Callable[[str, str], Any] | None = None,
+        upstream_observation_callback: Callable[[datetime | None], Any] | None = None,
+        observation_interval_seconds: int = 300,
         qr_output_dir: Path | str | None = None,
         download_history_media: bool = False,
         now: Callable[[], datetime] | None = None,
@@ -76,6 +78,13 @@ class WhatsAppClientRunner:
         self._client_id = client_id
         self._session_snapshot_callback = session_snapshot_callback
         self._session_status_callback = session_status_callback
+        self._upstream_observation_callback = upstream_observation_callback
+        self._observation_interval_seconds = max(1, observation_interval_seconds)
+        self._last_observed_at: datetime | None = None
+        #: The newest message WhatsApp delivered to this linked device in this
+        #: run (C11): what marts_ops.source_upstream_health compares with
+        #: base_whatsapp.messages.
+        self._newest_message_at: datetime | None = None
         self._qr_output_dir = Path(qr_output_dir).expanduser() if qr_output_dir is not None else None
         self._download_history_media = download_history_media
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -214,6 +223,7 @@ class WhatsAppClientRunner:
             self._batcher.add_media(record.media, downloader=self._downloader(client))
         with self._totals_lock:
             self._totals["messages_received"] += 1
+            self._note_message_at(record.payload)
 
     def _on_history_sync(self, client, event) -> None:
         try:
@@ -231,6 +241,8 @@ class WhatsAppClientRunner:
             if message.media is not None:
                 self._batcher.add_media(message.media, downloader=downloader)
         with self._totals_lock:
+            for message in records.messages:
+                self._note_message_at(message.payload)
             self._totals["history_messages_received"] += len(records.messages)
             self._totals["chats_received"] += len(records.chats)
             self._totals["contacts_received"] += len(records.contacts)
@@ -294,6 +306,40 @@ class WhatsAppClientRunner:
             if self._connected_event.is_set() and not self._groups_dumped:
                 self._dump_groups(client)
             self._flush_once()
+            self._maybe_observe()
+
+    def _note_message_at(self, payload: dict[str, Any]) -> None:
+        """Keep the newest message time seen (caller holds the totals lock)."""
+        try:
+            message_at = datetime.fromisoformat(str(payload.get("message_at", "")))
+        except ValueError:
+            return
+        if self._newest_message_at is None or message_at > self._newest_message_at:
+            self._newest_message_at = message_at
+
+    def _maybe_observe(self) -> None:
+        """Record the linked device's newest message, while connected (C11).
+
+        Only a connected client is looking at WhatsApp, so only it may claim a
+        fresh observation; a client that cannot connect lets the observation
+        age until the detector reads ``unknown``. Never raises.
+        """
+        if self._upstream_observation_callback is None or not self._connected_event.is_set():
+            return
+        now = self._now()
+        if (
+            self._last_observed_at is not None
+            and (now - self._last_observed_at).total_seconds() < self._observation_interval_seconds
+        ):
+            return
+        with self._totals_lock:
+            newest = self._newest_message_at
+        try:
+            self._upstream_observation_callback(newest)
+        except Exception as exc:  # noqa: BLE001 - evidence must never kill the client
+            self._logger.warning("WhatsApp upstream observation failed: %s", exc)
+            return
+        self._last_observed_at = now
 
     def _flush_once(self) -> None:
         try:

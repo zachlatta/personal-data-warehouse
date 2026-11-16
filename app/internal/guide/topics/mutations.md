@@ -2,6 +2,13 @@
 
 Nothing in PDW writes to an upstream service directly. A mutation is **proposed**, lands
 in a review queue, and runs only after a human approves it in the web or phone review UI.
+Only Zach's web and phone sessions can approve, deny or edit a request: every agent token,
+including a host's `full` token, gets 403 on those routes. Never try to approve your own proposal.
+A workflow whose own token holds a grant on a mutation policy (Zach's rule, e.g. a heating
+policy) may get `status: approved` straight back from `propose_mutation`: PDW approved it
+inside the policy and it runs within seconds. Anything outside the policy waits for Zach as
+usual, with the reason in the request's `policy`. Policies bind to the token id, never to
+the client name you send.
 Prefer this path for any change to Zach's Gmail (mail, labels and filters), Calendar, Google or Apple Contacts, Slack
 (a message sent as him, or his read state), Apple Notes, or a text message (RCS/SMS from his Pixel); use a direct connector only for
 something PDW has no mutation type for, and say why. Deleting a screen capture from the warehouse is a mutation too
@@ -22,7 +29,8 @@ Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_t
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
 `slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
 `apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `android_messages.send_message`,
-`apple_messages.mark_read`, `screen_timelapse.purge_moment`, `printer.print_document`, `resideo.set_thermostat`. The help call is
+`apple_messages.mark_read`, `screen_timelapse.purge_moment`, `printer.print_document`, `resideo.set_thermostat`,
+`pdw.mutation_policy`. The help call is
 authoritative when this list and it disagree.
 
 ## Rules
@@ -137,6 +145,17 @@ authoritative when this list and it disagree.
 on) or `permanent`. It does not change the
   mode (heat, cool, off). The review shows the temperature and mode now and warns when the mode
   makes the change do nothing. An approval over an hour old is not applied: propose again.
+- **Never proposable:** door locks, garage doors and payments are forbidden types; the
+  proposal is refused. **Policies** change only through `pdw.mutation_policy` (see its help):
+  PDW, not you, decides whether a change only narrows (then it applies at once) or needs Zach
+  (a new policy or grant, any widening, switching auto-approval on). Turning a policy off or
+  the kill switch off always narrows, so do it when automation is misbehaving.
+- **Approve now, run later:** any entry may carry `not_before` / `not_after` (RFC 3339 with a
+  zone). A `resideo.set_thermostat` entry may also carry `precondition`
+  `{"kind": "not_home", "within_minutes": 120}` (skipped, never run, when recent phone
+  location is at home or missing); other types refuse a precondition. Zach approves a plan once; each step
+  runs at its time. To drop an approved plan that no longer stands, {{if .CLI}}`pdw call cancel_mutation --data '{"request_id": "...", "reason": "..."}'`{{else}}`cancel_mutation` with `request_id` and `reason`{{end}}
+  (only the token that proposed it), then propose the new one.
 - **Status lives in the warehouse.** The request's state, result and error are in
   `ops.upstream_mutation_operations` (readable by the query role for exactly this), and
   every proposal is a `mutation_requests` event on the timeline (search scope `mutations`).

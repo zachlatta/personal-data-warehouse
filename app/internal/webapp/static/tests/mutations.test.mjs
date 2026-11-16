@@ -765,3 +765,57 @@ test("gmailSettingsView reads label changes", () => {
   assert.equal(create.heading, "New Gmail label \"pdw-test\"");
   assert.deepEqual(create.color, { background: "#16a766", text: "#ffffff" });
 });
+
+test("policyBadge names a dry run's would-approve and why a policy did not cover a request", () => {
+  assert.equal(V.policyBadge({}), null);
+  assert.equal(V.policyBadge({ policy: {} }), null);
+  const would = V.policyBadge({ policy: { decision: "would_approve", label: "Would auto-approve (policy heating-winter v1, dry run)", reasons: ["inside policy heating-winter v1"], policy_id: "heating-winter", mode: "dry_run" } });
+  assert.equal(would.tone, "info");
+  assert.match(would.label, /Would auto-approve/);
+  assert.equal(would.policyId, "heating-winter");
+  const review = V.policyBadge({ policy: { decision: "review", reasons: ["heat_setpoint 74 is above this policy's 72"] } });
+  assert.equal(review.tone, "muted");
+  assert.deepEqual(review.reasons, ["heat_setpoint 74 is above this policy's 72"]);
+  // The decision is shown as a badge, not again as raw context.
+  assert.equal("policy" in V.splitRequestContext({ policy: { decision: "review" }, note: "x" }).leftover, false);
+});
+
+test("requestSchedule reads a scheduled request's runs-at and deadline", () => {
+  assert.deepEqual(V.requestSchedule({ not_before: "2026-12-04T12:30:00Z", not_after: "2026-12-04T14:30:00Z" }), { runsAt: "2026-12-04T12:30:00Z", deadline: "2026-12-04T14:30:00Z" });
+  assert.deepEqual(V.requestSchedule({ not_before: null }), { runsAt: "", deadline: "" });
+});
+
+test("mutationSchedule shows each step its own runs-at, deadline and precondition", () => {
+  const step = V.mutationSchedule({ not_before: null, not_after: "2026-12-04T14:30:00Z", precondition: { kind: "not_home", within_minutes: 120 } });
+  assert.equal(step.runsAt, "");
+  assert.equal(step.deadline, "2026-12-04T14:30:00Z");
+  assert.match(step.precondition, /at home .*120 minutes/);
+  assert.deepEqual(V.mutationSchedule({}), { runsAt: "", deadline: "", precondition: "" });
+});
+
+test("policyChangeView shows PDW's verdict and the diff a reviewer approves", () => {
+  assert.equal(V.policyChangeView({ operation: "gmail.send_email" }), null);
+  const view = V.policyChangeView({ operation: "pdw.mutation_policy", preview: { policy_change: {
+    narrowing: false, summary: "changes policy heating-winter (v1 → v2)",
+    widens: ["match.heat_setpoint: a lower or removed minimum"],
+    diff: [{ field: "match.heat_setpoint", before: "min 55, max 72", after: "min 50, max 72", verdict: "widens" }],
+  } } });
+  assert.equal(view.narrowing, false);
+  assert.deepEqual(view.widens, ["match.heat_setpoint: a lower or removed minimum"]);
+  assert.equal(view.diff[0].after, "min 50, max 72");
+});
+
+test("policyChangeTable lines each value up under its own header, apart from the request list's column rules", () => {
+  const view = V.policyChangeView({ operation: "pdw.mutation_policy", preview: { policy_change: {
+    narrowing: false,
+    diff: [{ field: "match.heat_setpoint", before: "min 55, max 72", after: "min 50, max 72", verdict: "widens" }],
+  } } });
+  const table = V.policyChangeTable(view);
+  // The request list's table class right-aligns and (on phones) hides its
+  // 3rd and 4th columns, which put "After" over the verdict column.
+  assert.notEqual(table.className, "rtable");
+  assert.deepEqual(table.headers, ["Field", "Before", "After", "Verdict"]);
+  for (const row of table.rows) assert.equal(row.cells.length, table.headers.length);
+  assert.deepEqual(table.rows[0].cells, ["match.heat_setpoint", "min 55, max 72", "min 50, max 72", "widens"]);
+  assert.equal(table.rows[0].widens, true);
+});

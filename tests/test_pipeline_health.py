@@ -704,9 +704,10 @@ def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(ware
         VALUES
             ('apple_notes', 'porygon', %s, 'error', 'PermissionError: Operation not permitted', 1, 3, %s, 2),
             ('apple_messages', 'porygon', %s, 'ok', '', 0, 5, %s, 2),
-            ('claude_code', 'porygon', %s, 'ok', '', 0, 5, %s, 2)
+            ('claude_code', 'porygon', %s, 'ok', '', 0, 5, %s, 2),
+            ('mcp_proxy', 'app', %s, 'error', 'example: discovery failed', 1, 0, %s, 2)
         """,
-        (now, now, now, now, now - timedelta(hours=5), now - timedelta(hours=5)),
+        (now, now, now, now, now - timedelta(hours=5), now - timedelta(hours=5), now, now),
     )
     PipelineHealthCollector(warehouse).run()
 
@@ -715,7 +716,7 @@ def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(ware
         for row in warehouse._query_dicts(
             "SELECT pipeline, status, run_status, state_rows, state_error_rows, last_error, last_run_at"
             " FROM @marts_pipeline_health"
-            " WHERE pipeline IN ('apple_notes', 'apple_messages', 'claude_code', 'codex', 'uploader_heartbeats')"
+            " WHERE pipeline IN ('apple_notes', 'apple_messages', 'claude_code', 'codex', 'uploader_heartbeats', 'mcp_proxy')"
         )
     }
     assert rows["apple_notes"]["status"] == "failing"
@@ -724,6 +725,8 @@ def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(ware
     # Only its own row: the notes failure does not leak into messages.
     assert rows["apple_messages"]["state_error_rows"] == 0
     assert rows["apple_messages"]["run_status"] == "ok"
+    assert rows["mcp_proxy"]["status"] == "failing"
+    assert rows["mcp_proxy"]["last_error"] == "example: discovery failed"
     # A heartbeat five hours old on a thirty-minute cadence is past stale (6x).
     assert rows["claude_code"]["run_status"] == "stale"
     # No row at all is not a failure, it is the absence of a heartbeat.
@@ -738,6 +741,17 @@ INGEST_HEARTBEAT_EXEMPT_PIPELINES: dict[str, str] = {
     ),
     "uploader_heartbeats": "the internal heartbeat collector meta-pipeline itself",
 }
+
+
+def test_mcp_discovery_has_a_scoped_scheduled_heartbeat():
+    entry = pipeline("mcp_proxy")
+    assert entry.expected_run_interval == timedelta(minutes=10)
+    assert entry.state is not None
+    assert entry.state.table == "uploader_heartbeats"
+    assert entry.state.scope_column == "pipeline"
+    assert entry.state.scope_value == "mcp_proxy"
+    assert entry.state.status_column == "status"
+    assert entry.state.error_column == "error"
 
 
 def test_every_remote_device_uploader_declares_a_run_heartbeat():
@@ -1106,7 +1120,7 @@ def test_collector_skips_probes_it_cannot_afford(warehouse, monkeypatch):
     assert all(row["probe_detail"] for row in rows)
 
 
-def test_read_only_query_role_can_read_the_marts_views(warehouse):
+def test_read_only_query_role_can_read_the_marts_views(warehouse, query_login):
     """Zach and the MCP agent must be able to ask "when was gmail last updated?".
 
     The snapshot lives in ops, which the query role cannot read directly; the
@@ -1114,6 +1128,7 @@ def test_read_only_query_role_can_read_the_marts_views(warehouse):
     """
     _provision_every_table(warehouse)
     PipelineHealthCollector(warehouse).run()
+    query_login(warehouse)
     connection = warehouse.read_only_connection()
     try:
         with connection.cursor() as cursor:
@@ -1129,7 +1144,7 @@ def test_read_only_query_role_can_read_the_marts_views(warehouse):
         connection.close()
 
 
-def test_timeline_adapter_health_exposes_every_adapter_to_the_query_role(warehouse):
+def test_timeline_adapter_health_exposes_every_adapter_to_the_query_role(warehouse, query_login):
     """Level 3 of the health contract: is THIS kind of data current on the timeline?
 
     The single ``timeline`` row in ``marts_ops.pipeline_health`` cannot answer
@@ -1148,6 +1163,7 @@ def test_timeline_adapter_health_exposes_every_adapter_to_the_query_role(warehou
         dest_schema=warehouse._schema,
     ).run()
 
+    query_login(warehouse)
     connection = warehouse.read_only_connection()
     try:
         with connection.cursor() as cursor:
@@ -1895,9 +1911,10 @@ def test_a_stale_mart_snapshot_reports_unknown(warehouse):
     assert statuses == {"unknown"}
 
 
-def test_mart_health_is_readable_by_the_query_role(warehouse):
+def test_mart_health_is_readable_by_the_query_role(warehouse, query_login):
     _provision_every_table(warehouse)
     PipelineHealthCollector(warehouse).run_all()
+    query_login(warehouse)
     connection = warehouse.read_only_connection()
     try:
         with connection.cursor() as cursor:
@@ -2861,7 +2878,18 @@ def test_a_failing_search_health_component_fails_the_search_index_pipeline(wareh
 # {pi}. pi's 45d interval put late at 90 days of Zach not using a CLI, which is
 # not a pipeline fact; muse_code and argon copied it.
 
-USAGE_DRIVEN_PIPELINES = {"pi", "muse_code", "argon", "alice_voice_recordings", "search_requests"}
+USAGE_DRIVEN_PIPELINES = {
+    "pi",
+    "muse_code",
+    "argon",
+    "alice_voice_recordings",
+    "search_requests",
+    # Since the Pixel replaced the iPhone (2026-10-23) a Mac memo is occasional.
+    "apple_voice_memos",
+    # Judgments exist only when Zach records two memos back to back; the run
+    # heartbeat (failed judgments, stuck backlog) is the detector.
+    "voice_memo_continuity",
+}
 
 
 def test_exactly_the_usage_driven_sources_skip_freshness_escalation():
@@ -2925,6 +2953,103 @@ def test_a_usage_driven_source_with_a_stale_heartbeat_reads_stale(warehouse):
     row = _pi_row(warehouse)
     assert row["run_status"] == "stale"
     assert row["status"] == "stale"
+
+
+def _seed_apple_voice_memos(warehouse, *, written_ago: timedelta, heartbeat_ago: timedelta, status: str) -> None:
+    now = datetime.now(tz=UTC)
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    warehouse._command(
+        """
+        INSERT INTO @apple_voice_memos_files (account, recording_id, recorded_at, ingested_at, sync_version)
+        VALUES ('z', 'memo-1', %s, %s, 1)
+        """,
+        (now - written_ago, now - written_ago),
+    )
+    warehouse._command(
+        """
+        INSERT INTO @uploader_heartbeats
+            (pipeline, device, ran_at, status, error, exit_code, duration_seconds, updated_at, sync_version)
+        VALUES ('apple_voice_memos', 'porygon', %s, %s, %s, %s, 5, %s, 2)
+        """,
+        (
+            now - heartbeat_ago,
+            status,
+            "" if status == "ok" else "upload failed: 502",
+            0 if status == "ok" else 1,
+            now - heartbeat_ago,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_ago", "heartbeat_status", "expected"),
+    [
+        # Weeks without a Mac memo (Zach records on the Pixel now) and a
+        # clean uploader every few minutes read `late`.
+        (timedelta(minutes=5), "ok", {"status": "ok", "data_status": "quiet", "run_status": "ok"}),
+        # A memo that will not upload exits non-zero: still red.
+        (timedelta(minutes=5), "error", {"status": "failing", "data_status": "quiet", "run_status": "ok"}),
+        # The LaunchAgent stopped firing: still caught by the heartbeat.
+        (timedelta(hours=5), "ok", {"status": "stale", "data_status": "quiet", "run_status": "stale"}),
+    ],
+)
+def test_a_quiet_mac_voice_memos_library_is_ok_while_its_uploader_runs_clean(
+    warehouse, heartbeat_ago, heartbeat_status, expected
+):
+    _provision_every_table(warehouse)
+    _seed_apple_voice_memos(
+        warehouse, written_ago=timedelta(days=21), heartbeat_ago=heartbeat_ago, status=heartbeat_status
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    (row,) = warehouse._query_dicts(
+        "SELECT status, data_status, run_status FROM @marts_pipeline_health WHERE pipeline = 'apple_voice_memos'"
+    )
+    assert row == expected
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_ago", "heartbeat_ok", "expected"),
+    [
+        # Weeks without a back-to-back pair, the hourly run clean: Zach, not a fault.
+        (timedelta(minutes=20), True, {"status": "ok", "data_status": "quiet", "run_status": "ok"}),
+        # A failed judgment or a stuck backlog: the run says so.
+        (timedelta(minutes=20), False, {"status": "failing", "data_status": "quiet", "run_status": "ok"}),
+        # The pass stopped running (schedule and sensor both dead).
+        (timedelta(hours=7), True, {"status": "stale", "data_status": "quiet", "run_status": "stale"}),
+    ],
+)
+def test_voice_memo_continuity_is_judged_by_its_run_not_by_how_often_zach_records(
+    warehouse, heartbeat_ago, heartbeat_ok, expected
+):
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    warehouse._command(
+        """
+        INSERT INTO @voice_memo_continuity_judgments
+            (source, account, previous_recording_id, recording_id, status, created_at, sync_version)
+        VALUES ('google_recorder', 'z', 'a', 'b', 'completed', %s, 1)
+        """,
+        (now - timedelta(days=30),),
+    )
+    warehouse.record_run_heartbeat(
+        pipeline="voice_memo_continuity",
+        device="dagster",
+        ran_at=now - heartbeat_ago,
+        ok=heartbeat_ok,
+        error="" if heartbeat_ok else "1 eligible pair(s) unjudged for over 120 min",
+        duration_seconds=4,
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    (row,) = warehouse._query_dicts(
+        "SELECT status, data_status, run_status, last_error FROM @marts_pipeline_health"
+        " WHERE pipeline = 'voice_memo_continuity'"
+    )
+    assert {k: row[k] for k in ("status", "data_status", "run_status")} == expected
+    if not heartbeat_ok:
+        assert "unjudged" in row["last_error"]
 
 
 # --- search request timings (C6): the app appends, the writer's heartbeat judges --
@@ -3083,8 +3208,8 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     Live on 2026-10-25 the im row read p95 5,049s and S1 red because three
     messages woke two DMs quiet 16.5 and 19 days; they landed inside the 2h
     interval SLACK_FRESHNESS_DUE_INTERVALS gives them. The next night three
-    DMs quiet 7-39 hours -- warm, polled every 15 minutes, not every pass --
-    read p95 1,669s the same way. Such a wake-up -- and any message written
+    DMs quiet 7-39 hours -- warm, polled every 15 minutes then (ten since
+    2026-11-11), not every pass -- read p95 1,669s the same way. Such a wake-up -- and any message written
     before it lands -- leaves the 15-minute sample. A message into a DM
     active inside the four-hour hot window, a wake-up later than its own tier
     allows, and a brand-new conversation are still judged, so a tier that
@@ -3105,13 +3230,17 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     fresh = now - timedelta(minutes=30)
     conversations = {
         "D_WARM": "im",  # quiet 3 days, woke 2h ago, then a hot reply: judged
-        "D_WARM_WOKE": "im",  # quiet 3 days, wake landing inside 15m + margin
+        "D_WARM_WOKE": "im",  # quiet 3 days, wake landing inside 10m + margin
         "D_WOKE": "im",  # quiet 16 days, two-message wake landing inside 2h
         "D_COLD": "im",  # quiet 400 days, wake landing inside 12h
         "D_ANSWERED": "im",  # a wake, then a reply written after it landed
         "G_OVERDUE": "mpim",  # quiet 16 days, landed 5h later: past its tier
-        "G_WARM_SLOW": "mpim",  # quiet 3 days, landed 40m later: past 15m + margin
-        "G_NEW": "mpim",  # no earlier message: discovery polls it at once
+        "G_WARM_SLOW": "mpim",  # quiet 3 days, landed 40m later: past 10m + margin
+        # No earlier message, in a conversation opened in January: a first
+        # contact. Always judged, never a wake-up -- someone reaching Zach for
+        # the first time is where landing matters most, and the freshness
+        # pass polls it as soon as conversations.list bumps its `updated`.
+        "G_NEW": "mpim",
     }
     warehouse.insert_slack_conversations(
         [_health_conversation_row(cid, kind, synced_at=fresh) for cid, kind in conversations.items()]
@@ -3119,7 +3248,7 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     _poll_every_health_conversation(warehouse)
     written = {
         "D_WARM": [timedelta(days=3), timedelta(hours=2), timedelta(minutes=3)],
-        "D_WARM_WOKE": [timedelta(days=3), timedelta(minutes=25)],
+        "D_WARM_WOKE": [timedelta(days=3), timedelta(minutes=20)],
         "D_WOKE": [timedelta(days=16), timedelta(minutes=90), timedelta(minutes=80)],
         "D_COLD": [timedelta(days=400), timedelta(hours=6)],
         "D_ANSWERED": [timedelta(days=16), timedelta(hours=4), timedelta(minutes=20)],
@@ -3181,7 +3310,7 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     im = rows["im"]
     # Judged: D_WARM's 3-minute hot reply and D_ANSWERED's 20-minute reply.
     # Left out: D_WOKE's two, D_COLD's one, D_ANSWERED's wake, and the warm
-    # wakes of D_WARM (1 minute) and D_WARM_WOKE (25 minutes).
+    # wakes of D_WARM (1 minute) and D_WARM_WOKE (20 minutes).
     assert im["landing_sample_24h"] == 2, im
     assert im["landing_wakeups_excluded_24h"] == 6, im
     assert abs(im["landing_wakeup_max_seconds"] - 6 * 3600) <= 120, im
@@ -3189,7 +3318,7 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     assert im["landing_status"] == "late", "the reply came after the wake landed and is judged"
 
     mpim = rows["mpim"]
-    # G_OVERDUE, G_WARM_SLOW (40 minutes is past 15m + margin) and G_NEW.
+    # G_OVERDUE, G_WARM_SLOW (40 minutes is past 10m + margin) and G_NEW.
     assert mpim["landing_sample_24h"] == 3, mpim
     assert mpim["landing_wakeups_excluded_24h"] == 0 and mpim["landing_wakeup_max_seconds"] is None, mpim
     assert mpim["landing_p95_seconds"] > SLACK_DM_LANDING_LATE_P95_SECONDS

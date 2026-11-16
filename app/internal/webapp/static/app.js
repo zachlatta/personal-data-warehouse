@@ -15,7 +15,10 @@ import * as connectionsView from "./connections.js";
 
 import * as feedView from "./feed.js";
 
+import * as externalFeedsView from "./external_feeds.js";
+
 const ROUTES = [
+  { pattern: /^\/external-feeds\/?$/, view: externalFeedsView, nav: "external-feeds", params: () => ({}) },
   { pattern: /^\/feed\/?$/, view: feedView, nav: "feed", params: () => ({}) },
   { pattern: /^\/connections\/?$/, view: connectionsView, nav: "connections", params: () => ({}) },
   { pattern: /^\/notifications\/?$/, view: notificationsView, nav: "notifications", params: () => ({}) },
