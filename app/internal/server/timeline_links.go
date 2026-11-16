@@ -38,7 +38,9 @@ var (
 	// Apple Messages 1:1 chat identifiers are a handle (phone or email); a
 	// group chat's identifier is an opaque chatNNN token Messages cannot open
 	// from a URL.
-	appleMessagesHandlePattern = regexp.MustCompile(`^(\+?[0-9][0-9 ().-]{4,}|[^@\s]+@[^@\s]+)$`)
+	appleMessagesHandlePattern  = regexp.MustCompile(`^(\+?[0-9][0-9 ().-]{4,}|[^@\s]+@[^@\s]+)$`)
+	androidMessagesPhonePattern = regexp.MustCompile(`^\+?[0-9][0-9 ().-]{4,}$`)
+	androidMessagesEmailPattern = regexp.MustCompile(`^[a-zA-Z0-9._+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+$`)
 )
 
 func linkString(m map[string]any, key string) string {
@@ -135,6 +137,25 @@ func timelineDeepLinkFor(row map[string]any, env timelineLinkEnv) *timelineDeepL
 			AppURL: "sms:" + handle,
 			Label:  "Messages",
 		}
+	case sourceTable == "android_messages":
+		// sms: resolves a recipient in the default Android messaging app,
+		// including RCS conversations in Google Messages. Never use message_key:
+		// content://mms/N identifies a message, not an openable conversation.
+		// Opaque group keys have no recipient URL. Launching the app by package
+		// would require mobile support; keep the PDW fallback for those rows.
+		if group, _ := meta["group"].(bool); group {
+			return nil
+		}
+		handle := linkString(meta, "chat_key")
+		if androidMessagesPhonePattern.MatchString(handle) {
+			handle = strings.NewReplacer(" ", "", "(", "", ")", "", ".", "", "-", "").Replace(handle)
+			if digits := len(strings.TrimPrefix(handle, "+")); digits < 5 || digits > 20 {
+				return nil
+			}
+		} else if !androidMessagesEmailPattern.MatchString(handle) {
+			return nil
+		}
+		return &timelineDeepLink{URL: "sms:" + handle, AppURL: "sms:" + handle, Label: "Messages"}
 	case sourceTable == "apple_note_revisions":
 		noteID := linkString(pk, "note_id")
 		if noteID == "" {
