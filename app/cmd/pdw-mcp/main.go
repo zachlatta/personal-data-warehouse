@@ -67,6 +67,7 @@ func main() {
 		GmailAccounts:           cfg.GmailAccounts,
 		ContactGoogleAccounts:   cfg.ContactGoogleAccounts,
 		CalendarAccounts:        cfg.CalendarAccounts,
+		GoogleDriveAccounts:     cfg.GoogleDriveAccounts,
 		AppleNotesAccounts:      cfg.AppleNotesAccounts,
 		AppleContactsAccounts:   cfg.AppleContactsAccounts,
 		AppleMessagesAccounts:   cfg.AppleMessagesAccounts,

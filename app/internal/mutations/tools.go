@@ -151,7 +151,7 @@ type MutationHelpArg struct {
 }
 
 func MutationHelp() MutationHelpDocument {
-	return MutationHelpDocument{
+	doc := MutationHelpDocument{
 		Overview: "propose_mutation creates a pending mutation request for human review. " +
 			"The top-level fields (title, reason, mutations, context) wrap one or more mutations. " +
 			"Each entry in mutations is an object whose `type` selects one of the supported operations below; the remaining fields are the payload for that type. " +
@@ -759,4 +759,6 @@ func MutationHelp() MutationHelpDocument {
 			},
 		},
 	}
+	doc.Mutations = append(doc.Mutations, driveMutationHelp()...)
+	return doc
 }

@@ -20,6 +20,7 @@ from personal_data_warehouse.defs.upstream_mutations import (
     screen_timelapse_purge_executor,
 )
 from personal_data_warehouse.gmail_mutations import GmailMutationExecutor
+from personal_data_warehouse.google_drive_mutations import GoogleDriveMutationExecutor
 from personal_data_warehouse.mutation_notifications import (
     DEFAULT_MUTATION_QUEUE_POLL_SECONDS,
     PostgresMutationNotificationListener,
@@ -44,6 +45,7 @@ class CloudMutationProcessor:
         self.contact_executor = GoogleContactMutationExecutor(settings=self.settings)
         self.calendar_executor = CalendarMutationExecutor(settings=self.settings)
         self.slack_executor = SlackMutationExecutor(warehouse=self.warehouse)
+        self.drive_executor = GoogleDriveMutationExecutor(settings=self.settings)
         self.screen_timelapse_executor = screen_timelapse_purge_executor(settings=self.settings, warehouse=self.warehouse)
         self.resideo_executor = resideo_mutation_executor(settings=self.settings, warehouse=self.warehouse)
         self.claimed_by = f"resident:{socket.gethostname()}:upstream_mutation_worker"
@@ -69,6 +71,7 @@ class CloudMutationProcessor:
                 contact_executor=self.contact_executor,
                 calendar_executor=self.calendar_executor,
                 slack_executor=self.slack_executor,
+                drive_executor=self.drive_executor,
                 screen_timelapse_executor=self.screen_timelapse_executor,
                 resideo_executor=self.resideo_executor,
                 limit=_upstream_mutation_batch_size(),

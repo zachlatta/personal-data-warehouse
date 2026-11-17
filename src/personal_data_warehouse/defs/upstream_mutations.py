@@ -32,6 +32,7 @@ from personal_data_warehouse.calendar_mutations import (
     CalendarMutationExecutor,
 )
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.google_drive_mutations import GoogleDriveMutationExecutor
 from personal_data_warehouse.contact_mutations import (
     GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
     GoogleContactMutationExecutor,
@@ -184,6 +185,7 @@ def process_upstream_mutations(context) -> dict[str, object]:
                 slack_executor=SlackMutationExecutor(warehouse=warehouse),
                 screen_timelapse_executor=screen_timelapse_purge_executor(settings=settings, warehouse=warehouse),
                 resideo_executor=resideo_mutation_executor(settings=settings, warehouse=warehouse),
+                drive_executor=GoogleDriveMutationExecutor(settings=settings),
                 limit=batch_size,
                 claimed_by=claimed_by,
                 reclaim_after=reclaim_after,
@@ -241,7 +243,7 @@ def observe_upstream_mutations(context) -> dict[str, object]:
             if not acquired:
                 context.log.warning("Skipping upstream mutation observer because another run is active")
                 return asdict(UpstreamMutationObservationSummary(skipped_due_to_lock=True))
-            summary = observe_upstream_mutation_batch(warehouse=warehouse)
+            summary = observe_upstream_mutation_batch(warehouse=warehouse, drive_executor=GoogleDriveMutationExecutor(settings=settings))
     finally:
         warehouse.close()
     context.log.info("Observed upstream mutations: %s", summary)
@@ -377,6 +379,7 @@ def process_upstream_mutation_batch(
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
     ensure_tables: bool = True,
     on_gmail_settings_changed: Callable[[set[str]], None] | None,
+    drive_executor: GoogleDriveMutationExecutor | None = None,
 ) -> UpstreamMutationWorkerSummary:
     if ensure_tables:
         warehouse.ensure_upstream_mutation_tables()
@@ -463,6 +466,8 @@ def process_upstream_mutation_batch(
             result = screen_timelapse_executor.execute(mutation)
         elif provider == RESIDEO_PROVIDER:
             result = resideo_executor.execute(mutation)
+        elif provider == "google_drive" and drive_executor is not None:
+            result = drive_executor.execute(mutation)
         else:
             # Unknown providers should not be burned to failed_terminal by a stale worker
             # version. Leave them claimable for a worker that understands them.
@@ -496,7 +501,7 @@ def process_upstream_mutation_batch(
     )
 
 
-def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True) -> UpstreamMutationObservationSummary:
+def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True, drive_executor=None) -> UpstreamMutationObservationSummary:
     if ensure_tables:
         warehouse.ensure_upstream_mutation_tables()
     observed = warehouse.observe_succeeded_gmail_archive_mutations(ensure_tables=False)
@@ -508,7 +513,19 @@ def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True) ->
     observed += warehouse.observe_succeeded_slack_mark_conversation_read_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_slack_send_message_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_gmail_settings_mutations(ensure_tables=False)
+    if drive_executor is not None:
+        observed += observe_drive_mutation_batch(warehouse=warehouse, drive_executor=drive_executor)
     return UpstreamMutationObservationSummary(observed=observed)
+
+
+def observe_drive_mutation_batch(*, warehouse, drive_executor) -> int:
+    candidates = warehouse._query_dicts("""SELECT * FROM @upstream_mutations
+            WHERE provider='google_drive' AND status='succeeded'
+            ORDER BY executed_at, id LIMIT 100""")
+    observations = [(str(m["id"]), {"provider":"google_drive", "verified_upstream":True})
+                    for m in candidates if drive_executor.observed(m)]
+    return warehouse.observe_upstream_mutations(observations=observations,
+        actor_id="upstream_mutation_observer", ensure_tables=False)
 
 
 def _upstream_mutation_batch_size() -> int:

@@ -336,6 +336,44 @@ see `mobile/README.md`.
     `private.push_devices.capabilities` no longer holds `android_native_alerts`. Until that launch
     the server keeps sending data-only alerts, which the older build drops without a sign.
 
+## Google Drive reviewed writes
+
+`google_drive.upload_file`, `create_folder`, `add_permission`, `update_permission`
+and `remove_permission` use the same proposal/review queue and cloud worker as Gmail.
+The proposal half is `app/internal/mutations/google_drive.go`, and execution is in
+`src/personal_data_warehouse/google_drive_mutations.py`, wired into both resident
+and Dagster workers. `propose_mutation_help` documents each field on CLI and MCP.
+The app accepts only `GOOGLE_DRIVE_SOURCE_ACCOUNTS`. File/destination names are resolved
+from that account's synced `base_google_drive.files`; missing ids and non-folder parents
+are refused. Review shows names, ids, upload MIME/size/hash, recipients, roles and notification
+choice through the existing generic review card on both clients. No bytes enter the queue.
+
+Uploads take standard base64 (20 MiB decoded maximum) and stage privately under
+`pending/sha256/<sha256>/<unique-id>` in an S3-compatible bucket. The suffix prevents
+one request's retention from interfering with another request for identical bytes.
+The Go app writes bytes; Python reads them and verifies hash and length before Drive
+receives anything. Set `PDW_MUTATION_S3_ENDPOINT_URL` (HTTPS, path-style access),
+`PDW_MUTATION_S3_BUCKET`, `PDW_MUTATION_S3_ACCESS_KEY`, `PDW_MUTATION_S3_SECRET_KEY`
+and `PDW_MUTATION_S3_REGION` on app and worker deployments. No bucket or credentials
+are created by code. Before staging, the app checks a readable, enabled lifecycle
+rule with `Filter.Prefix` `pending/` and `Expiration.Days` 7. This expires applied,
+rejected, withdrawn, abandoned and still-pending bytes; old proposals with missing bytes
+fail without writing to Drive and must be proposed again. Lifecycle deletion is asynchronous.
+This dedicated staging path does not change the general objectstore's unfinished S3 backend.
+
+The existing Drive client already requests `https://www.googleapis.com/auth/drive`.
+Accounts with read-only tokens need human re-consent with production scopes before writes.
+Folder sharing affects children; user/group additions require an explicit notification
+choice, and domain/anyone additions require false. Ownership transfers and inherited
+permission edits are refused. Updates/removals re-read the permission and compare its
+type, recipient and expected role before writing. Nothing reclaims a stale Drive execution,
+and a transport error after a write starts is terminal (it may have applied); inspect
+Drive before proposing again. Normal source sync brings created files to the existing
+Drive timeline adapter; the observer independently reads upstream files/permissions and
+advances matching queue rows from succeeded to observed. Mutation requests already use
+the shared timeline and health registry.
+No tables, catalog objects or pipelines are added. Move/rename are left for a future change.
+
 ## Writing to Apple Notes (apple_notes mutations)
 
 Apple Notes is the first **write-back** source that reviewed mutations reach. Everything
