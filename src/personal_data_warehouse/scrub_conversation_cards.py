@@ -102,7 +102,7 @@ def _scan_table(warehouse, table, pool, page_size, connection=None, snapshot=Non
                 cursor.execute('SET parallel_setup_cost=0')
                 cursor.execute('SET parallel_tuple_cost=0')
             scope = "candidate.adapter IN ('agent_session', 'agent_session_turn')" if table in DERIVED else 'TRUE'
-            predicate = sql_prefilter('to_jsonb(candidate)::text')
+            predicate = sql_prefilter('to_jsonb(candidate)::text', scope=pool.selector.scope if pool.selector else 'all')
             keys=POSTGRES_TABLES[table].primary_key
             key_sql=','.join(keys)
             bounded = ' AND candidate.ctid >= %s::tid AND candidate.ctid < %s::tid' if blocks else ''
@@ -624,7 +624,7 @@ def rebuild_sessions(warehouse, sessions, page_size, selector=None):
                 if identity not in sessions:
                     continue
                 if any((selector.count if selector else sensitive_count)(str(row[i])) for i in (6, 7, 10, 11)):
-                    raise RuntimeError('canonical regeneration still contains card data; no changes committed')
+                    raise RuntimeError('canonical regeneration still contains selected sensitive data; no changes committed')
                 selected.append(row)
                 keys.add((name, row[0]))
                 regenerated_keys.add((name, row[0], identity))
@@ -760,6 +760,8 @@ def main():
         print(json.dumps({'counts_by_month_source': table, 'details_before': before, 'details_after': after, 'verification_pending':args.apply, 'left_alone': plan.get('left_alone') if not args.verify else None}))
         if args.report_html:
             args.report_html.write_text(report_html(table))
+        if args.verify and args.scope == 'tokens' and any(r['measure']=='matches' and r['count'] for r in after):
+            raise SystemExit('token verification failed: secrets remain')
     finally:
         warehouse.close()
 

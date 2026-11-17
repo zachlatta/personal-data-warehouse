@@ -120,7 +120,10 @@ def main():
         scrub_objects(store,apply=True,plan=plan,workers=args.workers,selector=selector)
         print(json.dumps({'baseline':plan['counts'],'verification_pending':True}))
     elif args.verify:
-        print(json.dumps({'after':discover_objects(store,workers=args.workers,selector=selector)['counts']}))
+        after=discover_objects(store,workers=args.workers,selector=selector)['counts']
+        print(json.dumps({'after':after}))
+        if args.scope == 'tokens' and after['matches']:
+            raise SystemExit('token verification failed: secrets remain')
     else:
         plan=discover_objects(store,workers=args.workers,selector=selector)
         _validate_object_plan(plan)

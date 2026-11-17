@@ -521,10 +521,61 @@ numbers or generate additional examples at test time; never copy live credential
 
 The same storage boundaries mask PDW access-token secrets as
 `pdw_<public-id>_[REDACTED]`, preserving the public id. This applies to nested
-JSON strings as well as ordinary transcript text. The default `--scope all`
-maintenance path below detects and rebuilds token-bearing rows and archived
-objects too; `--scope labelled` remains a card-only selector. Revocation is a
+JSON strings as well as ordinary transcript text. `--scope tokens` selects only
+PDW access-token secrets and masks only those secrets, preserving card numbers,
+security codes and all other bytes. It uses the storage boundary's token pattern
+and decoded JSON traversal. It accepts no card seeds. The default `--scope all`
+also detects tokens; `--scope labelled` remains a card-only selector. Revocation is a
 separate decision. Rebuilds do not erase historical backups or WAL.
+
+For a token-only landing, run these commands from the configured maintenance
+runtime with its existing environment (never put credentials on the command
+line). Use new private plan paths. Discovery and verification are read-only
+toward the warehouse and archive; discovery writes only the local ID-only plans.
+Finish the archive plan first, then take the fresh DB snapshot:
+
+```sh
+uv run python -m personal_data_warehouse.scrub_conversation_objects --scope tokens --plan .factory-scratch/token-objects-plan.json
+uv run python -m personal_data_warehouse.scrub_conversation_cards --scope tokens --plan .factory-scratch/token-db-plan.json
+```
+
+Review source-row and total-plan counts against the fail-closed limits below.
+Pause conversation writers, timeline sync and search workers with the deployment
+runbook, preserving their original states. Apply the saved plans in that window:
+
+```sh
+uv run python -m personal_data_warehouse.scrub_conversation_objects --scope tokens --apply --plan .factory-scratch/token-objects-plan.json
+uv run python -m personal_data_warehouse.scrub_conversation_cards --scope tokens --apply --plan .factory-scratch/token-db-plan.json
+```
+
+Restore the workers to their original states even if either apply fails. With
+workers restored, require both full scans to report zero matches and exit zero:
+
+```sh
+uv run python -m personal_data_warehouse.scrub_conversation_objects --scope tokens --verify --plan .factory-scratch/token-objects-plan.json
+uv run python -m personal_data_warehouse.scrub_conversation_cards --scope tokens --verify --plan .factory-scratch/token-db-plan.json
+```
+
+Token verification exits nonzero if a secret remains. Database repair uses the
+same canonical session regeneration, partial-title/snippet replacement and
+chunk/embedding invalidation as the card repair. The token SQL prefilter uses
+literal `pdw_` or `u00` substring probes (Unicode escapes can encode ASCII token
+bytes), then confirms decoded tokens in Python. Full discovery keeps the existing
+disjoint heap-block scans under one snapshot and bounded primary-key fetches;
+resumable discovery keeps the existing source/month partitions.
+For original host copies, repeat `scrub_conversation_jsonl --scope tokens --root
+<transcript-root> --session <affected-session>` with `--apply`, then without it
+and require zero matches. Before the final 30-day count, read
+`pdw columns marts_ai_conversations.events`, then run:
+
+```sh
+pdw sql -q 'Verify recent conversation token secrets are gone' "SELECT count(*) FROM marts_ai_conversations.events WHERE occurred_at >= now() - interval '30 days' AND raw_json ~ 'pdw_[a-z0-9]{12,24}_[A-Za-z0-9_-]{30,}'"
+```
+
+If that API query exceeds its statement budget, partition the same predicate
+by source and disjoint UTC days covering the entire 30-day window, and sum the
+counts. A timeout is not zero; all partitions must complete. The full maintenance
+verification above also checks other text/JSON columns and historical copies.
 
 Explicit maintenance modules (dry-run unless `--apply` is passed):
 `personal_data_warehouse.scrub_conversation_cards` reports source/month counts

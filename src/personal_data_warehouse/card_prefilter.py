@@ -16,7 +16,7 @@ _UNIT = re.compile(UNICODE_UNIT)
 _WINDOW = re.compile(DIGIT_WINDOW)
 
 
-def sql_prefilter(expression):
+def sql_prefilter(expression, *, scope='all'):
     """Parallel-safe SQL expression, requiring no installed function or DDL.
 
     Remove backslashes; replace each possible Unicode unit by FOUR digits.
@@ -31,6 +31,12 @@ def sql_prefilter(expression):
     False positives are always confirmed in Python.
     The expression is supplied by code, never by CLI input.
     """
+    if scope == 'tokens':
+        # JSON can encode any ASCII token byte (or its escape backslash).
+        # Literal substring tests are cheap even on large transcript values;
+        # decoded Python confirmation makes the final decision.
+        return (f"(strpos(COALESCE(({expression})::text, ''), 'pdw_') > 0 OR "
+                f"strpos(COALESCE(({expression})::text, ''), 'u00') > 0)")
     return (f"(regexp_replace(translate(COALESCE(({expression})::text, ''), chr(92), ''), "
             f"'{UNICODE_UNIT}', '{UNIT_DIGITS}', 'g') ~ '({DIGIT_WINDOW}|pdw_|{UNIT_DIGITS})')")
 

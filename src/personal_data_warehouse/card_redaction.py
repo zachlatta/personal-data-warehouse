@@ -196,6 +196,28 @@ def _text_edits(value):
     return sorted(edits + token_edits)
 
 
+def token_edits(value):
+    """Token secrets only, retaining JSON lexemes and all payment data.
+
+    Use the storage boundary's pattern and decoded-string traversal. Mapping
+    spans back through each wrapper also covers Unicode-escaped token bytes.
+    """
+    tokens = _json_tokens(value)
+    if tokens is not None:
+        edits = []
+        for token in tokens:
+            raw = token[0]
+            if not raw.startswith('"'):
+                continue
+            inner = token_edits(json.loads(raw))
+            if inner:
+                bounds = _json_string_bounds(raw)
+                edits.extend((token.start()+bounds[a], token.start()+bounds[b],
+                              json.dumps(replacement)[1:-1]) for a,b,replacement in inner)
+        return edits
+    return [(m.start()+len(m[1]), m.end(), '[REDACTED]') for m in PDW_TOKEN.finditer(value)]
+
+
 def _json_string_bounds(token):
     """Map decoded character boundaries to offsets in an original JSON string."""
     bounds = [1]; pos = 1
