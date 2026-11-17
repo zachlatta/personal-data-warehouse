@@ -1,5 +1,14 @@
 import type { TimelineDeepLink } from './api';
 
+export function mutationDisplayPayload(mutation: MutationLike): Record<string, unknown> {
+  if (mutation.provider !== 'google_drive') return mutation.payload ?? {};
+  const preview = mutation.preview?.google_drive;
+  const fields = { ...mutation.payload, ...(preview && typeof preview === 'object' && !Array.isArray(preview) ? preview : {}) };
+  delete fields.staging_key;
+  delete fields.data_base64;
+  return fields;
+}
+
 type MutationLike = {
   id?: string;
   provider?: string;

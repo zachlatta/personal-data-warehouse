@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  mutationDisplayPayload,
   appleContactPointExists,
   appleContactsBatchSummary,
   appleContactsReview,
@@ -51,6 +52,18 @@ import {
   gmailSettingsReview,
   isGmailSettingsMutation,
 } from './mutation-review.ts';
+
+test('Drive review shows resolved names and notification choice without staging internals', () => {
+  const fields = mutationDisplayPayload({
+    provider: 'google_drive',
+    payload: { name: 'report.txt', staging_key: 'private/key', data_base64: 'aGVsbG8=' },
+    preview: { google_drive: { name: 'report.txt', parent_id_name: 'Destination', size_bytes: 5, send_notification_email: false } },
+  });
+  assert.equal(fields.parent_id_name, 'Destination');
+  assert.equal(fields.send_notification_email, false);
+  assert.equal(fields.staging_key, undefined);
+  assert.equal(fields.data_base64, undefined);
+});
 
 test('a calendar create mutation becomes a complete day view with real conflicts and guests', () => {
   const mutation = {
