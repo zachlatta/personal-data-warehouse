@@ -2150,12 +2150,12 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Reason:    reason,
 				Payload:   payload,
 			})
-		case "google_drive.upload_file", "google_drive.create_folder", "google_drive.add_permission", "google_drive.update_permission", "google_drive.remove_permission":
+		case GoogleDriveUploadFileOperation, GoogleDriveCreateFolderOperation, GoogleDriveAddPermissionOperation, GoogleDriveUpdatePermissionOperation, GoogleDriveRemovePermissionOperation:
 			payload, err := drivePayload(mutation)
 			if err != nil {
 				return nil, fmt.Errorf("mutation %d %w", index, err)
 			}
-			out = append(out, storedMutation{Provider: "google_drive", Operation: mutation.Type, Account: account, Title: optionalTitle(mutation.Title, mutation.Type), Reason: reason, Payload: payload})
+			out = append(out, storedMutation{Provider: GoogleDriveProvider, Operation: mutation.Type, Account: account, Title: optionalTitle(mutation.Title, mutation.Type), Reason: reason, Payload: payload})
 		case PrinterPrintDocumentOperation:
 			doc, err := printDocumentFromInput(mutation)
 			if err != nil {

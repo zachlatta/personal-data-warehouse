@@ -22,7 +22,16 @@ import (
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
 )
 
-const driveOperations = "google_drive.upload_file,google_drive.create_folder,google_drive.add_permission,google_drive.update_permission,google_drive.remove_permission"
+const (
+	GoogleDriveProvider                  = "google_drive"
+	GoogleDriveUploadFileOperation       = "google_drive.upload_file"
+	GoogleDriveCreateFolderOperation     = "google_drive.create_folder"
+	GoogleDriveAddPermissionOperation    = "google_drive.add_permission"
+	GoogleDriveUpdatePermissionOperation = "google_drive.update_permission"
+	GoogleDriveRemovePermissionOperation = "google_drive.remove_permission"
+)
+
+var driveOperations = []string{GoogleDriveUploadFileOperation, GoogleDriveCreateFolderOperation, GoogleDriveAddPermissionOperation, GoogleDriveUpdatePermissionOperation, GoogleDriveRemovePermissionOperation}
 
 // Never renew a request that contains a successful write or another operation:
 // blindly repeating a partially applied batch could create duplicate folders.
@@ -35,7 +44,7 @@ func renewableDriveUpload(request Request) bool {
 		return false
 	}
 	for _, m := range request.Mutations {
-		if m.Operation != "google_drive.upload_file" {
+		if m.Operation != GoogleDriveUploadFileOperation {
 			return false
 		}
 		switch m.Status {
@@ -57,15 +66,15 @@ var driveMIME = regexp.MustCompile(`^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+
 func drivePayload(m MutationInput) (map[string]any, error) {
 	fields := ""
 	switch m.Type {
-	case "google_drive.upload_file":
+	case GoogleDriveUploadFileOperation:
 		fields = "name,parent_id,mime_type,data_base64"
-	case "google_drive.create_folder":
+	case GoogleDriveCreateFolderOperation:
 		fields = "name,parent_id,initial_permissions"
-	case "google_drive.add_permission":
+	case GoogleDriveAddPermissionOperation:
 		fields = "file_id,permission_type,email_address,domain,role,send_notification_email"
-	case "google_drive.update_permission":
+	case GoogleDriveUpdatePermissionOperation:
 		fields = "file_id,permission_id,permission_type,email_address,domain,expected_role,role"
-	case "google_drive.remove_permission":
+	case GoogleDriveRemovePermissionOperation:
 		fields = "file_id,permission_id,permission_type,email_address,domain,expected_role"
 	default:
 		return nil, errors.New("unsupported Drive operation")
@@ -110,7 +119,7 @@ func drivePayload(m MutationInput) (map[string]any, error) {
 			return nil, errors.New("invalid name (max 255 bytes, no paths or controls)")
 		}
 	}
-	if m.Type == "google_drive.upload_file" {
+	if m.Type == GoogleDriveUploadFileOperation {
 		mime, e := required("mime_type")
 		if e != nil {
 			return nil, e
@@ -175,7 +184,7 @@ func drivePayload(m MutationInput) (map[string]any, error) {
 				return nil, fmt.Errorf("%s must be reader, commenter or writer; ownership changes are unsupported", k)
 			}
 		}
-		if m.Type == "google_drive.add_permission" {
+		if m.Type == GoogleDriveAddPermissionOperation {
 			notify, ok := p["send_notification_email"].(bool)
 			if !ok {
 				return nil, errors.New("send_notification_email must explicitly be true or false")
@@ -203,7 +212,7 @@ func drivePayload(m MutationInput) (map[string]any, error) {
 				}
 				raw[k] = v
 			}
-			item, err := drivePayload(MutationInput{Type: "google_drive.add_permission", Raw: raw})
+			item, err := drivePayload(MutationInput{Type: GoogleDriveAddPermissionOperation, Raw: raw})
 			if err != nil {
 				return nil, fmt.Errorf("initial_permissions: %w", err)
 			}
@@ -239,7 +248,7 @@ func validMutationStagingEndpoint(u *url.URL) bool {
 func stageDriveUploads(ctx context.Context, mutations []storedMutation) error {
 	for i := range mutations {
 		m := &mutations[i]
-		if m.Operation != "google_drive.upload_file" {
+		if m.Operation != GoogleDriveUploadFileOperation {
 			continue
 		}
 		endpoint, err := url.Parse(os.Getenv("PDW_MUTATION_S3_ENDPOINT_URL"))
@@ -296,7 +305,7 @@ func stageDriveUpload(ctx context.Context, m *storedMutation, client driveStagin
 func (s *PostgresStore) enrichDrivePreviews(ctx context.Context, mutations []storedMutation) error {
 	for i := range mutations {
 		m := &mutations[i]
-		if m.Provider != "google_drive" {
+		if m.Provider != GoogleDriveProvider {
 			continue
 		}
 		preview := map[string]any{}
@@ -320,14 +329,14 @@ func (s *PostgresStore) enrichDrivePreviews(ctx context.Context, mutations []sto
 			preview[key+"_name"] = name
 		}
 		preview["effect"] = "Runs after approval. Folder sharing also affects its children. Public or domain sharing can expose content beyond named recipients."
-		m.Preview = map[string]any{"google_drive": preview}
+		m.Preview = map[string]any{GoogleDriveProvider: preview}
 	}
 	return nil
 }
 
 func driveMutationHelp() []MutationHelpType {
 	var entries []MutationHelpType
-	for _, op := range strings.Split(driveOperations, ",") {
+	for _, op := range driveOperations {
 		example := map[string]any{"type": op, "account": "you@example.com"}
 		fields := []MutationHelpArg{{Name: "type", JSONType: "string", Required: true, Description: "literal " + op}, {Name: "account", JSONType: "string", Required: true, Description: "synced Drive account"}}
 		add := func(k, kind, description string, required bool, value any) {
@@ -337,13 +346,13 @@ func driveMutationHelp() []MutationHelpType {
 			}
 		}
 		switch op {
-		case "google_drive.upload_file", "google_drive.create_folder":
+		case GoogleDriveUploadFileOperation, GoogleDriveCreateFolderOperation:
 			add("name", "string", "File or folder name, max 255 UTF-8 bytes", true, "Report")
 			add("parent_id", "string", "Destination folder id from base_google_drive.files (must already exist)", true, "folder-1")
-			if op == "google_drive.create_folder" {
+			if op == GoogleDriveCreateFolderOperation {
 				add("initial_permissions", "array<object>", "Optional sharing applied to the new folder in this same approval (max 100). Each object takes permission_type, email_address or domain when applicable, role, and explicit send_notification_email; same rules as add_permission.", false, []any{map[string]any{"permission_type": "user", "email_address": "person@example.com", "role": "reader", "send_notification_email": false}})
 			}
-			if op == "google_drive.upload_file" {
+			if op == GoogleDriveUploadFileOperation {
 				add("mime_type", "string", "Binary MIME type; no native Google conversion", true, "text/plain")
 				add("data_base64", "string", "Standard base64, at most 20 MiB decoded; use stdin JSON for large payloads", true, "aGVsbG8=")
 			}
@@ -352,18 +361,18 @@ func driveMutationHelp() []MutationHelpType {
 			add("permission_type", "string", "user, group, domain or anyone", true, "user")
 			add("email_address", "string", "Required for user/group only", false, "person@example.com")
 			add("domain", "string", "Required for domain only; omit for other types", false, nil)
-			if op != "google_drive.add_permission" {
+			if op != GoogleDriveAddPermissionOperation {
 				add("permission_id", "string", "Existing Drive permission id", true, "permission-1")
 				add("expected_role", "string", "Current reader, commenter or writer role; worker refuses a changed permission", true, "reader")
 			}
-			if op != "google_drive.remove_permission" {
+			if op != GoogleDriveRemovePermissionOperation {
 				add("role", "string", "reader, commenter or writer; ownership changes unsupported", true, "writer")
 			}
-			if op == "google_drive.add_permission" {
+			if op == GoogleDriveAddPermissionOperation {
 				add("send_notification_email", "boolean", "Explicit notification choice; false for domain/anyone", true, false)
 			}
 		}
-		entries = append(entries, MutationHelpType{Type: op, Summary: strings.ReplaceAll(strings.TrimPrefix(op, "google_drive."), "_", " ") + " in Google Drive after human review", RequiresEnv: "GOOGLE_DRIVE_SOURCE_ACCOUNTS", Fields: fields, Example: example, ExtraNotes: "Sharing folders affects children. No ownership transfer or inherited-permission changes. Uploads are staged privately in S3 and expire after 7 days, including rejected/withdrawn proposals; re-propose an expired upload. No automatic retry after an uncertain write: inspect Drive first. New folders cannot be referenced by another mutation until synced. Status is in ops.upstream_mutation_operations; normal Drive sync brings resulting files to the timeline."})
+		entries = append(entries, MutationHelpType{Type: op, Summary: strings.ReplaceAll(strings.TrimPrefix(op, GoogleDriveProvider+"."), "_", " ") + " in Google Drive after human review", RequiresEnv: "GOOGLE_DRIVE_SOURCE_ACCOUNTS", Fields: fields, Example: example, ExtraNotes: "Sharing folders affects children. No ownership transfer or inherited-permission changes. Uploads are staged privately in S3 and expire after 7 days, including rejected/withdrawn proposals; re-propose an expired upload. No automatic retry after an uncertain write: inspect Drive first. New folders cannot be referenced by another mutation until synced. Status is in ops.upstream_mutation_operations; normal Drive sync brings resulting files to the timeline."})
 	}
 	return entries
 }

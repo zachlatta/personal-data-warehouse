@@ -115,6 +115,14 @@ class FakeWarehouse:
         self.calls.append("observe_gmail_settings")
         return 0
 
+    def _query_dicts(self, _sql, params=None) -> list[dict]:
+        self.calls.append(f"succeeded_{params[0]}")
+        return []
+
+    def observe_upstream_mutations(self, *, observations, **_kwargs) -> int:
+        self.calls.append(f"observe_upstream:{len(observations)}")
+        return len(observations)
+
     def succeeded_upstream_mutation_count(self, *, ensure_tables=True, exclude_providers=None) -> int:
         self.calls.append("count_succeeded")
         return self.succeeded_count
@@ -408,6 +416,7 @@ def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> N
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=5,
         claimed_by="worker-1",
@@ -435,6 +444,7 @@ def test_process_upstream_mutation_batch_claims_before_any_observation_work() ->
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=5,
         claimed_by="worker-1",
@@ -446,7 +456,9 @@ def test_process_upstream_mutation_batch_claims_before_any_observation_work() ->
 def test_observation_batch_is_separate_from_execution() -> None:
     warehouse = FakeWarehouse(observed=2)
 
-    summary = upstream_mutation_defs.observe_upstream_mutation_batch(warehouse=warehouse)
+    summary = upstream_mutation_defs.observe_upstream_mutation_batch(
+        warehouse=warehouse, drive_executor=FakeExecutor([])
+    )
 
     assert summary.observed == 2
     assert warehouse.calls == [
@@ -459,6 +471,8 @@ def test_observation_batch_is_separate_from_execution() -> None:
         "observe_slack",
         "observe_slack_send",
         "observe_gmail_settings",
+        "succeeded_google_drive",
+        "observe_upstream:0",
     ]
 
 
@@ -473,6 +487,7 @@ def test_process_upstream_mutation_batch_reclaims_stale_executing_rows_before_cl
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=10,
         claimed_by="worker-1",
@@ -529,6 +544,7 @@ def test_process_upstream_mutation_batch_batches_gmail_archive_rows() -> None:
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=100,
         claimed_by="worker-1",
@@ -637,6 +653,7 @@ def test_process_upstream_mutation_batch_batches_matching_gmail_label_changes_se
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=100,
         claimed_by="worker-1",
@@ -723,6 +740,7 @@ def test_process_upstream_mutation_batch_falls_back_when_batch_modify_has_no_mes
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=100,
         claimed_by="worker-1",
@@ -775,6 +793,7 @@ def test_process_upstream_mutation_batch_records_retryable_batch_failure_progres
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=100,
         claimed_by="worker-1",
@@ -817,6 +836,7 @@ def test_process_upstream_mutation_batch_routes_contact_mutations_to_contact_exe
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=5,
         claimed_by="worker-1",
@@ -840,6 +860,7 @@ def test_process_upstream_mutation_batch_defers_unknown_provider() -> None:
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=5,
         claimed_by="worker-1",
@@ -873,6 +894,7 @@ def test_process_upstream_mutation_batch_routes_calendar_mutations_to_calendar_e
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=calendar_executor,
         limit=5,
         claimed_by="worker-1",
@@ -908,6 +930,7 @@ def test_process_upstream_mutation_batch_routes_slack_mark_read_to_slack_executo
         slack_executor=slack_executor,
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         limit=5,
         claimed_by="worker-1",
     )
@@ -955,6 +978,7 @@ def test_process_upstream_mutation_batch_routes_slack_send_to_slack_executor() -
         slack_executor=slack_executor,
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         limit=5,
         claimed_by="worker-1",
     )
@@ -1046,6 +1070,7 @@ def test_gmail_label_and_filter_changes_run_before_thread_batches_and_resync_the
         slack_executor=FakeExecutor([]),
         screen_timelapse_executor=FakeExecutor([]),
         resideo_executor=FakeExecutor([]),
+        drive_executor=FakeExecutor([]),
         calendar_executor=FakeExecutor([]),
         limit=100,
         claimed_by="worker-1",

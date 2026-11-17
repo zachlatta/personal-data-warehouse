@@ -647,6 +647,7 @@ def test_a_proposal_is_reviewed_approved_and_applied_by_the_worker() -> None:
                 warehouse=wh, account="home", client_factory=lambda: client, sleep=lambda seconds: None
             ),
             limit=10,
+            drive_executor=None,  # type: ignore[arg-type]
             claimed_by="resideo-test",
             ensure_tables=False,
             on_gmail_settings_changed=None,

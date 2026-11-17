@@ -201,6 +201,7 @@ def _work(wh, drive: FakeDrive, *, lock_acquired: bool = True):
         slack_executor=None,  # type: ignore[arg-type]
         screen_timelapse_executor=executor,
         resideo_executor=None,  # type: ignore[arg-type]
+        drive_executor=None,  # type: ignore[arg-type]
         limit=10,
         claimed_by="purge-test",
         ensure_tables=False,

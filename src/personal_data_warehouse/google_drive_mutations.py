@@ -29,6 +29,23 @@ from personal_data_warehouse.calendar_mutations import calendar_mutation_failure
 from personal_data_warehouse.objectstore.google_drive import build_google_drive_service
 
 
+GOOGLE_DRIVE_PROVIDER = "google_drive"
+GOOGLE_DRIVE_UPLOAD_FILE_OPERATION = "google_drive.upload_file"
+GOOGLE_DRIVE_CREATE_FOLDER_OPERATION = "google_drive.create_folder"
+GOOGLE_DRIVE_ADD_PERMISSION_OPERATION = "google_drive.add_permission"
+GOOGLE_DRIVE_UPDATE_PERMISSION_OPERATION = "google_drive.update_permission"
+GOOGLE_DRIVE_REMOVE_PERMISSION_OPERATION = "google_drive.remove_permission"
+GOOGLE_DRIVE_OPERATIONS = frozenset(
+    {
+        GOOGLE_DRIVE_UPLOAD_FILE_OPERATION,
+        GOOGLE_DRIVE_CREATE_FOLDER_OPERATION,
+        GOOGLE_DRIVE_ADD_PERMISSION_OPERATION,
+        GOOGLE_DRIVE_UPDATE_PERMISSION_OPERATION,
+        GOOGLE_DRIVE_REMOVE_PERMISSION_OPERATION,
+    }
+)
+
+
 @dataclass(frozen=True)
 class DriveMutationResult:
     status: str
@@ -89,7 +106,7 @@ class GoogleDriveMutationExecutor:
             service = self.service_factory(mutation["account"])
             p, result = mutation["payload_json"], mutation["result_json"]
             op = mutation["operation"]
-            if op in {"google_drive.upload_file", "google_drive.create_folder"}:
+            if op in {GOOGLE_DRIVE_UPLOAD_FILE_OPERATION, GOOGLE_DRIVE_CREATE_FOLDER_OPERATION}:
                 current = (
                     service.files()
                     .get(fileId=result["id"], fields="id,name,mimeType,parents,size,trashed", supportsAllDrives=True)
@@ -100,7 +117,7 @@ class GoogleDriveMutationExecutor:
                     and current.get("name") == p["name"]
                     and p["parent_id"] in current.get("parents", [])
                     and current.get("mimeType") == p.get("mime_type", "application/vnd.google-apps.folder")
-                    and (op != "google_drive.upload_file" or int(current.get("size", -1)) == p["size_bytes"])
+                    and (op != GOOGLE_DRIVE_UPLOAD_FILE_OPERATION or int(current.get("size", -1)) == p["size_bytes"])
                 )
                 permissions = p.get("initial_permissions", [])
                 completed = result.get("initial_permissions", [])
@@ -111,7 +128,7 @@ class GoogleDriveMutationExecutor:
                         self.observed(
                             {
                                 "account": mutation["account"],
-                                "operation": "google_drive.add_permission",
+                                "operation": GOOGLE_DRIVE_ADD_PERMISSION_OPERATION,
                                 "payload_json": {"file_id": result["id"], **permission},
                                 "result_json": receipt,
                             }
@@ -132,8 +149,8 @@ class GoogleDriveMutationExecutor:
                     .execute()
                 )
             except HttpError as exc:
-                return exc.resp.status == 404 and op == "google_drive.remove_permission"
-            if op == "google_drive.remove_permission":
+                return exc.resp.status == 404 and op == GOOGLE_DRIVE_REMOVE_PERMISSION_OPERATION
+            if op == GOOGLE_DRIVE_REMOVE_PERMISSION_OPERATION:
                 return False
             return (
                 current.get("type") == p["permission_type"]
@@ -152,20 +169,11 @@ class GoogleDriveMutationExecutor:
         result = dict(mutation.get("result_json") or {})
         try:
             op = mutation["operation"]
-            if op not in {
-                "google_drive." + suffix
-                for suffix in (
-                    "upload_file",
-                    "create_folder",
-                    "add_permission",
-                    "update_permission",
-                    "remove_permission",
-                )
-            }:
+            if op not in GOOGLE_DRIVE_OPERATIONS:
                 raise ValueError("unsupported Drive operation")
             p = mutation["payload_json"]
             data = None
-            if op == "google_drive.upload_file":
+            if op == GOOGLE_DRIVE_UPLOAD_FILE_OPERATION:
                 data = self.read_upload(p)
                 if len(data) != p["size_bytes"] or sha256(data).hexdigest() != p["sha256"]:
                     raise ValueError("staged upload differs from approved bytes")
@@ -178,7 +186,7 @@ class GoogleDriveMutationExecutor:
                 )
                 if parent.get("trashed") or parent.get("mimeType") != "application/vnd.google-apps.folder":
                     raise ValueError("destination is no longer a folder")
-            if op in {"google_drive.upload_file", "google_drive.create_folder"}:
+            if op in {GOOGLE_DRIVE_UPLOAD_FILE_OPERATION, GOOGLE_DRIVE_CREATE_FOLDER_OPERATION}:
                 body = {
                     "name": p["name"],
                     "parents": [p["parent_id"]],
@@ -193,12 +201,12 @@ class GoogleDriveMutationExecutor:
                 # in result_json; a credential repair never creates a second one.
                 if not result.get("id"):
                     result = service.files().create(**args).execute(num_retries=0)
-                if op == "google_drive.create_folder":
+                if op == GOOGLE_DRIVE_CREATE_FOLDER_OPERATION:
                     completed = result.setdefault("initial_permissions", [])
                     for permission in p.get("initial_permissions", [])[len(completed) :]:
                         shared = self._add_permission(service, result["id"], permission)
                         completed.append(shared)
-            elif op == "google_drive.add_permission":
+            elif op == GOOGLE_DRIVE_ADD_PERMISSION_OPERATION:
                 writing = True
                 result = self._add_permission(service, p["file_id"], p)
             else:
@@ -210,7 +218,7 @@ class GoogleDriveMutationExecutor:
                         .execute()
                     )
                 except HttpError as exc:
-                    if exc.resp.status == 404 and op == "google_drive.remove_permission":
+                    if exc.resp.status == 404 and op == GOOGLE_DRIVE_REMOVE_PERMISSION_OPERATION:
                         return DriveMutationResult("succeeded", {"already_removed": True})
                     raise
                 expected = {"type": p["permission_type"], "role": p["expected_role"]}
@@ -222,7 +230,7 @@ class GoogleDriveMutationExecutor:
                 if any(item.get("inherited") for item in current.get("permissionDetails", [])):
                     raise ValueError("inherited permissions must be changed on their parent")
                 writing = True
-                if op == "google_drive.update_permission":
+                if op == GOOGLE_DRIVE_UPDATE_PERMISSION_OPERATION:
                     result = (
                         service.permissions()
                         .update(**args, body={"role": p["role"]}, fields="id,type,role,emailAddress,domain")

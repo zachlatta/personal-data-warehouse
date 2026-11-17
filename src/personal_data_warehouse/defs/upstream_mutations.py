@@ -32,7 +32,10 @@ from personal_data_warehouse.calendar_mutations import (
     CalendarMutationExecutor,
 )
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.google_drive_mutations import GoogleDriveMutationExecutor
+from personal_data_warehouse.google_drive_mutations import (
+    GOOGLE_DRIVE_PROVIDER,
+    GoogleDriveMutationExecutor,
+)
 from personal_data_warehouse.contact_mutations import (
     GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
     GoogleContactMutationExecutor,
@@ -379,7 +382,7 @@ def process_upstream_mutation_batch(
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
     ensure_tables: bool = True,
     on_gmail_settings_changed: Callable[[set[str]], None] | None,
-    drive_executor: GoogleDriveMutationExecutor | None = None,
+    drive_executor: GoogleDriveMutationExecutor,
 ) -> UpstreamMutationWorkerSummary:
     if ensure_tables:
         warehouse.ensure_upstream_mutation_tables()
@@ -466,7 +469,7 @@ def process_upstream_mutation_batch(
             result = screen_timelapse_executor.execute(mutation)
         elif provider == RESIDEO_PROVIDER:
             result = resideo_executor.execute(mutation)
-        elif provider == "google_drive" and drive_executor is not None:
+        elif provider == GOOGLE_DRIVE_PROVIDER:
             result = drive_executor.execute(mutation)
         else:
             # Unknown providers should not be burned to failed_terminal by a stale worker
@@ -501,7 +504,9 @@ def process_upstream_mutation_batch(
     )
 
 
-def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True, drive_executor=None) -> UpstreamMutationObservationSummary:
+def observe_upstream_mutation_batch(
+    *, warehouse, drive_executor: GoogleDriveMutationExecutor, ensure_tables: bool = True
+) -> UpstreamMutationObservationSummary:
     if ensure_tables:
         warehouse.ensure_upstream_mutation_tables()
     observed = warehouse.observe_succeeded_gmail_archive_mutations(ensure_tables=False)
@@ -513,19 +518,27 @@ def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True, dr
     observed += warehouse.observe_succeeded_slack_mark_conversation_read_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_slack_send_message_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_gmail_settings_mutations(ensure_tables=False)
-    if drive_executor is not None:
-        observed += observe_drive_mutation_batch(warehouse=warehouse, drive_executor=drive_executor)
+    observed += observe_drive_mutation_batch(warehouse=warehouse, drive_executor=drive_executor)
     return UpstreamMutationObservationSummary(observed=observed)
 
 
 def observe_drive_mutation_batch(*, warehouse, drive_executor) -> int:
-    candidates = warehouse._query_dicts("""SELECT * FROM @upstream_mutations
-            WHERE provider='google_drive' AND status='succeeded'
-            ORDER BY executed_at, id LIMIT 100""")
-    observations = [(str(m["id"]), {"provider":"google_drive", "verified_upstream":True})
-                    for m in candidates if drive_executor.observed(m)]
-    return warehouse.observe_upstream_mutations(observations=observations,
-        actor_id="upstream_mutation_observer", ensure_tables=False)
+    candidates = warehouse._query_dicts(
+        """SELECT * FROM @upstream_mutations
+            WHERE provider = %s AND status = 'succeeded'
+            ORDER BY executed_at, id LIMIT 100""",
+        [GOOGLE_DRIVE_PROVIDER],
+    )
+    observations = [
+        (str(m["id"]), {"provider": GOOGLE_DRIVE_PROVIDER, "verified_upstream": True})
+        for m in candidates
+        if drive_executor.observed(m)
+    ]
+    return warehouse.observe_upstream_mutations(
+        observations=observations,
+        actor_id="upstream_mutation_observer",
+        ensure_tables=False,
+    )
 
 
 def _upstream_mutation_batch_size() -> int:
