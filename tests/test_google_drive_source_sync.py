@@ -15,9 +15,110 @@ from personal_data_warehouse.config import GoogleDriveSourceConfig, Settings
 from personal_data_warehouse.google_drive_source_sync import (
     FolderTree,
     GoogleDriveSourceSyncRunner,
+    GoogleApiDriveClient,
+    FOLDER_MIME,
     decide_extraction,
 )
 from personal_data_warehouse.postgres import PostgresWarehouse
+from personal_data_warehouse.timeline import TIMELINE_ADAPTERS, TimelineSyncEngine
+
+
+def test_incremental_sync_backfills_existing_folders_without_replaying_files(warehouse):
+    _seed_full(warehouse)
+    client = FakeDriveClient(
+        folders=[
+            {"id": "root", "name": "My Drive", "parents": []},
+            {"id": "empty", "name": "Empty folder", "parents": ["root"], "modifiedTime": "2026-06-01T00:00:00Z"},
+        ],
+        files=[],
+    )
+    summary = _runner(warehouse, client).sync_all()[0]
+    assert summary.sync_type == "incremental"
+    assert warehouse._query(
+        "SELECT file_id,mime_type,is_excluded,exclude_reason FROM @google_drive_files WHERE file_id='empty'"
+    ) == [("empty", FOLDER_MIME, 1, "folder_metadata")]
+    assert warehouse._query("SELECT count(*) FROM @google_drive_file_texts WHERE file_id IN ('root','empty')") == [(0,)]
+    assert client.export_calls == client.download_calls == []
+    adapter = next(a for a in TIMELINE_ADAPTERS if a.name == "drive_file")
+    engine = TimelineSyncEngine(
+        source_url=_postgres_url(), source_schema=warehouse._schema, dest_schema=warehouse._schema, adapters=(adapter,)
+    )
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    assert warehouse._query(
+        "SELECT source_pk->>'file_id',priority::text FROM @timeline_events WHERE source_pk->>'file_id' IN ('root','empty') ORDER BY 1"
+    ) == [("empty", "background"), ("root", "background")]
+
+
+def test_unchanged_folder_snapshot_does_not_rewrite_rows_or_freshness(warehouse):
+    """The per-run folder snapshot must not bump ingested_at (pipeline freshness,
+    timeline incremental re-reads) or churn tuples for folders that did not change."""
+    root = {"id": "root", "name": "My Drive", "parents": []}
+    folder = {"id": "folder", "name": "Original", "mimeType": FOLDER_MIME, "parents": ["root"]}
+    client = FakeDriveClient(folders=[root, folder], files=[])
+    first = datetime(2026, 6, 19, 12, 0, 0, tzinfo=UTC)
+    later = datetime(2026, 6, 19, 12, 30, 0, tzinfo=UTC)
+
+    def sync(at):
+        GoogleDriveSourceSyncRunner(
+            settings=_settings(), warehouse=warehouse, client_factory=lambda account: client, now=lambda: at
+        ).sync_all()
+
+    def stamps():
+        return warehouse._query("SELECT file_id, ingested_at FROM @google_drive_files ORDER BY file_id")
+
+    sync(first)
+    sync(later)
+    assert stamps() == [("folder", first), ("root", first)]
+
+    client.folders = [root, {**folder, "name": "Renamed"}]
+    sync(later)
+    assert stamps() == [("folder", later), ("root", first)]
+
+
+def test_drive_api_lists_full_root_and_shared_root_metadata():
+    from unittest.mock import MagicMock
+
+    service = MagicMock()
+
+    def get(**kwargs):
+        request = MagicMock()
+        root_id = "root-id" if kwargs["fileId"] == "root" else kwargs["fileId"]
+        request.execute.return_value = {
+            "id": root_id,
+            "name": "My Drive" if root_id == "root-id" else "Team drive",
+            "mimeType": FOLDER_MIME,
+            "parents": [],
+        }
+        assert "mimeType" in kwargs["fields"] and "modifiedTime" in kwargs["fields"]
+        return request
+
+    service.files.return_value.get.side_effect = get
+    service.files.return_value.list.return_value.execute.return_value = {"files": []}
+    service.drives.return_value.list.return_value.execute.return_value = {
+        "drives": [{"id": "shared-root", "name": "Team drive"}]
+    }
+    client = GoogleApiDriveClient(
+        service, config=GoogleDriveSourceConfig(accounts=("drive@example.test",), include_shared_drives=True)
+    )
+    assert {folder["id"] for folder in client.iter_folders()} == {"root-id", "shared-root"}
+
+
+def test_incremental_folder_changes_rename_and_trash_without_text_extraction(warehouse):
+    root = {"id": "root", "name": "My Drive", "parents": []}
+    folder = {"id": "folder", "name": "Original", "mimeType": FOLDER_MIME, "parents": ["root"]}
+    client = FakeDriveClient(folders=[root, folder], files=[])
+    _runner(warehouse, client).sync_all()
+    client._changes = [{"fileId": "folder", "file": {**folder, "name": "Renamed"}}]
+    _runner(warehouse, client).sync_all()
+    assert warehouse._query("SELECT name,trashed FROM @google_drive_files WHERE file_id='folder'") == [("Renamed", 0)]
+    client.folders = [root]
+    client._changes = [{"fileId": "folder", "removed": True}]
+    _runner(warehouse, client).sync_all()
+    assert warehouse._query("SELECT trashed FROM @google_drive_files WHERE file_id='folder'") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @google_drive_file_texts") == [(0,)]
 
 
 def _postgres_url() -> str:
@@ -319,7 +420,13 @@ def test_full_crawl_excludes_transport_folders(warehouse):
     excluded = warehouse._query(
         "SELECT file_id, is_excluded, exclude_reason FROM @google_drive_files ORDER BY file_id"
     )
-    assert excluded == [("drop", 1, "excluded_folder"), ("keep", 0, "")]
+    assert excluded == [
+        ("drop", 1, "excluded_folder"),
+        ("keep", 0, ""),
+        ("root", 1, "folder_metadata"),
+        ("sub", 1, "folder_metadata"),
+        ("transport", 1, "folder_metadata"),
+    ]
     # The excluded file's bytes were never downloaded and it has no text row.
     assert "drop" not in client.download_calls
     assert warehouse._query("SELECT count(*) FROM @google_drive_file_texts WHERE file_id = 'drop'") == [(0,)]
@@ -430,9 +537,9 @@ def test_full_crawl_flushes_batches_to_bound_memory():
 
     summary = _runner(warehouse, client).sync_all()[0]
 
-    assert summary.files_written == 30
+    assert summary.files_written == 31
     assert summary.texts_written == 30
-    assert warehouse.file_batches == [25, 5]
+    assert warehouse.file_batches == [1, 25, 5]
     assert warehouse.text_batches == [25, 5]
     assert warehouse.sync_states[-1]["status"] == "ok"
 

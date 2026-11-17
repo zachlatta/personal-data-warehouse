@@ -22265,6 +22265,10 @@ NOOP_UPSERT_GUARD_EXCLUDED_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
     "github_events": ("synced_at", "sync_version"),
     "slack_messages": ("synced_at", "sync_version"),
     "slack_files": ("synced_at", "sync_version"),
+    # Every Drive run re-snapshots all folders (mutation destinations); an
+    # unchanged folder must keep its ingested_at, which is the pipeline's
+    # freshness column and the timeline adapter's incremental cursor.
+    "google_drive_files": ("ingested_at", "sync_version"),
     "slack_message_reactions": ("synced_at", "sync_version"),
 }
 
