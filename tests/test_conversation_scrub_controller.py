@@ -64,15 +64,46 @@ def test_controller_stops_surviving_runtime_before_restoring(tmp_path, monkeypat
     assert calls[1:] == [['stop','--time','30','maintenance-id'], ['start','app'], ['start','dagster']]
 
 
-def test_restore_does_not_start_an_originally_stopped_writer(tmp_path,monkeypatch):
+def test_runtime_mounts_nothing_from_the_writer(tmp_path, monkeypatch):
+    # The scrub reads Postgres and Drive through its environment only; the
+    # Dagster container's volumes include the Docker socket.
     from personal_data_warehouse import scrub_conversation_window as m
-    (tmp_path/'state.json').write_text(json.dumps({'writers':[
-        {'Id':'dagster','State':{'Running':False}},{'Id':'app','State':{'Running':True}}]}))
     calls=[]
-    monkeypatch.setattr(m,'docker',lambda args,**kwargs: calls.append(args) or '')
-    m.restore(tmp_path)
-    assert calls[-1] == ['start','app']
-    assert ['start','dagster'] not in calls
+    monkeypatch.setattr(m,'docker',lambda args, **k: calls.append(args))
+    m.runtime(tmp_path,{'writers':[{'Id':'dagster'}],'image':'image','network':'net'},'cards')
+    assert '--volumes-from' not in calls[0]
+    assert not any('docker.sock' in a for a in calls[0])
+
+
+def test_apply_passes_the_group_cap_so_a_retry_can_isolate_a_session(tmp_path, monkeypatch):
+    from personal_data_warehouse import scrub_conversation_window as m
+    (tmp_path/'state.json').write_text(json.dumps({'writers':[{'Id':'dagster'},{'Id':'app'}],'image':'i','network':'n'}))
+    calls=[]
+    monkeypatch.setattr(m,'snapshot',lambda state: {'schedules': [], 'runs': []})
+    monkeypatch.setattr(m,'assert_current',lambda state: None)
+    monkeypatch.setattr(m,'docker',lambda args, **k: calls.append(args) or '')
+    m.apply(tmp_path,max_canonical_rows=7061)
+    cards=next(c for c in calls if 'personal_data_warehouse.scrub_conversation_cards' in c)
+    assert cards[cards.index('--max-canonical-rows')+1] == '7061'
+    with pytest.raises(ValueError):
+        m.apply(tmp_path,max_canonical_rows=10001)
+
+
+def test_verify_removes_the_runtime_environment_only_after_clean_scans(tmp_path, monkeypatch):
+    from personal_data_warehouse import scrub_conversation_window as m
+    (tmp_path/'state.json').write_text(json.dumps({'writers':[{'Id':'dagster'},{'Id':'app'}],'image':'i','network':'n'}))
+    (tmp_path/'before-stop.json').write_text(json.dumps({'schedules': [], 'runs': []}))
+    (tmp_path/'runtime.env').write_text('KEY=value\n')
+    monkeypatch.setattr(m,'snapshot',lambda state: {'schedules': [], 'runs': ['other']})
+    monkeypatch.setattr(m,'assert_current',lambda state: None)
+    def failing(args, **k):
+        if args[0]=='run': raise RuntimeError('secrets remain')
+    monkeypatch.setattr(m,'docker',failing)
+    with pytest.raises(RuntimeError): m.verify(tmp_path)
+    assert (tmp_path/'runtime.env').exists()
+    monkeypatch.setattr(m,'docker',lambda args, **k: '')
+    m.verify(tmp_path)
+    assert not (tmp_path/'runtime.env').exists()
 
 
 def test_jsonl_token_cli_reports_remaining_secret(tmp_path,monkeypatch):

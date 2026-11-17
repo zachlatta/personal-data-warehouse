@@ -3,7 +3,8 @@
 Only plan/verify read production data. Apply stops the app and entire Dagster
 container, including its daemon, run subprocesses and resident landing workers.
 The original schedule/sensor states are never modified. No credentials in argv
-or stdout; the runtime environment stays in a private local file.
+or stdout; the runtime environment stays in a private local file until a
+clean verify removes it.
 """
 import argparse
 import json
@@ -60,8 +61,9 @@ def assert_current(state):
 
 
 def runtime(directory, state, module, *args):
-    mounts=['--volumes-from',state['writers'][0]['Id']+':ro'] if state.get('writers') else []
-    docker(['run','--rm','--name',RUNTIME_NAME,*mounts,'--network',state['network'],'--env-file',str(directory/'runtime.env'),
+    # No writer volumes: the scrub reaches Postgres and Drive through the
+    # environment only, and the Dagster container mounts the Docker socket.
+    docker(['run','--rm','--name',RUNTIME_NAME,'--network',state['network'],'--env-file',str(directory/'runtime.env'),
             '--volume',f'{directory}:/scrub','--entrypoint','/app/.venv/bin/python',state['image'],
             '-m',f'personal_data_warehouse.scrub_conversation_{module}',
             '--scope','tokens','--plan',f'/scrub/token-{module}-plan.json',*args],capture=False)
@@ -81,7 +83,7 @@ def plan(directory):
         raise RuntimeError('multiline environment requires a reviewed runtime configuration')
     fd=os.open(directory/'runtime.env',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(fd,'w') as stream: stream.write('\n'.join(env)+'\n')
-    state=dict(writers=[{**{k:w[k] for k in ('Id','Image','Name')},'State':{'Running':w['State']['Running']}} for w in writers],
+    state=dict(writers=[{k:w[k] for k in ('Id','Image','Name')} for w in writers],
                image=dagster['Image'],network=dagster['HostConfig']['NetworkMode'])
     save(directory/'state.json',state)
     assert_current(state)
@@ -98,14 +100,17 @@ def restore(directory):
         # before any live writer is restored. Never start writers on stop failure.
         docker(['stop','--time','30',running])
     failures=[]
+    # plan records only running writers, so every saved writer is restarted.
     for writer in reversed(state['writers']):
-        if not writer.get('State',{'Running':True})['Running']: continue
         try: docker(['start',writer['Id']])
         except Exception: failures.append(writer['Id'])
     if failures: raise RuntimeError('writer restoration failed; rerun restore using the saved state')
 
 
-def apply(directory):
+def apply(directory, max_canonical_rows=10000):
+    # A group that overruns its 60-second transaction rolls back; rerunning
+    # apply with a cap just above the largest session isolates it.
+    if not 0<max_canonical_rows<=10000: raise ValueError('--max-canonical-rows must be 1..10000')
     state=json.loads((directory/'state.json').read_text())
     assert_current(state)
     save(directory/'before-stop.json',snapshot(state),replace=True)
@@ -115,7 +120,7 @@ def apply(directory):
         docker(['stop','--time','30',*[w['Id'] for w in state['writers']]])
         runtime(directory,state,'objects','--apply')
         runtime(directory,state,'cards','--apply','--session-batches','--planned-only',
-                '--writers-paused','--max-canonical-rows','10000','--window-seconds','60')
+                '--writers-paused','--max-canonical-rows',str(max_canonical_rows),'--window-seconds','60')
     finally:
         restore(directory)
 
@@ -129,17 +134,22 @@ def verify(directory):
         raise RuntimeError('schedule/sensor status changed; inspect saved state before proceeding')
     runtime(directory,state,'objects','--verify')
     runtime(directory,state,'cards','--verify')
+    # The environment file is a copy of the Dagster secrets; keep it only
+    # until the scans pass, so a failed verify can be rerun.
+    (directory/'runtime.env').unlink()
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('phase',choices=('plan','apply','restore','verify'))
     parser.add_argument('--state-dir',type=Path,required=True)
+    parser.add_argument('--max-canonical-rows',type=int,default=10000,help='apply only: canonical rows per session group')
     args=parser.parse_args()
     directory=args.state_dir.expanduser().resolve()
     def interrupted(*_): raise InterruptedError('maintenance interrupted; restoration required')
     signal.signal(signal.SIGTERM,interrupted)
-    globals()[args.phase](directory)
+    if args.phase=='apply': apply(directory,args.max_canonical_rows)
+    else: globals()[args.phase](directory)
 
 
 if __name__=='__main__': main()

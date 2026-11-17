@@ -157,8 +157,13 @@ def _apply_edits(value, edits):
     return ''.join(output)
 
 
+def _token_leaf_edits(value):
+    # Keep the public id; mask only the secret after it.
+    return [(m.start(0) + len(m[1]), m.end(), '[REDACTED]') for m in PDW_TOKEN.finditer(value)]
+
+
 def _text_edits(value):
-    token_edits = [(m.start(0) + len(m[1]), m.end(), '[REDACTED]') for m in PDW_TOKEN.finditer(value)]
+    token_edits = _token_leaf_edits(value)
     # Keep offsets through escaped-digit decoding: unmasked escapes must survive.
     chars = []; bounds = [0]; pos = 0
     while pos < len(value):
@@ -215,7 +220,7 @@ def token_edits(value):
                 edits.extend((token.start()+bounds[a], token.start()+bounds[b],
                               json.dumps(replacement)[1:-1]) for a,b,replacement in inner)
         return edits
-    return [(m.start()+len(m[1]), m.end(), '[REDACTED]') for m in PDW_TOKEN.finditer(value)]
+    return _token_leaf_edits(value)
 
 
 def _json_string_bounds(token):

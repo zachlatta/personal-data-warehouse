@@ -531,7 +531,7 @@ separate decision. Rebuilds do not erase historical backups or WAL.
 For a token-only landing, use the checked-in host controller below from the
 landed checkout on mew-dev. It runs a maintenance container on mew-coolify with
 the production Dagster image **by immutable image ID**, the same Docker network,
-read-only original mounts and a private environment file. It bypasses the image
+no writer volumes (so no Docker socket) and a private environment file. It bypasses the image
 entrypoint, so no bootstrap, daemon or resident worker starts in that container.
 No credentials go in command arguments or stdout. Choose a fresh state directory;
 `plan` refuses an existing one. Do not deploy while these phases are in progress.
@@ -545,7 +545,8 @@ ssh mew-coolify "sudo -n python3 - plan --state-dir $SCRUB_STATE" < "$SCRUB_CONT
 `plan` is read-only toward the warehouse/archive. It records container IDs,
 running states, image identity, every persisted Dagster schedule/sensor status
 and active/queued run ID, job and status. State and plans are mode 0600 in a
-0700 directory on mew-coolify; the environment file stays there too. An absent
+0700 directory on mew-coolify; the environment file (a copy of the Dagster
+secrets) stays there until `verify` passes and then removes it. An absent
 instigator row means its declared default, which is left unchanged. Archive
 discovery finishes before the fresh DB plan. Review the printed source-row and
 total-plan counts against the fail-closed limits below before apply.
@@ -592,9 +593,12 @@ remain the final guard against an unaccounted writer.
 Apply records a new `before-stop.json` before the first stop. It executes
 `docker stop --time 30 <dagster-id> <app-id>`, runs archive apply, then DB apply
 with `--session-batches --planned-only --writers-paused --max-canonical-rows 10000`.
+If a group overruns its transaction, it rolls back and the writers restart;
+rerun `apply --max-canonical-rows <largest session's rows>` so that session runs
+alone (completed groups are skipped).
 Each DB transaction retains the 60-second rollback deadline and row gates.
 Restoration is registered **before** stopping anything: even a partial stop or
-failed apply starts the originally running app, then Dagster, in `finally`.
+failed apply starts the app, then Dagster, in `finally` (`plan` accepts only running writers).
 Schedule/sensor settings are never changed. Interrupted run IDs are recorded;
 they do not resume from the killed process instruction: Dagster's run monitor
 reconciles them and the restored sensors/schedules launch normal follow-up work.
@@ -605,7 +609,7 @@ ssh mew-coolify "sudo -n python3 - apply --state-dir $SCRUB_STATE" < "$SCRUB_CON
 
 For SIGKILL, host/SSH loss, or a failed restoration, run this recovery command
 before retrying anything. It first stops a surviving named maintenance container
-so its transaction rolls back, then starts only the originally running writers:
+so its transaction rolls back, then starts the saved writers:
 
 ```sh
 ssh mew-coolify "sudo -n python3 - restore --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
