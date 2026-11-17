@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -153,11 +154,27 @@ func signedObjectDownloadURL(signer *pdwauth.Service, baseURL, fileID, account s
 	return link
 }
 
+// getObjectRequestIDHint answers a mutation request id with its status query.
+func getObjectRequestIDHint(raw json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return nil
+	}
+	for _, field := range fields {
+		var value string
+		if json.Unmarshal(field, &value) == nil && strings.HasPrefix(value, "req_") {
+			return &tool.InvalidInputError{Message: "mutation requests are not stored objects; pdw sql \"SELECT id, status, error FROM ops.upstream_mutation_requests WHERE id = '" + strings.ReplaceAll(value, "'", "''") + "'\"; see topic mutations for operation status"}
+		}
+	}
+	return nil
+}
+
 func getObjectTool(store objectstore.ObjectStore, driveStores map[string]objectstore.ObjectStore, signer *pdwauth.Service, baseURL string, ttl time.Duration, now func() time.Time) tool.Tool {
 	return &tool.Typed[getObjectInput, getObjectOutput]{
 		NameStr:        "get_object",
 		TitleStr:       "Get Stored Object",
 		DescriptionStr: getObjectDescription,
+		ArgumentHint:   getObjectRequestIDHint,
 		Handle: func(ctx context.Context, in getObjectInput) (getObjectOutput, error) {
 			ref := objectstore.StoredObject{
 				StorageBackend: in.StorageBackend,

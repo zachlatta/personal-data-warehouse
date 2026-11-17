@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from personal_data_warehouse.card_redaction import sensitive_count as card_count, redact
+from personal_data_warehouse.card_redaction import sensitive_count, redact
 from personal_data_warehouse.card_scrub_selector import add_selector_arguments, selector_from_args
 
 
@@ -27,8 +27,8 @@ def scrub_jsonl(root: Path, session: str, *, apply=False, selector=None):
                     selected = isinstance(parsed, dict) and parsed.get('sessionId') == session
                 except ValueError:
                     pass
-            n = (selector.count if selector else card_count)(line) if selected else 0
-            if selected and "left_alone" in counts: counts["left_alone"] += card_count(line) - n
+            n = (selector.count if selector else sensitive_count)(line) if selected else 0
+            if selected and "left_alone" in counts: counts["left_alone"] += sensitive_count(line) - n
             if n:
                 counts['matches'] += n
                 counts['lines'] += 1

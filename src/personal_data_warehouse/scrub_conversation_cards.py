@@ -23,7 +23,7 @@ from psycopg2.extras import Json, execute_batch
 import psycopg2
 
 from personal_data_warehouse.card_scrub_selector import ScrubSelector, resolve_selector, add_selector_arguments
-from personal_data_warehouse.card_redaction import sensitive_count as card_count, is_card, redact_row
+from personal_data_warehouse.card_redaction import sensitive_count, is_card, redact_row
 from personal_data_warehouse.postgres import PostgresWarehouse, POSTGRES_TABLES, _AI_CONVERSATION_EVENT_TABLES
 from personal_data_warehouse.card_prefilter import ConfirmationPool, available_cpus, count_row, sql_prefilter
 
@@ -623,7 +623,7 @@ def rebuild_sessions(warehouse, sessions, page_size, selector=None):
                 identity = session_identity(dict(source_pk=row[9]))
                 if identity not in sessions:
                     continue
-                if any((selector.count if selector else card_count)(str(row[i])) for i in (6, 7, 10, 11)):
+                if any((selector.count if selector else sensitive_count)(str(row[i])) for i in (6, 7, 10, 11)):
                     raise RuntimeError('canonical regeneration still contains card data; no changes committed')
                 selected.append(row)
                 keys.add((name, row[0]))

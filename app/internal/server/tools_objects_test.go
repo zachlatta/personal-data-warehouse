@@ -325,3 +325,11 @@ func TestGetObjectToolRequiresFileID(t *testing.T) {
 		t.Fatalf("expected error for missing storage_file_id")
 	}
 }
+
+func TestGetObjectAnswersAMutationRequestIDWithItsStatusQuery(t *testing.T) {
+	tl := getObjectTool(nil, nil, objectsTestSigner(), objectsTestBaseURL, time.Hour, func() time.Time { return objectsTestNow })
+	_, _, err := tl.Invoke(context.Background(), json.RawMessage(`{"storage_file_id":"req_example"}`))
+	if err == nil || !strings.Contains(err.Error(), "WHERE id = 'req_example'") {
+		t.Fatal(err)
+	}
+}

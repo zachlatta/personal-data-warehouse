@@ -28,6 +28,10 @@ type IsErrorFn[O any] func(O) bool
 // valid nested value into a string.
 type MCPArgumentNormalizer func(json.RawMessage) (json.RawMessage, error)
 
+// ArgumentHint inspects raw arguments on both surfaces before decoding and
+// returns an error naming the corrected call when a caller guessed a field.
+type ArgumentHint func(json.RawMessage) error
+
 // Typed is the concrete implementation tools use. The generic parameters
 // keep the MCP SDK able to reflect on I to build the JSON input schema.
 type Typed[I any, O any] struct {
@@ -43,6 +47,9 @@ type Typed[I any, O any] struct {
 	// advertised schema still comes from I; this only tolerates transport/client
 	// encoding quirks before applying that schema.
 	NormalizeMCPArguments MCPArgumentNormalizer
+	// ArgumentHint, when set, runs before decoding on the CLI/HTTP path and
+	// before normalization and validation on the MCP path.
+	ArgumentHint ArgumentHint
 }
 
 func (t *Typed[I, O]) Name() string        { return t.NameStr }
@@ -90,8 +97,10 @@ func jsonFieldNames(t reflect.Type) []string {
 }
 
 func (t *Typed[I, O]) Invoke(ctx context.Context, raw json.RawMessage) (any, bool, error) {
-	if err := argumentHint(t.NameStr, raw); err != nil {
-		return nil, true, err
+	if t.ArgumentHint != nil {
+		if err := t.ArgumentHint(raw); err != nil {
+			return nil, true, err
+		}
 	}
 	var input I
 	if len(raw) > 0 {
@@ -126,7 +135,7 @@ func (t *Typed[I, O]) Invoke(ctx context.Context, raw json.RawMessage) (any, boo
 }
 
 func (t *Typed[I, O]) RegisterMCP(server *mcp.Server, hooks Hooks) {
-	if t.NormalizeMCPArguments != nil || t.NameStr == "propose_mutation_help" || t.NameStr == "get_object" {
+	if t.NormalizeMCPArguments != nil || t.ArgumentHint != nil {
 		t.registerNormalizingMCP(server, hooks)
 		return
 	}
@@ -156,7 +165,10 @@ func (t *Typed[I, O]) registerNormalizingMCP(server *mcp.Server, hooks Hooks) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		input := req.Params.Arguments
 		var err error
-		if err = argumentHint(t.NameStr, input); err == nil && t.NormalizeMCPArguments != nil {
+		if t.ArgumentHint != nil {
+			err = t.ArgumentHint(input)
+		}
+		if err == nil && t.NormalizeMCPArguments != nil {
 			input, err = t.NormalizeMCPArguments(input)
 		}
 		if err != nil {
@@ -181,29 +193,6 @@ func (t *Typed[I, O]) registerNormalizingMCP(server *mcp.Server, hooks Hooks) {
 		}
 		return t.mcpCallToolResult(ctx, typedInput, hooks), nil
 	})
-}
-
-func argumentHint(name string, raw json.RawMessage) error {
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(raw, &fields) != nil {
-		return nil
-	}
-	if name == "propose_mutation_help" {
-		for _, key := range []string{"operation", "kind", "action"} {
-			if value, ok := fields[key]; ok {
-				return &InvalidInputError{Message: `use pdw call propose_mutation_help --data '{"type":` + string(value) + `}'`}
-			}
-		}
-	}
-	if name == "get_object" {
-		for _, raw := range fields {
-			var value string
-			if json.Unmarshal(raw, &value) == nil && strings.HasPrefix(value, "req_") {
-				return &InvalidInputError{Message: "mutation requests are not stored objects; pdw sql \"SELECT id, status, error FROM ops.upstream_mutation_requests WHERE id = '" + strings.ReplaceAll(value, "'", "''") + "'\"; see topic mutations for operation status"}
-			}
-		}
-	}
-	return nil
 }
 
 func validateMCPArguments(input json.RawMessage, resolved *jsonschema.Resolved) (json.RawMessage, error) {

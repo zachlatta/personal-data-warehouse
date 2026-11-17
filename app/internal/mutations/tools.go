@@ -2,6 +2,7 @@ package mutations
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 
@@ -53,11 +54,26 @@ func Tools(service *Service) []tool.Tool {
 			NameStr:        "propose_mutation_help",
 			TitleStr:       "Propose Mutation Help",
 			DescriptionStr: proposeMutationHelpDescription,
+			ArgumentHint:   mutationHelpTypeHint,
 			Handle: func(_ context.Context, in ProposeMutationHelpInput) (MutationHelpDocument, error) {
 				return MutationHelpFor(in)
 			},
 		},
 	}
+}
+
+// mutationHelpTypeHint answers a guessed type field with the corrected call.
+func mutationHelpTypeHint(raw json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return nil
+	}
+	for _, key := range []string{"operation", "kind", "action"} {
+		if value, ok := fields[key]; ok {
+			return &tool.InvalidInputError{Message: `use pdw call propose_mutation_help --data '{"type":` + string(value) + `}'`}
+		}
+	}
+	return nil
 }
 
 // agentFacingError turns the two outcomes a caller can act on — a rejected
