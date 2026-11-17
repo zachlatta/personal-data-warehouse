@@ -10,9 +10,18 @@ from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
 import os
+import ipaddress
+from urllib.parse import urlsplit
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    EndpointConnectionError,
+    ConnectTimeoutError,
+    ReadTimeoutError,
+)
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
@@ -28,15 +37,31 @@ class DriveMutationResult:
 
 
 def staging_client():
-    names = ("ENDPOINT_URL", "BUCKET", "ACCESS_KEY", "SECRET_KEY")
+    names = ("ENDPOINT_URL", "BUCKET", "ACCESS_KEY", "SECRET_KEY", "REGION")
     if any(not os.getenv("PDW_MUTATION_S3_" + name) for name in names):
         raise RuntimeError("PDW_MUTATION_S3 configuration is missing")
+    endpoint = urlsplit(os.environ["PDW_MUTATION_S3_ENDPOINT_URL"])
+    host = endpoint.hostname or ""
+    try:
+        tailnet = ipaddress.ip_address(host) in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        tailnet = host.endswith(".ts.net") and len(host.split(".")) >= 4
+    if (
+        not host
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or endpoint.path not in ("", "/")
+        or endpoint.query
+        or endpoint.fragment
+        or not (endpoint.scheme == "https" or endpoint.scheme == "http" and tailnet)
+    ):
+        raise ValueError("staging endpoint must use HTTPS or tailnet HTTP")
     return boto3.client(
         "s3",
         endpoint_url=os.environ["PDW_MUTATION_S3_ENDPOINT_URL"],
         aws_access_key_id=os.environ["PDW_MUTATION_S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["PDW_MUTATION_S3_SECRET_KEY"],
-        region_name=os.getenv("PDW_MUTATION_S3_REGION") or "us-east-1",
+        region_name=os.environ["PDW_MUTATION_S3_REGION"],
         config=Config(signature_version="s3v4", connect_timeout=15, read_timeout=60, s3={"addressing_style": "path"}),
     )
 
@@ -70,12 +95,29 @@ class GoogleDriveMutationExecutor:
                     .get(fileId=result["id"], fields="id,name,mimeType,parents,size,trashed", supportsAllDrives=True)
                     .execute()
                 )
-                return (
+                file_matches = (
                     not current.get("trashed")
                     and current.get("name") == p["name"]
                     and p["parent_id"] in current.get("parents", [])
                     and current.get("mimeType") == p.get("mime_type", "application/vnd.google-apps.folder")
                     and (op != "google_drive.upload_file" or int(current.get("size", -1)) == p["size_bytes"])
+                )
+                permissions = p.get("initial_permissions", [])
+                completed = result.get("initial_permissions", [])
+                return (
+                    file_matches
+                    and len(completed) == len(permissions)
+                    and all(
+                        self.observed(
+                            {
+                                "account": mutation["account"],
+                                "operation": "google_drive.add_permission",
+                                "payload_json": {"file_id": result["id"], **permission},
+                                "result_json": receipt,
+                            }
+                        )
+                        for permission, receipt in zip(permissions, completed)
+                    )
                 )
             permission_id = result.get("id") or p.get("permission_id")
             try:
@@ -107,6 +149,7 @@ class GoogleDriveMutationExecutor:
 
     def execute(self, mutation):
         writing = False
+        result = dict(mutation.get("result_json") or {})
         try:
             op = mutation["operation"]
             if op not in {
@@ -146,24 +189,18 @@ class GoogleDriveMutationExecutor:
                 if data is not None:
                     args["media_body"] = MediaIoBaseUpload(BytesIO(data), mimetype=p["mime_type"], resumable=False)
                 writing = True
-                result = service.files().create(**args).execute(num_retries=0)
+                # An interrupted sharing step retains the already-created folder
+                # in result_json; a credential repair never creates a second one.
+                if not result.get("id"):
+                    result = service.files().create(**args).execute(num_retries=0)
+                if op == "google_drive.create_folder":
+                    completed = result.setdefault("initial_permissions", [])
+                    for permission in p.get("initial_permissions", [])[len(completed) :]:
+                        shared = self._add_permission(service, result["id"], permission)
+                        completed.append(shared)
             elif op == "google_drive.add_permission":
-                body = {"type": p["permission_type"], "role": p["role"]}
-                for key, api_key in (("email_address", "emailAddress"), ("domain", "domain")):
-                    if key in p:
-                        body[api_key] = p[key]
                 writing = True
-                result = (
-                    service.permissions()
-                    .create(
-                        fileId=p["file_id"],
-                        body=body,
-                        sendNotificationEmail=p["send_notification_email"],
-                        supportsAllDrives=True,
-                        fields="id,type,role,emailAddress,domain",
-                    )
-                    .execute(num_retries=0)
-                )
+                result = self._add_permission(service, p["file_id"], p)
             else:
                 args = dict(fileId=p["file_id"], permissionId=p["permission_id"], supportsAllDrives=True)
                 try:
@@ -198,16 +235,52 @@ class GoogleDriveMutationExecutor:
             # Expiry also handles rejected/withdrawn proposals and abandoned puts.
             return DriveMutationResult("succeeded", dict(result or {}))
         except Exception as exc:
+            if not writing:
+                if isinstance(
+                    exc, (EndpointConnectionError, ConnectionClosedError, ConnectTimeoutError, ReadTimeoutError)
+                ):
+                    return DriveMutationResult(
+                        "failed_retryable", {}, "upload staging is unreachable; retrying before any Drive write"
+                    )
+                if isinstance(exc, ClientError):
+                    code = exc.response.get("Error", {}).get("Code")
+                    if code in {"NoSuchKey", "NotFound", "404"}:
+                        return DriveMutationResult("failed_terminal", {}, "staged bytes expired; propose again")
+                    if code in {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"}:
+                        return DriveMutationResult(
+                            "blocked_missing_credentials", {}, "upload staging credentials need repair"
+                        )
+                    return DriveMutationResult(
+                        "failed_retryable", {}, "upload staging failed before any Drive write; retrying"
+                    )
             status = calendar_mutation_failure_status(exc)
             if writing and status == "failed_retryable":
                 return DriveMutationResult(
-                    "failed_terminal", {}, "Drive may have applied the change; check Drive before proposing again"
+                    "failed_terminal", result, "Drive may have applied the change; check Drive before proposing again"
                 )
             # Do not include provider errors: they can contain upload bytes or tokens.
             return DriveMutationResult(
                 status,
-                {},
+                result,
                 str(exc)
                 if isinstance(exc, ValueError)
                 else "Drive mutation failed; verify credentials, staging configuration and upstream access",
             )
+
+    @staticmethod
+    def _add_permission(service, file_id, p):
+        body = {"type": p["permission_type"], "role": p["role"]}
+        for key, api_key in (("email_address", "emailAddress"), ("domain", "domain")):
+            if key in p:
+                body[api_key] = p[key]
+        return (
+            service.permissions()
+            .create(
+                fileId=file_id,
+                body=body,
+                sendNotificationEmail=p["send_notification_email"],
+                supportsAllDrives=True,
+                fields="id,type,role,emailAddress,domain",
+            )
+            .execute(num_retries=0)
+        )

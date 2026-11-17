@@ -10,6 +10,14 @@ from personal_data_warehouse.google_drive_mutations import GoogleDriveMutationEx
 from tests.test_gmail_settings_e2e import _isolated_warehouse, _run_go_test
 
 
+def test_upload_can_be_reproposed_after_terminal_state_or_expiration():
+    with _isolated_warehouse() as (warehouse, url):
+        warehouse._ensure_table_group(["google_drive_files"])
+        warehouse._command("""INSERT INTO @google_drive_files (account,file_id,name,mime_type)
+            VALUES ('drive@example.test','parent','Destination','application/vnd.google-apps.folder')""")
+        _run_go_test("TestDriveUploadReproposalAfterTerminalOrExpiry", {"PDW_DRIVE_TEST_URL": url})
+
+
 def test_drive_proposal_review_approval_and_worker():
     with _isolated_warehouse() as (warehouse, url):
         warehouse._ensure_table_group(["google_drive_files"])
@@ -23,6 +31,13 @@ def test_drive_proposal_review_approval_and_worker():
             "trashed": False,
         }
         drive.files.return_value.create.return_value.execute.return_value = {"id": "new-folder", "name": "Project"}
+        drive.permissions.return_value.create.return_value.execute.return_value = {"id": "new-permission"}
+        drive.permissions.return_value.get.return_value.execute.return_value = {
+            "id": "new-permission",
+            "type": "user",
+            "emailAddress": "person@example.com",
+            "role": "reader",
+        }
         summary = process_upstream_mutation_batch(
             warehouse=warehouse,
             gmail_executor=None,
@@ -38,6 +53,8 @@ def test_drive_proposal_review_approval_and_worker():
         )
         assert summary.claimed == summary.succeeded == 1
         drive.files.return_value.create.assert_called_once()
+        drive.permissions.return_value.create.assert_called_once()
+        assert drive.permissions.return_value.create.call_args.kwargs["fileId"] == "new-folder"
         assert drive.files.return_value.create.call_args.kwargs["body"]["parents"] == ["parent"]
         # A second worker pass never repeats the successful create.
         again = process_upstream_mutation_batch(

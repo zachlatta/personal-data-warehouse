@@ -38,15 +38,23 @@ authoritative when this list and it disagree.
 
 - **Google Drive:** `google_drive.upload_file` takes `name`, `parent_id`, `mime_type`
   and `data_base64` (20 MiB maximum). `google_drive.create_folder` takes `name` and
-  `parent_id`. Use the synced account and ids from `base_google_drive.files`; a newly
-  created folder must sync before another proposal can use it. `google_drive.add_permission`
+  `parent_id`, plus optional `initial_permissions`: an array of sharing objects with
+  `permission_type`, recipient (`email_address` or `domain` when applicable), `role`
+  and explicit `send_notification_email`. This creates AND shares the folder under
+  one approval, without waiting for sync. Use the synced account and ids from
+  `base_google_drive.files` for existing destinations. `google_drive.add_permission`
   shares a file or folder with a `user`, `group`, `domain` or `anyone`, with `role`
   `reader`, `commenter` or `writer`, and an explicit `send_notification_email` boolean.
   `google_drive.update_permission` / `google_drive.remove_permission` name a
   `permission_id`, its `permission_type`, recipient and `expected_role`; a changed
   permission is refused. No ownership transfer. Folder permissions affect children.
   Pending bytes stay in private S3 and expire after seven days (rejected and withdrawn
-  uploads too); propose an expired upload again. A write with an uncertain response
+  uploads too). Re-proposing an upload-only request that failed terminal, was rejected,
+  withdrawn or expired stages fresh bytes and asks for a new approval; live/successful
+  requests still deduplicate. An expired pending proposal is withdrawn atomically.
+  A reviewer-edited expired proposal needs explicit replacement with its revision.
+  S3 connectivity failures before any Drive write retry; missing bytes report
+  "staged bytes expired; propose again". A write with an uncertain response
   fails for inspection, so check Drive before proposing again.
 
 - **A batch is reviewed as the thing it is about**, so propose one request per intent

@@ -6,8 +6,10 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
 	"io"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDriveUploadSnapshotsMetadata(t *testing.T) {
@@ -17,6 +19,54 @@ func TestDriveUploadSnapshotsMetadata(t *testing.T) {
 	}
 	if p["size_bytes"] != 5 || len(p["sha256"].(string)) != 64 {
 		t.Fatalf("%#v", p)
+	}
+}
+
+func TestDriveUploadRenewalNeverRepeatsSuccessOrMixedBatch(t *testing.T) {
+	for _, m := range []Mutation{
+		{Operation: "google_drive.upload_file", Status: "succeeded"},
+		{Operation: "google_drive.upload_file", Status: "approved"},
+		{Operation: "google_drive.create_folder", Status: "failed_terminal"},
+	} {
+		if renewableDriveUpload(Request{Status: "failed", Mutations: []Mutation{{Operation: "google_drive.upload_file", Status: "failed_terminal"}, m}}) {
+			t.Fatalf("unsafe renewal: %#v", m)
+		}
+	}
+	if renewableDriveUpload(Request{Status: "pending_review", CreatedAt: time.Now(), Mutations: []Mutation{{Operation: "google_drive.upload_file", Status: "pending_review"}}}) {
+		t.Fatal("renewed a live pending upload")
+	}
+}
+
+func TestDriveFolderInitialPermissionsValidateAndAppearInPayload(t *testing.T) {
+	permission := map[string]any{"permission_type": "user", "email_address": "person@example.com", "role": "reader", "send_notification_email": false}
+	p, err := drivePayload(MutationInput{Type: "google_drive.create_folder", Raw: map[string]any{"name": "Shared project", "parent_id": "parent", "initial_permissions": []any{permission}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p["initial_permissions"].([]any)) != 1 {
+		t.Fatalf("%#v", p)
+	}
+	permission["role"] = "owner"
+	if _, err := drivePayload(MutationInput{Type: "google_drive.create_folder", Raw: map[string]any{"name": "Shared project", "parent_id": "parent", "initial_permissions": []any{permission}}}); err == nil {
+		t.Fatal("accepted ownership transfer")
+	}
+}
+
+func TestMutationStagingEndpointAllowsOnlyHTTPSOrTailnetHTTP(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{"https://storage.example.com", true}, {"http://100.64.0.1:3900", true}, {"http://100.127.255.254:3900", true},
+		{"http://nas.example-tailnet.ts.net:3900", true}, {"http://100.63.255.255:3900", false},
+		{"http://100.128.0.1:3900", false}, {"http://192.168.1.1:3900", false}, {"http://example.com", false},
+		{"http://example.ts.net.attacker.test", false}, {"http://example.ts.net@attacker.test", false},
+		{"http://nas.example-tailnet.ts.net/path", false}, {"http://nas.example-tailnet.ts.net?x=y", false},
+	} {
+		u, _ := url.Parse(tc.raw)
+		if got := validMutationStagingEndpoint(u); got != tc.want {
+			t.Errorf("%s: %v", tc.raw, got)
+		}
 	}
 }
 

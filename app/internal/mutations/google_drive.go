@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"net/mail"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -21,6 +23,33 @@ import (
 )
 
 const driveOperations = "google_drive.upload_file,google_drive.create_folder,google_drive.add_permission,google_drive.update_permission,google_drive.remove_permission"
+
+// Never renew a request that contains a successful write or another operation:
+// blindly repeating a partially applied batch could create duplicate folders.
+func renewableDriveUpload(request Request) bool {
+	if len(request.Mutations) == 0 {
+		return false
+	}
+	expired := request.Status == "pending_review" && time.Since(request.CreatedAt) > 7*24*time.Hour
+	if request.Status == "pending_review" && !expired {
+		return false
+	}
+	for _, m := range request.Mutations {
+		if m.Operation != "google_drive.upload_file" {
+			return false
+		}
+		switch m.Status {
+		case "failed_terminal", "rejected", "withdrawn":
+		case "pending_review":
+			if !expired {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 var driveID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
 var driveMIME = regexp.MustCompile(`^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$`)
@@ -31,7 +60,7 @@ func drivePayload(m MutationInput) (map[string]any, error) {
 	case "google_drive.upload_file":
 		fields = "name,parent_id,mime_type,data_base64"
 	case "google_drive.create_folder":
-		fields = "name,parent_id"
+		fields = "name,parent_id,initial_permissions"
 	case "google_drive.add_permission":
 		fields = "file_id,permission_type,email_address,domain,role,send_notification_email"
 	case "google_drive.update_permission":
@@ -156,7 +185,53 @@ func drivePayload(m MutationInput) (map[string]any, error) {
 			}
 		}
 	}
+	if value, present := p["initial_permissions"]; present {
+		permissions, ok := value.([]any)
+		if !ok || len(permissions) > 100 {
+			return nil, errors.New("initial_permissions must be an array with at most 100 permissions")
+		}
+		validated := make([]any, 0, len(permissions))
+		for _, value := range permissions {
+			permission, ok := value.(map[string]any)
+			if !ok {
+				return nil, errors.New("each initial permission must be an object")
+			}
+			raw := map[string]any{"file_id": "new-folder"}
+			for k, v := range permission {
+				if k != "permission_type" && k != "email_address" && k != "domain" && k != "role" && k != "send_notification_email" {
+					return nil, fmt.Errorf("unknown initial permission field %q", k)
+				}
+				raw[k] = v
+			}
+			item, err := drivePayload(MutationInput{Type: "google_drive.add_permission", Raw: raw})
+			if err != nil {
+				return nil, fmt.Errorf("initial_permissions: %w", err)
+			}
+			delete(item, "file_id")
+			validated = append(validated, item)
+		}
+		p["initial_permissions"] = validated
+	}
 	return p, nil
+}
+
+// Plain HTTP is permitted only over the fleet's Tailscale address space.
+// Credentials, paths and query strings in endpoint URLs are never accepted.
+func validMutationStagingEndpoint(u *url.URL) bool {
+	if u == nil || u.Host == "" || u.User != nil || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	if u.Scheme != "http" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return netip.MustParsePrefix("100.64.0.0/10").Contains(addr)
+	}
+	return strings.HasSuffix(host, ".ts.net") && len(strings.Split(host, ".")) >= 4
 }
 
 // stageDriveUploads runs after the duplicate-request check. Only the private
@@ -169,10 +244,10 @@ func stageDriveUploads(ctx context.Context, mutations []storedMutation) error {
 		}
 		endpoint, err := url.Parse(os.Getenv("PDW_MUTATION_S3_ENDPOINT_URL"))
 		bucket := os.Getenv("PDW_MUTATION_S3_BUCKET")
-		if err != nil || endpoint.Host == "" || endpoint.Scheme != "https" || bucket == "" || os.Getenv("PDW_MUTATION_S3_ACCESS_KEY") == "" || os.Getenv("PDW_MUTATION_S3_SECRET_KEY") == "" {
-			return errors.New("uploads require PDW_MUTATION_S3_ENDPOINT_URL (https), BUCKET, ACCESS_KEY and SECRET_KEY")
+		if err != nil || !validMutationStagingEndpoint(endpoint) || bucket == "" || os.Getenv("PDW_MUTATION_S3_ACCESS_KEY") == "" || os.Getenv("PDW_MUTATION_S3_SECRET_KEY") == "" || os.Getenv("PDW_MUTATION_S3_REGION") == "" {
+			return errors.New("uploads require PDW_MUTATION_S3_ENDPOINT_URL (HTTPS or tailnet HTTP), BUCKET, ACCESS_KEY, SECRET_KEY and REGION")
 		}
-		client, err := minio.New(endpoint.Host, &minio.Options{Creds: credentials.NewStaticV4(os.Getenv("PDW_MUTATION_S3_ACCESS_KEY"), os.Getenv("PDW_MUTATION_S3_SECRET_KEY"), ""), Secure: true, Region: os.Getenv("PDW_MUTATION_S3_REGION"), BucketLookup: minio.BucketLookupPath})
+		client, err := minio.New(endpoint.Host, &minio.Options{Creds: credentials.NewStaticV4(os.Getenv("PDW_MUTATION_S3_ACCESS_KEY"), os.Getenv("PDW_MUTATION_S3_SECRET_KEY"), ""), Secure: endpoint.Scheme == "https", Region: os.Getenv("PDW_MUTATION_S3_REGION"), BucketLookup: minio.BucketLookupPath})
 		if err != nil {
 			return errors.New("could not configure mutation staging")
 		}
@@ -265,6 +340,9 @@ func driveMutationHelp() []MutationHelpType {
 		case "google_drive.upload_file", "google_drive.create_folder":
 			add("name", "string", "File or folder name, max 255 UTF-8 bytes", true, "Report")
 			add("parent_id", "string", "Destination folder id from base_google_drive.files (must already exist)", true, "folder-1")
+			if op == "google_drive.create_folder" {
+				add("initial_permissions", "array<object>", "Optional sharing applied to the new folder in this same approval (max 100). Each object takes permission_type, email_address or domain when applicable, role, and explicit send_notification_email; same rules as add_permission.", false, []any{map[string]any{"permission_type": "user", "email_address": "person@example.com", "role": "reader", "send_notification_email": false}})
+			}
 			if op == "google_drive.upload_file" {
 				add("mime_type", "string", "Binary MIME type; no native Google conversion", true, "text/plain")
 				add("data_base64", "string", "Standard base64, at most 20 MiB decoded; use stdin JSON for large payloads", true, "aGVsbG8=")
