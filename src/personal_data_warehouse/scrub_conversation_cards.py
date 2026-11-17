@@ -23,7 +23,7 @@ from psycopg2.extras import Json, execute_batch
 import psycopg2
 
 from personal_data_warehouse.card_scrub_selector import ScrubSelector, resolve_selector, add_selector_arguments
-from personal_data_warehouse.card_redaction import card_count, is_card, redact_row
+from personal_data_warehouse.card_redaction import sensitive_count as card_count, is_card, redact_row
 from personal_data_warehouse.postgres import PostgresWarehouse, POSTGRES_TABLES, _AI_CONVERSATION_EVENT_TABLES
 from personal_data_warehouse.card_prefilter import ConfirmationPool, available_cpus, count_row, sql_prefilter
 

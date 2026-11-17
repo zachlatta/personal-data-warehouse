@@ -106,10 +106,12 @@ class ScrubSelector:
         return [(bounds[a],bounds[b],r) for a,b,r in merged]
 
     def count(self, value):
-        if self.scope=='all': return cr.card_count(value)
+        if self.scope=='all': return cr.sensitive_count(value)
         return sum('[card ' in r for _,_,r in self._edits(value))
 
     def count_row(self, row):
+        if self.scope == 'all':
+            return sum(cr.sensitive_count(v if isinstance(v,str) else json.dumps(v)) for v in row.values() if isinstance(v,(str,dict,list)))
         return sum(self.count(v if isinstance(v,str) else json.dumps(v)) for v in row.values() if isinstance(v,(str,dict,list)))
 
     def redact(self, value):

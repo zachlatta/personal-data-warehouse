@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from personal_data_warehouse.card_redaction import card_count, redact
+from personal_data_warehouse.card_redaction import sensitive_count as card_count, redact
 from personal_data_warehouse.card_scrub_selector import add_selector_arguments, selector_from_args
 
 

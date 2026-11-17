@@ -258,7 +258,8 @@ func validCard(s string) bool {
 }
 
 func redactCardText(s string, context bool) string {
-	return applyCardEdits(s, cardRedactionEdits(s, context))
+	s = applyCardEdits(s, cardRedactionEdits(s, context))
+	return applyCardEdits(s, accessTokenEdits(s))
 }
 
 func redactConversationBatch(body []byte, maxBytes int64) ([]byte, error) {
@@ -280,10 +281,14 @@ func redactConversationBatch(body []byte, maxBytes int64) ([]byte, error) {
 		if !json.Valid(line) {
 			return nil, fmt.Errorf("invalid conversation JSON")
 		}
-		if cardCount(string(line)) == 0 {
+		if cardCount(string(line)) == 0 && !bytes.Contains(line, []byte("pdw_")) && !bytes.Contains(line, []byte(`\u`)) {
 			continue
 		}
-		cleaned := applyCardEdits(string(line), cardJSONEdits(string(line)))
+		cleaned := string(line)
+		if cardCount(cleaned) > 0 {
+			cleaned = applyCardEdits(cleaned, cardJSONEdits(cleaned))
+		}
+		cleaned = applyCardEdits(cleaned, accessTokenEdits(cleaned))
 		if cleaned == string(line) {
 			continue
 		}

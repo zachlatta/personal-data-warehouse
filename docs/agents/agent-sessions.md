@@ -520,6 +520,13 @@ recipe checked by `tests/test_card_fixture_provenance.py`. Use published sandbox
 numbers or generate additional examples at test time; never copy live credentials.
 
 Explicit maintenance modules (dry-run unless `--apply` is passed):
+The same storage boundaries mask PDW access-token secrets as
+`pdw_<public-id>_[REDACTED]`, preserving the public id. This applies to nested
+JSON strings as well as ordinary transcript text. The default `--scope all`
+maintenance path below detects and rebuilds token-bearing rows and archived
+objects too; `--scope labelled` remains a card-only selector. Revocation is a
+separate decision. Rebuilds do not erase historical backups or WAL.
+
 `personal_data_warehouse.scrub_conversation_cards` reports source/month counts
 and cleans source rows, timeline text and search chunks/embeddings;
 `personal_data_warehouse.scrub_conversation_objects` replaces inbox/library

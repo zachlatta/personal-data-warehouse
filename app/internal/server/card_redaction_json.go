@@ -12,6 +12,7 @@ import (
 // Validation and token edits preserve untouched bytes, including duplicate keys,
 // numeric lexemes, whitespace and escapes. No parsed object is reserialized.
 var cardJSONToken = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|[{}\[\]:,]|true|false|null`)
+var pdwAccessToken = regexp.MustCompile(`(pdw_[a-z0-9]{12,24}_)[A-Za-z0-9_-]{30,}`)
 
 type cardEdit struct {
 	start, end  int
@@ -258,6 +259,29 @@ func cardJSONEdits(s string) []cardEdit {
 				edits = append(edits, cardEdit{token[0], token[1], string(encoded)})
 			}
 		}
+	}
+	return edits
+}
+
+func accessTokenEdits(s string) []cardEdit {
+	edits := []cardEdit{}
+	if tokens, valid := cardJSONTokens(s); valid {
+		for _, token := range tokens {
+			raw := s[token[0]:token[1]]
+			if !strings.HasPrefix(raw, `"`) {
+				continue
+			}
+			var decoded string
+			_ = json.Unmarshal([]byte(raw), &decoded)
+			bounds := cardJSONStringBounds(raw)
+			for _, e := range accessTokenEdits(decoded) {
+				edits = append(edits, cardEdit{token[0] + bounds[e.start], token[0] + bounds[e.end], e.replacement})
+			}
+		}
+		return edits
+	}
+	for _, m := range pdwAccessToken.FindAllStringSubmatchIndex(s, -1) {
+		edits = append(edits, cardEdit{m[3], m[1], `[REDACTED]`})
 	}
 	return edits
 }

@@ -76,6 +76,7 @@ _CODE_KEY = re.compile(r'(?i)^' + _LABEL + '$')
 _CODE_SCALAR = re.compile(r'[0-9]{3,4}(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
 _ESCAPE = re.compile(r'\\+u(003[0-9]|0020|002[dD])')
 _DIGITS = re.compile(r'[0-9]+')
+PDW_TOKEN = re.compile(r'(pdw_[a-z0-9]{12,24}_)[A-Za-z0-9_-]{30,}')
 _SEPARATOR = re.compile(r'[ -]{1,3}')
 _ADJACENT_CODE = re.compile(r'(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})(?![0-9])')
 _JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|[{}\[\]:,]|true|false|null')
@@ -157,6 +158,7 @@ def _apply_edits(value, edits):
 
 
 def _text_edits(value):
+    token_edits = [(m.start(0) + len(m[1]), m.end(), '[REDACTED]') for m in PDW_TOKEN.finditer(value)]
     # Keep offsets through escaped-digit decoding: unmasked escapes must survive.
     chars = []; bounds = [0]; pos = 0
     while pos < len(value):
@@ -188,7 +190,10 @@ def _text_edits(value):
             merged[-1] = (previous_start, max(end, previous_end), previous_replacement)
         else:
             merged.append((start, end, replacement))
-    return [(bounds[a], bounds[b], replacement) for a, b, replacement in merged]
+    edits = [(bounds[a], bounds[b], replacement) for a, b, replacement in merged]
+    # A token owns its entire secret, even when it contains card-like digits.
+    edits = [e for e in edits if not any(e[0] < b and e[1] > a for a,b,_ in token_edits)]
+    return sorted(edits + token_edits)
 
 
 def _json_string_bounds(token):
@@ -237,7 +242,7 @@ def _json_tokens(value):
 
 
 def _redaction_edits(value, context):
-    if not context and not card_count(value):
+    if not context and not sensitive_count(value):
         return []
     tokens = _json_tokens(value)
     if tokens is not None:
@@ -297,6 +302,14 @@ def redact(value: str, *, card_context: bool = False) -> str:
     A code is masked only when this value (or its containing row) holds a card.
     """
     return _apply_edits(value, _redaction_edits(value, card_context))
+
+
+def sensitive_count(value: str) -> int:
+    tokens = _json_tokens(value)
+    if tokens is not None:
+        return sum(sensitive_count(json.loads(raw)) if raw.startswith('"') else sensitive_count(raw)
+                   for token in tokens if (raw := token[0])[0] in '"-0123456789')
+    return card_count(value) + len(PDW_TOKEN.findall(value))
 
 
 def redact_row(row: dict[str, Any]) -> dict[str, Any]:

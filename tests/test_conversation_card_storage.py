@@ -30,6 +30,39 @@ def event():
     return claude_code_event_row({'type': 'user', 'uuid': 'test-event', 'message': {'role': 'user', 'content': '4111111111111111 CVV: 987'}}, session_id='test-session', account='test', device='test', seq=1, ingested_at=datetime.now(UTC))
 
 
+def test_access_token_storage_and_legacy_rebuild(warehouse):
+    token = 'pdw_' + 'a' * 16 + '_' + 'B' * 40
+    masked = 'pdw_' + 'a' * 16 + '_[REDACTED]'
+    row = dict(event(), text=token, raw_json=json.dumps({'text': token}),
+               tool_input_json=json.dumps({'token': token}), tool_result_json=token)
+    warehouse.insert_agent_session_events([row])
+    stored = warehouse._query_dicts('SELECT * FROM @claude_code_events')[0]
+    assert stored['text'] == masked
+    assert token not in json.dumps(stored, default=str)
+    legacy = dict(row, event_uuid='legacy-token', seq=2)
+    warehouse._insert_rows('claude_code_events', [legacy], AGENT_SESSION_EVENT_COLUMNS)
+    assert scrub(warehouse)
+    scrub(warehouse, apply=True)
+    assert scrub(warehouse) == []
+    for relation, column in [('ai_conversation_events', 'raw_json'), ('timeline_events', 'search_text')]:
+        rows = warehouse._query_dicts(f'SELECT {column} FROM @{relation}')
+        assert rows and any(masked in r[column] for r in rows)
+        assert all(token not in r[column] for r in rows)
+
+
+def test_access_token_jsonl_and_object_repair(tmp_path):
+    from personal_data_warehouse.scrub_conversation_objects import _line_matches
+    from personal_data_warehouse.card_prefilter import ConfirmationPool
+    token = 'pdw_' + 'a' * 16 + '_' + 'B' * 40
+    line = json.dumps({'text': token}) + '\n'
+    path = tmp_path / 'session.jsonl'
+    path.write_text(line)
+    scrub_jsonl(tmp_path, 'session', apply=True)
+    assert token not in path.read_text()
+    with ConfirmationPool(1) as pool:
+        assert _line_matches(line, pool)[1]
+
+
 def test_every_source_writer_masks_all_content(warehouse):
     for source in _AI_EVENT_TABLE_BY_SOURCE:
         row = event()

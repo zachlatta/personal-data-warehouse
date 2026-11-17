@@ -6,7 +6,7 @@ import os
 import re
 import threading
 
-from personal_data_warehouse.card_redaction import CARD_POLICY, card_count, redact_row
+from personal_data_warehouse.card_redaction import CARD_POLICY, sensitive_count, redact_row
 
 UNICODE_UNIT = r'u[0-9a-fA-F]{4}'
 UNIT_DIGITS = '0000'
@@ -31,12 +31,12 @@ def sql_prefilter(expression):
     False positives are always confirmed in Python.
     The expression is supplied by code, never by CLI input.
     """
-    return (f"regexp_replace(translate(COALESCE(({expression})::text, ''), chr(92), ''), "
-            f"'{UNICODE_UNIT}', '{UNIT_DIGITS}', 'g') ~ '{DIGIT_WINDOW}'")
+    return (f"(regexp_replace(translate(COALESCE(({expression})::text, ''), chr(92), ''), "
+            f"'{UNICODE_UNIT}', '{UNIT_DIGITS}', 'g') ~ '({DIGIT_WINDOW}|pdw_|{UNIT_DIGITS})')")
 
 
 def might_contain_card(value):
-    return bool(_WINDOW.search(_UNIT.sub(UNIT_DIGITS,value.replace('\\',''))))
+    return 'pdw_' in value or 'u00' in value or bool(_WINDOW.search(_UNIT.sub(UNIT_DIGITS,value.replace('\\',''))))
 
 
 def available_cpus():
@@ -44,7 +44,7 @@ def available_cpus():
 
 
 def count_row(row):
-    return sum(card_count(v if isinstance(v,str) else json.dumps(v))
+    return sum(sensitive_count(v if isinstance(v,str) else json.dumps(v))
                for v in row.values() if isinstance(v,(str,dict,list)))
 
 

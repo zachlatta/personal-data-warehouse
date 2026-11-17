@@ -393,3 +393,27 @@ func TestAdjacentCodeChainFollowedByIssuerValidCard(t *testing.T) {
 		}
 	}
 }
+
+func TestPDWTokenRedaction(t *testing.T) {
+	token := `pdw_` + strings.Repeat(`a`, 16) + `_` + strings.Repeat(`B`, 40)
+	want := `pdw_` + strings.Repeat(`a`, 16) + `_[REDACTED]`
+	for _, value := range []string{token, `{"text":"` + token + `"}`} {
+		got := redactCardText(value, false)
+		if strings.Contains(got, token) || !strings.Contains(got, want) {
+			t.Fatal(got)
+		}
+	}
+	batch, err := redactConversationBatch(conversationTestBatch(`{"text":"`+token+`"}`), 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := gzip.NewReader(bytes.NewReader(batch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	raw, err := io.ReadAll(r)
+	if err != nil || bytes.Contains(raw, []byte(token)) || !bytes.Contains(raw, []byte(want)) {
+		t.Fatal("batch token was not redacted")
+	}
+}
