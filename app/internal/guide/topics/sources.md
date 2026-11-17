@@ -50,6 +50,9 @@ and state the window and freshness.
 - `base_google_drive.files` with extracted text in `derived_documents.google_drive_file_texts`;
   search scope `drive`. A file id found in a URL or an email searches with `exact`. To upload,
   create a folder or change sharing, see `google_drive.*` in the mutations topic.
+  Folder rows include My Drive and configured shared-drive roots, refresh every sync,
+  and have `exclude_reason='folder_metadata'` (background, no extracted text).
+  Filter out `mime_type='application/vnd.google-apps.folder'` to count content files.
 - `base_apple_notes.notes`, `.revisions`, `.attachments` (call recordings and voicemails are
   audio attachments and are transcribed through the voice pipeline).
 - `marts_photos.photos` — one row per deduplicated logical photo with its AI caption;

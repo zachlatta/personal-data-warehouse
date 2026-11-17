@@ -7,6 +7,49 @@ import (
 	"time"
 )
 
+// Called only after the real source runner populated root, empty, shared-root
+// and just-created folder rows from a fake Drive API (no INSERT fixtures).
+func TestDriveSyncedFoldersAcceptMutations(t *testing.T) {
+	url := os.Getenv("PDW_DRIVE_TEST_URL")
+	if url == "" {
+		t.Skip("run through Python sync e2e")
+	}
+	store, err := NewPostgresStore(url, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.stageUploads = func(_ context.Context, ms []storedMutation) error {
+		for i := range ms {
+			delete(ms[i].Payload, "data_base64")
+			ms[i].Payload["staging_key"] = "pending/test"
+		}
+		return nil
+	}
+	svc := NewService(store, Config{GoogleDriveAccounts: []string{"drive@example.test"}})
+	for _, id := range []string{"parent", "empty-folder", "shared-root", "new-folder"} {
+		for _, op := range []string{GoogleDriveUploadFileOperation, GoogleDriveCreateFolderOperation, GoogleDriveAddPermissionOperation} {
+			entry := map[string]any{"type": op, "account": "drive@example.test"}
+			if op == GoogleDriveAddPermissionOperation {
+				entry["file_id"] = id
+				entry["permission_type"] = "anyone"
+				entry["role"] = "reader"
+				entry["send_notification_email"] = false
+			} else {
+				entry["name"] = "New item"
+				entry["parent_id"] = id
+			}
+			if op == GoogleDriveUploadFileOperation {
+				entry["mime_type"] = "text/plain"
+				entry["data_base64"] = "aGVsbG8="
+			}
+			if _, err := svc.ProposeMutation(context.Background(), ProposeMutationInput{Title: op + " " + id, Reason: "real sync regression", Mutations: []map[string]any{entry}}); err != nil {
+				t.Fatalf("%s %s: %v", op, id, err)
+			}
+		}
+	}
+}
+
 func TestDriveProposalReviewApproval(t *testing.T) {
 	url := os.Getenv("PDW_DRIVE_TEST_URL")
 	if url == "" {

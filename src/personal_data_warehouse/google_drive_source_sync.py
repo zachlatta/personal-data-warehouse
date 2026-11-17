@@ -1,4 +1,4 @@
-"""Ingest Google Drive files (metadata + extracted text) into the warehouse.
+"""Ingest Google Drive files and folder metadata into the warehouse.
 
 This is Google Drive *as a data source*, distinct from Drive-as-transport used
 by the object-storage backends. Files are mirrored into ``google_drive_files``
@@ -218,6 +218,9 @@ class FolderTree:
         self._folders = folders
         self._chain_cache: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {}
 
+    def folder_nodes(self) -> Iterable[Mapping[str, Any]]:
+        return self._folders.values()
+
     def _chain(self, folder_id: str) -> tuple[tuple[str, ...], frozenset[str]]:
         cached = self._chain_cache.get(folder_id)
         if cached is not None:
@@ -365,15 +368,47 @@ class GoogleDriveSourceSyncRunner:
                 folders[folder_id] = folder
         return FolderTree(folders)
 
+    def _store_folders(self, account: str, tree: FolderTree, synced_at: datetime) -> int:
+        """Backfill folder entities on every run, even with an existing change cursor.
+
+        They are metadata, not content to extract: the existing excluded branch
+        in the Drive timeline adapter makes their events background without a
+        signature change or a replay of every ordinary file.
+        """
+        rows: list[dict[str, Any]] = []
+        written = 0
+        for folder in tree.folder_nodes():
+            folder = {"mimeType": FOLDER_MIME, **folder}
+            path, _, _ = tree.resolve(folder, exclude_ids=frozenset(), exclude_globs=())
+            rows.append(
+                self._file_row(
+                    account=account,
+                    file=folder,
+                    folder_path=path,
+                    is_excluded=True,
+                    reason="folder_metadata",
+                    content_sha256="",
+                    synced_at=synced_at,
+                )
+            )
+            if len(rows) >= MAX_BUFFERED_FILE_ROWS:
+                self._warehouse.insert_google_drive_files(rows)
+                written += len(rows)
+                rows.clear()
+        if rows:
+            self._warehouse.insert_google_drive_files(rows)
+            written += len(rows)
+        return written
+
     def _full_crawl(self, account: str, client: DriveClient) -> AccountSyncSummary:
         synced_at = self._now()
         start_token = client.get_start_page_token()
         tree = self._build_tree(client)
+        files_written = self._store_folders(account, tree, synced_at)
         known_text_state = self._warehouse.load_google_drive_text_state(account)
         file_rows: list[dict[str, Any]] = []
         text_rows: list[dict[str, Any]] = []
         seen = 0
-        files_written = 0
         texts_written = 0
         for file in client.iter_files():
             seen += 1
@@ -405,6 +440,7 @@ class GoogleDriveSourceSyncRunner:
             max_changes=self._config.files_per_run,
         )
         tree = self._build_tree(client)
+        files_written = self._store_folders(account, tree, synced_at)
         known_text_state = self._warehouse.load_google_drive_text_state(account)
         docx_backfill_files = self._warehouse.load_google_drive_docx_backfill_files(
             account,
@@ -414,7 +450,6 @@ class GoogleDriveSourceSyncRunner:
         text_rows: list[dict[str, Any]] = []
         trashed_ids: list[str] = []
         seen = 0
-        files_written = 0
         texts_written = 0
         changed_file_ids = {
             str(change.get("fileId", "") or (change.get("file") or {}).get("id", ""))
@@ -445,8 +480,6 @@ class GoogleDriveSourceSyncRunner:
             if change.get("removed") or (file or {}).get("trashed") or file is None:
                 if file_id:
                     trashed_ids.append(file_id)
-                continue
-            if file.get("mimeType") == FOLDER_MIME:
                 continue
             self._process_file(account, client, file, tree, known_text_state, synced_at, file_rows, text_rows)
             if self._should_flush(file_rows, text_rows):
@@ -489,6 +522,8 @@ class GoogleDriveSourceSyncRunner:
             exclude_ids=frozenset(self._config.exclude_folder_ids),
             exclude_globs=self._config.exclude_path_globs,
         )
+        if file.get("mimeType") == FOLDER_MIME:
+            is_excluded, reason = True, "folder_metadata"
         file_id = str(file.get("id", ""))
         modified_time = _parse_dt(file.get("modifiedTime"))
         content_sha256 = ""
@@ -720,21 +755,25 @@ class GoogleApiDriveClient:
         return str(resp.get("startPageToken", ""))
 
     def iter_folders(self) -> Iterator[Mapping[str, Any]]:
-        try:
-            root = self._service.files().get(
-                fileId="root",
-                fields="id,name,parents,driveId",
-                supportsAllDrives=True,
-            ).execute()
-        except Exception as exc:  # noqa: BLE001 - root naming is metadata quality, not sync-critical
-            logger.warning("Google Drive root folder lookup failed: %s", exc)
-        else:
-            root_id = str(root.get("id", ""))
-            if root_id:
-                yield {"id": root_id, "name": "My Drive", "parents": [], "driveId": root.get("driveId", "")}
+        # Roots do not appear in files.list. Their real provider ids must be
+        # queryable, including an empty My Drive and configured shared drives.
+        yield self._service.files().get(fileId="root", fields=FILE_FIELDS, supportsAllDrives=True).execute()
+        if self._config.include_shared_drives:
+            page_token = ""
+            while True:
+                response = self._service.drives().list(
+                    pageSize=100,
+                    pageToken=page_token or None,
+                    fields="nextPageToken,drives(id)",
+                ).execute()
+                for drive in response.get("drives", []):
+                    yield self._service.files().get(fileId=drive["id"], fields=FILE_FIELDS, supportsAllDrives=True).execute()
+                page_token = response.get("nextPageToken", "")
+                if not page_token:
+                    break
         yield from self._list(
             f"mimeType = '{FOLDER_MIME}' and trashed = false",
-            "nextPageToken,files(id,name,parents,driveId)",
+            f"nextPageToken,files({FILE_FIELDS})",
         )
 
     def _file_query(self) -> str:

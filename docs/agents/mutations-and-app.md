@@ -352,7 +352,14 @@ credential-repair retry resumes using those receipts, never creates another fold
 The observer requires both the folder and every initial permission to match upstream.
 The app accepts only `GOOGLE_DRIVE_SOURCE_ACCOUNTS`. File/destination names are resolved
 from that account's synced `base_google_drive.files`; missing ids and non-folder parents
-are refused. Review shows names, ids, upload MIME/size/hash, recipients, roles and notification
+are refused. The source persists the entire folder snapshot on every run, including
+My Drive and configured shared-drive roots, so existing deployments acquire destinations
+on the next incremental sync without resetting the Changes cursor. A newly created folder
+becomes referenceable after that sync, even if its change is behind the feed's batch cap.
+Folders use `is_excluded=1`, `exclude_reason='folder_metadata'`: the existing timeline
+adapter emits background events and extraction/enrichment never downloads folder bytes.
+The adapter SQL/signature is unchanged; there is no file-history re-walk.
+Review shows names, ids, upload MIME/size/hash, recipients, roles and notification
 choice through the existing generic review card on both clients. No bytes enter the queue.
 
 Uploads take standard base64 (20 MiB decoded maximum) and stage privately under
