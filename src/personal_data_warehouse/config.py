@@ -5,8 +5,11 @@ import base64
 import os
 import re
 import socket
+import ipaddress
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
+from personal_data_warehouse.objectstore.spec import S3Connection
 
 from personal_data_warehouse.agent_runner import (
     DEFAULT_AGENT_REASONING_EFFORT,
@@ -733,6 +736,7 @@ class Settings:
     whoop_private: WhoopPrivateConfig | None = None
     hacker_news: HackerNewsConfig | None = None
     resideo: "ResideoConfig | None" = None
+    mutation_staging: S3Connection | None = None
     comma: "CommaConfig | None" = None
     github: GitHubConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
@@ -835,6 +839,39 @@ def _default_upload_backend(legacy_default: str = "google_drive", *, google_driv
     return legacy_default
 
 
+def _load_mutation_staging() -> S3Connection | None:
+    names = ("ENDPOINT_URL", "BUCKET", "ACCESS_KEY", "SECRET_KEY", "REGION")
+    values = {name: (os.getenv("PDW_MUTATION_S3_" + name) or "").strip() for name in names}
+    if not any(values.values()):
+        return None
+    if not all(values.values()):
+        raise ValueError("PDW_MUTATION_S3 requires ENDPOINT_URL, BUCKET, ACCESS_KEY, SECRET_KEY and REGION together")
+    endpoint = urlsplit(values["ENDPOINT_URL"])
+    host = endpoint.hostname or ""
+    try:
+        tailnet = ipaddress.ip_address(host) in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        tailnet = host.endswith(".ts.net") and len(host.split(".")) >= 4
+    if (
+        not host
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or endpoint.path not in ("", "/")
+        or endpoint.query
+        or endpoint.fragment
+        or not (endpoint.scheme == "https" or endpoint.scheme == "http" and tailnet)
+    ):
+        raise ValueError("PDW_MUTATION_S3_ENDPOINT_URL must use HTTPS or tailnet HTTP without credentials, paths or queries")
+    return S3Connection(
+        bucket=values["BUCKET"],
+        region=values["REGION"],
+        endpoint_url=values["ENDPOINT_URL"],
+        access_key=values["ACCESS_KEY"],
+        secret_key=values["SECRET_KEY"],
+        addressing_style="path",
+    )
+
+
 def load_settings(
     *,
     require_postgres: bool = True,
@@ -874,6 +911,8 @@ def load_settings(
     require_agent: bool = False,
 ) -> Settings:
     load_dotenv()
+
+    mutation_staging = _load_mutation_staging()
 
     postgres_database_url = normalize_postgres_url(os.getenv("POSTGRES_DATABASE_URL"))
     if require_postgres and not postgres_database_url:
@@ -2408,6 +2447,7 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
 
     return Settings(
+        mutation_staging=mutation_staging,
         gmail_accounts=gmail_accounts,
         gmail_oauth_client_secrets_json=client_secrets_json,
         google_scopes=tuple(dict.fromkeys(google_scopes)),

@@ -21,6 +21,7 @@ dependencies = [
     # curl_cffi impersonates a browser for the server-side claude.ai / chatgpt.com
     # / WHOOP pollers, which sit behind Cloudflare managed challenges.
     "curl-cffi>=0.13",
+    "boto3>=1.44.4",
 ]
 
 [project.scripts]

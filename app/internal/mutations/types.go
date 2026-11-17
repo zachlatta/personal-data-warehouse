@@ -58,6 +58,7 @@ type Config struct {
 	GmailAccounts         []string
 	ContactGoogleAccounts []string
 	CalendarAccounts      []string
+	GoogleDriveAccounts   []string
 	AppleNotesAccounts    []string
 	AppleContactsAccounts []string
 	AppleMessagesAccounts []string
