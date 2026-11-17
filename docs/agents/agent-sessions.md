@@ -528,32 +528,95 @@ and decoded JSON traversal. It accepts no card seeds. The default `--scope all`
 also detects tokens; `--scope labelled` remains a card-only selector. Revocation is a
 separate decision. Rebuilds do not erase historical backups or WAL.
 
-For a token-only landing, run these commands from the configured maintenance
-runtime with its existing environment (never put credentials on the command
-line). Use new private plan paths. Discovery and verification are read-only
-toward the warehouse and archive; discovery writes only the local ID-only plans.
-Finish the archive plan first, then take the fresh DB snapshot:
+For a token-only landing, use the checked-in host controller below from the
+landed checkout on mew-dev. It runs a maintenance container on mew-coolify with
+the production Dagster image **by immutable image ID**, the same Docker network,
+read-only original mounts and a private environment file. It bypasses the image
+entrypoint, so no bootstrap, daemon or resident worker starts in that container.
+No credentials go in command arguments or stdout. Choose a fresh state directory;
+`plan` refuses an existing one. Do not deploy while these phases are in progress.
 
 ```sh
-uv run python -m personal_data_warehouse.scrub_conversation_objects --scope tokens --plan .factory-scratch/token-objects-plan.json
-uv run python -m personal_data_warehouse.scrub_conversation_cards --scope tokens --plan .factory-scratch/token-db-plan.json
+SCRUB_STATE=/var/lib/pdw-maintenance/token-cleanup-001
+SCRUB_CONTROLLER=src/personal_data_warehouse/scrub_conversation_window.py
+ssh mew-coolify "sudo -n python3 - plan --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
 ```
 
-Review source-row and total-plan counts against the fail-closed limits below.
-Pause conversation writers, timeline sync and search workers with the deployment
-runbook, preserving their original states. Apply the saved plans in that window:
+`plan` is read-only toward the warehouse/archive. It records container IDs,
+running states, image identity, every persisted Dagster schedule/sensor status
+and active/queued run ID, job and status. State and plans are mode 0600 in a
+0700 directory on mew-coolify; the environment file stays there too. An absent
+instigator row means its declared default, which is left unchanged. Archive
+discovery finishes before the fresh DB plan. Review the printed source-row and
+total-plan counts against the fail-closed limits below before apply.
+
+The controller stops the **whole** `personal-data-warehouse-dagster` container
+and `app` container, dynamically resolved by `coolify.resourceName`, rather than
+editing schedule statuses. Thus every schedule and sensor keeps its original
+running/stopped/default status, including ones already disabled. This covers:
+
+| writer job | schedule or sensor stopped with its container |
+| --- | --- |
+| `agent_sessions_drive_ingest_job` | `agent_sessions_drive_inbox_sensor` |
+| `claude_desktop_client_job` | `claude_desktop_client_keepalive_sensor` |
+| `chatgpt_backend_ingest_job` | `chatgpt_backend_ingest_sensor` |
+| `timeline_sync_job` | `timeline_sync_every_five_minutes` |
+| `search_chunks_job` | `search_chunks_every_five_minutes` |
+| `search_chunk_embeddings_job` | `search_chunk_embeddings_every_ten_minutes` |
+| `gmail_mailbox_sync_job` (timeline fast lane) | `gmail_mailbox_sync_keepalive_sensor` |
+| `slack_workspace_sync_job` (timeline fast lane) | `slack_workspace_sync_every_five_minutes` |
+| `apple_messages_drive_ingest_job` | `apple_messages_drive_inbox_sensor` |
+| `whatsapp_drive_ingest_job` | `whatsapp_drive_inbox_sensor` |
+| `scans_drive_ingest_job` | `scans_drive_inbox_sensor` |
+| `apple_voice_memos_drive_ingest_job` | `apple_voice_memos_drive_inbox_sensor` |
+| `apple_voice_memos_transcription_job` | `apple_voice_memos_transcription_backlog_sensor` |
+| `apple_voice_memos_enrichment_job` | `apple_voice_memos_enrichment_backlog_sensor` |
+| `google_recorder_drive_ingest_job` | `google_recorder_drive_inbox_sensor` |
+| `android_call_recordings_drive_ingest_job` | `android_call_recordings_drive_inbox_sensor` |
+| `upstream_mutation_worker_job` (screen-capture deletion) | `upstream_mutation_sensor`, and the resident executor |
+| `upstream_mutation_observer_job` | `upstream_mutation_observation_sensor` |
+
+All other jobs, schedules and sensors in that container stop too. Its
+`agent_sessions_landing_worker`, `voice_memo_landing_worker` and
+`upstream_mutation_worker` resident processes stop, as do local run subprocesses
+and gRPC/daemon/webserver processes (`docker/start-dagster.sh`). The stopped app
+cannot accept `/ingest/agent-sessions/batch` or other ingest/mutation writes;
+device uploaders retry with their original local copies. The GPU container on
+physical mew is an HTTP model server (`embeddings/docker-compose.yaml`), has no
+warehouse credentials and does not write chunks/embeddings; its **Dagster client**
+is stopped above, so leave the GPU server running. Independent Docker-launched
+Dagster runs cause preflight refusal; drain those before taking the plan.
+Do not run manual warehouse writers during maintenance. NOWAIT table locks
+remain the final guard against an unaccounted writer.
+
+Apply records a new `before-stop.json` before the first stop. It executes
+`docker stop --time 30 <dagster-id> <app-id>`, runs archive apply, then DB apply
+with `--session-batches --planned-only --writers-paused --max-canonical-rows 10000`.
+Each DB transaction retains the 60-second rollback deadline and row gates.
+Restoration is registered **before** stopping anything: even a partial stop or
+failed apply starts the originally running app, then Dagster, in `finally`.
+Schedule/sensor settings are never changed. Interrupted run IDs are recorded;
+they do not resume from the killed process instruction: Dagster's run monitor
+reconciles them and the restored sensors/schedules launch normal follow-up work.
 
 ```sh
-uv run python -m personal_data_warehouse.scrub_conversation_objects --scope tokens --apply --plan .factory-scratch/token-objects-plan.json
-uv run python -m personal_data_warehouse.scrub_conversation_cards --scope tokens --apply --plan .factory-scratch/token-db-plan.json
+ssh mew-coolify "sudo -n python3 - apply --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
 ```
 
-Restore the workers to their original states even if either apply fails. With
-workers restored, require both full scans to report zero matches and exit zero:
+For SIGKILL, host/SSH loss, or a failed restoration, run this recovery command
+before retrying anything. It first stops a surviving named maintenance container
+so its transaction rolls back, then starts only the originally running writers:
 
 ```sh
-uv run python -m personal_data_warehouse.scrub_conversation_objects --scope tokens --verify --plan .factory-scratch/token-objects-plan.json
-uv run python -m personal_data_warehouse.scrub_conversation_cards --scope tokens --verify --plan .factory-scratch/token-db-plan.json
+ssh mew-coolify "sudo -n python3 - restore --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
+```
+
+After restore, `verify` checks that both original containers run with unchanged
+image IDs and that every saved schedule/sensor status matches. It then runs
+both full read-only scans, requiring zero matches and exit zero:
+
+```sh
+ssh mew-coolify "sudo -n python3 - verify --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
 ```
 
 Token verification exits nonzero if a secret remains. Database repair uses the
@@ -562,10 +625,23 @@ chunk/embedding invalidation as the card repair. The token SQL prefilter uses
 literal `pdw_` or `u00` substring probes (Unicode escapes can encode ASCII token
 bytes), then confirms decoded tokens in Python. Full discovery keeps the existing
 disjoint heap-block scans under one snapshot and bounded primary-key fetches;
-resumable discovery keeps the existing source/month partitions.
+resumable discovery keeps the existing source/month partitions. Explicit
+`--planned-only` token repair replaces the in-window corpus-wide `age(xmin)`
+scan with indexed source/session confirmation and 500-key primary-key batches.
+New selected source keys **within a planned session** abort for rediscovery.
+Timeline reads use `(adapter,event_id)` and canonical chunks use their indexed
+`anchor`; late-built chunks for rebuilt events are removed too. Chunk/embedding
+deletes and saved-key confirmation are batched. Complete-session groups accept
+up to 10,000 canonical rows, so a session larger than the legacy 5,000-row cap
+can be repaired without splitting its canonical regeneration. Oversized groups
+still fail the CLI as incomplete. This explicit mode repairs the plan, **not
+unrelated sessions**: it makes no global in-window absence claim. The mandatory
+full post-restore scans and 30-day count below establish completion; remaining
+tokens require a new reviewed plan. Normal apply retains its full delta gate.
 For original host copies, repeat `scrub_conversation_jsonl --scope tokens --root
 <transcript-root> --session <affected-session>` with `--apply`, then without it
-and require zero matches. Before the final 30-day count, read
+and require zero matches. Token JSONL commands exit nonzero when a secret
+remains; apply rereads the files before returning success. Before the final 30-day count, read
 `pdw columns marts_ai_conversations.events`, then run:
 
 ```sh

@@ -62,7 +62,11 @@ def main():
     add_selector_arguments(parser)
     args = parser.parse_args()
     selector = selector_from_args(args)
-    print(json.dumps(scrub_jsonl(args.root, args.session, apply=args.apply,selector=selector)))
+    counts=scrub_jsonl(args.root,args.session,apply=args.apply,selector=selector)
+    print(json.dumps(counts))
+    if args.scope=='tokens':
+        remaining=scrub_jsonl(args.root,args.session,selector=selector)['matches'] if args.apply else counts['matches']
+        if remaining: raise SystemExit('token verification failed: secrets remain')
 
 
 if __name__ == '__main__':

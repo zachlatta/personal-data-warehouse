@@ -405,13 +405,15 @@ def _related_rows(warehouse, table, sessions, event_keys, *, connection=None,ids
 
 def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, selector=None,
           max_source_rows=500, max_delta_rows=10000, window_seconds=60, max_plan_rows=20000,
-          max_canonical_rows=None, _known_plan=None):
+          max_canonical_rows=None, _known_plan=None, planned_only=False):
     plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size,selector=selector)
     _validate_plan(plan)
     if plan.get("selector", ScrubSelector().specification) != (selector or ScrubSelector()).specification:
         raise ValueError("plan selector differs from current selector")
     if plan['scope'] != _scope(warehouse): raise ValueError('discovery plan belongs to another warehouse')
     if not apply: return plan['counts']
+    if planned_only and (not selector or selector.scope != 'tokens'):
+        raise ValueError('planned-only repair requires the token selector')
     if not 0<window_seconds<=60: raise ValueError('maintenance budget must be at most 60 seconds')
     if 'discovery' in plan: raise ValueError('partition discovery incomplete')
     source_rows=sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])
@@ -428,20 +430,66 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
                 raise ValueError('canonical row gate exceeded; no changes committed')
         planned={(c['table'],tuple(c['key'])) for c in (_known_plan or plan)['candidates']}
         with ConfirmationPool(workers,selector) as pool:
-            delta=_selected_delta(warehouse,plan,pool,page_size,max_delta_rows)
+            delta=(_session_candidates(warehouse,plan,pool) if planned_only else
+                   _selected_delta(warehouse,plan,pool,page_size,max_delta_rows))
             for item in delta:
                 if (item['table'],tuple(item['key'])) not in planned:
                     raise RuntimeError('new candidates require discovery; no changes committed')
-        _apply_plan(warehouse,plan,page_size,workers,selector)
+        if planned_only:
+            _apply_plan(warehouse,plan,page_size,workers,selector,planned_only=True)
+        else:
+            _apply_plan(warehouse,plan,page_size,workers,selector)
         # Canonical new keys are checked before upsert by rebuild_sessions.
         # Recheck saved keys without running whole-corpus detection in-window.
-        rows=[]
-        for item in plan['candidates']:
-            keys=POSTGRES_TABLES[item['table']].primary_key
-            rows.extend(warehouse._query_dicts(f'SELECT * FROM @{item["table"]} WHERE '+' AND '.join(f'{k}=%s' for k in keys),item['key']))
+        rows=[row for _,row in _planned_rows(warehouse,plan['candidates'])]
         with ConfirmationPool(workers,selector) as pool:
             if any(pool.counts(rows)): raise RuntimeError('planned row verification failed; no changes committed')
     return plan['counts']
+
+
+def _session_candidates(warehouse, plan, pool):
+    """Indexed source/session confirmation for explicit planned-only token repair.
+
+    This does not certify unrelated sessions. Full post-restore verification
+    remains mandatory. Unknown selected rows IN a planned session fail closed.
+    """
+    from personal_data_warehouse.postgres import _AI_EVENT_TABLE_BY_SOURCE
+    selected=[]
+    for source,session in sorted({tuple(c['session']) for c in plan['candidates'] if c['session']}):
+        table=_AI_EVENT_TABLE_BY_SOURCE[source]
+        rows=warehouse._query_dicts(f'SELECT * FROM @{table} WHERE source=%s AND session_id=%s', (source,session))
+        for row,n in zip(rows,pool.counts(rows),strict=True):
+            if n: selected.append(dict(table=table,key=[row[k] for k in POSTGRES_TABLES[table].primary_key]))
+    return selected
+
+
+def _planned_rows(warehouse, candidates, *, lock=False):
+    rows=[]
+    for table in sorted({c['table'] for c in candidates}):
+        keys=POSTGRES_TABLES[table].primary_key
+        identities=[c['key'] for c in candidates if c['table']==table]
+        for offset in range(0,len(identities),500):
+            batch=identities[offset:offset+500]
+            rows.extend((table,r) for r in warehouse._query_dicts(
+                f'SELECT * FROM @{table} WHERE ('+','.join(keys)+') IN ('+
+                ','.join('('+','.join('%s' for _ in keys)+')' for _ in batch)+')'+(' FOR UPDATE' if lock else ''),
+                tuple(v for identity in batch for v in identity)))
+    return rows
+
+
+def _indexed_related(warehouse, table, event_keys):
+    """Timeline PK and canonical chunk anchor probes, never computed identities."""
+    result=[]
+    ordered=sorted(event_keys)
+    for offset in range(0,len(ordered),500):
+        batch=ordered[offset:offset+500]
+        if table=='timeline_events':
+            result.extend(warehouse._query_dicts('SELECT * FROM @timeline_events WHERE (adapter,event_id) IN ('+
+                ','.join('(%s,%s)' for _ in batch)+')',tuple(v for key in batch for v in key)))
+        else:
+            result.extend(warehouse._query_dicts('SELECT * FROM @search_chunks WHERE anchor = ANY(%s)',
+                ([f'{a}|{e}' for a,e in batch],)))
+    return result
 
 
 def _canonical_counts(warehouse, sessions, limit):
@@ -454,7 +502,7 @@ def _canonical_counts(warehouse, sessions, limit):
 def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_partial=False,
                   max_canonical_rows=2500, window_seconds=45, gap_seconds=15,
                   max_source_rows=500, max_plan_rows=20000, max_delta_rows=1000,
-                  progress=None):
+                  progress=None, planned_only=False):
     """One owner; live planning, then an atomic transaction per session group.
 
     ``window(index)`` must pause writers on entry and restore them in finally,
@@ -463,7 +511,7 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     Partial discovery retains its original horizon and pending partitions;
     no partial run constitutes final verification. Selector stays in memory.
     """
-    if not 0<max_canonical_rows<=5000 or not 0<window_seconds<=60 or gap_seconds<0:
+    if not 0<max_canonical_rows<=(10000 if planned_only else 5000) or not 0<window_seconds<=60 or gap_seconds<0:
         raise ValueError('invalid batch budget')
     plan=read_plan(Path(path))
     if 'discovery' in plan and not allow_partial: raise ValueError('partition discovery incomplete')
@@ -477,11 +525,9 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     completed={tuple(s) for g in state['completed'] for s in g['sessions']}
     # Never silently trust a completion if an old key has become selected again.
     with ConfirmationPool(workers,selector) as pool:
-        for c in plan['candidates']:
-            if tuple(c['session']) not in completed: continue
-            keys=POSTGRES_TABLES[c['table']].primary_key
-            rows=warehouse._query_dicts(f'SELECT * FROM @{c["table"]} WHERE '+' AND '.join(f'{k}=%s' for k in keys),c['key'])
-            if any(pool.counts(rows)): raise RuntimeError('completed session changed; rediscovery required')
+        finished=[c for c in plan['candidates'] if tuple(c['session']) in completed]
+        if any(pool.counts([row for _,row in _planned_rows(warehouse,finished)])):
+            raise RuntimeError('completed session changed; rediscovery required')
     sessions={tuple(c['session']) for c in plan['candidates']}-completed
     counts=_canonical_counts(warehouse,sessions,max_canonical_rows)
     state['oversized']=[dict(sessions=[list(s)],canonical_rows=n,seconds=0) for s,n in counts.items() if n>max_canonical_rows]
@@ -497,7 +543,7 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     for index,(sessions,total) in enumerate(groups):
         time.sleep(gap_seconds)  # workers LIVE, including after a resumed run
         candidates=[c for c in plan['candidates'] if tuple(c['session']) in sessions]
-        candidates=_attach_related(warehouse,candidates,warehouse._connection)
+        if not planned_only: candidates=_attach_related(warehouse,candidates,warehouse._connection)
         if len(candidates)>min(20000,max_plan_rows):
             raise ValueError('group candidate gate exceeded; no maintenance started')
         subset={k:v for k,v in plan.items() if k not in ('discovery','batches')}
@@ -508,7 +554,7 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
             scrub(warehouse,apply=True,plan=subset,selector=selector,workers=workers,
                   max_source_rows=max_source_rows,max_plan_rows=max_plan_rows,
                   max_delta_rows=max_delta_rows,window_seconds=window_seconds,
-                  max_canonical_rows=max_canonical_rows,_known_plan=known)
+                  max_canonical_rows=max_canonical_rows,_known_plan=known,planned_only=planned_only)
         elapsed=time.monotonic()-started
         state['completed'].append(dict(sessions=[list(s) for s in sessions],canonical_rows=total,seconds=elapsed))
         _checkpoint(path,plan)
@@ -516,20 +562,19 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     return plan
 
 
-def _apply_plan(warehouse, plan, page_size, workers, selector=None):
+def _apply_plan(warehouse, plan, page_size, workers, selector=None, *, planned_only=False):
     sessions = {tuple(c['session']) for c in plan['candidates'] if c['session']}
-    current = {}
-    for item in plan['candidates']:
-        table = item['table']; keys = POSTGRES_TABLES[table].primary_key
-        rows = warehouse._query_dicts(f'SELECT * FROM @{table} WHERE '+ ' AND '.join(f'{k}=%s' for k in keys)+' FOR UPDATE',item['key'])
-        for row in rows: current[table,tuple(row[k] for k in keys)] = row
+    current = {(table,tuple(row[k] for k in POSTGRES_TABLES[table].primary_key)):row
+               for table,row in _planned_rows(warehouse,plan['candidates'],lock=True)}
     for (table,_),row in current.items():
         identity=session_identity(row) if table in DERIVED else (row['source'],row['session_id'])
         if identity:sessions.add(identity)
     event_keys = {(row['adapter'],row['event_id']) for (table,_),row in current.items() if table in DERIVED}
     for table in DERIVED:
         if not sessions and not event_keys: break
-        for row in _related_rows(warehouse,table,sessions,event_keys,delta=plan['watermarks']):
+        related=(_indexed_related(warehouse,table,event_keys) if planned_only else
+                 _related_rows(warehouse,table,sessions,event_keys,delta=plan['watermarks']))
+        for row in related:
             current[table,tuple(row[k] for k in POSTGRES_TABLES[table].primary_key)] = row
             event_keys.add((row['adapter'],row['event_id']))
     active = set()
@@ -578,9 +623,16 @@ def _apply_plan(warehouse, plan, page_size, workers, selector=None):
     for (adapter,event_id),_ in old_timeline:
         if (adapter,event_id) not in new_keys:
             warehouse._command('DELETE FROM @timeline_events WHERE adapter=%s AND event_id=%s',(adapter,event_id))
-    for chunk_id,sha,_,_ in chunks:
-        warehouse._command('DELETE FROM @search_chunk_embeddings WHERE text_sha256=%s',(sha,))
-        warehouse._command('DELETE FROM @search_chunks WHERE chunk_id=%s',(chunk_id,))
+    if planned_only:
+        # Include canonical chunks created since discovery, including events
+        # that were not yet present in the original timeline plan.
+        extra=_indexed_related(warehouse,'search_chunks',new_keys)
+        chunks.extend((r['chunk_id'],r['text_sha256'],(r['adapter'],r['event_id']),session_identity(r)) for r in extra)
+        chunks=list({r[0]:r for r in chunks}.values())
+    for offset in range(0,len(chunks),500):
+        batch=chunks[offset:offset+500]
+        warehouse._command('DELETE FROM @search_chunk_embeddings WHERE text_sha256 = ANY(%s)',([c[1] for c in batch],))
+        warehouse._command('DELETE FROM @search_chunks WHERE chunk_id = ANY(%s)',([c[0] for c in batch],))
 
 
 def rebuild_sessions(warehouse, sessions, page_size, selector=None):
@@ -716,11 +768,18 @@ def main():
     parser.add_argument('--max-delta-rows',type=int,default=10000)
     parser.add_argument('--max-plan-rows',type=int,default=20000)
     parser.add_argument('--window-seconds',type=int,default=60)
+    parser.add_argument('--session-batches',action='store_true',help='apply complete sessions in separate bounded transactions')
+    parser.add_argument('--planned-only',action='store_true',help='tokens only: indexed planned-session repair; unrelated sessions require full post-restore verify')
+    parser.add_argument('--writers-paused',action='store_true',help='acknowledge external writer shutdown and guaranteed restoration')
+    parser.add_argument('--max-canonical-rows',type=int,default=10000)
     parser.add_argument('--report-html', type=Path, help='counts-only table for the private email body')
     add_selector_arguments(parser)
     args = parser.parse_args()
     if args.workers < 1: parser.error('--workers must be positive')
     if args.apply and args.verify: parser.error('--apply and --verify are mutually exclusive')
+    if args.planned_only or args.session_batches:
+        if not (args.apply and args.planned_only and args.session_batches and args.writers_paused and args.scope=='tokens'):
+            parser.error('session batches require --apply --scope tokens --planned-only --writers-paused')
     if not args.verify and args.plan is None: parser.error('--plan is required for discovery and apply')
     warehouse = PostgresWarehouse(os.environ['POSTGRES_DATABASE_URL'],initialize=False)
     warehouse._connection.set_session(readonly=not args.apply,autocommit=True)
@@ -736,7 +795,15 @@ def main():
         elif args.apply:
             plan = read_plan(args.plan)
             before = plan['counts']
-            scrub(warehouse,apply=True,plan=plan,workers=args.workers,selector=selector,max_source_rows=args.max_source_rows,max_delta_rows=args.max_delta_rows,window_seconds=args.window_seconds,max_plan_rows=args.max_plan_rows)
+            if args.session_batches:
+                from contextlib import nullcontext
+                plan=apply_batches(warehouse,args.plan,window=lambda _:nullcontext(),selector=selector,
+                    workers=args.workers,planned_only=True,max_canonical_rows=args.max_canonical_rows,
+                    window_seconds=args.window_seconds,gap_seconds=0,max_source_rows=args.max_source_rows,
+                    max_plan_rows=args.max_plan_rows,max_delta_rows=args.max_delta_rows)
+                if plan['batches']['oversized']: raise RuntimeError('oversized sessions remain; repair incomplete')
+            else:
+                scrub(warehouse,apply=True,plan=plan,workers=args.workers,selector=selector,max_source_rows=args.max_source_rows,max_delta_rows=args.max_delta_rows,window_seconds=args.window_seconds,max_plan_rows=args.max_plan_rows)
             # Only planned/delta rows were checked in-window. A full read-only
             # post-resume scan must establish corpus-wide after counts.
             after = None
