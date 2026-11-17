@@ -148,21 +148,22 @@ func (c Config) ObjectStoreEnabled() bool {
 // ingestSourceEnvInfix maps each ingestion source slug to the infix used in its
 // per-source folder override env var (PDW_INGEST_<INFIX>_FOLDER_ID).
 var ingestSourceEnvInfix = map[string]string{
-	"agent_sessions":        "AGENT_SESSIONS",
-	"apple_contacts":        "APPLE_CONTACTS",
-	"apple_messages":        "APPLE_MESSAGES",
-	"apple_voice_memos":     "VOICE_MEMOS",
-	"apple_notes":           "APPLE_NOTES",
-	"google_recorder":       "GOOGLE_RECORDER",
-	"browser_history":       "BROWSER_HISTORY",
-	"android_notifications": "ANDROID_NOTIFICATIONS",
-	"android_messages":      "ANDROID_MESSAGES",
-	"android_screen_time":   "ANDROID_SCREEN_TIME",
-	"android_location":      "ANDROID_LOCATION",
-	"photos":                "PHOTOS",
-	"manual_finance":        "MANUAL_FINANCE",
-	"screen_timelapse":      "SCREEN_TIMELAPSE",
-	"scans":                 "SCANS",
+	"agent_sessions":          "AGENT_SESSIONS",
+	"apple_contacts":          "APPLE_CONTACTS",
+	"apple_messages":          "APPLE_MESSAGES",
+	"apple_voice_memos":       "VOICE_MEMOS",
+	"apple_notes":             "APPLE_NOTES",
+	"google_recorder":         "GOOGLE_RECORDER",
+	"android_call_recordings": "ANDROID_CALL_RECORDINGS",
+	"browser_history":         "BROWSER_HISTORY",
+	"android_notifications":   "ANDROID_NOTIFICATIONS",
+	"android_messages":        "ANDROID_MESSAGES",
+	"android_screen_time":     "ANDROID_SCREEN_TIME",
+	"android_location":        "ANDROID_LOCATION",
+	"photos":                  "PHOTOS",
+	"manual_finance":          "MANUAL_FINANCE",
+	"screen_timelapse":        "SCREEN_TIMELAPSE",
+	"scans":                   "SCANS",
 }
 
 // IngestEnabled reports whether the app can accept client uploads: it needs the
