@@ -2,8 +2,10 @@ package query
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // ContextMaxWindow is timeline.context()'s own cap on each side of a hit.
@@ -13,9 +15,20 @@ const ContextMaxWindow = 50
 const ContextDefaultWindow = 5
 
 const contextRefSuggestionSQL = `SELECT DISTINCT adapter || ':' || event_id AS ref
-FROM timeline.events WHERE (event_id = $2 OR right(event_id, length($2) + 1) = '|' || $2)
-AND NOT EXISTS (SELECT 1 FROM timeline.events WHERE adapter = $1) LIMIT 2`
-const contextGmailAccountsSQL = `SELECT DISTINCT account FROM base_gmail.messages ORDER BY account`
+FROM timeline.events WHERE event_id = $2 AND adapter <> $1 LIMIT 2`
+const contextGmailRefSuggestionSQL = `SELECT 'gmail_email:' || account || '|' || message_id AS ref
+FROM base_gmail.messages WHERE message_id = $1 LIMIT 2`
+
+// Walk distinct account keys with the existing (account, message_id) index.
+// DISTINCT account would read every message just to name a few mailboxes.
+const contextGmailAccountsSQL = `WITH RECURSIVE accounts AS (
+  (SELECT account FROM base_gmail.messages ORDER BY account LIMIT 1)
+  UNION ALL
+  SELECT next.account FROM accounts CROSS JOIN LATERAL (
+    SELECT account FROM base_gmail.messages WHERE account > accounts.account ORDER BY account LIMIT 1
+  ) next
+) SELECT account FROM accounts`
+const contextLookupTimeout = time.Second
 
 // contextSQL names the columns a reader uses. `SELECT *` from
 // timeline.context() returned metadata and the full search_text of every row:
@@ -84,20 +97,42 @@ func (s *Service) Context(ctx context.Context, req ContextRequest) ContextRespon
 		resp.Error = s.queryErrorMessage(ctx, err.Error(), statement)
 		prefix, id, hasPrefix := strings.Cut(resp.Ref, ":")
 		if hasPrefix && id != "" && strings.Contains(err.Error(), "no timeline event for ref") {
-			matches, lookupErr := runner.QueryArgs(ctx, contextRefSuggestionSQL, []any{prefix, id}, 2)
+			gmail := prefix == "gmail" || prefix == "gmail_message" || prefix == "gmail_email"
+			lookupSQL, lookupArgs := contextRefSuggestionSQL, []any{prefix, id}
+			if gmail {
+				lookupSQL, lookupArgs = contextGmailRefSuggestionSQL, []any{id}
+			}
+			lookupCtx, cancel := context.WithTimeout(ctx, contextLookupTimeout)
+			matches, lookupErr := runner.QueryArgs(lookupCtx, lookupSQL, lookupArgs, 2)
+			cancel()
 			if lookupErr == nil && len(matches.Rows) == 1 {
 				resp.Error += fmt.Sprintf("; use the canonical ref %s", matches.Rows[0]["ref"])
-			} else if lookupErr == nil && len(matches.Rows) == 0 && (prefix == "gmail" || prefix == "gmail_message" || prefix == "gmail_email") {
-				accounts, accountErr := runner.QueryArgs(ctx, contextGmailAccountsSQL, nil, 0)
+			} else if gmail {
+				accountCtx, cancel := context.WithTimeout(ctx, contextLookupTimeout)
+				accounts, accountErr := runner.QueryArgs(accountCtx, contextGmailAccountsSQL, nil, 0)
+				cancel()
+				names := []string{}
 				if accountErr == nil {
-					names := []string{}
 					for _, row := range accounts.Rows {
 						if name, ok := row["account"].(string); ok {
 							names = append(names, name)
 						}
 					}
-					resp.Error += "; no synced mailbox holds this id. PDW syncs: " + strings.Join(names, ", ") + `. zrl-bot@hackclub.com mail is read with pdw call zrl_bot_email_control__get_thread --data '{"thread_id":"<id>"}'`
 				}
+				finding := "no synced mailbox holds this id"
+				if lookupErr != nil {
+					finding = "could not check this id in synced mailboxes"
+				} else if len(matches.Rows) > 1 {
+					finding = "this id matches more than one synced mailbox"
+				}
+				accountList := strings.Join(names, ", ")
+				if accountErr != nil {
+					accountList = "(account lookup unavailable)"
+				}
+				payload, _ := json.Marshal(map[string]string{"thread_id": id})
+				// Quote the JSON as one shell argument, including any apostrophe in an invalid id.
+				argument := "'" + strings.ReplaceAll(string(payload), "'", "'\"'\"'") + "'"
+				resp.Error += "; " + finding + ". PDW syncs: " + accountList + ". zrl-bot@hackclub.com mail is read with pdw call zrl_bot_email_control__get_thread --data " + argument
 			}
 		}
 		return resp

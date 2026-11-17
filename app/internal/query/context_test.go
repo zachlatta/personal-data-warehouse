@@ -5,13 +5,67 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
+
+type failedContextLookupRunner struct {
+	fakeSearchRunner
+	boundedLookup bool
+}
+
+func (r *failedContextLookupRunner) QueryArgs(ctx context.Context, sql string, args []any, cap int) (RawResult, error) {
+	if sql == contextGmailAccountsSQL {
+		if ctx.Err() != nil {
+			return RawResult{}, ctx.Err()
+		}
+		return RawResult{Rows: []map[string]any{{"account": "test@example.invalid"}}}, nil
+	}
+	if sql == contextSQL {
+		return RawResult{}, errors.New("context: no timeline event for ref gmail:abc")
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) > 2*time.Second {
+		return RawResult{}, errors.New("lookup has no short deadline")
+	}
+	r.boundedLookup = true
+	return RawResult{}, context.DeadlineExceeded
+}
+
+func TestContextGmailLookupFailureStillGivesAccounts(t *testing.T) {
+	r := &failedContextLookupRunner{}
+	resp := NewService(r, Options{}).Context(context.Background(), ContextRequest{Ref: "gmail:abc"})
+	for _, want := range []string{"test@example.invalid", `"thread_id":"abc"`, "zrl_bot_email_control__get_thread"} {
+		if !strings.Contains(resp.Error, want) {
+			t.Fatalf("missing %s: %s", want, resp.Error)
+		}
+	}
+	if strings.Contains(resp.Error, "no synced mailbox holds") {
+		t.Fatal("a failed lookup cannot prove absence")
+	}
+	if !r.boundedLookup {
+		t.Fatal("recovery lookup must have a short deadline")
+	}
+}
+
+func TestContextSuggestsExactCanonicalRef(t *testing.T) {
+	r := &fakeSearchRunner{
+		argsErrs:    map[string]error{contextSQL: errors.New("context: no timeline event for ref mail:account|abc")},
+		argsResults: map[string]RawResult{contextRefSuggestionSQL: {Rows: []map[string]any{{"ref": "gmail_email:account|abc"}}}},
+	}
+	resp := NewService(r, Options{}).Context(context.Background(), ContextRequest{Ref: "mail:account|abc"})
+	if !strings.Contains(resp.Error, "use the canonical ref gmail_email:account|abc") {
+		t.Fatal(resp.Error)
+	}
+	if calls := r.callsFor(contextRefSuggestionSQL); len(calls) != 1 || calls[0][0] != "mail" || calls[0][1] != "account|abc" {
+		t.Fatal(calls)
+	}
+}
 
 func TestContextExplainsGuessedGmailRefs(t *testing.T) {
 	for _, matched := range []bool{true, false} {
 		r := &fakeSearchRunner{argsErrs: map[string]error{contextSQL: errors.New("context: no timeline event for ref gmail:abc")}, argsResults: map[string]RawResult{}}
 		if matched {
-			r.argsResults[contextRefSuggestionSQL] = RawResult{Rows: []map[string]any{{"ref": "gmail_email:test@example.invalid|abc"}}}
+			r.argsResults[contextGmailRefSuggestionSQL] = RawResult{Rows: []map[string]any{{"ref": "gmail_email:test@example.invalid|abc"}}}
 		}
 		r.argsResults[contextGmailAccountsSQL] = RawResult{Rows: []map[string]any{{"account": "test@example.invalid"}}}
 		resp := NewService(r, Options{}).Context(context.Background(), ContextRequest{Ref: "gmail:abc"})
