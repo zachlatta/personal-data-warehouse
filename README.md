@@ -637,6 +637,19 @@ Slides→text), DOCX documents, and already-text files (`.md`, `.txt`, `.json`, 
 The sync writes
 `google_drive_files`, `google_drive_file_texts`, and `google_drive_sync_state`.
 
+Every run also refreshes folder metadata in `base_google_drive.files`, including
+My Drive's real root id and shared-drive roots when shared drives are enabled.
+This snapshot runs even with an existing Changes cursor, so upgrading backfills
+folders on the next sync without recrawling ordinary files. An unchanged folder is
+not rewritten (a no-op upsert guard keeps its `ingested_at`), so the snapshot does
+not mask a stalled sync in `marts_ops.pipeline_health` or re-walk the timeline. Empty and newly created
+folders are valid mutation destinations after that run. Folders have
+`mime_type='application/vnd.google-apps.folder'`, `is_excluded=1` and
+`exclude_reason='folder_metadata'`: they receive background timeline events through
+the existing adapter and have no extracted-text rows. Filter out that MIME type
+when counting content files. Root lookup failures fail the account's sync rather
+than silently leaving destinations unavailable.
+
 File bytes are **not** copied into the warehouse: rows carry `storage_backend='google_drive_source'`
 and `storage_file_id=<Drive file id>`. The Go app's `get_object` MCP tool mints an account-aware,
 time-limited `download_url` (`/objects/{id}?account=...&exp=...&sig=...`) that streams the file

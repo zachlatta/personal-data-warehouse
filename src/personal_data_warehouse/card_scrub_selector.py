@@ -27,16 +27,26 @@ class ScrubSelector:
     seed_revision: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
-        if self.scope not in ('all', 'labelled', 'tokens'):
+        if self.scope not in ('all', 'labelled', 'seed', 'tokens'):
             raise ValueError('unknown scrub scope')
         if self.scope == 'tokens' and (self.seed_rows or self.seeds or self.seed_revision):
             raise ValueError('token scope does not accept card seeds')
+
+    def seed_only(self, expected):
+        """Bind a narrower policy to an already resolved checkpoint revision.
+
+        The owner retains this object across connection replacement; no source
+        read is needed after sanitation. A digest alone cannot recover a seed.
+        """
+        if self.specification != expected or not self.seeds or not self.seed_revision:
+            raise ValueError('retained selector differs from checkpoint revision')
+        return ScrubSelector('seed', self.seed_rows, self.seeds, dict(self.seed_revision))
 
     @property
     def specification(self):
         return {'scope': self.scope, 'seed_rows': list(self.seed_rows), 'seed_revision': self.seed_revision}
 
-    def _edits(self, value, labelled=False, collect=None, code_side=None):
+    def _edits(self, value, labelled=False, collect=None, code_side=None, selected_edges=None):
         tokens = cr._json_tokens(value)
         if tokens is not None:
             # Only immediate scalar fields can establish adjacency. Nested
@@ -58,9 +68,16 @@ class ScrubSelector:
                 inner_value = json.loads(raw) if raw.startswith('"') else raw
                 # A decoded container consumes its wrapper's field context.
                 # String wrappers may unwrap to another scalar, never to fields.
-                inner = self._edits(inner_value, context, collect, side) if raw.startswith('"') else self._text(inner_value, context, collect, side)
+                edges = set()
+                inner = self._edits(inner_value, context, collect, side, edges) if raw.startswith('"') else self._text(inner_value, context, collect, side, edges)
                 if not inner: continue
-                selected.update(neighbours)
+                # Each code belongs to its nearest scalar reading. An edit to
+                # an interior/opposite reading does not claim that code. Only
+                # scalar string wrappers propagate edges; containers consume
+                # their wrapper's adjacency context.
+                selected.update(j for j in neighbours if ('first' if j<i else 'last') in edges)
+                if len(tokens)==1 and selected_edges is not None:
+                    selected_edges.update(edges)
                 if raw.startswith('"'):
                     bounds = cr._json_string_bounds(raw)
                     edits.extend((token.start()+bounds[a],token.start()+bounds[b],json.dumps(r)[1:-1]) for a,b,r in inner)
@@ -70,9 +87,9 @@ class ScrubSelector:
                 token=tokens[i]
                 edits.append((token.start(),token.end(),'"[redacted]"'))
             return sorted(edits)
-        return self._text(value, labelled, collect, code_side)
+        return self._text(value, labelled, collect, code_side, selected_edges)
 
-    def _text(self, value, labelled, collect, code_side=None):
+    def _text(self, value, labelled, collect, code_side=None, selected_edges=None):
         chars=[]; bounds=[0]; pos=0
         while pos<len(value):
             match=cr._ESCAPE.match(value,pos) if value[pos]=='\\' else None
@@ -89,7 +106,12 @@ class ScrubSelector:
                     (m.end()<=a and GAP.fullmatch(decoded[m.end():a]))]
             adjacent = (code_side in ('first','both') and a==readings[0][0] or
                         code_side in ('last','both') and b==readings[-1][1])
-            if not (adjacent or labelled and not decoded[:a].strip() or digits in self.seeds or FIELD_BEFORE.search(decoded[max(0,a-128):a]) or CODE_AFTER.search(decoded[b:b+128]) or nearby): continue
+            if self.scope == 'seed':
+                if digits not in self.seeds: continue
+            elif not (adjacent or labelled and not decoded[:a].strip() or digits in self.seeds or FIELD_BEFORE.search(decoded[max(0,a-128):a]) or CODE_AFTER.search(decoded[b:b+128]) or nearby): continue
+            if selected_edges is not None:
+                if a==readings[0][0]: selected_edges.add('first')
+                if b==readings[-1][1]: selected_edges.add('last')
             edits.append((a,b,'[card ****'+digits[-4:]+']'))
             end=b
             while (code:=cr._ADJACENT_CODE.match(decoded,end)) and cr.standalone_end(decoded,code.end()):
@@ -157,7 +179,7 @@ def resolve_selector(warehouse, scope='all', seed_rows=(), *, expected=None):
 
 
 def add_selector_arguments(parser):
-    parser.add_argument('--scope',choices=('all','labelled','tokens'),default='all')
+    parser.add_argument('--scope',choices=('all','labelled','seed','tokens'),default='all')
     parser.add_argument('--seed-row',action='append',default=[],help='logical_table:JSON primary-key object; repeatable, IDs only')
 
 
@@ -178,7 +200,7 @@ def selector_from_args(args, expected=None):
 
 def validate_specification(spec):
     from personal_data_warehouse.postgres import POSTGRES_TABLES, _AI_CONVERSATION_EVENT_TABLES
-    if not isinstance(spec,dict) or set(spec)!={'scope','seed_rows','seed_revision'} or spec['scope'] not in ('all','labelled','tokens') or not isinstance(spec['seed_rows'],list):
+    if not isinstance(spec,dict) or set(spec)!={'scope','seed_rows','seed_revision'} or spec['scope'] not in ('all','labelled','seed','tokens') or not isinstance(spec['seed_rows'],list):
         raise ValueError('invalid selector specification')
     if spec['scope']=='tokens' and (spec['seed_rows'] or spec['seed_revision']):
         raise ValueError('token scope does not accept card seeds')

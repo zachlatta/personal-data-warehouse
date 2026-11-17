@@ -405,7 +405,8 @@ def _related_rows(warehouse, table, sessions, event_keys, *, connection=None,ids
 
 def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, selector=None,
           max_source_rows=500, max_delta_rows=10000, window_seconds=60, max_plan_rows=20000,
-          max_canonical_rows=None, _known_plan=None, planned_only=False):
+          max_canonical_rows=None, _known_plan=None, planned_only=False,
+          exact_source_rows=None, allow_clean=False):
     plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size,selector=selector)
     _validate_plan(plan)
     if plan.get("selector", ScrubSelector().specification) != (selector or ScrubSelector()).specification:
@@ -416,6 +417,8 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
         raise ValueError('planned-only repair requires the token selector')
     if not 0<window_seconds<=60: raise ValueError('maintenance budget must be at most 60 seconds')
     if 'discovery' in plan: raise ValueError('partition discovery incomplete')
+    if exact_source_rows is not None and not 0<exact_source_rows<=max_source_rows:
+        raise ValueError('invalid exact source-row gate')
     source_rows=sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])
     if source_rows>max_source_rows: raise ValueError('candidate gate exceeded; no changes committed')
     if len(plan['candidates'])>max_plan_rows: raise ValueError('total candidate gate exceeded; no changes committed')
@@ -435,6 +438,18 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
             for item in delta:
                 if (item['table'],tuple(item['key'])) not in planned:
                     raise RuntimeError('new candidates require discovery; no changes committed')
+            # Saved matches are only a live preflight. Known zero-match IDs
+            # can acquire selected readings before these writer locks. Recount
+            # the exact source identities apply will read, in bounded pages,
+            # under the same locks/transaction/deadline as the mutation.
+            sources=[row for _,row in _planned_rows(warehouse,[c for c in plan['candidates'] if c['table'] not in DERIVED])]
+            current_sources=sum(sum(n>0 for n in pool.counts(sources[i:i+page_size]))
+                                for i in range(0,len(sources),page_size))
+            if current_sources>max_source_rows:
+                raise ValueError('current source-row gate exceeded; no changes committed')
+            if (exact_source_rows is not None and current_sources!=exact_source_rows and
+                    not (allow_clean and current_sources==0)):
+                raise ValueError('exact source-row gate differs under locks; no changes committed')
         if planned_only:
             _apply_plan(warehouse,plan,page_size,workers,selector,planned_only=True)
         else:
@@ -497,6 +512,73 @@ def _canonical_counts(warehouse, sessions, limit):
     return {s:warehouse._query('SELECT count(*) FROM (SELECT 1 FROM @ai_conversation_events '
         'WHERE source=%s AND session_id=%s LIMIT %s) bounded',(*s,limit+1))[0][0]
         for s in sorted(sessions)}
+
+
+def session_subplan(warehouse, plan, session, *, selector):
+    """Reconfirm one session from a fully scanned checkpoint while live.
+
+    Does not advance the horizon or discard the caller's full known-ID set.
+    A final-partition connection failure may leave a complete discovery ledger
+    without its related-row attachment; that attachment is repeated here.
+    """
+    _validate_plan(plan)
+    state = plan.get('discovery')
+    if state is not None:
+        jobs = [tuple(j) for j in state['jobs']]
+        done = [tuple(j) for j in state['completed']]
+        if len(set(jobs)) != len(jobs) or len(set(done)) != len(done) or set(jobs) != set(done):
+            raise ValueError('partition discovery incomplete or duplicated')
+    if plan['scope'] != _scope(warehouse):
+        raise ValueError('plan belongs to another warehouse')
+    spec = plan.get('selector')
+    if (selector is None or selector.scope != 'seed' or not selector.seeds or
+            spec is None or selector.seed_revision != spec['seed_revision'] or
+            list(selector.seed_rows) != spec['seed_rows']):
+        raise ValueError('retained seed selector differs from checkpoint')
+    candidates = []
+    for c in plan['candidates']:
+        if c['session'] != list(session) or c['table'] in DERIVED: continue
+        keys = POSTGRES_TABLES[c['table']].primary_key
+        rows = warehouse._query_dicts(f'SELECT * FROM @{c["table"]} WHERE ' +
+            ' AND '.join(f'{k}=%s' for k in keys), c['key'])
+        n = sum(selector.count_row(r) for r in rows)
+        # Keep clean IDs for commit-before-checkpoint replay.
+        candidates.append(dict(c, matches=n))
+    if not candidates: raise ValueError('session absent from checkpoint')
+    candidates = _attach_related(warehouse, candidates, warehouse._connection)
+    subset = {k:v for k,v in plan.items() if k not in ('discovery','batches')}
+    subset.update(candidates=candidates, counts=_details(candidates), selector=selector.specification)
+    return subset
+
+
+def apply_session(warehouse, plan, session, *, selector, window, exact_source_rows,
+                  workers=1, max_canonical_rows=2500, window_seconds=45,
+                  max_plan_rows=20000, max_delta_rows=1000, allow_clean=False):
+    """One bounded window; restore belongs to the supplied context manager.
+
+    Keep ``selector`` in the owner through restoration, JSONL, and global
+    verification. On connection failure replace the connection, not the selector.
+    """
+    if not 0 < max_canonical_rows <= 5000:
+        raise ValueError('canonical row gate exceeded')
+    if not 0 < exact_source_rows <= 500:
+        raise ValueError('invalid exact source-row gate')
+    if len(plan['candidates']) > min(20000, max_plan_rows):
+        raise ValueError('total candidate gate exceeded')
+    subset = session_subplan(warehouse, plan, session, selector=selector)
+    n = sum(c['table'] not in DERIVED and c['matches'] > 0 for c in subset['candidates'])
+    if n != exact_source_rows and not (allow_clean and n == 0):
+        raise ValueError('exact source-row gate differs')
+    if sum(_canonical_counts(warehouse, {tuple(session)}, max_canonical_rows).values()) > max_canonical_rows:
+        raise ValueError('canonical row gate exceeded')
+    known = dict(plan, candidates=plan['candidates'] + subset['candidates'])
+    with window(0):
+        scrub(warehouse, apply=True, plan=subset, selector=selector, workers=workers,
+              max_source_rows=exact_source_rows, max_plan_rows=max_plan_rows,
+              max_delta_rows=max_delta_rows, max_canonical_rows=max_canonical_rows,
+              window_seconds=window_seconds, _known_plan=known,
+              exact_source_rows=exact_source_rows, allow_clean=allow_clean)
+    return subset
 
 
 def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_partial=False,
@@ -765,6 +847,8 @@ def main():
     parser.add_argument('--plan', type=Path, help='private ID-only discovery plan; new file for discovery, existing file for apply')
     parser.add_argument('--workers', type=int, default=available_cpus(), help='Python confirmation processes and concurrent SQL scan budget')
     parser.add_argument('--max-source-rows',type=int,default=500)
+    parser.add_argument('--only-session', nargs=2, metavar=('SOURCE','SESSION'),
+                        help='apply only seed-matched readings in this session from a completed checkpoint')
     parser.add_argument('--max-delta-rows',type=int,default=10000)
     parser.add_argument('--max-plan-rows',type=int,default=20000)
     parser.add_argument('--window-seconds',type=int,default=60)
@@ -777,6 +861,8 @@ def main():
     args = parser.parse_args()
     if args.workers < 1: parser.error('--workers must be positive')
     if args.apply and args.verify: parser.error('--apply and --verify are mutually exclusive')
+    if args.only_session and (args.planned_only or args.session_batches):
+        parser.error('--only-session is a seed repair; it cannot combine with token session batches')
     if args.planned_only or args.session_batches:
         if not (args.apply and args.planned_only and args.session_batches and args.writers_paused and args.scope=='tokens'):
             parser.error('session batches require --apply --scope tokens --planned-only --writers-paused')
@@ -786,7 +872,11 @@ def main():
     try:
         args.workers=connection_workers(warehouse,args.workers)
         baseline = read_plan(args.plan) if args.plan and args.plan.exists() and (args.apply or args.verify or args.resume or args.catch_up) else None
-        selector = resolve_selector(warehouse,args.scope,args.seed_row,expected=baseline.get('selector') if baseline else None)
+        if args.only_session and (not args.apply or baseline is None):
+            parser.error('--only-session requires --apply and a completed checkpoint')
+        binding_scope = baseline['selector']['scope'] if args.only_session else args.scope
+        selector = resolve_selector(warehouse,binding_scope,args.seed_row,expected=baseline.get('selector') if baseline else None)
+        if args.only_session: selector = selector.seed_only(baseline['selector'])
         after = None
         if args.catch_up:
             if baseline is None: parser.error('--catch-up requires an existing complete plan')
@@ -802,6 +892,12 @@ def main():
                     window_seconds=args.window_seconds,gap_seconds=0,max_source_rows=args.max_source_rows,
                     max_plan_rows=args.max_plan_rows,max_delta_rows=args.max_delta_rows)
                 if plan['batches']['oversized']: raise RuntimeError('oversized sessions remain; repair incomplete')
+            elif args.only_session:
+                from contextlib import nullcontext
+                apply_session(warehouse,plan,args.only_session,selector=selector,
+                    window=lambda _:nullcontext(),workers=args.workers,
+                    exact_source_rows=args.max_source_rows,max_delta_rows=args.max_delta_rows,
+                    window_seconds=args.window_seconds,max_plan_rows=args.max_plan_rows)
             else:
                 scrub(warehouse,apply=True,plan=plan,workers=args.workers,selector=selector,max_source_rows=args.max_source_rows,max_delta_rows=args.max_delta_rows,window_seconds=args.window_seconds,max_plan_rows=args.max_plan_rows)
             # Only planned/delta rows were checked in-window. A full read-only
