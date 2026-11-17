@@ -638,7 +638,20 @@ pass advances the horizon; an interrupted pass leaves the previous checkpoint.
 Apply counts changed rows that still hold selected readings, rather than all
 changed rows. Clean ingestion churn cannot exhaust that gate. Unknown selected
 IDs still abort for catch-up, and the locked transaction always has a maximum
-60-second rollback deadline. Incomplete partition plans cannot be applied.
+60-second rollback deadline. Single-window apply rejects incomplete partition
+plans. The maintenance API `apply_batches` accepts one only with explicit
+`allow_partial=True`; its pending partitions and original transaction horizon
+remain reusable. It groups whole sessions by canonical source-row count
+(default 2,500, hard maximum 5,000), rechecks growth under the writer locks,
+and uses a 45-second apply deadline by default. Oversized sessions are reported
+and skipped. A controller must pause and restore workers separately for every
+group, including on failure; the default live gap between groups is 15 seconds.
+Private checkpoints record completed groups only after restoration. Replay
+after commit but before checkpoint is idempotent. A failed group rolls back
+alone and stops the run. Completion records do not replace final verification:
+finish discovery and scan every partition with workers restored. Keep the
+original in-memory seed selector alive through this process; a sanitized seed
+cannot be reconstructed from an ID-only checkpoint.
 Planned keys and canonical regenerated rows are verified transactionally;
 whole-corpus verification follows restoration of workers.
 

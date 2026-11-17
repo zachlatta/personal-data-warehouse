@@ -16,6 +16,7 @@ import html
 import signal
 import threading
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from psycopg2.extras import Json, execute_batch
@@ -341,8 +342,19 @@ def _validate_plan(plan):
         from personal_data_warehouse.card_scrub_selector import validate_specification
         validate_specification(plan["selector"])
         if type(plan.get("left_alone")) is not int or plan["left_alone"] < 0: raise ValueError("invalid left-alone count")
-    if set(plan) - {"selector","left_alone","discovery"} != {'version','scope','watermarks','candidates','counts'} or plan['version'] != 2:
+    if set(plan) - {"selector","left_alone","discovery","batches"} != {'version','scope','watermarks','candidates','counts'} or plan['version'] != 2:
         raise ValueError('invalid discovery plan')
+    if 'batches' in plan:
+        state=plan['batches']
+        if set(state)!={'completed','oversized'}: raise ValueError('invalid batch checkpoint')
+        for group in state['completed']+state['oversized']:
+            if set(group)!={'sessions','canonical_rows','seconds'} or not isinstance(group['sessions'],list):
+                raise ValueError('invalid batch record')
+            if type(group['canonical_rows']) is not int or group['canonical_rows']<0 or not isinstance(group['seconds'],(float,int)) or not 0<=group['seconds']<float('inf'):
+                raise ValueError('invalid batch measurements')
+            known={tuple(c['session']) for c in plan['candidates'] if c['session']}
+            if any(not isinstance(s,list) or len(s)!=2 or tuple(s) not in known for s in group['sessions']):
+                raise ValueError('invalid batch session')
     if 'discovery' in plan:
         state=plan['discovery']
         if (set(state)!={'jobs','completed'} or any(not isinstance(j,list) or len(j)!=2 or j[0] not in TABLES or
@@ -392,7 +404,8 @@ def _related_rows(warehouse, table, sessions, event_keys, *, connection=None,ids
 
 
 def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, selector=None,
-          max_source_rows=500, max_delta_rows=10000, window_seconds=60, max_plan_rows=20000):
+          max_source_rows=500, max_delta_rows=10000, window_seconds=60, max_plan_rows=20000,
+          max_canonical_rows=None, _known_plan=None):
     plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size,selector=selector)
     _validate_plan(plan)
     if plan.get("selector", ScrubSelector().specification) != (selector or ScrubSelector()).specification:
@@ -409,7 +422,11 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
         # Fail immediately on a live writer. Hold every lock until commit so
         # nothing can appear between delta confirmation and verification.
         warehouse._command('LOCK TABLE '+','.join('@'+t for t in (*TABLES,'search_chunk_embeddings'))+' IN SHARE ROW EXCLUSIVE MODE NOWAIT')
-        planned={(c['table'],tuple(c['key'])) for c in plan['candidates']}
+        if max_canonical_rows is not None:
+            sessions={tuple(c['session']) for c in plan['candidates'] if c['session']}
+            if sum(_canonical_counts(warehouse,sessions,max_canonical_rows).values())>max_canonical_rows:
+                raise ValueError('canonical row gate exceeded; no changes committed')
+        planned={(c['table'],tuple(c['key'])) for c in (_known_plan or plan)['candidates']}
         with ConfirmationPool(workers,selector) as pool:
             delta=_selected_delta(warehouse,plan,pool,page_size,max_delta_rows)
             for item in delta:
@@ -425,6 +442,78 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
         with ConfirmationPool(workers,selector) as pool:
             if any(pool.counts(rows)): raise RuntimeError('planned row verification failed; no changes committed')
     return plan['counts']
+
+
+def _canonical_counts(warehouse, sessions, limit):
+    # Bound each count, including a session that grew since live planning.
+    return {s:warehouse._query('SELECT count(*) FROM (SELECT 1 FROM @ai_conversation_events '
+        'WHERE source=%s AND session_id=%s LIMIT %s) bounded',(*s,limit+1))[0][0]
+        for s in sorted(sessions)}
+
+
+def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_partial=False,
+                  max_canonical_rows=2500, window_seconds=45, gap_seconds=15,
+                  max_source_rows=500, max_plan_rows=20000, max_delta_rows=1000,
+                  progress=None):
+    """One owner; live planning, then an atomic transaction per session group.
+
+    ``window(index)`` must pause writers on entry and restore them in finally,
+    including on partial entry failure. Completion is persisted AFTER restore.
+    A crash after commit is safe: replay rechecks and applies the same IDs.
+    Partial discovery retains its original horizon and pending partitions;
+    no partial run constitutes final verification. Selector stays in memory.
+    """
+    if not 0<max_canonical_rows<=5000 or not 0<window_seconds<=60 or gap_seconds<0:
+        raise ValueError('invalid batch budget')
+    plan=read_plan(Path(path))
+    if 'discovery' in plan and not allow_partial: raise ValueError('partition discovery incomplete')
+    if plan['scope']!=_scope(warehouse) or plan.get('selector',ScrubSelector().specification)!=(selector or ScrubSelector()).specification:
+        raise ValueError('plan scope or selector differs')
+    if sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])>min(500,max_source_rows) or len(plan['candidates'])>min(20000,max_plan_rows):
+        raise ValueError('candidate gate exceeded')
+    if any(not c['session'] for c in plan['candidates']):
+        raise ValueError('cannot group unidentified session')
+    state=plan.setdefault('batches',dict(completed=[],oversized=[]))
+    completed={tuple(s) for g in state['completed'] for s in g['sessions']}
+    # Never silently trust a completion if an old key has become selected again.
+    with ConfirmationPool(workers,selector) as pool:
+        for c in plan['candidates']:
+            if tuple(c['session']) not in completed: continue
+            keys=POSTGRES_TABLES[c['table']].primary_key
+            rows=warehouse._query_dicts(f'SELECT * FROM @{c["table"]} WHERE '+' AND '.join(f'{k}=%s' for k in keys),c['key'])
+            if any(pool.counts(rows)): raise RuntimeError('completed session changed; rediscovery required')
+    sessions={tuple(c['session']) for c in plan['candidates']}-completed
+    counts=_canonical_counts(warehouse,sessions,max_canonical_rows)
+    state['oversized']=[dict(sessions=[list(s)],canonical_rows=n,seconds=0) for s,n in counts.items() if n>max_canonical_rows]
+    groups=[]; group=[]; total=0
+    for s,n in counts.items():
+        if n>max_canonical_rows: continue
+        if group and total+n>max_canonical_rows:
+            groups.append((group,total)); group=[]; total=0
+        group.append(s); total+=n
+    if group: groups.append((group,total))
+    _checkpoint(path,plan)
+    if progress: progress(dict(groups=len(groups),oversized_sessions=len(state['oversized']),canonical_rows=sum(counts.values())))
+    for index,(sessions,total) in enumerate(groups):
+        time.sleep(gap_seconds)  # workers LIVE, including after a resumed run
+        candidates=[c for c in plan['candidates'] if tuple(c['session']) in sessions]
+        candidates=_attach_related(warehouse,candidates,warehouse._connection)
+        if len(candidates)>min(20000,max_plan_rows):
+            raise ValueError('group candidate gate exceeded; no maintenance started')
+        subset={k:v for k,v in plan.items() if k not in ('discovery','batches')}
+        subset.update(candidates=candidates,counts=_details(candidates))
+        known=dict(plan,candidates=plan['candidates']+candidates)
+        started=time.monotonic()
+        with window(index):
+            scrub(warehouse,apply=True,plan=subset,selector=selector,workers=workers,
+                  max_source_rows=max_source_rows,max_plan_rows=max_plan_rows,
+                  max_delta_rows=max_delta_rows,window_seconds=window_seconds,
+                  max_canonical_rows=max_canonical_rows,_known_plan=known)
+        elapsed=time.monotonic()-started
+        state['completed'].append(dict(sessions=[list(s) for s in sessions],canonical_rows=total,seconds=elapsed))
+        _checkpoint(path,plan)
+        if progress: progress(dict(completed_groups=len(state['completed']),canonical_rows=total,window_seconds=elapsed))
+    return plan
 
 
 def _apply_plan(warehouse, plan, page_size, workers, selector=None):
