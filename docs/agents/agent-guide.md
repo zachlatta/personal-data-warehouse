@@ -45,7 +45,9 @@ CLI before the next week.
 their transcripts (`marts_ai_conversations.events`) and writes two things:
 
 - `marts_ops.agent_usage`: the fortnight's rates. A session is a SQL-error session when a
-  `pdw sql` / `query` result carries `SQLSTATE` 42703, 42P01, 42883, 42501, 57014 or 42804.
+  `pdw sql` / `query` result has its own error: a line beginning
+  `pdw sql|columns|schema: ERROR:` (optionally after an exit-code line), or an
+  MCP query result with `isError: true`. A result row quoting an error is data.
   Until 2026-10-28 it matched the bare digits, so a result row holding `42703` counted, and
   42804 (`NOT is_deleted` on an integer flag) did not count at all.
   The search-first share is the C3 timeline-first share: a session's first question call is

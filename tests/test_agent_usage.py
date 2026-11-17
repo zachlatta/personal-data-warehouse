@@ -42,7 +42,7 @@ def _seed(wh: PostgresWarehouse) -> None:
             _event("a", 1, tool="Bash", inp='{"command":"pdw schema"}'),
             _event("a", 2, res="ok"),
             _event("a", 3, tool="Bash", inp='{"command":"pdw sql -q x \"SELECT * FROM base_slack.messages WHERE text ILIKE \'%x%\'\""}'),
-            _event("a", 4, res="ERROR: column x does not exist (SQLSTATE 42703)"),
+            _event("a", 4, res="pdw sql: ERROR: column x does not exist (SQLSTATE 42703)"),
             _event("a", 5, tool="Bash", inp='{"command":"pdw search --priority self,direct \"budget\""}'),
             _event(
                 "a", 6,
@@ -761,3 +761,60 @@ def test_top_failures_rank_each_week_and_flag_a_shape_left_unfixed(warehouse: Po
     # The window is rewritten whole, so a re-run does not double count.
     AgentFailureShapeCollector(warehouse).run(now=now)
     assert len(warehouse._query_dicts("SELECT 1 FROM @marts_agent_top_failures")) == 3
+
+
+def test_quoted_sql_errors_are_data(warehouse):
+    from personal_data_warehouse.agent_usage import failure_shape
+    wh = warehouse
+    wh.ensure_agent_sessions_tables()
+    wh.ensure_pipeline_health_tables()
+    error = "pdw sql: ERROR: invalid repetition count(s) (SQLSTATE 2201B)"
+    assert failure_shape("sql", "pdw sql x", "shape,example\n2201B,"+error) is None
+    assert failure_shape("sql", "pdw sql x", 'seq,text\n1,"quoted transcript\n'+error+'\nend"') is None
+    own = 'pdw sql: ERROR: column x does not exist (SQLSTATE 42703)'
+    assert failure_shape('sql', '', 'seq,text\n1,"quoted\n'+error+'\nend"\n'+own)[1] == '42703'
+    assert failure_shape("sql", "pdw sql x", error)[1] == "2201B"
+    wh.insert_agent_session_events([_event("quoted",1,tool="Bash",inp='{"command":"pdw sql x"}'), _event("quoted",2,res="shape,example\n2201B,"+error)])
+    assert AgentUsageCollector(wh).collect()[0].sql_error_sessions == 0
+
+
+def test_prose_is_not_an_invented_command():
+    from personal_data_warehouse.agent_usage import failure_shape
+    for word in ["sends", "design", "examples", "worktree", "read-only"]:
+        for script in ["python -c \"print('pdw "+word+"')\"", "# pdw "+word, "cat <<EOF\npdw "+word+"\nEOF", "python -c \"x='safe; pdw "+word+"'\"", "cat <<EOF\n; pdw "+word+"\nEOF"]:
+            assert failure_shape("invented", script, "") is None
+
+
+def test_mcp_own_error_flag_not_a_quoted_result(warehouse):
+    from personal_data_warehouse.agent_usage import failure_shape
+    import json
+    error = 'ERROR: invalid repetition count(s) (SQLSTATE 2201B)'
+    payload = json.dumps({'isError': True, 'content': [{'type':'text','text':error}]})
+    assert failure_shape('sql', '', payload)[1] == '2201B'
+    quoted = json.dumps({'rows':[{'isError':True,'text':error}]})
+    assert failure_shape('sql', '', quoted) is None
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    for session,result in [('real',payload),('quoted',quoted)]:
+        warehouse.insert_agent_session_events([_event(session,1,tool='mcp__personal_data_warehouse__query',inp='{}'), _event(session,2,res=result)])
+    assert {s.source:s for s in AgentUsageCollector(warehouse).collect()}['all'].sql_error_sessions == 1
+
+
+def test_claude_result_envelope_preserves_real_errors(warehouse):
+    import json
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    error = "Exit code 1\npdw sql: ERROR: invalid repetition count(s) (SQLSTATE 2201B)"
+    warehouse.insert_agent_session_events([_event("wrapped",1,tool="Bash",inp='{"command":"pdw sql x"}'), _event("wrapped",2,res=json.dumps({"content":[{"content":error}]}))])
+    assert {s.source:s for s in AgentUsageCollector(warehouse).collect()}["all"].sql_error_sessions == 1
+
+
+def test_shell_opening_quote_is_a_command_position(warehouse):
+    from personal_data_warehouse.agent_usage import failure_shape
+    import json
+    command = 'bash -c "pdw design"'
+    assert failure_shape('invented', command, '')[2] == 'pdw design'
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.insert_agent_session_events([_event('shell-quote',1,tool='Bash',inp=json.dumps({'command':command}))])
+    assert {s.source:s for s in AgentUsageCollector(warehouse).collect()}['all'].invented_calls == 1

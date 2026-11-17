@@ -73,14 +73,12 @@ SQL_ERROR_SESSION_CEILING = 0.1
 #: Contract C17: each week this many top failure shapes are fixed before the next.
 AGENT_TOP_FAILURES = 3
 
-#: The SQLSTATEs that make a session a SQL-error session: a guessed column,
-#: relation, function or operator, a denied relation, a timeout, and an integer
-#: 0/1 flag used as a boolean (42804, 42 sessions in the fortnight to
-#: 2026-10-27 that the metric did not count). Matched as `SQLSTATE <code>`, the
-#: way every error PDW returns spells it: the bare digits also matched data
-#: rows and transcripts quoted back, 34 of 371 flagged sessions that fortnight.
-SQL_ERROR_SQLSTATES = ("42703", "42P01", "42883", "42501", "57014", "42804")
-SQL_ERROR_RE = "SQLSTATE (" + "|".join(SQL_ERROR_SQLSTATES) + ")"
+#: Only the call's own CLI error line or MCP error flag qualifies. Quoted
+#: CSV transcript cells are data, even when they contain apparent error lines.
+SQL_ERROR_RE = r"(?:^|\n)(?:Exit code [0-9]+\n)?pdw (?:sql|columns|schema): ERROR:"
+SQL_FAILED_PREDICATE = "(regexp_replace(result, '\"([^\"]|\"\")*\"', '', 'g') ~ '{sql_error}' OR (is_mcp AND CASE WHEN pg_input_is_valid(result, 'jsonb') THEN result::jsonb->>'isError' = 'true' ELSE false END))"
+HEREDOC_RE = r'''<<-?[ \t]*["']?([A-Za-z_][A-Za-z0-9_]*)["']?[^\n]*\n.*?\n\1([ \t]*\n|$)'''
+PYTHON_STRING_RE = r'''(^|[^A-Za-z0-9_])python[0-9.]*[ \t]+-c[ \t]+("([^"\\]|\\.)*"|'([^'\\]|\\.)*')'''
 
 #: The pdw CLI's real subcommands, split by whether they are a question. The
 #: lists live in pdw_cli_commands, which a test pins to the Go dispatcher.
@@ -126,6 +124,10 @@ CLI_INVENTED_RE = (
     + "|"
     + _cli_re("call") + r"(sql|query|search|context|schema_overview|describe_table|run)" + _CLI_AFTER
 )
+# Unknown commands require an invocation boundary, not an arbitrary quote in
+# Python/prose. Keep the broader read matcher for historical tool encodings.
+_INVENTED_BOUNDARY = r'''(^|[;|&]|\n|\$\(|"?(command|cmd)"?[[:space:]]*:[[:space:]]*"|(^|[^A-Za-z0-9_])(sh|bash|zsh)[[:space:]]+-c[[:space:]]+["'])'''
+CLI_INVENTED_RE = CLI_INVENTED_RE.replace(_BOUNDARY, _INVENTED_BOUNDARY)
 CLI_SEARCH_RE = _cli_re("search")
 CLI_SQL_RE = _cli_re("sql")
 CLI_SCHEMA_RE = _cli_re("schema|columns")
@@ -564,7 +566,7 @@ ev2 AS (
     ON r.source = e.source AND r.session_id = e.session_id
    AND e.turn_id <> '' AND r.turn_id = e.turn_id AND e.subtype <> 'tool_result'
 ),
-calls AS (
+calls_raw AS (
   SELECT source, session_id, seq, occurred_at, tool_name, inp0 AS inp,
          CASE WHEN source = 'codex' AND subtype = 'item_completed' THEN res0
               ELSE coalesce(NULLIF(id_res, ''), NULLIF(next_res, ''), res0) END AS result,
@@ -585,10 +587,24 @@ calls AS (
       AND next_subtype = 'item_completed'
     )
 ),
+calls AS (
+  SELECT source, session_id, seq, occurred_at, tool_name,
+    CASE WHEN pg_input_is_valid(inp, 'jsonb') THEN
+      CASE WHEN jsonb_typeof(inp::jsonb->'commands') = 'array' THEN
+        (SELECT string_agg(cmd, chr(10)) FROM jsonb_array_elements_text(inp::jsonb->'commands') AS cmd)
+      ELSE coalesce(inp::jsonb->>'command', inp::jsonb->>'cmd', inp) END
+      ELSE inp END AS inp, is_mcp,
+    CASE WHEN NOT is_mcp AND pg_input_is_valid(result, 'jsonb') THEN
+      coalesce(result::jsonb #>> '{item,aggregated_output}',
+               result::jsonb ->> 'aggregated_output', result::jsonb ->> 'output',
+               result::jsonb #>> '{content,0,content}', result::jsonb #>> '{content,0,text}', result)
+      ELSE result END AS result
+  FROM calls_raw
+),
 classified AS (
   SELECT *,
     CASE
-      WHEN NOT is_mcp AND inp ~ '{invented}' THEN 'invented'
+      WHEN NOT is_mcp AND regexp_replace(regexp_replace(regexp_replace(inp, '{heredoc}', '', 'gs'), '{python_string}', '', 'g'), '{comment}', '', 'g') ~ '{invented}' THEN 'invented'
       WHEN (is_mcp AND tool_name ~* '{mcp_connection}')
         OR (NOT is_mcp AND inp ~ '{connection}') THEN 'connection'
       WHEN tool_name ~* '(__|[.])run$'
@@ -626,8 +642,9 @@ pdw AS (
   SELECT s.source, s.session_id, s.seq + o.ordinality::numeric / 100,
          s.occurred_at, 'personal_data_warehouse__' || (o.item->>'method'),
          jsonb_build_object('priorities', coalesce(o.item->'priorities','[]'::jsonb))::text,
-         CASE WHEN o.item ? 'error' THEN 'ERROR: script operation failed (' ||
-              coalesce(nullif(o.item->'error'->>'message',''),o.item->'error'->>'code') || ')'
+         CASE WHEN o.item ? 'error' THEN jsonb_build_object('isError',true,'content',jsonb_build_array(
+              jsonb_build_object('text','ERROR: script operation failed (' ||
+              coalesce(nullif(o.item->'error'->>'message',''),o.item->'error'->>'code') || ')')))::text
               ELSE jsonb_build_object('priority_scope', CASE WHEN jsonb_array_length(coalesce(o.item->'priorities','[]'::jsonb)) > 0 THEN 'selected' ELSE 'all' END,
                    'selected_priorities',coalesce(o.item->'priorities','[]'::jsonb),
                    'returned_priority_counts',coalesce(o.item->'returned_priority_counts','{}'::jsonb))::text END,
@@ -659,9 +676,9 @@ per_session AS (
          count(*) FILTER (WHERE kind = 'sql') AS sql_calls,
          count(*) FILTER (WHERE kind = 'sql' AND inp ~* 'base_[a-z0-9_]+[.]'
                             AND inp !~* 'timeline[.]' AND inp !~* 'marts_') AS sql_base_only,
-         max(CASE WHEN kind = 'sql' AND result ~ '{sql_error}' THEN 1 ELSE 0 END)
+         max(CASE WHEN kind = 'sql' AND {sql_failed} THEN 1 ELSE 0 END)
              AS sql_error_session,
-         count(*) FILTER (WHERE kind = 'sql' AND result ~ 'SQLSTATE 57014') AS sql_timeouts,
+         count(*) FILTER (WHERE kind = 'sql' AND {sql_failed} AND result ~ 'SQLSTATE 57014') AS sql_timeouts,
          count(*) FILTER (WHERE kind = 'invented') AS invented_calls
   FROM reads
   GROUP BY source, session_id
@@ -718,8 +735,11 @@ ORDER BY source, session_id, seq
 
 def _expand_agent_usage_regexes(statement: str) -> str:
     return (
-        statement.replace("{invoked}", CLI_INVOKED_RE)
-        .replace("{invented}", CLI_INVENTED_RE)
+        statement.replace("{sql_failed}", SQL_FAILED_PREDICATE).replace("{invoked}", CLI_INVOKED_RE)
+        .replace("{invented}", CLI_INVENTED_RE.replace("'", "''"))
+        .replace("{heredoc}", HEREDOC_RE.replace("'", "''"))
+        .replace("{python_string}", PYTHON_STRING_RE.replace("'", "''"))
+        .replace("{comment}", r"#[^\n]*")
         .replace("{script}", _cli_re("run"))
         .replace("{search}", CLI_SEARCH_RE)
         .replace("{sql}", CLI_SQL_RE)
@@ -745,11 +765,11 @@ def _expand_agent_usage_regexes(statement: str) -> str:
 AGENT_FAILURE_CALLS_SQL = _AGENT_USAGE_CALLS_CTE + """
 SELECT source, session_id, seq, occurred_at, kind, left(inp, 4000) AS inp,
        CASE WHEN kind = 'sql'
-            THEN substring(result from greatest(position('SQLSTATE' in result) - 600, 1) for 640)
+            THEN left(result, 4000)
             WHEN kind = 'script_error' THEN result ELSE '' END AS error
 FROM pdw
 WHERE occurred_at >= %(since)s
-  AND (kind IN ('invented','script_error') OR (kind = 'sql' AND result ~ 'SQLSTATE [0-9A-Z]{5}'))
+  AND (kind IN ('invented','script_error') OR (kind = 'sql' AND {sql_failed}))
 ORDER BY occurred_at, source, session_id, seq
 """
 
@@ -760,7 +780,7 @@ AGENT_FAILURE_CALLS_SQL = _expand_agent_usage_regexes(AGENT_FAILURE_CALLS_SQL)
 
 
 _PY_INVENTED_RE = re.compile(CLI_INVENTED_RE.replace("[[:space:]]", r"\s"))
-_SQL_ERROR_LINE_RE = re.compile(r"ERROR:\s*([^\n]*?)\s*\(SQLSTATE ([0-9A-Z]{5})\)")
+_SQL_ERROR_LINE_RE = re.compile(SQL_ERROR_RE + r"\s*([^\n]*?)\s*\(SQLSTATE ([0-9A-Z]{5})\)")
 _MISSING_COLUMN_RE = re.compile(r'^column "?(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)"? does not exist$')
 _STATEMENT_RELATION_RE = re.compile(
     r"(?<![A-Za-z0-9_.])((?:base|derived|marts)_[a-z0-9_]+|timeline|ops)\.([a-z_][a-z0-9_]*)\b(?!\s*\()"
@@ -792,6 +812,7 @@ def failure_shape(kind: str, inp: str, error: str) -> tuple[str, str, str] | Non
     if kind == "script_error":
         return "script_error", "", "script " + re.sub(r"[^a-z_]", "", error)[:60]
     if kind == "invented":
+        inp = _command_text(inp)
         match = _PY_INVENTED_RE.search(inp)
         if not match:
             return None
@@ -801,7 +822,7 @@ def failure_shape(kind: str, inp: str, error: str) -> tuple[str, str, str] | Non
             return "invented", "", f"pdw call {call.group(1)}"
         token = re.match(r"[-A-Za-z0-9_]+", after)
         return "invented", "", f"pdw {token.group(0) if token else after[:20].strip()}"
-    match = _SQL_ERROR_LINE_RE.search(_unescape(error))
+    match = _own_sql_error(error)
     if not match:
         return None
     message, sqlstate = match.group(1).strip(), match.group(2)
@@ -817,11 +838,37 @@ def failure_shape(kind: str, inp: str, error: str) -> tuple[str, str, str] | Non
     return "sql_error", sqlstate, shape
 
 
+def _command_text(inp: str) -> str:
+    return re.sub(r"#[^\n]*", "", re.sub(PYTHON_STRING_RE, "", re.sub(HEREDOC_RE, "", _unescape(inp), flags=re.S)))
+
+
+def _own_sql_error(error: str):
+    try:
+        body = json.loads(error)
+    except (ValueError, TypeError):
+        body = None
+    if isinstance(body, dict) and body.get('isError') is True:
+        for content in body.get('content', []):
+            text = content.get('text', '')
+            match = _SQL_ERROR_LINE_RE.search('pdw sql: ' + text)
+            if match:
+                return match
+    decoded = _unescape(error)
+    # CSV cells can contain whole transcripts with apparent error lines.
+    # Only a line outside a quoted result cell is the call's own error.
+    cells = list(re.finditer(r'"([^"]|"")*"', decoded))
+    for match in _SQL_ERROR_LINE_RE.finditer(decoded):
+        if not any(cell.start() <= match.start() < cell.end() for cell in cells):
+            return match
+    return None
+
+
 def _failure_example(kind: str, inp: str, error: str) -> str:
     if kind == "invented":
+        inp = _command_text(inp)
         match = _PY_INVENTED_RE.search(inp)
         return _unescape(inp[match.start():] if match else inp)[:160].strip()
-    match = _SQL_ERROR_LINE_RE.search(_unescape(error))
+    match = _own_sql_error(error)
     return (match.group(0) if match else "")[:240]
 
 
