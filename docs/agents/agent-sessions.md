@@ -542,13 +542,13 @@ SCRUB_CONTROLLER=src/personal_data_warehouse/scrub_conversation_window.py
 ssh mew-coolify "sudo -n python3 - plan --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
 ```
 
-`plan` is read-only toward the warehouse/archive. It records container IDs,
+`plan` reads only the database, never the archive. It records container IDs,
 running states, image identity, every persisted Dagster schedule/sensor status
 and active/queued run ID, job and status. State and plans are mode 0600 in a
 0700 directory on mew-coolify; the environment file (a copy of the Dagster
 secrets) stays there until `verify` passes and then removes it. An absent
-instigator row means its declared default, which is left unchanged. Archive
-discovery finishes before the fresh DB plan. Review the printed source-row and
+instigator row means its declared default, which is left unchanged.
+Review the printed source-row and
 total-plan counts against the fail-closed limits below before apply.
 
 The controller stops the **whole** `personal-data-warehouse-dagster` container
@@ -591,7 +591,7 @@ Do not run manual warehouse writers during maintenance. NOWAIT table locks
 remain the final guard against an unaccounted writer.
 
 Apply records a new `before-stop.json` before the first stop. It executes
-`docker stop --time 30 <dagster-id> <app-id>`, runs archive apply, then DB apply
+`docker stop --time 30 <dagster-id> <app-id>`, runs only DB apply
 with `--session-batches --planned-only --writers-paused --max-canonical-rows 10000`.
 If a group overruns its transaction, it rolls back and the writers restart;
 rerun `apply --max-canonical-rows <largest session's rows>` so that session runs
@@ -617,7 +617,7 @@ ssh mew-coolify "sudo -n python3 - restore --state-dir $SCRUB_STATE" < "$SCRUB_C
 
 After restore, `verify` checks that both original containers run with unchanged
 image IDs and that every saved schedule/sensor status matches. It then runs
-both full read-only scans, requiring zero matches and exit zero:
+the full read-only DB scan, requiring zero matches and exit zero:
 
 ```sh
 ssh mew-coolify "sudo -n python3 - verify --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
@@ -640,12 +640,9 @@ up to 10,000 canonical rows, so a session larger than the legacy 5,000-row cap
 can be repaired without splitting its canonical regeneration. Oversized groups
 still fail the CLI as incomplete. This explicit mode repairs the plan, **not
 unrelated sessions**: it makes no global in-window absence claim. The mandatory
-full post-restore scans and 30-day count below establish completion; remaining
+full post-restore DB scan and 30-day count below establish DB completion; remaining
 tokens require a new reviewed plan. Normal apply retains its full delta gate.
-For original host copies, repeat `scrub_conversation_jsonl --scope tokens --root
-<transcript-root> --session <affected-session>` with `--apply`, then without it
-and require zero matches. Token JSONL commands exit nonzero when a secret
-remains; apply rereads the files before returning success. Before the final 30-day count, read
+Before archive or host work, read
 `pdw columns marts_ai_conversations.events`, then run:
 
 ```sh
@@ -656,6 +653,70 @@ If that API query exceeds its statement budget, partition the same predicate
 by source and disjoint UTC days covering the entire 30-day window, and sum the
 counts. A timeout is not zero; all partitions must complete. The full maintenance
 verification above also checks other text/JSON columns and historical copies.
+
+Next scrub the archive **live**, in a separate state directory. No container
+stops occur in `archive-plan`, `archive-apply` or `archive-verify`. Existing batch
+metadata has export timestamps but no device, provider or session index: do not
+pretend those fields can filter historical objects. Select a conservative UTC
+export interval from before the earliest affected event through the latest
+possible unsanitized upload. Include delayed uploads, re-exports and both inbox
+and library copies; event dates alone do not bound delayed uploads. An unknown
+batch filename fails closed. If coverage cannot be established from the reviewed
+incident and deployment history, widen the interval before approving the plan.
+Pick the lower bound from the reviewed incident evidence, never later than the
+earliest affected event.
+
+Set `ARCHIVE_FROM` and `ARCHIVE_BEFORE` to reviewed UTC seconds
+(`YYYY-MM-DDTHH:MM:SSZ`, inclusive/exclusive). Measure object count and compressed
+bytes from the synced Drive file index before downloading; set explicit limits
+above those measurements. The actual scan reports objects/bytes too, and prints
+counts-only progress to stderr every 1,000 objects. Plan and
+verify list metadata and download only interval members, using 16 download
+threads with separate clients and at most 16 payloads buffered. The saved plan
+retains the interval and limits; verify relists that interval so replacement IDs
+are checked as well. Neither phase scans the whole archive. Byte-limit failure
+may read up to one buffered group beyond the cap, then fails without a plan.
+Archive apply replaces only saved candidate IDs, verifies each sanitized upload,
+then deletes its original. It is safe alongside ingestion because replacements
+contain only sanitized bytes. A deployment change requires a fresh archive plan.
+
+```sh
+ARCHIVE_STATE=/var/lib/pdw-maintenance/token-archive-001
+ssh mew-coolify "sudo -n python3 - archive-plan --state-dir $ARCHIVE_STATE --exported-from ${ARCHIVE_FROM:?} --exported-before ${ARCHIVE_BEFORE:?} --max-objects ${ARCHIVE_MAX_OBJECTS:?} --max-bytes ${ARCHIVE_MAX_BYTES:?}" < "$SCRUB_CONTROLLER"
+# Review the counts and coverage before replacement.
+ssh mew-coolify "sudo -n python3 - archive-apply --state-dir $ARCHIVE_STATE" < "$SCRUB_CONTROLLER"
+ssh mew-coolify "sudo -n python3 - archive-verify --state-dir $ARCHIVE_STATE" < "$SCRUB_CONTROLLER"
+```
+
+Then repair original JSONL copies **on mew-dev**. Use the DB plan's source/session
+identities and device evidence to find each transcript, checking uploader root
+overrides first. Default roots are `~/.claude/projects`, `~/.codex/sessions` and
+`~/.gemini/antigravity-cli/brain` for Claude Code, Codex and Argon; see the uploader
+roots above. Inspect filenames only, never print matching transcript lines. From
+the landed checkout on that host, repeat for every affected session/root:
+
+```sh
+uv run python -m personal_data_warehouse.scrub_conversation_jsonl --scope tokens --root "$TRANSCRIPT_ROOT" --session "$SESSION_ID" --apply
+uv run python -m personal_data_warehouse.scrub_conversation_jsonl --scope tokens --root "$TRANSCRIPT_ROOT" --session "$SESSION_ID"
+```
+
+Require zero matches and an actual matching file for each session. Token JSONL
+commands exit nonzero if a secret remains; apply rereads before returning success.
+Finally remove controller state, including abandoned archive-first plans. Use the
+cleanup command, never a shell recursive delete. It accepts only a direct child
+of `/var/lib/pdw-maintenance` (no `..` in the path), refuses symlinks/unknown files, active maintenance
+and saved stopped writers, and removes only its known files and their crash-left
+`<name>.<random>` temporaries. It also accepts an
+incomplete plan with no DB plan or stop record. Successful DB/archive verify
+already deletes its environment copy; cleanup removes the remaining records.
+
+```sh
+ssh mew-coolify "sudo -n python3 - cleanup --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
+ssh mew-coolify "sudo -n python3 - cleanup --state-dir $ARCHIVE_STATE" < "$SCRUB_CONTROLLER"
+```
+
+Clean any earlier or abandoned state directory under `/var/lib/pdw-maintenance`
+the same way, passing it as `--state-dir`.
 
 One-session card repairs first confirm the original checkpoint's global MVCC
 delta while writers remain live. A transient fence is captured before that
@@ -690,8 +751,8 @@ accepts `--root` and `--session` to clean host JSONL copies. First run DB/archiv
 discovery with `--plan <private-new-file>` while workers remain live. Plans hold
 IDs, cursors and counts only, are created exclusively with mode 0600, and are
 reused with `--apply --plan <file>`; apply never repeats baseline discovery.
-Only apply requires pausing writers, timeline sync and search workers. Archive
-discovery can be network-bound, so finish it before taking the fresh DB plan.
+Only DB apply requires pausing writers, timeline sync and search workers. Archive
+discovery, replacement and verification run live after DB verification.
 After resume, use `--verify` for read-only DB/archive checks; the DB check may
 also take `--plan` to retain the baseline groups in `--report-html` output.
 Maintenance commands also accept `--scope labelled` and repeatable

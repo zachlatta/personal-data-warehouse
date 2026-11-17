@@ -140,7 +140,14 @@ def test_token_object_verify_cli_fails_until_clean(monkeypatch):
     store = MemoryArchive([TOKEN])
     monkeypatch.setattr(config, 'load_settings', lambda **k: None)
     monkeypatch.setattr(ingest, '_agent_sessions_object_store', lambda settings: store)
-    monkeypatch.setattr(sys, 'argv', ['scrub', '--scope', 'tokens', '--verify', '--workers', '1'])
+    original_listing=store.list_objects
+    def listings(**kw):
+        rows=original_listing(**kw)
+        for row in rows: row.filename='20000102T000000Z-synthetic.jsonl.gz'
+        return rows
+    monkeypatch.setattr(store,'list_objects',listings)
+    monkeypatch.setattr(sys, 'argv', ['scrub', '--scope', 'tokens', '--verify', '--workers', '1',
+        '--exported-from','2000-01-02T00:00:00Z','--exported-before','2000-01-03T00:00:00Z'])
     with pytest.raises(SystemExit, match='secrets remain'):
         main()
     store.objects.clear()

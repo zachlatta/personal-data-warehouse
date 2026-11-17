@@ -117,3 +117,90 @@ def test_jsonl_token_cli_reports_remaining_secret(tmp_path,monkeypatch):
     with pytest.raises(SystemExit,match='secrets remain'): m.main()
     monkeypatch.setattr(sys,'argv',args+['--apply'])
     m.main()
+
+
+def test_database_window_never_runs_archive(tmp_path, monkeypatch):
+    from personal_data_warehouse import scrub_conversation_window as m
+    state={'writers':[{'Id':'dagster'},{'Id':'app'}],'image':'i','network':'n'}
+    (tmp_path/'state.json').write_text(json.dumps(state))
+    calls=[]
+    monkeypatch.setattr(m,'assert_current',lambda _: None)
+    monkeypatch.setattr(m,'snapshot',lambda _: {'schedules':[]})
+    monkeypatch.setattr(m,'docker',lambda *a,**k: '')
+    monkeypatch.setattr(m,'runtime',lambda d,s,module,*a: calls.append(module))
+    m.apply(tmp_path)
+    m.verify(tmp_path)
+    assert calls == ['cards','cards']
+
+
+def test_cleanup_confined_and_refuses_unknown_files_and_links(tmp_path, monkeypatch):
+    from personal_data_warehouse import scrub_conversation_window as m
+    monkeypatch.setattr(m,'MAINTENANCE_ROOT',tmp_path)
+    monkeypatch.setattr(m,'docker',lambda *a,**k: '')
+    directory=tmp_path/'stale'
+    directory.mkdir()
+    (directory/'runtime.env').write_text('secret')
+    (directory/'unowned').write_text('keep')
+    with pytest.raises(ValueError): m.cleanup(directory)
+    assert (directory/'runtime.env').exists()
+    (directory/'unowned').unlink()
+    (directory/'state.json').symlink_to(tmp_path/'outside')
+    with pytest.raises(ValueError): m.cleanup(directory)
+    (directory/'state.json').unlink()
+    m.cleanup(directory)
+    assert not directory.exists()
+    m.cleanup(directory)  # retry
+    with pytest.raises(ValueError): m.cleanup(tmp_path)
+    with pytest.raises(ValueError): m.cleanup(tmp_path.parent/'outside')
+
+
+def test_live_archive_never_stops_writers(tmp_path, monkeypatch):
+    from personal_data_warehouse import scrub_conversation_window as m
+    (tmp_path/'state.json').write_text(json.dumps({'writers':[]}))
+    (tmp_path/'runtime.env').write_text('private')
+    calls=[]
+    monkeypatch.setattr(m,'assert_current',lambda _:None)
+    monkeypatch.setattr(m,'runtime',lambda d,s,module,*args:calls.append((module,args)))
+    monkeypatch.setattr(m,'docker',lambda *a,**k:pytest.fail('live archive stopped a writer'))
+    m.archive(tmp_path,'apply')
+    m.archive(tmp_path,'verify')
+    assert calls==[('objects',('--apply',)),('objects',('--verify',))]
+    assert not (tmp_path/'runtime.env').exists()
+
+
+def test_cleanup_preserves_recovery_for_stopped_writer(tmp_path, monkeypatch):
+    from personal_data_warehouse import scrub_conversation_window as m
+    monkeypatch.setattr(m,'MAINTENANCE_ROOT',tmp_path)
+    directory=tmp_path/'stale'
+    directory.mkdir()
+    (directory/'state.json').write_text(json.dumps({'writers':[{'Id':'saved'}]}))
+    (directory/'runtime.env').write_text('private')
+    def docker(args, **kw):
+        if args[0]=='inspect': return json.dumps([{'State':{'Running':False}}])
+        return 'saved' if '-a' in args or '-aq' in args else ''
+    monkeypatch.setattr(m,'docker',docker)
+    with pytest.raises(RuntimeError,match='stopped'): m.cleanup(directory)
+    assert (directory/'runtime.env').exists()
+
+
+def test_cleanup_removes_crash_left_controller_temp_files(tmp_path, monkeypatch):
+    from personal_data_warehouse import scrub_conversation_window as m
+    monkeypatch.setattr(m,'MAINTENANCE_ROOT',tmp_path)
+    monkeypatch.setattr(m,'docker',lambda *a,**k: '')
+    directory=tmp_path/'crashed'
+    directory.mkdir()
+    (directory/'before-stop.json.k2j3h4').write_text('{}')
+    (directory/'token-cards-plan.json.a8b7.pending').write_text('{}')
+    m.cleanup(directory)
+    assert not directory.exists()
+
+
+def test_cleanup_refuses_parent_references(tmp_path, monkeypatch):
+    from personal_data_warehouse import scrub_conversation_window as m
+    monkeypatch.setattr(m,'MAINTENANCE_ROOT',tmp_path)
+    monkeypatch.setattr(m,'docker',lambda *a,**k: '')
+    (tmp_path/'a').mkdir()
+    (tmp_path/'b').mkdir()
+    for path in (tmp_path/'..', tmp_path/'a'/'..'/'b'):
+        with pytest.raises(ValueError,match='parent'): m.cleanup(path)
+    assert (tmp_path/'b').exists()

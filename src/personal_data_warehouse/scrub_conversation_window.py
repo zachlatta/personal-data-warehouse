@@ -1,6 +1,7 @@
 """Host-side token scrub controller. Run on the production Docker host as root.
 
-Only plan/verify read production data. Apply stops the app and entire Dagster
+Only plan/verify read production data; the archive-* phases repair the Drive
+archive live and never stop a writer. Apply stops the app and entire Dagster
 container, including its daemon, run subprocesses and resident landing workers.
 The original schedule/sensor states are never modified. No credentials in argv
 or stdout; the runtime environment stays in a private local file until a
@@ -15,6 +16,7 @@ import subprocess
 import tempfile
 
 RUNTIME_NAME='pdw-conversation-token-scrub'
+MAINTENANCE_ROOT=Path('/var/lib/pdw-maintenance')
 
 
 def docker(args, *, capture=True):
@@ -69,7 +71,7 @@ def runtime(directory, state, module, *args):
             '--scope','tokens','--plan',f'/scrub/token-{module}-plan.json',*args],capture=False)
 
 
-def plan(directory):
+def plan(directory, archive_args=None):
     directory.mkdir(mode=0o700,parents=True,exist_ok=False)
     writers=[]
     for label in ('personal-data-warehouse-dagster','app'):
@@ -88,8 +90,10 @@ def plan(directory):
     save(directory/'state.json',state)
     assert_current(state)
     save(directory/'before-plan.json',snapshot(state))
-    runtime(directory,state,'objects')
-    runtime(directory,state,'cards')
+    if archive_args is None: runtime(directory,state,'cards')
+    else:
+        save(directory/'archive-scope.json',archive_args)
+        runtime(directory,state,'objects',*archive_args)
 
 
 def restore(directory):
@@ -118,7 +122,6 @@ def apply(directory, max_canonical_rows=10000):
     # list before returning an error. SIGKILL/host loss needs explicit restore.
     try:
         docker(['stop','--time','30',*[w['Id'] for w in state['writers']]])
-        runtime(directory,state,'objects','--apply')
         runtime(directory,state,'cards','--apply','--session-batches','--planned-only',
                 '--writers-paused','--max-canonical-rows',str(max_canonical_rows),'--window-seconds','60')
     finally:
@@ -132,23 +135,72 @@ def verify(directory):
     before=json.loads((directory/'before-stop.json').read_text())
     if after['schedules'] != before['schedules']:
         raise RuntimeError('schedule/sensor status changed; inspect saved state before proceeding')
-    runtime(directory,state,'objects','--verify')
     runtime(directory,state,'cards','--verify')
     # The environment file is a copy of the Dagster secrets; keep it only
     # until the scans pass, so a failed verify can be rerun.
-    (directory/'runtime.env').unlink()
+    (directory/'runtime.env').unlink(missing_ok=True)
+
+
+def cleanup(directory):
+    """Remove only controller-owned files from a direct maintenance child.
+
+    Refuse symlinks, unknown entries and active runtimes before deleting anything.
+    Incomplete plans (including the old archive-first plan) need no state.json.
+    """
+    if '..' in directory.parts:
+        raise ValueError('cleanup refuses parent references in the state path')
+    if directory.is_symlink() or directory.parent.resolve()!=MAINTENANCE_ROOT.resolve():
+        raise ValueError('cleanup requires a direct directory under the maintenance root')
+    if not directory.exists(): return
+    allowed={'runtime.env','state.json','before-plan.json','before-stop.json',
+             'token-cards-plan.json','token-objects-plan.json','archive-scope.json'}
+    entries=list(directory.iterdir())
+    # save(replace=True) and the cards plan writer leave '<name>.<random>'
+    # temporaries behind if killed between create and rename.
+    def owned(name): return name in allowed or any(name.startswith(a+'.') for a in allowed)
+    if any(not owned(p.name) or p.is_symlink() or not p.is_file() for p in entries):
+        raise ValueError('state contains unowned entries; nothing removed')
+    if docker(['ps','-q','--filter',f'name=^/{RUNTIME_NAME}$']).strip():
+        raise RuntimeError('maintenance runtime is active; restore before cleanup')
+    state_path=directory/'state.json'
+    if state_path.exists():
+        # Old deployment containers may have been removed. Existing saved
+        # writers must be running; never discard the only restoration record.
+        for writer in json.loads(state_path.read_text())['writers']:
+            ids=docker(['ps','-aq','--no-trunc','--filter',f"id={writer['Id']}"]).split()
+            if ids and not json.loads(docker(['inspect',writer['Id']]))[0]['State']['Running']:
+                raise RuntimeError('saved writer is stopped; restore before cleanup')
+    for path in entries: path.unlink()
+    directory.rmdir()
+
+
+def archive(directory, phase):
+    state=json.loads((directory/'state.json').read_text())
+    assert_current(state)
+    runtime(directory,state,'objects','--'+phase)
+    if phase=='verify': (directory/'runtime.env').unlink(missing_ok=True)
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase',choices=('plan','apply','restore','verify'))
+    parser.add_argument('phase',choices=('plan','apply','restore','verify','cleanup',
+                                        'archive-plan','archive-apply','archive-verify'))
     parser.add_argument('--state-dir',type=Path,required=True)
     parser.add_argument('--max-canonical-rows',type=int,default=10000,help='apply only: canonical rows per session group')
+    parser.add_argument('--exported-from')
+    parser.add_argument('--exported-before')
+    parser.add_argument('--max-objects',type=int,default=70000)
+    parser.add_argument('--max-bytes',type=int,default=5_000_000_000)
     args=parser.parse_args()
-    directory=args.state_dir.expanduser().resolve()
+    directory=args.state_dir.expanduser().absolute()
     def interrupted(*_): raise InterruptedError('maintenance interrupted; restoration required')
     signal.signal(signal.SIGTERM,interrupted)
-    if args.phase=='apply': apply(directory,args.max_canonical_rows)
+    if args.phase=='archive-plan':
+        if not args.exported_from or not args.exported_before: parser.error('archive-plan requires both UTC bounds')
+        plan(directory,['--exported-from',args.exported_from,'--exported-before',args.exported_before,
+                        '--max-objects',str(args.max_objects),'--max-bytes',str(args.max_bytes)])
+    elif args.phase.startswith('archive-'): archive(directory,args.phase.removeprefix('archive-'))
+    elif args.phase=='apply': apply(directory,args.max_canonical_rows)
     else: globals()[args.phase](directory)
 
 
