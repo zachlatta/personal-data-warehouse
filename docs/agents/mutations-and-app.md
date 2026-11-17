@@ -354,7 +354,9 @@ The app accepts only `GOOGLE_DRIVE_SOURCE_ACCOUNTS`. File/destination names are 
 from that account's synced `base_google_drive.files`; missing ids and non-folder parents
 are refused. The source persists the entire folder snapshot on every run, including
 My Drive and configured shared-drive roots, so existing deployments acquire destinations
-on the next incremental sync without resetting the Changes cursor. A newly created folder
+on the next incremental sync without resetting the Changes cursor. Only folders whose
+metadata changed are rewritten (`google_drive_files` is in the no-op upsert guard), so
+`ingested_at` stays a real freshness signal. A newly created folder
 becomes referenceable after that sync, even if its change is behind the feed's batch cap.
 Folders use `is_excluded=1`, `exclude_reason='folder_metadata'`: the existing timeline
 adapter emits background events and extraction/enrichment never downloads folder bytes.

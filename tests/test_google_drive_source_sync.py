@@ -52,6 +52,32 @@ def test_incremental_sync_backfills_existing_folders_without_replaying_files(war
     ) == [("empty", "background"), ("root", "background")]
 
 
+def test_unchanged_folder_snapshot_does_not_rewrite_rows_or_freshness(warehouse):
+    """The per-run folder snapshot must not bump ingested_at (pipeline freshness,
+    timeline incremental re-reads) or churn tuples for folders that did not change."""
+    root = {"id": "root", "name": "My Drive", "parents": []}
+    folder = {"id": "folder", "name": "Original", "mimeType": FOLDER_MIME, "parents": ["root"]}
+    client = FakeDriveClient(folders=[root, folder], files=[])
+    first = datetime(2026, 6, 19, 12, 0, 0, tzinfo=UTC)
+    later = datetime(2026, 6, 19, 12, 30, 0, tzinfo=UTC)
+
+    def sync(at):
+        GoogleDriveSourceSyncRunner(
+            settings=_settings(), warehouse=warehouse, client_factory=lambda account: client, now=lambda: at
+        ).sync_all()
+
+    def stamps():
+        return warehouse._query("SELECT file_id, ingested_at FROM @google_drive_files ORDER BY file_id")
+
+    sync(first)
+    sync(later)
+    assert stamps() == [("folder", first), ("root", first)]
+
+    client.folders = [root, {**folder, "name": "Renamed"}]
+    sync(later)
+    assert stamps() == [("folder", later), ("root", first)]
+
+
 def test_drive_api_lists_full_root_and_shared_root_metadata():
     from unittest.mock import MagicMock
 

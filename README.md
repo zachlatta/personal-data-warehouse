@@ -640,7 +640,9 @@ The sync writes
 Every run also refreshes folder metadata in `base_google_drive.files`, including
 My Drive's real root id and shared-drive roots when shared drives are enabled.
 This snapshot runs even with an existing Changes cursor, so upgrading backfills
-folders on the next sync without recrawling ordinary files. Empty and newly created
+folders on the next sync without recrawling ordinary files. An unchanged folder is
+not rewritten (a no-op upsert guard keeps its `ingested_at`), so the snapshot does
+not mask a stalled sync in `marts_ops.pipeline_health` or re-walk the timeline. Empty and newly created
 folders are valid mutation destinations after that run. Folders have
 `mime_type='application/vnd.google-apps.folder'`, `is_excluded=1` and
 `exclude_reason='folder_metadata'`: they receive background timeline events through
