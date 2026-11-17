@@ -84,7 +84,7 @@ Not commands: `pdw query` (it is `pdw sql`), `pdw tools` / `pdw connections` (`p
 - Keys are `<thing>_id`, almost never a bare `id`: `base_gmail.messages.message_id`, `base_feed.items.item_id`.
   Slack: `conversation_id` (not `channel_id`), `user_id`/`username` (not `user_name`), channel names in
   `base_slack.conversations`. `search_text()` rows name the sender `who` (not `actor`); agent `events`
-  have `role`, `occurred_at` (no `actor`, `created_at`). Regex repeats max 255: `.{0,255}`.
+  have `role`, `occurred_at` (no `actor`, `created_at`). Regex repeat counts max out at 255: use `.{0,255}`, or `substr(col, greatest(1, strpos(col, x) - 300), 600)`.
 - `ops.*` is unreadable by the query role; `marts_ops.*` is the health surface (topic `ops`).
 
 ## Where things live

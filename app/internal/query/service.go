@@ -1296,6 +1296,9 @@ func undefinedFunctionHint(message string) string {
 	if !strings.Contains(message, "42883") || !strings.Contains(message, "does not exist") {
 		return ""
 	}
+	if strings.Contains(message, "round(double precision, integer)") {
+		return "(hint: use round(x::numeric, 2).)"
+	}
 	match := undefinedFunctionRe.FindStringSubmatch(message)
 	if match == nil {
 		return ""
@@ -1413,6 +1416,9 @@ func inventedAgentSessionRelation(rel string) bool {
 func undefinedColumnHint(message, sql string) string {
 	if !strings.Contains(message, "42703") || !strings.Contains(message, "does not exist") {
 		return ""
+	}
+	if (strings.Contains(sql, "ops.upstream_mutation_requests") || strings.Contains(sql, "ops.upstream_mutation_operations")) && (quotedIdentifier(message) == "request_id" || quotedIdentifier(message) == "mutation_type" || strings.Contains(message, "column request_id ")) {
+		return "(hint: the key is id; operations link to requests with request_id. Read topic mutations for the status query.)"
 	}
 	if hint := searchResultColumnHint(sql); hint != "" {
 		return hint

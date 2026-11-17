@@ -108,7 +108,7 @@ echo '{"queued":""}'
 			return ""
 		}
 		code := Run([]string{"--spool-dir", dir, "--lock-file", filepath.Join(dir, "lock"), "--account", "test@example.invalid"}, strings.NewReader(""), &out, &out, env, ingestclient.Config{BaseURL: "http://127.0.0.1:1", Token: "fake"})
-		if code == 0 || !strings.Contains(out.String(), "queued samples drained") {
+		if code == 0 || !strings.Contains(out.String(), "pdw ingest android-location: ") || !strings.Contains(out.String(), "queued samples drained") {
 			t.Fatalf("failure reported success: %d %s", code, out.String())
 		}
 	}

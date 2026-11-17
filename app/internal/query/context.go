@@ -12,6 +12,11 @@ const ContextMaxWindow = 50
 // ContextDefaultWindow is how many events either side a caller gets unasked.
 const ContextDefaultWindow = 5
 
+const contextRefSuggestionSQL = `SELECT DISTINCT adapter || ':' || event_id AS ref
+FROM timeline.events WHERE (event_id = $2 OR right(event_id, length($2) + 1) = '|' || $2)
+AND NOT EXISTS (SELECT 1 FROM timeline.events WHERE adapter = $1) LIMIT 2`
+const contextGmailAccountsSQL = `SELECT DISTINCT account FROM base_gmail.messages ORDER BY account`
+
 // contextSQL names the columns a reader uses. `SELECT *` from
 // timeline.context() returned metadata and the full search_text of every row:
 // 3.8 KB against 0.5 KB, measured over twelve sessions on 2026-09-22.
@@ -77,6 +82,24 @@ func (s *Service) Context(ctx context.Context, req ContextRequest) ContextRespon
 	raw, err := runner.QueryArgs(ctx, statement, args, 0)
 	if err != nil {
 		resp.Error = s.queryErrorMessage(ctx, err.Error(), statement)
+		prefix, id, hasPrefix := strings.Cut(resp.Ref, ":")
+		if hasPrefix && id != "" && strings.Contains(err.Error(), "no timeline event for ref") {
+			matches, lookupErr := runner.QueryArgs(ctx, contextRefSuggestionSQL, []any{prefix, id}, 2)
+			if lookupErr == nil && len(matches.Rows) == 1 {
+				resp.Error += fmt.Sprintf("; use the canonical ref %s", matches.Rows[0]["ref"])
+			} else if lookupErr == nil && len(matches.Rows) == 0 && (prefix == "gmail" || prefix == "gmail_message" || prefix == "gmail_email") {
+				accounts, accountErr := runner.QueryArgs(ctx, contextGmailAccountsSQL, nil, 0)
+				if accountErr == nil {
+					names := []string{}
+					for _, row := range accounts.Rows {
+						if name, ok := row["account"].(string); ok {
+							names = append(names, name)
+						}
+					}
+					resp.Error += "; no synced mailbox holds this id. PDW syncs: " + strings.Join(names, ", ") + `. zrl-bot@hackclub.com mail is read with pdw call zrl_bot_email_control__get_thread --data '{"thread_id":"<id>"}'`
+				}
+			}
+		}
 		return resp
 	}
 	if req.Full {

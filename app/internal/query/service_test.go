@@ -1037,3 +1037,14 @@ func TestCatalogRelationSuggestionsAreBoundedDeterministicAndExcludeDeniedObject
 		t.Fatal("test needs denied private catalog relations")
 	}
 }
+
+func TestAuditSQLHints(t *testing.T) {
+	if h := undefinedFunctionHint(`ERROR: function round(double precision, integer) does not exist (SQLSTATE 42883)`); !strings.Contains(h, `round(x::numeric, 2)`) {
+		t.Fatal(h)
+	}
+	for _, table := range []string{`ops.upstream_mutation_requests`, `ops.upstream_mutation_operations`} {
+		if h := undefinedColumnHint(`ERROR: column request_id does not exist (SQLSTATE 42703)`, `SELECT request_id FROM `+table); !strings.Contains(h, `the key is id`) {
+			t.Fatal(h)
+		}
+	}
+}

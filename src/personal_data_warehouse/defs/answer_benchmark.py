@@ -43,7 +43,7 @@ def benchmark_agent_resource(settings) -> AgentResource:
 @asset(group_name="search")
 def answer_benchmark(context) -> MaterializeResult:
     """Grade real questions with the managed agent and persist C16's results."""
-    settings = load_settings(require_gmail=False)
+    settings = load_settings(require_gmail=False, require_agent=True)
     warehouse = warehouse_from_settings(settings)
     try:
         with exclusive_sync_lock(

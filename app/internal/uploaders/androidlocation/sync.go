@@ -131,7 +131,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	env, err := common.LoadProjectDotenv(getenv)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "pdw ingest android-location: ", err)
 		return 1
 	}
 	cfg = cfg.WithEnvFallback(env)
@@ -190,7 +190,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	fmt.Fprintf(stdout, "Android location queue: samples=%d dry_run=%t\n", n, *dry)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "pdw ingest android-location: ", err)
 		return 1
 	}
 	return 0

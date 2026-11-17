@@ -303,10 +303,8 @@ func (t *proxyTool) Invoke(ctx context.Context, input json.RawMessage) (any, boo
 	}
 	if err != nil {
 		t.service.status(ctx, c, "call_failed")
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, true, fmt.Errorf("the %s connection did not answer within %s, PDW's budget for one live upstream call; it was not retried, as a write may already have occurred. A long read query will not finish on a rerun: narrow it (tighter filters, LIMIT, fewer joins) or split it", t.connection, upstreamCallBudget)
-		}
-		return nil, true, errors.New("upstream MCP call failed; it was not retried, as a write may already have occurred")
+		readOnly := t.definition.Annotations != nil && t.definition.Annotations.ReadOnlyHint
+		return nil, true, upstreamFailure(ctx, t.connection, t.definition.Name, readOnly, c.Token.AccessToken, err)
 	}
 	t.service.status(ctx, c, "connected")
 	if result == nil {

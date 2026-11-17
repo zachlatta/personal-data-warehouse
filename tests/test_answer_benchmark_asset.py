@@ -52,6 +52,7 @@ def test_asset_lock_runner_and_cleanup(monkeypatch, acquired, failed):
         else:
             asset_module.answer_benchmark(context)
     warehouse.close.assert_called_once()
+    asset_module.load_settings.assert_called_once_with(require_gmail=False, require_agent=True)
     assert lock_calls == [dict(name='answer_benchmark', postgres_lock_id=asset_module.ANSWER_BENCHMARK_POSTGRES_LOCK_ID)]
     if acquired:
         assert run.call_args.kwargs['warehouse'] is warehouse

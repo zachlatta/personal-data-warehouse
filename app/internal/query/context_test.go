@@ -2,9 +2,31 @@ package query
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
+
+func TestContextExplainsGuessedGmailRefs(t *testing.T) {
+	for _, matched := range []bool{true, false} {
+		r := &fakeSearchRunner{argsErrs: map[string]error{contextSQL: errors.New("context: no timeline event for ref gmail:abc")}, argsResults: map[string]RawResult{}}
+		if matched {
+			r.argsResults[contextRefSuggestionSQL] = RawResult{Rows: []map[string]any{{"ref": "gmail_email:test@example.invalid|abc"}}}
+		}
+		r.argsResults[contextGmailAccountsSQL] = RawResult{Rows: []map[string]any{{"account": "test@example.invalid"}}}
+		resp := NewService(r, Options{}).Context(context.Background(), ContextRequest{Ref: "gmail:abc"})
+		want := "zrl_bot_email_control__get_thread"
+		if matched {
+			want = "gmail_email:test@example.invalid|abc"
+		}
+		if !strings.Contains(resp.Error, want) || resp.TotalRows != 0 {
+			t.Fatal(resp)
+		}
+		if !matched && !strings.Contains(resp.Error, "test@example.invalid") {
+			t.Fatal(resp)
+		}
+	}
+}
 
 func TestContextReadsTimelineContextWithBoundParameters(t *testing.T) {
 	runner := &fakeSearchRunner{

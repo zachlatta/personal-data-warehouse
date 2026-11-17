@@ -162,3 +162,15 @@ on) or `permanent`. It does not change the
   `blocked_missing_credentials` means a person must re-grant something; it is not
   retried.
 - Do not retry one mutation across both surfaces{{if .CLI}} (CLI and MCP){{end}}; check the queue first.
+
+## Check status
+
+The request key is `id`; operations link with `request_id`, and their type is `operation`.
+
+```sql
+SELECT r.id, r.status, o.id AS operation_id, o.operation, o.status AS operation_status, o.error
+FROM ops.upstream_mutation_requests r
+LEFT JOIN ops.upstream_mutation_operations o ON o.request_id = r.id
+WHERE r.id = 'req_example'
+ORDER BY o.request_index;
+```
