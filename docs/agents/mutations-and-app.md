@@ -364,8 +364,12 @@ Tailscale CGNAT addresses in 100.64.0.0/10 or tailnet hostnames ending in `.ts.n
 path-style bucket access, no URL credentials/path/query),
 `PDW_MUTATION_S3_BUCKET`, `PDW_MUTATION_S3_ACCESS_KEY`, `PDW_MUTATION_S3_SECRET_KEY`
 and `PDW_MUTATION_S3_REGION` on app and worker deployments (region is required; there
-is no AWS region fallback). No bucket or credentials
-are created by code. Before staging, the app checks a readable, enabled lifecycle
+is no AWS region fallback). Go `config.LoadFromEnv` and Python `load_settings`
+validate the optional staging config
+at startup, require all five fields together, and pass it to the store/executor.
+With no fields set staging is disabled; partial or invalid settings fail startup.
+The execution code reads no staging environment variables and creates no buckets or
+credentials. Before staging, the app checks a readable, enabled lifecycle
 rule with `Filter.Prefix` `pending/` and `Expiration.Days` 7. This expires applied,
 rejected, withdrawn, abandoned and still-pending bytes; old proposals with missing bytes
 fail without writing to Drive and must be proposed again. Lifecycle deletion is asynchronous.

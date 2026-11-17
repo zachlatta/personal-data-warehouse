@@ -10,9 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/mail"
-	"net/netip"
-	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -20,6 +17,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 )
 
 const (
@@ -224,43 +222,29 @@ func drivePayload(m MutationInput) (map[string]any, error) {
 	return p, nil
 }
 
-// Plain HTTP is permitted only over the fleet's Tailscale address space.
-// Credentials, paths and query strings in endpoint URLs are never accepted.
-func validMutationStagingEndpoint(u *url.URL) bool {
-	if u == nil || u.Host == "" || u.User != nil || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
-		return false
+// ConfigureMutationStaging injects the validated startup configuration.
+func (s *PostgresStore) ConfigureMutationStaging(staging *config.MutationStagingConfig) {
+	s.stageUploads = func(ctx context.Context, mutations []storedMutation) error {
+		return stageDriveUploads(ctx, mutations, staging)
 	}
-	if u.Scheme == "https" {
-		return true
-	}
-	if u.Scheme != "http" {
-		return false
-	}
-	host := strings.ToLower(u.Hostname())
-	if addr, err := netip.ParseAddr(host); err == nil {
-		return netip.MustParsePrefix("100.64.0.0/10").Contains(addr)
-	}
-	return strings.HasSuffix(host, ".ts.net") && len(strings.Split(host, ".")) >= 4
 }
 
 // stageDriveUploads runs after the duplicate-request check. Only the private
 // object reference enters Postgres, the timeline, or a review response.
-func stageDriveUploads(ctx context.Context, mutations []storedMutation) error {
+func stageDriveUploads(ctx context.Context, mutations []storedMutation, staging *config.MutationStagingConfig) error {
 	for i := range mutations {
 		m := &mutations[i]
 		if m.Operation != GoogleDriveUploadFileOperation {
 			continue
 		}
-		endpoint, err := url.Parse(os.Getenv("PDW_MUTATION_S3_ENDPOINT_URL"))
-		bucket := os.Getenv("PDW_MUTATION_S3_BUCKET")
-		if err != nil || !validMutationStagingEndpoint(endpoint) || bucket == "" || os.Getenv("PDW_MUTATION_S3_ACCESS_KEY") == "" || os.Getenv("PDW_MUTATION_S3_SECRET_KEY") == "" || os.Getenv("PDW_MUTATION_S3_REGION") == "" {
-			return errors.New("uploads require PDW_MUTATION_S3_ENDPOINT_URL (HTTPS or tailnet HTTP), BUCKET, ACCESS_KEY, SECRET_KEY and REGION")
+		if staging == nil || staging.Endpoint == nil {
+			return errors.New("upload staging is not configured; set PDW_MUTATION_S3 settings at startup")
 		}
-		client, err := minio.New(endpoint.Host, &minio.Options{Creds: credentials.NewStaticV4(os.Getenv("PDW_MUTATION_S3_ACCESS_KEY"), os.Getenv("PDW_MUTATION_S3_SECRET_KEY"), ""), Secure: endpoint.Scheme == "https", Region: os.Getenv("PDW_MUTATION_S3_REGION"), BucketLookup: minio.BucketLookupPath})
+		client, err := minio.New(staging.Endpoint.Host, &minio.Options{Creds: credentials.NewStaticV4(staging.AccessKey, staging.SecretKey, ""), Secure: staging.Endpoint.Scheme == "https", Region: staging.Region, BucketLookup: minio.BucketLookupPath})
 		if err != nil {
 			return errors.New("could not configure mutation staging")
 		}
-		if err := stageDriveUpload(ctx, m, client, bucket); err != nil {
+		if err := stageDriveUpload(ctx, m, client, staging.Bucket); err != nil {
 			return err
 		}
 	}

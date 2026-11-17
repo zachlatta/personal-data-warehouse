@@ -9,9 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
-import os
-import ipaddress
-from urllib.parse import urlsplit
 
 import boto3
 from botocore.config import Config
@@ -26,6 +23,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
 from personal_data_warehouse.calendar_mutations import calendar_mutation_failure_status
+from personal_data_warehouse.config import Settings
 from personal_data_warehouse.objectstore.google_drive import build_google_drive_service
 
 
@@ -53,52 +51,41 @@ class DriveMutationResult:
     error: str = ""
 
 
-def staging_client():
-    names = ("ENDPOINT_URL", "BUCKET", "ACCESS_KEY", "SECRET_KEY", "REGION")
-    if any(not os.getenv("PDW_MUTATION_S3_" + name) for name in names):
+def staging_client(settings: Settings):
+    staging = settings.mutation_staging
+    if staging is None:
         raise RuntimeError("PDW_MUTATION_S3 configuration is missing")
-    endpoint = urlsplit(os.environ["PDW_MUTATION_S3_ENDPOINT_URL"])
-    host = endpoint.hostname or ""
-    try:
-        tailnet = ipaddress.ip_address(host) in ipaddress.ip_network("100.64.0.0/10")
-    except ValueError:
-        tailnet = host.endswith(".ts.net") and len(host.split(".")) >= 4
-    if (
-        not host
-        or endpoint.username is not None
-        or endpoint.password is not None
-        or endpoint.path not in ("", "/")
-        or endpoint.query
-        or endpoint.fragment
-        or not (endpoint.scheme == "https" or endpoint.scheme == "http" and tailnet)
-    ):
-        raise ValueError("staging endpoint must use HTTPS or tailnet HTTP")
     return boto3.client(
         "s3",
-        endpoint_url=os.environ["PDW_MUTATION_S3_ENDPOINT_URL"],
-        aws_access_key_id=os.environ["PDW_MUTATION_S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["PDW_MUTATION_S3_SECRET_KEY"],
-        region_name=os.environ["PDW_MUTATION_S3_REGION"],
-        config=Config(signature_version="s3v4", connect_timeout=15, read_timeout=60, s3={"addressing_style": "path"}),
+        endpoint_url=staging.endpoint_url,
+        aws_access_key_id=staging.access_key,
+        aws_secret_access_key=staging.secret_key,
+        region_name=staging.region,
+        config=Config(
+            signature_version="s3v4",
+            connect_timeout=15,
+            read_timeout=60,
+            s3={"addressing_style": staging.addressing_style},
+        ),
     )
 
 
-def read_staged_upload(payload):
+def read_staged_upload(payload, *, settings: Settings):
     key = payload["staging_key"]
     if not key.startswith("pending/sha256/" + payload["sha256"] + "/"):
         raise ValueError("invalid staging key")
-    response = staging_client().get_object(Bucket=os.environ["PDW_MUTATION_S3_BUCKET"], Key=key)
+    response = staging_client(settings).get_object(Bucket=settings.mutation_staging.bucket, Key=key)
     with response["Body"] as body:
         return body.read((20 << 20) + 1)
 
 
 class GoogleDriveMutationExecutor:
-    def __init__(self, *, settings, service_factory=None, read_upload=read_staged_upload):
+    def __init__(self, *, settings, service_factory=None, read_upload=None):
         self.settings = settings
         self.service_factory = service_factory or (
             lambda account: build_google_drive_service(account=account, settings=settings)
         )
-        self.read_upload = read_upload
+        self.read_upload = read_upload or (lambda payload: read_staged_upload(payload, settings=self.settings))
 
     def observed(self, mutation):
         """Read upstream only; a successful write is observed independently."""

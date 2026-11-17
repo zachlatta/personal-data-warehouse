@@ -245,7 +245,9 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 
 	stage := s.stageUploads
 	if stage == nil {
-		stage = stageDriveUploads
+		stage = func(ctx context.Context, mutations []storedMutation) error {
+			return stageDriveUploads(ctx, mutations, nil)
+		}
 	}
 	if err := stage(ctx, normalized); err != nil {
 		return Request{}, err

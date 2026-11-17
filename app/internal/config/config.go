@@ -53,6 +53,7 @@ type Config struct {
 	ContactGoogleAccounts   []string
 	CalendarAccounts        []string
 	GoogleDriveAccounts     []string
+	MutationStaging         *MutationStagingConfig
 	AppleNotesAccounts      []string
 	AppleContactsAccounts   []string
 	AppleMessagesAccounts   []string
@@ -241,6 +242,9 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 
 	var err error
+	if cfg.MutationStaging, err = loadMutationStaging(getenv); err != nil {
+		return Config{}, err
+	}
 	if cfg.MaxRows, err = parsePositiveInt(getenv("MCP_MAX_ROWS"), cfg.MaxRows, "MCP_MAX_ROWS"); err != nil {
 		return Config{}, err
 	}

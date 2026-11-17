@@ -1,4 +1,5 @@
 from hashlib import sha256
+from io import BytesIO
 from unittest.mock import MagicMock
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -7,6 +8,7 @@ from httplib2 import Response
 
 from personal_data_warehouse.google_drive_mutations import GoogleDriveMutationExecutor
 from personal_data_warehouse import google_drive_mutations
+from personal_data_warehouse import config as warehouse_config
 
 
 @pytest.mark.parametrize(
@@ -21,6 +23,7 @@ from personal_data_warehouse import google_drive_mutations
     ],
 )
 def test_staging_endpoint_and_region_are_explicit(monkeypatch, endpoint, allowed):
+    monkeypatch.setattr(warehouse_config, "load_dotenv", lambda: None)
     for name in ("BUCKET", "ACCESS_KEY", "SECRET_KEY"):
         monkeypatch.setenv("PDW_MUTATION_S3_" + name, "test-placeholder")
     monkeypatch.setenv("PDW_MUTATION_S3_ENDPOINT_URL", endpoint)
@@ -29,14 +32,74 @@ def test_staging_endpoint_and_region_are_explicit(monkeypatch, endpoint, allowed
     monkeypatch.setattr(google_drive_mutations.boto3, "client", client)
     if not allowed:
         with pytest.raises(ValueError):
-            google_drive_mutations.staging_client()
+            warehouse_config.load_settings(require_postgres=False, require_gmail=False)
         client.assert_not_called()
     else:
-        google_drive_mutations.staging_client()
+        settings = warehouse_config.load_settings(require_postgres=False, require_gmail=False)
+        # The client uses the loaded snapshot, not a later environment value.
+        monkeypatch.setenv("PDW_MUTATION_S3_REGION", "changed-after-load")
+        google_drive_mutations.staging_client(settings)
         assert client.call_args.kwargs["region_name"] == "test-region"
+        assert settings.mutation_staging.bucket == "test-placeholder"
+        assert settings.mutation_staging.endpoint_url == endpoint
+        assert settings.mutation_staging.addressing_style == "path"
     monkeypatch.delenv("PDW_MUTATION_S3_REGION")
-    with pytest.raises(RuntimeError, match="configuration is missing"):
-        google_drive_mutations.staging_client()
+    with pytest.raises(ValueError, match="PDW_MUTATION_S3"):
+        warehouse_config.load_settings(require_postgres=False, require_gmail=False)
+
+
+def test_mutation_staging_settings_disabled_without_env(monkeypatch):
+    monkeypatch.setattr(warehouse_config, "load_dotenv", lambda: None)
+    for name in ("ENDPOINT_URL", "BUCKET", "ACCESS_KEY", "SECRET_KEY", "REGION"):
+        monkeypatch.delenv("PDW_MUTATION_S3_" + name, raising=False)
+    settings = warehouse_config.load_settings(require_postgres=False, require_gmail=False)
+    assert settings.mutation_staging is None
+
+
+def test_upload_executor_uses_loaded_staging_bucket_and_credentials(monkeypatch):
+    monkeypatch.setattr(warehouse_config, "load_dotenv", lambda: None)
+    values = {
+        "ENDPOINT_URL": "http://nas.example-tailnet.ts.net:3900",
+        "BUCKET": "test-pending",
+        "ACCESS_KEY": "test-access",
+        "SECRET_KEY": "test-secret",
+        "REGION": "test-region",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv("PDW_MUTATION_S3_" + name, value)
+    settings = warehouse_config.load_settings(require_postgres=False, require_gmail=False)
+    for name in values:
+        monkeypatch.delenv("PDW_MUTATION_S3_" + name)
+    client = MagicMock()
+    client.return_value.get_object.return_value = {"Body": BytesIO(b"hello")}
+    monkeypatch.setattr(google_drive_mutations.boto3, "client", client)
+    service = MagicMock()
+    service.files.return_value.get.return_value.execute.return_value = {
+        "mimeType": "application/vnd.google-apps.folder"
+    }
+    service.files.return_value.create.return_value.execute.return_value = {"id": "uploaded"}
+    digest = sha256(b"hello").hexdigest()
+    key = "pending/sha256/" + digest + "/test-upload"
+    result = GoogleDriveMutationExecutor(settings=settings, service_factory=lambda account: service).execute(
+        {
+            "id": "m",
+            "account": "you@example.com",
+            "operation": "google_drive.upload_file",
+            "payload_json": {
+                "name": "report.txt",
+                "parent_id": "parent",
+                "mime_type": "text/plain",
+                "staging_key": key,
+                "sha256": digest,
+                "size_bytes": 5,
+            },
+        }
+    )
+    assert result.status == "succeeded"
+    client.return_value.get_object.assert_called_once_with(Bucket="test-pending", Key=key)
+    assert client.call_args.kwargs["aws_access_key_id"] == "test-access"
+    assert client.call_args.kwargs["aws_secret_access_key"] == "test-secret"
+    assert client.call_args.kwargs["endpoint_url"] == values["ENDPOINT_URL"]
 
 
 def test_folder_observation_requires_initial_permissions():
