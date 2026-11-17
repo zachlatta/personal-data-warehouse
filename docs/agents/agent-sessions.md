@@ -662,6 +662,18 @@ cannot be reconstructed from an ID-only checkpoint.
 Planned keys and canonical regenerated rows are verified transactionally;
 whole-corpus verification follows restoration of workers.
 
+For a seed-only repair, `--only-session SOURCE SESSION` on the database
+maintenance command derives one session from a completed checkpoint. Pin
+`--max-source-rows` to the exact selected source count. It retains the original
+transaction horizon and full known candidate set for the delta guard. Only
+seed-matched readings and their adjacent codes change; other labelled readings
+are retained. The `card_scrub_keeper.SessionKeeper` API owns one bound selector
+through its supplied pause/restore window, connection replacement, JSONL apply
+and global source/timeline/chunk verification. Reconnect after restoration with
+`reconnect(connect)`; this rebinds the retained selector against the checkpoint
+revision without reading the sanitized seed. Keep the process alive: an ID-only
+checkpoint cannot recover secret values after process death.
+
 ## Claude Desktop Sessions (claude.ai)
 
 Captures normal Claude conversations from the Claude Desktop app so they're queryable in

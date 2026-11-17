@@ -27,8 +27,18 @@ class ScrubSelector:
     seed_revision: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
-        if self.scope not in ('all', 'labelled'):
+        if self.scope not in ('all', 'labelled', 'seed'):
             raise ValueError('unknown scrub scope')
+
+    def seed_only(self, expected):
+        """Bind a narrower policy to an already resolved checkpoint revision.
+
+        The owner retains this object across connection replacement; no source
+        read is needed after sanitation. A digest alone cannot recover a seed.
+        """
+        if self.specification != expected or not self.seeds or not self.seed_revision:
+            raise ValueError('retained selector differs from checkpoint revision')
+        return ScrubSelector('seed', self.seed_rows, self.seeds, dict(self.seed_revision))
 
     @property
     def specification(self):
@@ -87,7 +97,9 @@ class ScrubSelector:
                     (m.end()<=a and GAP.fullmatch(decoded[m.end():a]))]
             adjacent = (code_side in ('first','both') and a==readings[0][0] or
                         code_side in ('last','both') and b==readings[-1][1])
-            if not (adjacent or labelled and not decoded[:a].strip() or digits in self.seeds or FIELD_BEFORE.search(decoded[max(0,a-128):a]) or CODE_AFTER.search(decoded[b:b+128]) or nearby): continue
+            if self.scope == 'seed':
+                if digits not in self.seeds: continue
+            elif not (adjacent or labelled and not decoded[:a].strip() or digits in self.seeds or FIELD_BEFORE.search(decoded[max(0,a-128):a]) or CODE_AFTER.search(decoded[b:b+128]) or nearby): continue
             edits.append((a,b,'[card ****'+digits[-4:]+']'))
             end=b
             while (code:=cr._ADJACENT_CODE.match(decoded,end)) and cr.standalone_end(decoded,code.end()):
@@ -153,7 +165,7 @@ def resolve_selector(warehouse, scope='all', seed_rows=(), *, expected=None):
 
 
 def add_selector_arguments(parser):
-    parser.add_argument('--scope',choices=('all','labelled'),default='all')
+    parser.add_argument('--scope',choices=('all','labelled','seed'),default='all')
     parser.add_argument('--seed-row',action='append',default=[],help='logical_table:JSON primary-key object; repeatable, IDs only')
 
 
@@ -170,7 +182,7 @@ def selector_from_args(args, expected=None):
 
 def validate_specification(spec):
     from personal_data_warehouse.postgres import POSTGRES_TABLES, _AI_CONVERSATION_EVENT_TABLES
-    if not isinstance(spec,dict) or set(spec)!={'scope','seed_rows','seed_revision'} or spec['scope'] not in ('all','labelled') or not isinstance(spec['seed_rows'],list):
+    if not isinstance(spec,dict) or set(spec)!={'scope','seed_rows','seed_revision'} or spec['scope'] not in ('all','labelled','seed') or not isinstance(spec['seed_rows'],list):
         raise ValueError('invalid selector specification')
     revision=spec['seed_revision']
     if spec['seed_rows'] and (not isinstance(revision,dict) or set(revision)!={'salt','digest'} or any(not isinstance(v,str) or not re.fullmatch('[a-f0-9]{64}',v) for v in revision.values())):

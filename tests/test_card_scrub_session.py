@@ -1,0 +1,110 @@
+"""A retained exact selector repairs one session without broadening its scope."""
+from contextlib import nullcontext
+import json
+
+import pytest
+
+from personal_data_warehouse import scrub_conversation_cards as m
+from personal_data_warehouse.card_scrub_selector import resolve_selector
+from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
+from personal_data_warehouse.scrub_conversation_jsonl import scrub_jsonl
+from tests.test_conversation_card_storage import event, warehouse
+
+
+def test_one_session_retains_selector_after_connection_loss(warehouse, tmp_path):
+    chosen = dict(event(), session_id='chosen')
+    other = dict(event(), session_id='other')
+    # Published processor test fixture; deliberately distinct from event().
+    unrelated = 'card: ' + ''.join(['5' * 12, '4444']) + ' CVV: 123'
+    chosen['text'] += '\n' + unrelated
+    warehouse._insert_rows('claude_code_events', [chosen, other], AGENT_SESSION_EVENT_COLUMNS)
+    key = {k: chosen[k] for k in ('source', 'session_id', 'event_uuid')}
+    identity = 'claude_code_events:' + json.dumps(key)
+    # Resolve from a seed row containing only the selected test reading.
+    warehouse._command('UPDATE @claude_code_events SET text=%s WHERE session_id=%s',
+                       (event()['text'], 'chosen'))
+    retained = resolve_selector(warehouse, 'labelled', [identity])
+    warehouse._command('UPDATE @claude_code_events SET text=%s WHERE session_id=%s',
+                       (chosen['text'], 'chosen'))
+    plan = m.discover(warehouse, selector=retained)
+    plan['discovery'] = {'jobs': [['claude_code_events', '1970-01']],
+                         'completed': [['claude_code_events', '1970-01']]}
+    exact = retained.seed_only(plan['selector'])
+    before_other = warehouse._query_dicts('SELECT * FROM @claude_code_events WHERE session_id=%s', ('other',))
+    with pytest.raises(ValueError, match='exact source'):
+        m.apply_session(warehouse, plan, ('claude_code', 'chosen'), selector=exact,
+                        window=lambda _: nullcontext(), exact_source_rows=2)
+    with pytest.raises(ValueError, match='canonical'):
+        m.apply_session(warehouse, plan, ('claude_code', 'chosen'), selector=exact,
+                        window=lambda _: nullcontext(), exact_source_rows=1, max_canonical_rows=0)
+    m.apply_session(warehouse, plan, ('claude_code', 'chosen'), selector=exact,
+                    window=lambda _: nullcontext(), exact_source_rows=1)
+    assert warehouse._query_dicts('SELECT * FROM @claude_code_events WHERE session_id=%s', ('other',)) == before_other
+    assert unrelated in warehouse._query('SELECT text FROM @claude_code_events WHERE session_id=%s', ('chosen',))[0][0]
+    # The bound selector can be rebound without touching the sanitized seed.
+    warehouse._connection.close()
+    import psycopg2
+    warehouse._connection = psycopg2.connect(warehouse._database_url)
+    warehouse._connection.autocommit = True
+    replacement = warehouse
+    try:
+        resumed = retained.seed_only(plan['selector'])
+        m.apply_session(replacement, plan, ('claude_code', 'chosen'), selector=resumed,
+                        window=lambda _: nullcontext(), exact_source_rows=1, allow_clean=True)
+        path = tmp_path / 'chosen.jsonl'
+        path.write_text(json.dumps({'text': chosen['text']}) + '\n')
+        assert scrub_jsonl(tmp_path, 'chosen', apply=True, selector=resumed)['matches'] > 0
+        assert unrelated in path.read_text()
+        assert scrub_jsonl(tmp_path, 'chosen', selector=resumed)['matches'] == 0
+    finally:
+        pass  # The fixture owns the replacement connection too.
+
+
+def test_incomplete_or_duplicate_partitions_refused(warehouse):
+    plan = m.discover(warehouse)
+    job = ['claude_code_events', '1970-01']
+    for completed in ([], [job, job]):
+        plan['discovery'] = {'jobs': [job], 'completed': completed}
+        with pytest.raises(ValueError, match='partition'):
+            m.session_subplan(warehouse, plan, ('claude_code', 'chosen'), selector=None)
+
+
+def test_keeper_recovers_interface_error_and_verifies_globally(warehouse, tmp_path, monkeypatch):
+    import psycopg2
+    from contextlib import contextmanager
+    from personal_data_warehouse.card_scrub_keeper import SessionKeeper
+    row = event()
+    warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+    identity = 'claude_code_events:' + json.dumps({k: row[k] for k in ('source','session_id','event_uuid')})
+    bound = resolve_selector(warehouse, 'labelled', [identity])
+    plan = m.discover(warehouse, selector=bound)
+    keeper = SessionKeeper(warehouse, plan, ('claude_code', row['session_id']))
+    restored = []
+    @contextmanager
+    def broken(_):
+        try:
+            warehouse._connection.close()
+            yield
+        finally:
+            restored.append(True)
+    with pytest.raises(psycopg2.InterfaceError):
+        keeper.apply(window=broken, exact_source_rows=1)
+    assert restored == [True]
+    def connect():
+        warehouse._connection = psycopg2.connect(warehouse._database_url)
+        warehouse._connection.autocommit = True
+        return warehouse
+    keeper.reconnect(connect)
+    keeper.apply(window=lambda _:nullcontext(), exact_source_rows=1)
+    # Reconnect AGAIN after seed sanitation; forbid re-resolution explicitly.
+    monkeypatch.setattr('personal_data_warehouse.card_scrub_keeper.resolve_selector',
+                        lambda *a, **kw: pytest.fail('sanitized seed read'))
+    warehouse._connection.close()
+    keeper.reconnect(connect)
+    path = tmp_path / (row['session_id'] + '.jsonl')
+    path.write_text(json.dumps({'text': row['text']}) + '\n')
+    keeper.jsonl(tmp_path, apply=True)
+    assert keeper.jsonl(tmp_path)['matches'] == 0
+    assert not keeper.verify()['candidates']
+    assert keeper.plan['watermarks'] == plan['watermarks']
+    assert keeper.plan['candidates'] == plan['candidates']
