@@ -9,14 +9,20 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import html
+import signal
+import threading
+import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from psycopg2.extras import Json, execute_batch
 import psycopg2
 
+from personal_data_warehouse.card_scrub_selector import ScrubSelector, resolve_selector, add_selector_arguments
 from personal_data_warehouse.card_redaction import card_count, is_card, redact_row
 from personal_data_warehouse.postgres import PostgresWarehouse, POSTGRES_TABLES, _AI_CONVERSATION_EVENT_TABLES
 from personal_data_warehouse.card_prefilter import ConfirmationPool, available_cpus, count_row, sql_prefilter
@@ -25,6 +31,45 @@ from personal_data_warehouse.card_prefilter import ConfirmationPool, available_c
 TABLES = (*_AI_CONVERSATION_EVENT_TABLES, 'timeline_events', 'search_chunks')
 DERIVED = ('timeline_events', 'search_chunks')
 row_matches = count_row
+
+
+def connection_workers(warehouse,requested,headroom=6):
+    maximum,reserved,used=warehouse._query("SELECT current_setting('max_connections')::int,current_setting('superuser_reserved_connections')::int,(SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend')")[0]
+    spare=maximum-reserved-used-headroom
+    if spare<3: raise RuntimeError('insufficient connection headroom; no maintenance started')
+    return max(1,min(requested,spare-2))
+
+
+@contextmanager
+def maintenance_deadline(seconds):
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError('bounded maintenance must run on the main thread')
+    if seconds<=0: raise ValueError('maintenance budget must be positive')
+    def expired(*_): raise TimeoutError('maintenance budget exhausted; rollback required')
+    previous=signal.signal(signal.SIGALRM,expired)
+    timer=signal.setitimer(signal.ITIMER_REAL,seconds)
+    try: yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL,*timer)
+        signal.signal(signal.SIGALRM,previous)
+
+
+@contextmanager
+def _maintenance_transaction(connection):
+    """A pending SQL timeout must not interrupt rollback after SIGALRM.
+
+    psycopg's transaction context can itself receive the server cancellation
+    while cleaning up the signal exception. Explicitly roll back once that
+    cancellation has been consumed, before returning control to restoration.
+    """
+    try:
+        with connection:
+            yield
+    except BaseException as error:
+        connection.rollback()
+        if isinstance(error,psycopg2.errors.QueryCanceled):
+            raise TimeoutError('maintenance budget exhausted; rollback required') from None
+        raise
 
 
 def _scope(warehouse):
@@ -40,7 +85,8 @@ def _details(candidates):
     return [dict(table=t,month=m,source=s,measure=k,count=n) for (t,m,s,k),n in sorted(counts.items())]
 
 
-def _scan_table(warehouse, table, pool, page_size, connection=None, snapshot=None, blocks=None):
+def _scan_table(warehouse, table, pool, page_size, connection=None, snapshot=None, blocks=None,
+                since=None, month=None, selected_limit=None, statistics=None):
     owned = connection is None
     conn = connection or psycopg2.connect(warehouse._database_url)
     try:
@@ -60,7 +106,13 @@ def _scan_table(warehouse, table, pool, page_size, connection=None, snapshot=Non
             keys=POSTGRES_TABLES[table].primary_key
             key_sql=','.join(keys)
             bounded = ' AND candidate.ctid >= %s::tid AND candidate.ctid < %s::tid' if blocks else ''
-            params=(f'({blocks[0]},0)',f'({blocks[1]},0)') if blocks else None
+            params=(f'({blocks[0]},0)',f'({blocks[1]},0)') if blocks else ()
+            if since:
+                bounded += ' AND age(candidate.xmin) <= age(pg_snapshot_xmin(%s::pg_snapshot)::xid)'
+                params += (since,)
+            if month:
+                bounded += " AND candidate.occurred_at >= %s::timestamptz AND candidate.occurred_at < ((%s::date + interval '1 month') AT TIME ZONE 'UTC')"
+                params += (month+'-01T00:00:00Z',month+'-01')
             # Buffer only IDs, never every prefiltered payload. Fetch matching
             # content in bounded PK batches using this same MVCC snapshot.
             cursor.execute(warehouse._expand_relations(f'SELECT {key_sql} FROM @{table} candidate WHERE {scope} AND ({predicate}){bounded}'),params)
@@ -68,12 +120,15 @@ def _scan_table(warehouse, table, pool, page_size, connection=None, snapshot=Non
             while values := cursor.fetchmany(page_size):
                 placeholders=','.join('('+','.join('%s' for _ in keys)+')' for _ in values)
                 rows=_read_on(warehouse,conn,f'SELECT * FROM @{table} WHERE ({key_sql}) IN ({placeholders})',tuple(v for key in values for v in key))
-                for row,matches in zip(rows,pool.counts(rows),strict=True):
+                counts=pool.counts(rows,statistics=statistics) if statistics is not None else pool.counts(rows)
+                for row,matches in zip(rows,counts,strict=True):
                     if not matches: continue
                     identity = session_identity(row) if table in DERIVED else (row['source'],row['session_id'])
                     result.append(dict(table=table,key=[row[k] for k in POSTGRES_TABLES[table].primary_key],
                                        session=list(identity) if identity else None,month=row['occurred_at'].strftime('%Y-%m'),
                                        source=row['source'],matches=matches))
+                    if selected_limit is not None and len(result)>selected_limit:
+                        raise RuntimeError('delta limit exceeded; selected readings require catch-up')
             return result
     finally:
         if owned: conn.close()
@@ -89,7 +144,8 @@ def _read_on(warehouse,connection,sql,params=None):
 def _watermarks(warehouse,connection):
     timeline=_read_on(warehouse,connection,'SELECT COALESCE(max(seq),0) AS value FROM @timeline_events')[0]['value']
     chunks=_read_on(warehouse,connection,"SELECT COALESCE(max(built_at),'1970-01-01'::timestamptz)::text AS value FROM @search_chunks")[0]['value']
-    return {'timeline_events':timeline,'search_chunks':chunks}
+    snapshot=_read_on(warehouse,connection,'SELECT pg_current_snapshot()::text AS value')[0]['value']
+    return {'timeline_events':timeline,'search_chunks':chunks,'snapshot':snapshot}
 
 
 def _attach_related(warehouse,candidates,connection):
@@ -107,14 +163,14 @@ def _attach_related(warehouse,candidates,connection):
     return list(indexed.values())
 
 
-def discover(warehouse, *, workers=1, page_size=500, connection=None, include_related=True):
+def discover(warehouse, *, workers=1, page_size=500, connection=None, include_related=True, selector=None):
     """One read-only discovery pass. CLI defaults to all available host CPUs.
 
     Table scans run concurrently and allow server-side parallel scans; only
     prefiltered rows cross memory-only IPC to spawned Python confirmations.
     Supplying the existing connection verifies uncommitted application changes.
     """
-    with ConfirmationPool(workers) as pool:
+    with ConfirmationPool(workers, selector) as pool:
         if connection is not None:
             watermarks=_watermarks(warehouse,connection)
             candidates = [item for table in TABLES for item in _scan_table(warehouse,table,pool,page_size,connection)]
@@ -151,7 +207,10 @@ def discover(warehouse, *, workers=1, page_size=500, connection=None, include_re
                     candidates=[item for group in groups for item in group]
                 if include_related:candidates=_attach_related(warehouse,candidates,coordinator)
             finally:coordinator.close()
-    return dict(version=2,scope=_scope(warehouse),watermarks=watermarks,candidates=candidates,counts=_details(candidates))
+    plan = dict(version=2,scope=_scope(warehouse),watermarks=watermarks,candidates=candidates,counts=_details(candidates))
+    if selector and selector.scope != "all":
+        plan.update(selector=selector.specification,left_alone=pool.left_alone)
+    return plan
 
 
 def write_plan(path, plan):
@@ -161,6 +220,117 @@ def write_plan(path, plan):
         json.dump(plan,stream)
 
 
+def _checkpoint(path, plan):
+    """Atomic private replacement; interruption retains the last complete pass."""
+    path = Path(path)
+    _validate_plan(plan)
+    fd,name=tempfile.mkstemp(prefix=path.name+'.',suffix='.pending',dir=path.parent)
+    temporary=Path(name)
+    try:
+        with os.fdopen(fd,'w') as stream:
+            json.dump(plan,stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _check_horizon(warehouse, snapshot):
+    horizon=warehouse._query("SELECT pg_current_xact_id()::text::numeric - pg_snapshot_xmin(%s::pg_snapshot)::text::numeric",(snapshot,))[0][0]
+    if not 0<=horizon<2**31:
+        raise RuntimeError('discovery transaction horizon expired; rediscovery required')
+
+
+def _selected_delta(warehouse, plan, pool, page_size=500, limit=None):
+    # N6: oldest top-level active xid conservatively includes its savepoints.
+    # Check the full epoch before making modular age comparisons. SQL first
+    # filters revisions and cheap candidate text; Python sees only those hits.
+    snapshot=plan['watermarks']['snapshot']
+    _check_horizon(warehouse,snapshot)
+    candidates=[]
+    for table in TABLES:
+        candidates.extend(_scan_table(warehouse,table,pool,page_size,warehouse._connection,
+            since=snapshot,selected_limit=None if limit is None else limit-len(candidates)))
+    return candidates
+
+
+def catch_up(warehouse, plan, *, selector=None, workers=1, path=None, max_passes=5,
+             remaining_limit=0, progress=None):
+    """Read-only live passes. Advance the horizon only after a complete scan.
+
+    Keep historical IDs for truncated derived copies; merge new selected IDs.
+    An old open writer may repeat a candidate: stop at the bounded pass count
+    and leave the final locked selected gate to decide whether apply is safe.
+    """
+    _validate_plan(plan)
+    if plan['scope'] != _scope(warehouse) or plan.get('selector',ScrubSelector().specification) != (selector or ScrubSelector()).specification:
+        raise ValueError('plan scope or selector differs')
+    if 'discovery' in plan: raise ValueError('partition discovery incomplete')
+    for _ in range(max_passes):
+        watermarks=_watermarks(warehouse,warehouse._connection)
+        with ConfirmationPool(workers,selector) as pool:
+            delta=_selected_delta(warehouse,plan,pool)
+        indexed={(c['table'],tuple(c['key'])):c for c in plan['candidates']}
+        indexed.update({(c['table'],tuple(c['key'])):c for c in delta})
+        candidates=_attach_related(warehouse,list(indexed.values()),warehouse._connection)
+        plan=dict(plan,watermarks=watermarks,candidates=candidates,counts=_details(candidates))
+        if path: _checkpoint(path,plan)
+        if progress: progress(dict(selected_delta_rows=len(delta),planned_rows=len(candidates)))
+        if len(delta)<=remaining_limit: break
+    return plan
+
+
+def discover_resumable(warehouse, path, *, selector=None, workers=1, page_size=500, progress=None):
+    """Checkpoint each source-table/month while writers remain live.
+
+    Run one owner per checkpoint. Threads share the measured worker budget.
+    The original conservative horizon survives every restart, so revisions
+    moved across month boundaries or committed later are caught by catch_up.
+    """
+    path=Path(path)
+    if path.exists():
+        plan=read_plan(path)
+        if plan['scope'] != _scope(warehouse) or plan.get('selector',ScrubSelector().specification) != (selector or ScrubSelector()).specification:
+            raise ValueError('plan scope or selector differs')
+        if 'discovery' not in plan: return plan
+        _check_horizon(warehouse,plan['watermarks']['snapshot'])
+    else:
+        watermarks=_watermarks(warehouse,warehouse._connection)
+        jobs=[]
+        for table in TABLES:
+            months=warehouse._query(f"SELECT DISTINCT to_char(occurred_at AT TIME ZONE 'UTC','YYYY-MM') FROM @{table} ORDER BY 1")
+            jobs.extend([table,m] for m, in months)
+        plan=dict(version=2,scope=_scope(warehouse),watermarks=watermarks,candidates=[],counts=[],
+                  discovery=dict(jobs=jobs,completed=[]))
+        if selector and selector.scope!='all': plan.update(selector=selector.specification,left_alone=0)
+        _checkpoint(path,plan)
+    state=plan['discovery']
+    pending=[job for job in state['jobs'] if job not in state['completed']]
+    def scan(job, pool):
+        statistics={'left_alone':0}
+        rows=_scan_table(warehouse,job[0],pool,page_size,month=job[1],statistics=statistics)
+        return rows,statistics['left_alone']
+    with ConfirmationPool(workers,selector) as pool, ThreadPoolExecutor(max_workers=workers) as scans:
+        futures={scans.submit(scan,job,pool):job for job in pending}
+        for future in as_completed(futures):
+            job=futures[future]
+            group,left_alone=future.result()
+            indexed={(c['table'],tuple(c['key'])):c for c in plan['candidates']}
+            indexed.update({(c['table'],tuple(c['key'])):c for c in group})
+            plan['candidates']=list(indexed.values())
+            plan['counts']=_details(plan['candidates'])
+            state['completed'].append(job)
+            if 'left_alone' in plan: plan['left_alone']+=left_alone
+            _checkpoint(path,plan)
+            if progress: progress(dict(completed_partitions=len(state['completed']),total_partitions=len(state['jobs']),selected_rows=len(plan['candidates'])))
+    plan['candidates']=_attach_related(warehouse,plan['candidates'],warehouse._connection)
+    plan['counts']=_details(plan['candidates'])
+    del plan['discovery']
+    _checkpoint(path,plan)
+    return plan
+
+
 def read_plan(path):
     plan = json.loads(path.read_text())
     _validate_plan(plan)
@@ -168,9 +338,30 @@ def read_plan(path):
 
 
 def _validate_plan(plan):
-    if set(plan) != {'version','scope','watermarks','candidates','counts'} or plan['version'] != 2:
+    if "selector" in plan:
+        from personal_data_warehouse.card_scrub_selector import validate_specification
+        validate_specification(plan["selector"])
+        if type(plan.get("left_alone")) is not int or plan["left_alone"] < 0: raise ValueError("invalid left-alone count")
+    if set(plan) - {"selector","left_alone","discovery","batches"} != {'version','scope','watermarks','candidates','counts'} or plan['version'] != 2:
         raise ValueError('invalid discovery plan')
-    if (set(plan['watermarks']) != set(DERIVED) or type(plan['watermarks']['timeline_events']) is not int or
+    if 'batches' in plan:
+        state=plan['batches']
+        if set(state)!={'completed','oversized'}: raise ValueError('invalid batch checkpoint')
+        for group in state['completed']+state['oversized']:
+            if set(group)!={'sessions','canonical_rows','seconds'} or not isinstance(group['sessions'],list):
+                raise ValueError('invalid batch record')
+            if type(group['canonical_rows']) is not int or group['canonical_rows']<0 or not isinstance(group['seconds'],(float,int)) or not 0<=group['seconds']<float('inf'):
+                raise ValueError('invalid batch measurements')
+            known={tuple(c['session']) for c in plan['candidates'] if c['session']}
+            if any(not isinstance(s,list) or len(s)!=2 or tuple(s) not in known for s in group['sessions']):
+                raise ValueError('invalid batch session')
+    if 'discovery' in plan:
+        state=plan['discovery']
+        if (set(state)!={'jobs','completed'} or any(not isinstance(j,list) or len(j)!=2 or j[0] not in TABLES or
+            not isinstance(j[1],str) or len(j[1])!=7 for j in state['jobs']) or
+            any(j not in state['jobs'] for j in state['completed'])):
+            raise ValueError('invalid partition checkpoint')
+    if (set(plan['watermarks']) != set(DERIVED)|{'snapshot'} or type(plan['watermarks']['timeline_events']) is not int or
             not isinstance(plan['watermarks']['search_chunks'],str)):
         raise ValueError('invalid discovery cursors')
     for item in plan['candidates']:
@@ -212,21 +403,120 @@ def _related_rows(warehouse, table, sessions, event_keys, *, connection=None,ids
         f"SELECT {columns} FROM @{table} WHERE adapter IN ('agent_session','agent_session_turn') AND (({identity}) = ANY(%s::jsonb[]) OR jsonb_build_array(adapter,event_id) = ANY(%s::jsonb[])){since}"+(' FOR UPDATE' if lock else ''),params)
 
 
-def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None):
-    plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size)
+def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, selector=None,
+          max_source_rows=500, max_delta_rows=10000, window_seconds=60, max_plan_rows=20000,
+          max_canonical_rows=None, _known_plan=None):
+    plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size,selector=selector)
     _validate_plan(plan)
+    if plan.get("selector", ScrubSelector().specification) != (selector or ScrubSelector()).specification:
+        raise ValueError("plan selector differs from current selector")
     if plan['scope'] != _scope(warehouse): raise ValueError('discovery plan belongs to another warehouse')
     if not apply: return plan['counts']
-    with warehouse._connection:
-        _apply_plan(warehouse,plan,page_size,workers)
-        # Fast full verification sees this transaction's sanitized rows. New
-        # candidates outside the saved plan cause rollback, never a false zero.
-        if discover(warehouse,workers=workers,page_size=page_size,connection=warehouse._connection,include_related=False)['candidates']:
-            raise RuntimeError('new candidates require discovery; no changes committed')
+    if not 0<window_seconds<=60: raise ValueError('maintenance budget must be at most 60 seconds')
+    if 'discovery' in plan: raise ValueError('partition discovery incomplete')
+    source_rows=sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])
+    if source_rows>max_source_rows: raise ValueError('candidate gate exceeded; no changes committed')
+    if len(plan['candidates'])>max_plan_rows: raise ValueError('total candidate gate exceeded; no changes committed')
+    with maintenance_deadline(window_seconds), _maintenance_transaction(warehouse._connection):
+        warehouse._command('SET LOCAL statement_timeout = %s',(int(window_seconds*1000),))
+        # Fail immediately on a live writer. Hold every lock until commit so
+        # nothing can appear between delta confirmation and verification.
+        warehouse._command('LOCK TABLE '+','.join('@'+t for t in (*TABLES,'search_chunk_embeddings'))+' IN SHARE ROW EXCLUSIVE MODE NOWAIT')
+        if max_canonical_rows is not None:
+            sessions={tuple(c['session']) for c in plan['candidates'] if c['session']}
+            if sum(_canonical_counts(warehouse,sessions,max_canonical_rows).values())>max_canonical_rows:
+                raise ValueError('canonical row gate exceeded; no changes committed')
+        planned={(c['table'],tuple(c['key'])) for c in (_known_plan or plan)['candidates']}
+        with ConfirmationPool(workers,selector) as pool:
+            delta=_selected_delta(warehouse,plan,pool,page_size,max_delta_rows)
+            for item in delta:
+                if (item['table'],tuple(item['key'])) not in planned:
+                    raise RuntimeError('new candidates require discovery; no changes committed')
+        _apply_plan(warehouse,plan,page_size,workers,selector)
+        # Canonical new keys are checked before upsert by rebuild_sessions.
+        # Recheck saved keys without running whole-corpus detection in-window.
+        rows=[]
+        for item in plan['candidates']:
+            keys=POSTGRES_TABLES[item['table']].primary_key
+            rows.extend(warehouse._query_dicts(f'SELECT * FROM @{item["table"]} WHERE '+' AND '.join(f'{k}=%s' for k in keys),item['key']))
+        with ConfirmationPool(workers,selector) as pool:
+            if any(pool.counts(rows)): raise RuntimeError('planned row verification failed; no changes committed')
     return plan['counts']
 
 
-def _apply_plan(warehouse, plan, page_size, workers):
+def _canonical_counts(warehouse, sessions, limit):
+    # Bound each count, including a session that grew since live planning.
+    return {s:warehouse._query('SELECT count(*) FROM (SELECT 1 FROM @ai_conversation_events '
+        'WHERE source=%s AND session_id=%s LIMIT %s) bounded',(*s,limit+1))[0][0]
+        for s in sorted(sessions)}
+
+
+def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_partial=False,
+                  max_canonical_rows=2500, window_seconds=45, gap_seconds=15,
+                  max_source_rows=500, max_plan_rows=20000, max_delta_rows=1000,
+                  progress=None):
+    """One owner; live planning, then an atomic transaction per session group.
+
+    ``window(index)`` must pause writers on entry and restore them in finally,
+    including on partial entry failure. Completion is persisted AFTER restore.
+    A crash after commit is safe: replay rechecks and applies the same IDs.
+    Partial discovery retains its original horizon and pending partitions;
+    no partial run constitutes final verification. Selector stays in memory.
+    """
+    if not 0<max_canonical_rows<=5000 or not 0<window_seconds<=60 or gap_seconds<0:
+        raise ValueError('invalid batch budget')
+    plan=read_plan(Path(path))
+    if 'discovery' in plan and not allow_partial: raise ValueError('partition discovery incomplete')
+    if plan['scope']!=_scope(warehouse) or plan.get('selector',ScrubSelector().specification)!=(selector or ScrubSelector()).specification:
+        raise ValueError('plan scope or selector differs')
+    if sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])>min(500,max_source_rows) or len(plan['candidates'])>min(20000,max_plan_rows):
+        raise ValueError('candidate gate exceeded')
+    if any(not c['session'] for c in plan['candidates']):
+        raise ValueError('cannot group unidentified session')
+    state=plan.setdefault('batches',dict(completed=[],oversized=[]))
+    completed={tuple(s) for g in state['completed'] for s in g['sessions']}
+    # Never silently trust a completion if an old key has become selected again.
+    with ConfirmationPool(workers,selector) as pool:
+        for c in plan['candidates']:
+            if tuple(c['session']) not in completed: continue
+            keys=POSTGRES_TABLES[c['table']].primary_key
+            rows=warehouse._query_dicts(f'SELECT * FROM @{c["table"]} WHERE '+' AND '.join(f'{k}=%s' for k in keys),c['key'])
+            if any(pool.counts(rows)): raise RuntimeError('completed session changed; rediscovery required')
+    sessions={tuple(c['session']) for c in plan['candidates']}-completed
+    counts=_canonical_counts(warehouse,sessions,max_canonical_rows)
+    state['oversized']=[dict(sessions=[list(s)],canonical_rows=n,seconds=0) for s,n in counts.items() if n>max_canonical_rows]
+    groups=[]; group=[]; total=0
+    for s,n in counts.items():
+        if n>max_canonical_rows: continue
+        if group and total+n>max_canonical_rows:
+            groups.append((group,total)); group=[]; total=0
+        group.append(s); total+=n
+    if group: groups.append((group,total))
+    _checkpoint(path,plan)
+    if progress: progress(dict(groups=len(groups),oversized_sessions=len(state['oversized']),canonical_rows=sum(counts.values())))
+    for index,(sessions,total) in enumerate(groups):
+        time.sleep(gap_seconds)  # workers LIVE, including after a resumed run
+        candidates=[c for c in plan['candidates'] if tuple(c['session']) in sessions]
+        candidates=_attach_related(warehouse,candidates,warehouse._connection)
+        if len(candidates)>min(20000,max_plan_rows):
+            raise ValueError('group candidate gate exceeded; no maintenance started')
+        subset={k:v for k,v in plan.items() if k not in ('discovery','batches')}
+        subset.update(candidates=candidates,counts=_details(candidates))
+        known=dict(plan,candidates=plan['candidates']+candidates)
+        started=time.monotonic()
+        with window(index):
+            scrub(warehouse,apply=True,plan=subset,selector=selector,workers=workers,
+                  max_source_rows=max_source_rows,max_plan_rows=max_plan_rows,
+                  max_delta_rows=max_delta_rows,window_seconds=window_seconds,
+                  max_canonical_rows=max_canonical_rows,_known_plan=known)
+        elapsed=time.monotonic()-started
+        state['completed'].append(dict(sessions=[list(s) for s in sessions],canonical_rows=total,seconds=elapsed))
+        _checkpoint(path,plan)
+        if progress: progress(dict(completed_groups=len(state['completed']),canonical_rows=total,window_seconds=elapsed))
+    return plan
+
+
+def _apply_plan(warehouse, plan, page_size, workers, selector=None):
     sessions = {tuple(c['session']) for c in plan['candidates'] if c['session']}
     current = {}
     for item in plan['candidates']:
@@ -251,7 +541,7 @@ def _apply_plan(warehouse, plan, page_size, workers):
             identity=session_identity(row)
             if identity in sessions:active.add(identity)
     updates={}
-    with ConfirmationPool(workers) as pool:
+    with ConfirmationPool(workers, selector) as pool:
         sources=[]
         for ((table,_),row),matches in zip(current.items(),pool.counts(list(current.values())),strict=True):
             if not matches: continue
@@ -282,7 +572,7 @@ def _apply_plan(warehouse, plan, page_size, workers):
         key = (row['adapter'],row['event_id'])
         if table == 'timeline_events': old_timeline.append((key,identity))
         else: chunks.append((row['chunk_id'],row['text_sha256'],key,identity))
-    new_keys, regenerated = rebuild_sessions(warehouse,active,page_size)
+    new_keys, regenerated = rebuild_sessions(warehouse,active,page_size,selector)
     if any((*key,identity) not in regenerated for key,identity in old_timeline) or any((*key,identity) not in regenerated for _,_,key,identity in chunks):
         raise RuntimeError('canonical event missing for derived copy; no changes committed')
     for (adapter,event_id),_ in old_timeline:
@@ -293,7 +583,7 @@ def _apply_plan(warehouse, plan, page_size, workers):
         warehouse._command('DELETE FROM @search_chunks WHERE chunk_id=%s',(chunk_id,))
 
 
-def rebuild_sessions(warehouse, sessions, page_size):
+def rebuild_sessions(warehouse, sessions, page_size, selector=None):
     from personal_data_warehouse.postgres import _AI_EVENT_TABLE_BY_SOURCE
     from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
 
@@ -333,7 +623,7 @@ def rebuild_sessions(warehouse, sessions, page_size):
                 identity = session_identity(dict(source_pk=row[9]))
                 if identity not in sessions:
                     continue
-                if any(card_count(str(row[i])) for i in (6, 7, 10, 11)):
+                if any((selector.count if selector else card_count)(str(row[i])) for i in (6, 7, 10, 11)):
                     raise RuntimeError('canonical regeneration still contains card data; no changes committed')
                 selected.append(row)
                 keys.add((name, row[0]))
@@ -418,9 +708,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--verify', action='store_true', help='read-only fast verification without writing a plan')
+    parser.add_argument('--resume', action='store_true', help='checkpoint source-table/month discovery and resume an existing private plan')
+    parser.add_argument('--catch-up', action='store_true', help='refresh an existing plan with live selected-delta passes')
     parser.add_argument('--plan', type=Path, help='private ID-only discovery plan; new file for discovery, existing file for apply')
     parser.add_argument('--workers', type=int, default=available_cpus(), help='Python confirmation processes and concurrent SQL scan budget')
+    parser.add_argument('--max-source-rows',type=int,default=500)
+    parser.add_argument('--max-delta-rows',type=int,default=10000)
+    parser.add_argument('--max-plan-rows',type=int,default=20000)
+    parser.add_argument('--window-seconds',type=int,default=60)
     parser.add_argument('--report-html', type=Path, help='counts-only table for the private email body')
+    add_selector_arguments(parser)
     args = parser.parse_args()
     if args.workers < 1: parser.error('--workers must be positive')
     if args.apply and args.verify: parser.error('--apply and --verify are mutually exclusive')
@@ -428,21 +725,39 @@ def main():
     warehouse = PostgresWarehouse(os.environ['POSTGRES_DATABASE_URL'],initialize=False)
     warehouse._connection.set_session(readonly=not args.apply,autocommit=True)
     try:
+        args.workers=connection_workers(warehouse,args.workers)
+        baseline = read_plan(args.plan) if args.plan and args.plan.exists() and (args.apply or args.verify or args.resume or args.catch_up) else None
+        selector = resolve_selector(warehouse,args.scope,args.seed_row,expected=baseline.get('selector') if baseline else None)
         after = None
-        if args.apply:
+        if args.catch_up:
+            if baseline is None: parser.error('--catch-up requires an existing complete plan')
+            plan=catch_up(warehouse,baseline,workers=args.workers,selector=selector,path=args.plan,progress=lambda counts:print(json.dumps(counts),flush=True))
+            before=plan['counts']
+        elif args.apply:
             plan = read_plan(args.plan)
             before = plan['counts']
-            scrub(warehouse,apply=True,plan=plan,workers=args.workers)
-            after = [] # Verified against this transaction before committing.
+            scrub(warehouse,apply=True,plan=plan,workers=args.workers,selector=selector,max_source_rows=args.max_source_rows,max_delta_rows=args.max_delta_rows,window_seconds=args.window_seconds,max_plan_rows=args.max_plan_rows)
+            # Only planned/delta rows were checked in-window. A full read-only
+            # post-resume scan must establish corpus-wide after counts.
+            after = None
         elif args.verify:
-            after = discover(warehouse,workers=args.workers)['counts']
-            before = read_plan(args.plan)['counts'] if args.plan else after
+            if args.plan:
+                baseline = read_plan(args.plan)
+                if baseline.get('selector',ScrubSelector().specification) != selector.specification:
+                    raise ValueError('plan selector differs from current selector')
+            after = discover(warehouse,workers=args.workers,selector=selector)['counts']
+            before = baseline['counts'] if args.plan else after
         else:
-            plan = discover(warehouse,workers=args.workers)
-            write_plan(args.plan,plan)
+            if args.resume:
+                plan=discover_resumable(warehouse,args.plan,workers=args.workers,selector=selector,
+                    progress=lambda counts:print(json.dumps(counts),flush=True))
+                plan=catch_up(warehouse,plan,workers=args.workers,selector=selector,path=args.plan)
+            else:
+                plan = discover(warehouse,workers=args.workers,selector=selector)
+                write_plan(args.plan,plan)
             before = plan['counts']
         table = month_source_report(before, after)
-        print(json.dumps({'counts_by_month_source': table, 'details_before': before, 'details_after': after}))
+        print(json.dumps({'counts_by_month_source': table, 'details_before': before, 'details_after': after, 'verification_pending':args.apply, 'left_alone': plan.get('left_alone') if not args.verify else None}))
         if args.report_html:
             args.report_html.write_text(report_html(table))
     finally:

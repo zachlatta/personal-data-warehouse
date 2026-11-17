@@ -6,10 +6,12 @@ from pathlib import Path
 import tempfile
 
 from personal_data_warehouse.card_redaction import card_count, redact
+from personal_data_warehouse.card_scrub_selector import add_selector_arguments, selector_from_args
 
 
-def scrub_jsonl(root: Path, session: str, *, apply=False):
+def scrub_jsonl(root: Path, session: str, *, apply=False, selector=None):
     counts = {'files': 0, 'lines': 0, 'matches': 0}
+    if selector and selector.scope != "all": counts["left_alone"] = 0
     for path in root.rglob('*.jsonl'):
         if path.is_symlink():
             continue
@@ -25,13 +27,14 @@ def scrub_jsonl(root: Path, session: str, *, apply=False):
                     selected = isinstance(parsed, dict) and parsed.get('sessionId') == session
                 except ValueError:
                     pass
-            n = card_count(line) if selected else 0
+            n = (selector.count if selector else card_count)(line) if selected else 0
+            if selected and "left_alone" in counts: counts["left_alone"] += card_count(line) - n
             if n:
                 counts['matches'] += n
                 counts['lines'] += 1
                 changed += 1
                 newline = '\n' if line.endswith('\n') else ''
-                output.append(redact(line.rstrip('\n')) + newline)
+                output.append((selector.redact if selector else redact)(line.rstrip('\n')) + newline)
             else:
                 output.append(line)
         if changed:
@@ -56,8 +59,10 @@ def main():
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--session', required=True)
     parser.add_argument('--apply', action='store_true')
+    add_selector_arguments(parser)
     args = parser.parse_args()
-    print(json.dumps(scrub_jsonl(args.root, args.session, apply=args.apply)))
+    selector = selector_from_args(args)
+    print(json.dumps(scrub_jsonl(args.root, args.session, apply=args.apply,selector=selector)))
 
 
 if __name__ == '__main__':

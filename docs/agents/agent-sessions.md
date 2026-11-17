@@ -532,6 +532,48 @@ Only apply requires pausing writers, timeline sync and search workers. Archive
 discovery can be network-bound, so finish it before taking the fresh DB plan.
 After resume, use `--verify` for read-only DB/archive checks; the DB check may
 also take `--plan` to retain the baseline groups in `--report-html` output.
+Maintenance commands also accept `--scope labelled` and repeatable
+`--seed-row 'logical_table:{"source":"example","session_id":"example","event_uuid":"example"}'`.
+This scope selects only card readings with an immediate card/PAN/number field
+label or an adjacent security-code field, plus exact readings resolved from
+seed rows. Expiry alone does not select a reading. Other numbers in a selected
+row retain their original bytes. Discovery plans contain only identities,
+selector configuration, a salted seed-revision digest and counts, including selected and left-alone readings;
+apply recomputes spans and refuses a different selector. This maintenance scope
+does not change ingest policy.
+
+Field labels apply only to the immediate scalar, never to the contents of an
+encoded object or array. An adjacent JSON security-code field selects the
+nearest reading in the neighbouring scalar (first when the code precedes it,
+last when it follows it), including after prose; unrelated readings remain.
+
+Resolve seeds before sanitizing any seed row, and retain that selector object
+in memory through database, archive and JSONL apply and post-resume verification.
+Never save seed values or pass them as arguments. A fresh command refuses a
+seed with no remaining readings; that refusal is not a successful verification.
+Use the Python functions with the same resolved `selector` for coordinated
+maintenance across surfaces. Re-resolving for apply requires the plan's salted
+revision and rejects changed seed rows before mutation. All keepers use the
+same plan revision. Plans contain no seed values and cannot recover a
+sanitized seed. Keep discovery and full post-resume scans outside the paused
+window; record the selected baseline and the unselected count separately.
+
+Database apply refuses more than 500 selected source rows or 20,000 planned
+rows by default; landing pins the actual discovered count with
+`--max-source-rows`. `--workers` is capped by current connection headroom.
+Apply takes NOWAIT writer locks and confirms only planned identities plus a
+bounded conservative transaction-age delta; a new selected identity requires rediscovery.
+The delta includes every tuple revision at or after the discovery snapshot's
+oldest active transaction, including child transactions created under savepoints.
+Direct snapshot-visibility tests on tuple transaction IDs are not safe for
+subtransactions. Comparisons retain modular xid ordering across wraparound;
+plans outside the unambiguous half-range of transaction IDs fail closed.
+The MVCC metadata filter may read heap pages but does no corpus text/JSON
+detection. A wall-clock deadline rolls back over-budget repairs. Full scans
+run after restore. Archive replacement runs live: new ingest is already
+masked, objects have immutable IDs, and replacements are verified before
+old objects are deleted.
+
 The database scrub discovers
 affected sessions in sources AND derived copies by source session identity (a
 rollup's context is a directory/account, not its session id). In one transaction
@@ -583,9 +625,35 @@ Only prefiltered IDs are fetched and confirmed in bounded memory batches by
 spawned processes. The CLI defaults `--workers` to available CPUs. Large heaps
 use disjoint block ranges under one exported read-only snapshot so live tuple
 updates cannot escape discovery; ordinary scans allow parallel PostgreSQL plans.
-Apply rechecks saved identities, checks indexed timeline/chunk changes since the
-discovery cursors, and verifies the repaired transaction with the fast filter.
-New candidates outside its plan roll back the repair and require fresh discovery.
+Apply rechecks saved identities, checks timeline/chunk changes since the
+discovery cursors and confirms a bounded MVCC delta under writer locks.
+New selected candidates outside its plan roll back the repair and require live catch-up.
+`--resume --plan <private-path>` checkpoints discovery by source table and UTC
+month, with counts-only progress and the original conservative transaction
+horizon retained across restarts. Use one process per checkpoint; its scan
+threads share the connection-aware `--workers` budget. `--catch-up --plan
+<private-path>` merges selected changed rows into that plan while ingestion
+continues. Only SQL-prefilter hits reach Python confirmation. Each complete
+pass advances the horizon; an interrupted pass leaves the previous checkpoint.
+Apply counts changed rows that still hold selected readings, rather than all
+changed rows. Clean ingestion churn cannot exhaust that gate. Unknown selected
+IDs still abort for catch-up, and the locked transaction always has a maximum
+60-second rollback deadline. Single-window apply rejects incomplete partition
+plans. The maintenance API `apply_batches` accepts one only with explicit
+`allow_partial=True`; its pending partitions and original transaction horizon
+remain reusable. It groups whole sessions by canonical source-row count
+(default 2,500, hard maximum 5,000), rechecks growth under the writer locks,
+and uses a 45-second apply deadline by default. Oversized sessions are reported
+and skipped. A controller must pause and restore workers separately for every
+group, including on failure; the default live gap between groups is 15 seconds.
+Private checkpoints record completed groups only after restoration. Replay
+after commit but before checkpoint is idempotent. A failed group rolls back
+alone and stops the run. Completion records do not replace final verification:
+finish discovery and scan every partition with workers restored. Keep the
+original in-memory seed selector alive through this process; a sanitized seed
+cannot be reconstructed from an ID-only checkpoint.
+Planned keys and canonical regenerated rows are verified transactionally;
+whole-corpus verification follows restoration of workers.
 
 ## Claude Desktop Sessions (claude.ai)
 

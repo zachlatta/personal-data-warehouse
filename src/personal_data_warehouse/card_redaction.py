@@ -98,7 +98,7 @@ def standalone_end(value: str, end: int) -> bool:
                 (next_char == '.' and end + 1 < len(value) and value[end + 1].isdigit()))
 
 
-def card_spans(value: str):
+def card_spans(value: str, *, merge=True):
     """Enumerate complete runs/layouts at every start, then check Luhn.
 
     Separators may mix 1–3 spaces/dashes. A complete valid layout wins over
@@ -133,6 +133,9 @@ def card_spans(value: str):
             continue
         codes.append((code.start(1),code.end()))
     valid = [(a,b) for a,b in valid if not any(a<d and b>c for c,d in codes)]
+    if not merge:
+        yield from valid
+        return
     # Mask the union of overlapping valid readings: ambiguity never exposes a
     # complete alternative PAN. Only explicit layouts reached this point.
     merged = []

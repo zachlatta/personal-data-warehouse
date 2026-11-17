@@ -50,16 +50,23 @@ def count_row(row):
 
 class ConfirmationPool:
     """Bounded in-memory IPC; spawned children never inherit DB connections."""
-    def __init__(self, workers):
+    def __init__(self, workers, selector=None):
         self.workers = max(1,workers)
+        self.selector = selector
+        self.left_alone = 0
         self._pool = None
         self._lock = threading.Lock()
 
-    def counts(self, rows):
-        return self._map(count_row,rows)
+    def counts(self, rows, *, statistics=None):
+        counts = self._map(self.selector.count_row if self.selector else count_row,rows)
+        if self.selector and self.selector.scope != "all":
+            total = sum(self._map(count_row,rows))
+            with self._lock: self.left_alone += total - sum(counts)
+            if statistics is not None: statistics['left_alone'] += total - sum(counts)
+        return counts
 
     def redacted(self, rows):
-        return self._map(redact_row,rows)
+        return self._map(self.selector.redact_row if self.selector else redact_row,rows)
 
     def _map(self,function,rows):
         if self.workers == 1 or len(rows) < 64:
@@ -69,10 +76,20 @@ class ConfirmationPool:
                 self._pool = ProcessPoolExecutor(max_workers=self.workers,mp_context=multiprocessing.get_context('spawn'))
         try:
             return list(self._pool.map(function,rows,chunksize=8))
+        except TimeoutError:
+            raise
         except Exception:
             raise RuntimeError('candidate confirmation worker failed') from None
 
     def __enter__(self): return self
 
-    def __exit__(self,*args):
-        if self._pool is not None: self._pool.shutdown(cancel_futures=True)
+    def __exit__(self,exc_type,*args):
+        if self._pool is None: return
+        if exc_type is not None:
+            # Python 3.12 has no public terminate_workers API. An aborted
+            # maintenance deadline must not wait for queued confirmations.
+            for process in (self._pool._processes or {}).values():
+                process.terminate()
+            self._pool.shutdown(wait=False,cancel_futures=True)
+        else:
+            self._pool.shutdown(cancel_futures=True)
