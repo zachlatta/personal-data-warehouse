@@ -113,6 +113,7 @@ def test_a_failed_precondition_skips_the_step_without_a_write(warehouse, monkeyp
         contact_executor=_NoWrites(),
         calendar_executor=_NoWrites(),
         slack_executor=_NoWrites(),
+        drive_executor=_NoWrites(),
         screen_timelapse_executor=_NoWrites(),
         resideo_executor=_NoWrites(),
         limit=10,

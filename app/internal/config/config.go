@@ -52,6 +52,8 @@ type Config struct {
 	GmailAccounts           []string
 	ContactGoogleAccounts   []string
 	CalendarAccounts        []string
+	GoogleDriveAccounts     []string
+	MutationStaging         *MutationStagingConfig
 	AppleNotesAccounts      []string
 	AppleContactsAccounts   []string
 	AppleMessagesAccounts   []string
@@ -200,6 +202,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		GmailAccounts:         parseCSV(getenv("GMAIL_ACCOUNTS")),
 		ContactGoogleAccounts: parseCSV(getenv("CONTACT_GOOGLE_ACCOUNTS")),
 		CalendarAccounts:      parseCSV(firstNonEmpty(getenv("CALENDAR_ACCOUNTS"), getenv("GMAIL_ACCOUNTS"))),
+		GoogleDriveAccounts:   parseCSV(getenv("GOOGLE_DRIVE_SOURCE_ACCOUNTS")),
 		AppleNotesAccounts:    parseCSV(firstNonEmpty(getenv("APPLE_NOTES_ACCOUNTS"), getenv("APPLE_NOTES_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
 		AppleContactsAccounts: parseCSV(firstNonEmpty(getenv("APPLE_CONTACTS_ACCOUNTS"), getenv("APPLE_CONTACTS_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
 		AppleMessagesAccounts: parseCSV(firstNonEmpty(getenv("APPLE_MESSAGES_ACCOUNTS"), getenv("APPLE_MESSAGES_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
@@ -239,6 +242,9 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 
 	var err error
+	if cfg.MutationStaging, err = loadMutationStaging(getenv); err != nil {
+		return Config{}, err
+	}
 	if cfg.MaxRows, err = parsePositiveInt(getenv("MCP_MAX_ROWS"), cfg.MaxRows, "MCP_MAX_ROWS"); err != nil {
 		return Config{}, err
 	}

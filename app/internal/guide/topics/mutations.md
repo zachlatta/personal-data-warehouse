@@ -9,7 +9,7 @@ policy) may get `status: approved` straight back from `propose_mutation`: PDW ap
 inside the policy and it runs within seconds. Anything outside the policy waits for Zach as
 usual, with the reason in the request's `policy`. Policies bind to the token id, never to
 the client name you send.
-Prefer this path for any change to Zach's Gmail (mail, labels and filters), Calendar, Google or Apple Contacts, Slack
+Prefer this path for any change to Zach's Gmail (mail, labels and filters), Google Drive, Calendar, Google or Apple Contacts, Slack
 (a message sent as him, or his read state), Apple Notes, or a text message (RCS/SMS from his Pixel); use a direct connector only for
 something PDW has no mutation type for, and say why. Deleting a screen capture from the warehouse is a mutation too
 (`screen_timelapse.purge_moment`); never delete warehouse rows or stored objects by hand. Printing a PDF on
@@ -30,10 +30,32 @@ Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_t
 `slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
 `apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `android_messages.send_message`,
 `apple_messages.mark_read`, `screen_timelapse.purge_moment`, `printer.print_document`, `resideo.set_thermostat`,
-`pdw.mutation_policy`. The help call is
+`pdw.mutation_policy`, `google_drive.upload_file`, `google_drive.create_folder`, `google_drive.add_permission`,
+`google_drive.update_permission`, `google_drive.remove_permission`. The help call is
 authoritative when this list and it disagree.
 
 ## Rules
+
+- **Google Drive:** `google_drive.upload_file` takes `name`, `parent_id`, `mime_type`
+  and `data_base64` (20 MiB maximum). `google_drive.create_folder` takes `name` and
+  `parent_id`, plus optional `initial_permissions`: an array of sharing objects with
+  `permission_type`, recipient (`email_address` or `domain` when applicable), `role`
+  and explicit `send_notification_email`. This creates AND shares the folder under
+  one approval, without waiting for sync. Use the synced account and ids from
+  `base_google_drive.files` for existing destinations. `google_drive.add_permission`
+  shares a file or folder with a `user`, `group`, `domain` or `anyone`, with `role`
+  `reader`, `commenter` or `writer`, and an explicit `send_notification_email` boolean.
+  `google_drive.update_permission` / `google_drive.remove_permission` name a
+  `permission_id`, its `permission_type`, recipient and `expected_role`; a changed
+  permission is refused. No ownership transfer. Folder permissions affect children.
+  Pending bytes stay in private S3 and expire after seven days (rejected and withdrawn
+  uploads too). Re-proposing an upload-only request that failed terminal, was rejected,
+  withdrawn or expired stages fresh bytes and asks for a new approval; live/successful
+  requests still deduplicate. An expired pending proposal is withdrawn atomically.
+  A reviewer-edited expired proposal needs explicit replacement with its revision.
+  S3 connectivity failures before any Drive write retry; missing bytes report
+  "staged bytes expired; propose again". A write with an uncertain response
+  fails for inspection, so check Drive before proposing again.
 
 - **A batch is reviewed as the thing it is about**, so propose one request per intent
   (one archive batch, one reply) rather than many single-item requests, and give each

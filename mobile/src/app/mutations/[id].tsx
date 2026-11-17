@@ -23,6 +23,7 @@ import { approveMutationRequest, cancelMutationRequest, undoMutationRequest, get
 import { formatWhen, pretty } from '@/lib/format';
 import {
   MUTATION_PAGE_SIZE,
+  mutationDisplayPayload,
   gmailRequestSummary,
   hasGmailThreadMutations,
   gmailThreadDayGroups,
@@ -145,7 +146,7 @@ function MutationCardBody({ mutation, pending, busy, onRemove, onSaveSlackMessag
       </View>
     );
   }
-  const merged = flattenPayload(mutation.payload ?? {});
+  const merged = flattenPayload(mutationDisplayPayload(mutation));
   const headline = HEADLINE_KEYS.filter((key) => merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
   const rest = Object.keys(merged).filter((key) => !HEADLINE_KEYS.includes(key) && merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
   const removed = mutation.status === 'removed' || mutation.status === 'skipped';

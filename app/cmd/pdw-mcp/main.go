@@ -58,6 +58,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer mutationStore.Close()
+	mutationStore.ConfigureMutationStaging(cfg.MutationStaging)
 	if err := mutationStore.EnsureTables(context.Background()); err != nil {
 		logger.Error("ensure mutation tables failed", "error", err)
 		os.Exit(1)
@@ -67,6 +68,7 @@ func main() {
 		GmailAccounts:           cfg.GmailAccounts,
 		ContactGoogleAccounts:   cfg.ContactGoogleAccounts,
 		CalendarAccounts:        cfg.CalendarAccounts,
+		GoogleDriveAccounts:     cfg.GoogleDriveAccounts,
 		AppleNotesAccounts:      cfg.AppleNotesAccounts,
 		AppleContactsAccounts:   cfg.AppleContactsAccounts,
 		AppleMessagesAccounts:   cfg.AppleMessagesAccounts,

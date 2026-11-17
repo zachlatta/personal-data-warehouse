@@ -93,6 +93,7 @@ func NewService(store Store, cfg Config) *Service {
 	cfg.GmailAccounts = normalizeAccountList(cfg.GmailAccounts)
 	cfg.ContactGoogleAccounts = normalizeAccountList(cfg.ContactGoogleAccounts)
 	cfg.CalendarAccounts = normalizeAccountList(cfg.CalendarAccounts)
+	cfg.GoogleDriveAccounts = normalizeAccountList(cfg.GoogleDriveAccounts)
 	cfg.AppleNotesAccounts = normalizeAccountList(cfg.AppleNotesAccounts)
 	cfg.AppleContactsAccounts = normalizeAccountList(cfg.AppleContactsAccounts)
 	cfg.AppleMessagesAccounts = normalizeAccountList(cfg.AppleMessagesAccounts)
@@ -450,6 +451,13 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		// Warehouse data, not an upstream account: the device is the account,
 		// and the store refuses a moment that matches no rows.
 		if err := validateScreenTimelapsePurge(mutation); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
+	case GoogleDriveUploadFileOperation, GoogleDriveCreateFolderOperation, GoogleDriveAddPermissionOperation, GoogleDriveUpdatePermissionOperation, GoogleDriveRemovePermissionOperation:
+		if err := validateConfiguredAccount(account, s.cfg.GoogleDriveAccounts, "GOOGLE_DRIVE_SOURCE_ACCOUNTS"); err != nil {
+			return err
+		}
+		if _, err := drivePayload(mutation); err != nil {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
 	case PrinterPrintDocumentOperation:

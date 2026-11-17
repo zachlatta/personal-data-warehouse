@@ -31,6 +31,8 @@ type PostgresStore struct {
 	timeout  time.Duration
 	ensureMu sync.Mutex
 	ensured  bool
+	// Optional staging dependency; production uses stageDriveUploads.
+	stageUploads func(context.Context, []storedMutation) error
 }
 
 type storedMutation struct {
@@ -192,13 +194,43 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	s.enrichContactPreviews(ctx, normalized)
 	s.enrichSlackMarkReadPreviews(ctx, normalized)
 	s.enrichSlackSendMessagePreviews(ctx, normalized)
+	if err := s.enrichDrivePreviews(ctx, normalized); err != nil {
+		return Request{}, err
+	}
 	idempotencyKey, err := requestIdempotencyKey(input, normalized)
 	if err != nil {
 		return Request{}, err
 	}
-	if existing, err := s.getRequestByIdempotencyKey(ctx, idempotencyKey); err != nil {
-		return Request{}, err
-	} else if existing.ID != "" {
+	var existing Request
+	for generation := 0; ; generation++ {
+		if generation >= 1000 {
+			return Request{}, errors.New("upload proposal history exceeds renewal limit")
+		}
+		existing, err = s.getRequestByIdempotencyKey(ctx, idempotencyKey)
+		if err != nil {
+			return Request{}, err
+		}
+		if existing.ID == "" || !renewableDriveUpload(existing) {
+			break
+		}
+		if existing.Status == "pending_review" {
+			if input.Replaces != nil && input.Replaces.RequestID != existing.ID {
+				return Request{}, invalidProposalInput(errors.New("expired upload must be replaced using its own request_id"))
+			}
+			if input.Replaces == nil {
+				if existing.Revision > 1 {
+					return Request{}, invalidProposalInput(errors.New("expired upload was edited by a reviewer; use replaces_request_id and replaces_revision for the version you read"))
+				}
+				input.Replaces = &RequestReplacement{RequestID: existing.ID, ExpectedRevision: existing.Revision, Reason: "staged upload expired; fresh bytes proposed"}
+			}
+		}
+		// Stable generation chains preserve retry deduplication while allowing a
+		// new approval and fresh staging after a dead upload. Existing records
+		// keep their audit history and unique keys.
+		sum := sha256.Sum256([]byte(idempotencyKey + ":" + existing.ID))
+		idempotencyKey = hex.EncodeToString(sum[:])
+	}
+	if existing.ID != "" {
 		// The same proposal is already stored (a retry, or an agent proposing
 		// twice). The replacement it names still has to be closed out, and
 		// applyReplacement is a no-op when that already happened.
@@ -211,6 +243,15 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 		return existing, nil
 	}
 
+	stage := s.stageUploads
+	if stage == nil {
+		stage = func(ctx context.Context, mutations []storedMutation) error {
+			return stageDriveUploads(ctx, mutations, nil)
+		}
+	}
+	if err := stage(ctx, normalized); err != nil {
+		return Request{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Request{}, err
@@ -2111,6 +2152,12 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Reason:    reason,
 				Payload:   payload,
 			})
+		case GoogleDriveUploadFileOperation, GoogleDriveCreateFolderOperation, GoogleDriveAddPermissionOperation, GoogleDriveUpdatePermissionOperation, GoogleDriveRemovePermissionOperation:
+			payload, err := drivePayload(mutation)
+			if err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			out = append(out, storedMutation{Provider: GoogleDriveProvider, Operation: mutation.Type, Account: account, Title: optionalTitle(mutation.Title, mutation.Type), Reason: reason, Payload: payload})
 		case PrinterPrintDocumentOperation:
 			doc, err := printDocumentFromInput(mutation)
 			if err != nil {
