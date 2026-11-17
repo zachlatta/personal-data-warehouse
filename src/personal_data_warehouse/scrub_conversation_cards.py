@@ -33,6 +33,33 @@ DERIVED = ('timeline_events', 'search_chunks')
 row_matches = count_row
 
 
+@contextmanager
+def apply_phase(timings, phase):
+    """Record only a fixed phase name and elapsed seconds, including failures."""
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        if timings is not None:
+            timings.append(dict(phase=phase, seconds=time.monotonic()-start))
+
+
+@contextmanager
+def apply_clock(timings):
+    current = None
+    def phase(name):
+        nonlocal current
+        if current is not None:
+            current.__exit__(None, None, None)
+        current = apply_phase(timings, name)
+        current.__enter__()
+    try:
+        yield phase
+    finally:
+        if current is not None:
+            current.__exit__(None, None, None)
+
+
 def connection_workers(warehouse,requested,headroom=6):
     maximum,reserved,used=warehouse._query("SELECT current_setting('max_connections')::int,current_setting('superuser_reserved_connections')::int,(SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend')")[0]
     spare=maximum-reserved-used-headroom
@@ -55,7 +82,7 @@ def maintenance_deadline(seconds):
 
 
 @contextmanager
-def _maintenance_transaction(connection):
+def _maintenance_transaction(connection, phase=lambda name: None):
     """A pending SQL timeout must not interrupt rollback after SIGALRM.
 
     psycopg's transaction context can itself receive the server cancellation
@@ -65,6 +92,7 @@ def _maintenance_transaction(connection):
     try:
         with connection:
             yield
+            phase('commit')
     except BaseException as error:
         connection.rollback()
         if isinstance(error,psycopg2.errors.QueryCanceled):
@@ -115,6 +143,11 @@ def _scan_table(warehouse, table, pool, page_size, connection=None, snapshot=Non
                 params += (month+'-01T00:00:00Z',month+'-01')
             # Buffer only IDs, never every prefiltered payload. Fetch matching
             # content in bounded PK batches using this same MVCC snapshot.
+            # Keep payload conversion/TOAST reads behind the cheap MVCC test;
+            # WHERE conjunct order is not an execution-order guarantee.
+            if since:
+                predicate = 'CASE WHEN age(candidate.xmin) <= age(pg_snapshot_xmin(%s::pg_snapshot)::xid) THEN ('+predicate+') ELSE false END'
+                params = (since,)+params
             cursor.execute(warehouse._expand_relations(f'SELECT {key_sql} FROM @{table} candidate WHERE {scope} AND ({predicate}){bounded}'),params)
             result = []
             while values := cursor.fetchmany(page_size):
@@ -406,7 +439,7 @@ def _related_rows(warehouse, table, sessions, event_keys, *, connection=None,ids
 def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, selector=None,
           max_source_rows=500, max_delta_rows=10000, window_seconds=60, max_plan_rows=20000,
           max_canonical_rows=None, _known_plan=None, planned_only=False,
-          exact_source_rows=None, allow_clean=False):
+          exact_source_rows=None, allow_clean=False, timings=None):
     plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size,selector=selector)
     _validate_plan(plan)
     if plan.get("selector", ScrubSelector().specification) != (selector or ScrubSelector()).specification:
@@ -422,16 +455,19 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
     source_rows=sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])
     if source_rows>max_source_rows: raise ValueError('candidate gate exceeded; no changes committed')
     if len(plan['candidates'])>max_plan_rows: raise ValueError('total candidate gate exceeded; no changes committed')
-    with maintenance_deadline(window_seconds), _maintenance_transaction(warehouse._connection):
+    with maintenance_deadline(window_seconds), apply_clock(timings) as phase, _maintenance_transaction(warehouse._connection, phase):
+        phase('lock_acquisition')
         warehouse._command('SET LOCAL statement_timeout = %s',(int(window_seconds*1000),))
         # Fail immediately on a live writer. Hold every lock until commit so
         # nothing can appear between delta confirmation and verification.
         warehouse._command('LOCK TABLE '+','.join('@'+t for t in (*TABLES,'search_chunk_embeddings'))+' IN SHARE ROW EXCLUSIVE MODE NOWAIT')
+        phase('recount')
         if max_canonical_rows is not None:
             sessions={tuple(c['session']) for c in plan['candidates'] if c['session']}
             if sum(_canonical_counts(warehouse,sessions,max_canonical_rows).values())>max_canonical_rows:
                 raise ValueError('canonical row gate exceeded; no changes committed')
         planned={(c['table'],tuple(c['key'])) for c in (_known_plan or plan)['candidates']}
+        phase('delta_guard')
         with ConfirmationPool(workers,selector) as pool:
             delta=(_session_candidates(warehouse,plan,pool) if planned_only else
                    _selected_delta(warehouse,plan,pool,page_size,max_delta_rows))
@@ -442,6 +478,7 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
             # can acquire selected readings before these writer locks. Recount
             # the exact source identities apply will read, in bounded pages,
             # under the same locks/transaction/deadline as the mutation.
+            phase('recount')
             sources=[row for _,row in _planned_rows(warehouse,[c for c in plan['candidates'] if c['table'] not in DERIVED])]
             current_sources=sum(sum(n>0 for n in pool.counts(sources[i:i+page_size]))
                                 for i in range(0,len(sources),page_size))
@@ -451,11 +488,12 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
                     not (allow_clean and current_sources==0)):
                 raise ValueError('exact source-row gate differs under locks; no changes committed')
         if planned_only:
-            _apply_plan(warehouse,plan,page_size,workers,selector,planned_only=True)
+            _apply_plan(warehouse,plan,page_size,workers,selector,planned_only=True,phase=phase)
         else:
-            _apply_plan(warehouse,plan,page_size,workers,selector)
+            _apply_plan(warehouse,plan,page_size,workers,selector,phase=phase)
         # Canonical new keys are checked before upsert by rebuild_sessions.
         # Recheck saved keys without running whole-corpus detection in-window.
+        phase('verification')
         rows=[row for _,row in _planned_rows(warehouse,plan['candidates'])]
         with ConfirmationPool(workers,selector) as pool:
             if any(pool.counts(rows)): raise RuntimeError('planned row verification failed; no changes committed')
@@ -553,7 +591,7 @@ def session_subplan(warehouse, plan, session, *, selector):
 
 def apply_session(warehouse, plan, session, *, selector, window, exact_source_rows,
                   workers=1, max_canonical_rows=2500, window_seconds=45,
-                  max_plan_rows=20000, max_delta_rows=1000, allow_clean=False):
+                  max_plan_rows=20000, max_delta_rows=1000, allow_clean=False, timings=None):
     """One bounded window; restore belongs to the supplied context manager.
 
     Keep ``selector`` in the owner through restoration, JSONL, and global
@@ -565,6 +603,16 @@ def apply_session(warehouse, plan, session, *, selector, window, exact_source_ro
         raise ValueError('invalid exact source-row gate')
     if len(plan['candidates']) > min(20000, max_plan_rows):
         raise ValueError('total candidate gate exceeded')
+    # Capture BEFORE the live scan. Every change racing any part of that scan
+    # is checked again under the writer locks, including active parents' child
+    # transactions (the N6 oldest-active-xid rule). Never persist or overwrite
+    # the checkpoint horizon: this fence is valid only for this apply attempt.
+    fence = _watermarks(warehouse, warehouse._connection)
+    known_ids = {(c['table'], tuple(c['key'])) for c in plan['candidates']}
+    with ConfirmationPool(workers, selector) as pool:
+        for item in _selected_delta(warehouse, plan, pool, limit=max_delta_rows):
+            if (item['table'], tuple(item['key'])) not in known_ids:
+                raise RuntimeError('new candidates require discovery; no changes committed')
     subset = session_subplan(warehouse, plan, session, selector=selector)
     n = sum(c['table'] not in DERIVED and c['matches'] > 0 for c in subset['candidates'])
     if n != exact_source_rows and not (allow_clean and n == 0):
@@ -573,11 +621,11 @@ def apply_session(warehouse, plan, session, *, selector, window, exact_source_ro
         raise ValueError('canonical row gate exceeded')
     known = dict(plan, candidates=plan['candidates'] + subset['candidates'])
     with window(0):
-        scrub(warehouse, apply=True, plan=subset, selector=selector, workers=workers,
+        scrub(warehouse, apply=True, plan=dict(subset, watermarks=fence), selector=selector, workers=workers,
               max_source_rows=exact_source_rows, max_plan_rows=max_plan_rows,
               max_delta_rows=max_delta_rows, max_canonical_rows=max_canonical_rows,
               window_seconds=window_seconds, _known_plan=known,
-              exact_source_rows=exact_source_rows, allow_clean=allow_clean)
+              exact_source_rows=exact_source_rows, allow_clean=allow_clean, timings=timings)
     return subset
 
 
@@ -644,7 +692,8 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     return plan
 
 
-def _apply_plan(warehouse, plan, page_size, workers, selector=None, *, planned_only=False):
+def _apply_plan(warehouse, plan, page_size, workers, selector=None, *, planned_only=False, phase=lambda name: None):
+    phase('sanitize')
     sessions = {tuple(c['session']) for c in plan['candidates'] if c['session']}
     current = {(table,tuple(row[k] for k in POSTGRES_TABLES[table].primary_key)):row
                for table,row in _planned_rows(warehouse,plan['candidates'],lock=True)}
@@ -699,12 +748,14 @@ def _apply_plan(warehouse, plan, page_size, workers, selector=None, *, planned_o
         key = (row['adapter'],row['event_id'])
         if table == 'timeline_events': old_timeline.append((key,identity))
         else: chunks.append((row['chunk_id'],row['text_sha256'],key,identity))
+    phase('regenerate_timeline')
     new_keys, regenerated = rebuild_sessions(warehouse,active,page_size,selector)
     if any((*key,identity) not in regenerated for key,identity in old_timeline) or any((*key,identity) not in regenerated for _,_,key,identity in chunks):
         raise RuntimeError('canonical event missing for derived copy; no changes committed')
     for (adapter,event_id),_ in old_timeline:
         if (adapter,event_id) not in new_keys:
             warehouse._command('DELETE FROM @timeline_events WHERE adapter=%s AND event_id=%s',(adapter,event_id))
+    phase('regenerate_chunks_embeddings')
     if planned_only:
         # Include canonical chunks created since discovery, including events
         # that were not yet present in the original timeline plan.

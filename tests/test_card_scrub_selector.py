@@ -158,8 +158,8 @@ def test_maintenance_deadline_rolls_back(warehouse,monkeypatch):
     row=event();warehouse._insert_rows('claude_code_events',[row],AGENT_SESSION_EVENT_COLUMNS)
     plan=module.discover(warehouse)
     actual=module._apply_plan
-    def stall(*args):
-        actual(*args)
+    def stall(*args, **kwargs):
+        actual(*args, **kwargs)
         time.sleep(.1)
     monkeypatch.setattr(module,'_apply_plan',stall)
     with pytest.raises(TimeoutError,match='budget exhausted'):

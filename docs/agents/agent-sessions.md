@@ -657,6 +657,30 @@ by source and disjoint UTC days covering the entire 30-day window, and sum the
 counts. A timeout is not zero; all partitions must complete. The full maintenance
 verification above also checks other text/JSON columns and historical copies.
 
+One-session card repairs first confirm the original checkpoint's global MVCC
+delta while writers remain live. A transient fence is captured before that
+scan; under NOWAIT writer locks the same guard checks all changes since the
+fence, including children of transactions active at the fence. Unknown
+selected identities still abort. The checkpoint's horizon and known-ID set
+are never advanced or discarded. The fence is never saved for reuse: every
+retry repeats the live confirmation. This keeps old payload confirmation out
+of the paused interval without weakening the global delta guard.
+
+Callers may pass a `timings` list to `apply_session` or `scrub`. On success or
+rollback it receives only phase names and durations: lock acquisition,
+delta guard, recount, sanitation, timeline regeneration, chunk/embedding
+invalidation, verification and commit. Persist this list in the private stage
+record, including on failure. Chunk generation remains asynchronous; verify
+after restoration and after the normal builder catches up.
+
+The token-only window controller above shuts down whole containers and launches
+token-only runtime commands. It cannot own a retained in-memory card selector.
+For a card keeper deployment handover, bind a replacement against the original
+checkpoint's salted seed revision before sanitizing that seed, require its
+ready state and identical selector specification, then retire the old owner.
+After sanitation, keep that replacement alive through transcript repair and
+global verification. A digest checkpoint cannot reconstruct a sanitized seed.
+
 Explicit maintenance modules (dry-run unless `--apply` is passed):
 `personal_data_warehouse.scrub_conversation_cards` reports source/month counts
 and cleans source rows, timeline text and search chunks/embeddings;

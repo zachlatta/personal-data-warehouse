@@ -79,6 +79,11 @@ def test_keeper_recovers_interface_error_and_verifies_globally(warehouse, tmp_pa
     bound = resolve_selector(warehouse, 'labelled', [identity])
     plan = m.discover(warehouse, selector=bound)
     keeper = SessionKeeper(warehouse, plan, ('claude_code', row['session_id']))
+    # Deployment handover must bind the replacement before sanitation; its
+    # own retained selector remains usable after the old owner goes away.
+    replacement_owner = SessionKeeper(warehouse, plan, ('claude_code', row['session_id']))
+    assert replacement_owner.selector.specification == keeper.selector.specification
+    assert replacement_owner.selector.seeds == keeper.selector.seeds
     restored = []
     @contextmanager
     def broken(_):
@@ -96,6 +101,7 @@ def test_keeper_recovers_interface_error_and_verifies_globally(warehouse, tmp_pa
         return warehouse
     keeper.reconnect(connect)
     keeper.apply(window=lambda _:nullcontext(), exact_source_rows=1)
+    assert replacement_owner.selector.count(row['text']) > 0
     # Reconnect AGAIN after seed sanitation; forbid re-resolution explicitly.
     monkeypatch.setattr('personal_data_warehouse.card_scrub_keeper.resolve_selector',
                         lambda *a, **kw: pytest.fail('sanitized seed read'))
@@ -133,6 +139,64 @@ def test_exact_gate_rechecks_known_row_becoming_selected(warehouse):
     assert warehouse._query('SELECT text FROM @claude_code_events WHERE event_uuid=%s', ('test-event',))[0][0] == row['text']
 
 
+def test_live_fence_keeps_original_horizon_and_checks_racing_unknown_row(warehouse):
+    from contextlib import contextmanager
+    row = dict(event(), raw_json='{}')
+    warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+    identity = 'claude_code_events:' + json.dumps({k: row[k] for k in ('source','session_id','event_uuid')})
+    retained = resolve_selector(warehouse, 'labelled', [identity])
+    plan = m.discover(warehouse, selector=retained)
+    original = dict(plan['watermarks'])
+    @contextmanager
+    def racing(_):
+        warehouse._insert_rows('claude_code_events', [dict(row,session_id='other',event_uuid='late')], AGENT_SESSION_EVENT_COLUMNS)
+        yield
+    timings = []
+    with pytest.raises(RuntimeError, match='new candidates'):
+        m.apply_session(warehouse, plan, ('claude_code',row['session_id']),
+                        selector=retained.seed_only(plan['selector']),
+                        window=racing, exact_source_rows=1, timings=timings)
+    assert plan['watermarks'] == original
+    assert [t['phase'] for t in timings] == ['lock_acquisition','recount','delta_guard']
+    assert warehouse._query('SELECT text FROM @claude_code_events WHERE event_uuid=%s', (row['event_uuid'],))[0][0] == row['text']
+
+
+def test_live_fence_checks_unknown_changes_before_the_new_snapshot(warehouse):
+    row = dict(event(), raw_json='{}')
+    warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+    identity = 'claude_code_events:' + json.dumps({k: row[k] for k in ('source','session_id','event_uuid')})
+    retained = resolve_selector(warehouse, 'labelled', [identity])
+    plan = m.discover(warehouse, selector=retained)
+    warehouse._insert_rows('claude_code_events', [dict(row,session_id='other',event_uuid='late')], AGENT_SESSION_EVENT_COLUMNS)
+    with pytest.raises(RuntimeError, match='new candidates'):
+        m.apply_session(warehouse, plan, ('claude_code',row['session_id']),
+                        selector=retained.seed_only(plan['selector']),
+                        window=lambda _:pytest.fail('pause before live confirmation'), exact_source_rows=1)
+
+
+def test_live_fence_includes_active_parent_savepoint_committed_at_pause(warehouse):
+    import psycopg2
+    from contextlib import contextmanager
+    row = dict(event(), raw_json='{}')
+    warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+    identity = 'claude_code_events:' + json.dumps({k: row[k] for k in ('source','session_id','event_uuid')})
+    retained = resolve_selector(warehouse, 'labelled', [identity])
+    plan = m.discover(warehouse, selector=retained)
+    with psycopg2.connect(warehouse._database_url) as writer:
+        with writer.cursor() as cursor:
+            cursor.execute('SAVEPOINT child')
+            cursor.execute(warehouse._expand_relations("INSERT INTO @claude_code_events (source,session_id,event_uuid,text) VALUES ('claude_code','other','child',%s)"), (row['text'],))
+            cursor.execute('RELEASE SAVEPOINT child')
+        @contextmanager
+        def racing(_):
+            writer.commit()
+            yield
+        with pytest.raises(RuntimeError, match='new candidates'):
+            m.apply_session(warehouse, plan, ('claude_code',row['session_id']),
+                            selector=retained.seed_only(plan['selector']),
+                            window=racing, exact_source_rows=1)
+
+
 @pytest.mark.parametrize('scope', ['seed', 'labelled', 'all'])
 @pytest.mark.parametrize('selected', [0, 1, 2])
 def test_locked_source_gate_and_clean_replay_in_every_scope(warehouse, monkeypatch, scope, selected):
@@ -150,9 +214,9 @@ def test_locked_source_gate_and_clean_replay_in_every_scope(warehouse, monkeypat
         warehouse._command('UPDATE @claude_code_events SET text=%s', ('safe',))
     original = m._apply_plan
     called = []
-    def apply(*args):
+    def apply(*args, **kwargs):
         called.append(True)
-        return original(*args)
+        return original(*args, **kwargs)
     monkeypatch.setattr(m, '_apply_plan', apply)
     if selected != 1:
         with pytest.raises(ValueError, match='source-row gate'):
