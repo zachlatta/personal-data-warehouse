@@ -108,3 +108,64 @@ def test_keeper_recovers_interface_error_and_verifies_globally(warehouse, tmp_pa
     assert not keeper.verify()['candidates']
     assert keeper.plan['watermarks'] == plan['watermarks']
     assert keeper.plan['candidates'] == plan['candidates']
+
+
+def test_exact_gate_rechecks_known_row_becoming_selected(warehouse):
+    from contextlib import contextmanager
+    row = dict(event(), raw_json='{}')
+    other = dict(row, event_uuid='other', text='card: ' + ''.join(['5'*12, '4444']) + ' CVV: 123')
+    warehouse._insert_rows('claude_code_events', [row, other], AGENT_SESSION_EVENT_COLUMNS)
+    identity = 'claude_code_events:' + json.dumps({k: row[k] for k in ('source','session_id','event_uuid')})
+    bound = resolve_selector(warehouse, 'labelled', [identity])
+    plan = m.discover(warehouse, selector=bound)
+    selector = bound.seed_only(plan['selector'])
+    restored = []
+    @contextmanager
+    def window(_):
+        warehouse._command('UPDATE @claude_code_events SET text=%s WHERE event_uuid=%s', (row['text'], 'other'))
+        try: yield
+        finally: restored.append(True)
+    with pytest.raises(ValueError, match='source-row gate'):
+        m.apply_session(warehouse, plan, ('claude_code', row['session_id']),
+                        selector=selector, exact_source_rows=1, window=window)
+    assert restored == [True]
+    assert warehouse._query("SELECT count(*) FROM @claude_code_events WHERE text LIKE '%%[card %%'")[0][0] == 0
+    assert warehouse._query('SELECT text FROM @claude_code_events WHERE event_uuid=%s', ('test-event',))[0][0] == row['text']
+
+
+@pytest.mark.parametrize('scope', ['seed', 'labelled', 'all'])
+@pytest.mark.parametrize('selected', [0, 1, 2])
+def test_locked_source_gate_and_clean_replay_in_every_scope(warehouse, monkeypatch, scope, selected):
+    from personal_data_warehouse.card_scrub_selector import ScrubSelector
+    row = dict(event(), raw_json='{}')
+    warehouse._insert_rows('claude_code_events', [row, dict(row,event_uuid='other')], AGENT_SESSION_EVENT_COLUMNS)
+    selector = ScrubSelector(scope, seeds=('4111111111111111',))
+    plan = m.discover(warehouse, selector=selector)
+    # Keep both known identities, but the saved preflight sees only one match.
+    plan['candidates'][1]['matches'] = 0
+    plan['counts'] = m._details(plan['candidates'])
+    if selected < 2:
+        warehouse._command('UPDATE @claude_code_events SET text=%s WHERE event_uuid=%s', ('safe', 'other'))
+    if selected == 0:
+        warehouse._command('UPDATE @claude_code_events SET text=%s', ('safe',))
+    original = m._apply_plan
+    called = []
+    def apply(*args):
+        called.append(True)
+        return original(*args)
+    monkeypatch.setattr(m, '_apply_plan', apply)
+    if selected != 1:
+        with pytest.raises(ValueError, match='source-row gate'):
+            m.scrub(warehouse, apply=True, plan=plan, selector=selector,
+                    max_source_rows=1, exact_source_rows=1)
+        assert not called
+    if selected == 0:
+        m.scrub(warehouse, apply=True, plan=plan, selector=selector,
+                max_source_rows=1, exact_source_rows=1, allow_clean=True)
+    elif selected == 1:
+        m.scrub(warehouse, apply=True, plan=plan, selector=selector,
+                max_source_rows=1, exact_source_rows=1)
+    else:
+        # The current-count ceiling also applies without an exact count.
+        with pytest.raises(ValueError, match='source-row gate'):
+            m.scrub(warehouse, apply=True, plan=plan, selector=selector, max_source_rows=1)

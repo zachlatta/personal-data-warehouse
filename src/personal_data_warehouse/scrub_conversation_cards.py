@@ -405,7 +405,7 @@ def _related_rows(warehouse, table, sessions, event_keys, *, connection=None,ids
 
 def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, selector=None,
           max_source_rows=500, max_delta_rows=10000, window_seconds=60, max_plan_rows=20000,
-          max_canonical_rows=None, _known_plan=None):
+          max_canonical_rows=None, _known_plan=None, exact_source_rows=None, allow_clean=False):
     plan = plan if plan is not None else discover(warehouse,workers=workers,page_size=page_size,selector=selector)
     _validate_plan(plan)
     if plan.get("selector", ScrubSelector().specification) != (selector or ScrubSelector()).specification:
@@ -414,6 +414,8 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
     if not apply: return plan['counts']
     if not 0<window_seconds<=60: raise ValueError('maintenance budget must be at most 60 seconds')
     if 'discovery' in plan: raise ValueError('partition discovery incomplete')
+    if exact_source_rows is not None and not 0<exact_source_rows<=max_source_rows:
+        raise ValueError('invalid exact source-row gate')
     source_rows=sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])
     if source_rows>max_source_rows: raise ValueError('candidate gate exceeded; no changes committed')
     if len(plan['candidates'])>max_plan_rows: raise ValueError('total candidate gate exceeded; no changes committed')
@@ -432,6 +434,26 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
             for item in delta:
                 if (item['table'],tuple(item['key'])) not in planned:
                     raise RuntimeError('new candidates require discovery; no changes committed')
+            # Saved matches are only a live preflight. Known zero-match IDs
+            # can acquire selected readings before these writer locks. Recount
+            # the exact source identities apply will read, in bounded pages,
+            # under the same locks/transaction/deadline as the mutation.
+            current_sources=0
+            rows=[]
+            for item in plan['candidates']:
+                if item['table'] in DERIVED: continue
+                keys=POSTGRES_TABLES[item['table']].primary_key
+                rows.extend(warehouse._query_dicts(f'SELECT * FROM @{item["table"]} WHERE '+
+                    ' AND '.join(f'{k}=%s' for k in keys),item['key']))
+                if len(rows)>=page_size:
+                    current_sources+=sum(n>0 for n in pool.counts(rows))
+                    rows=[]
+            current_sources+=sum(n>0 for n in pool.counts(rows))
+            if current_sources>max_source_rows:
+                raise ValueError('current source-row gate exceeded; no changes committed')
+            if (exact_source_rows is not None and current_sources!=exact_source_rows and
+                    not (allow_clean and current_sources==0)):
+                raise ValueError('exact source-row gate differs under locks; no changes committed')
         _apply_plan(warehouse,plan,page_size,workers,selector)
         # Canonical new keys are checked before upsert by rebuild_sessions.
         # Recheck saved keys without running whole-corpus detection in-window.
@@ -513,7 +535,8 @@ def apply_session(warehouse, plan, session, *, selector, window, exact_source_ro
         scrub(warehouse, apply=True, plan=subset, selector=selector, workers=workers,
               max_source_rows=exact_source_rows, max_plan_rows=max_plan_rows,
               max_delta_rows=max_delta_rows, max_canonical_rows=max_canonical_rows,
-              window_seconds=window_seconds, _known_plan=known)
+              window_seconds=window_seconds, _known_plan=known,
+              exact_source_rows=exact_source_rows, allow_clean=allow_clean)
     return subset
 
 
