@@ -715,7 +715,7 @@ func MutationHelp() MutationHelpDocument {
 			},
 			{
 				Type:    PrinterPrintDocumentOperation,
-				Summary: "Print one PDF on Zach's home printer (the Brother MFC-L2710DW), one-sided, black and white, on US Letter. Executed at home beside the scanner, not in the cloud.",
+				Summary: "Print one PDF in black and white on US Letter on the home Brother MFC-L2710DW. Supports one-sided and two-sided printing.",
 				Fields: []MutationHelpArg{
 					{Name: "type", JSONType: "string", Required: true, Description: "literal " + PrinterPrintDocumentOperation},
 					{Name: "account", JSONType: "string", Required: false, Description: `"` + PrinterAccount + `", the only printer; may be omitted`},
@@ -724,18 +724,20 @@ func MutationHelp() MutationHelpDocument {
 					{Name: "data_base64", JSONType: "string", Required: true, Description: "the PDF's bytes as canonical standard base64 on one line (not base64url, a URL or a local path), at most 20 MiB decoded"},
 					{Name: "page_count", JSONType: "integer", Required: true, Description: "the PDF's page count (1 to 200), e.g. from pdfinfo; the reviewer sees it, and the printer refuses a PDF whose real count differs"},
 					{Name: "copies", JSONType: "integer", Required: false, Description: "copies to print, 1 to 20; defaults to 1"},
+					{Name: "sides", JSONType: "string", Required: false, Description: PrintOneSided + " (default), " + PrintLongEdge + " (flip along the long edge), or " + PrintShortEdge + " (flip along the short edge)"},
 				},
 				Example: map[string]any{
 					"type":         PrinterPrintDocumentOperation,
-					"filename":     "boarding-pass.pdf",
+					"filename":     "handout.pdf",
 					"content_type": "application/pdf",
 					"data_base64":  "JVBERi0xLjQK...",
-					"page_count":   1,
+					"page_count":   2,
+					"sides":        PrintLongEdge,
 				},
-				ExtraNotes: "Nothing prints until a human approves the request. The review shows the file name, pages, copies, sheets, size and the PDF's sha256 (the bytes themselves are left out of review reads); say in reason what the document is and why it should be on paper. " +
+				ExtraNotes: "Nothing prints until a human approves the request. The review shows the file name, pages, copies, sides, sheets, size and the PDF's sha256 (the bytes themselves are left out of review reads); say in reason what the document is and why it should be on paper. " +
 					"After approval the resident printer worker (`pdw mutations printer`, beside the scanner on mew-coolify) checks the bytes against the stored sha256, counts the pages with pdfinfo, renders them at 600 dpi grey with Ghostscript and sends one IPP Print-Job named pdw-<mutation id>, then follows the job for up to 5 minutes. The result JSON carries the IPP job id and its final state (verified false when it was still printing). " +
 					"One approval prints at most once: a job that may have reached the printer is never sent again on its own. If the connection drops after sending, the mutation fails with \"may have printed, check the printer\"; to print it again, propose a new request with a different title or reason (an identical proposal returns the old request). " +
-					"A printer that is off or unreachable before anything was sent is retried with backoff. Two-sided printing is not supported yet.",
+					"A printer that is off or unreachable before anything was sent is retried with backoff. For two-sided printing the worker requires the printer to honor the specified job attributes.",
 			},
 			{
 				Type:        CalendarDeleteEventOperation,

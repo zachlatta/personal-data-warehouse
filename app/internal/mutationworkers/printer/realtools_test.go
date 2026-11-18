@@ -13,7 +13,8 @@ import (
 
 // TestRealToolsPrintToAFakePrinter runs the executor with the real pdfinfo,
 // Ghostscript and ipptool against PDW_PRINTER_TEST_URI, which must be a fake
-// IPP printer (ippeveprinter), never the Brother. It is skipped otherwise.
+// duplex-capable IPP printer (ippeveprinter -2), never the Brother. It is
+// skipped otherwise.
 // Run it in the printer image: see docs/agents/mutations-and-app.md.
 func TestRealToolsPrintToAFakePrinter(t *testing.T) {
 	uri := os.Getenv("PDW_PRINTER_TEST_URI")
@@ -34,10 +35,15 @@ func TestRealToolsPrintToAFakePrinter(t *testing.T) {
 	}
 	followFor = time.Minute
 	followEvery = 2 * time.Second
-	result := NewExecutor(uri, ExecRunner, true).Execute(mutation)
-	t.Logf("result: %#v", result)
-	if result.Status != queue.StatusSucceeded || result.ResultJSON["job_id"] == "" {
-		t.Fatalf("result = %#v", result)
+	for _, sides := range []string{"one-sided", "two-sided-long-edge", "two-sided-short-edge"} {
+		t.Run(sides, func(t *testing.T) {
+			mutation.Payload["sides"] = sides
+			result := NewExecutor(uri, ExecRunner, true).Execute(mutation)
+			t.Logf("result: %#v", result)
+			if result.Status != queue.StatusSucceeded || result.ResultJSON["job_id"] == "" || result.ResultJSON["verified"] != true {
+				t.Fatalf("result = %#v", result)
+			}
+		})
 	}
 	// A wrong page count is refused before anything is sent.
 	mutation.Payload["page_count"] = float64(3)

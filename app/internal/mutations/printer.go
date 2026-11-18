@@ -25,20 +25,21 @@ import (
 // human approves is exactly what prints. Review reads drop the bytes
 // (hydratePrintDocuments) and show the sha256, size and page count instead,
 // so a 20 MiB request does not land in a review page or a push alert.
-// One-sided only: the printer rotates the back of a duplex sheet, and that
-// is unchecked on the real printer.
-
 const (
 	maxPrintDocumentBytes = 20 << 20
 	maxPrintPages         = 200
 	maxPrintCopies        = 20
-	printDocumentSides    = "one-sided"
 	printDocumentPrinter  = "Brother MFC-L2710DW (home)"
+
+	PrintOneSided  = "one-sided"
+	PrintLongEdge  = "two-sided-long-edge"
+	PrintShortEdge = "two-sided-short-edge"
 )
 
 var printDocumentKeys = map[string]bool{
 	"type": true, "operation": true, "account": true, "title": true, "reason": true,
 	"filename": true, "content_type": true, "data_base64": true, "page_count": true, "copies": true,
+	"sides": true,
 }
 
 // printDocument is a validated print request.
@@ -49,6 +50,23 @@ type printDocument struct {
 	SHA256    string
 	PageCount int
 	Copies    int
+	Sides     string
+}
+
+// PrintDocumentSides validates the IPP sides keyword for both proposals and
+// stored jobs. Omission preserves the original one-sided default.
+func PrintDocumentSides(payload map[string]any) (string, error) {
+	value, present := payload["sides"]
+	if !present {
+		return PrintOneSided, nil
+	}
+	sides, _ := value.(string)
+	switch sides {
+	case PrintOneSided, PrintLongEdge, PrintShortEdge:
+		return sides, nil
+	default:
+		return "", fmt.Errorf("sides must be %q, %q, or %q", PrintOneSided, PrintLongEdge, PrintShortEdge)
+	}
 }
 
 func printDocumentFromInput(mutation MutationInput) (printDocument, error) {
@@ -61,10 +79,14 @@ func printDocumentFromInput(mutation MutationInput) (printDocument, error) {
 	}
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
-		return printDocument{}, fmt.Errorf("has unknown field(s) %s; %s takes filename, content_type, data_base64, page_count, copies, title and reason (one-sided only)", strings.Join(unknown, ", "), PrinterPrintDocumentOperation)
+		return printDocument{}, fmt.Errorf("has unknown field(s) %s; %s takes filename, content_type, data_base64, page_count, copies, sides, title and reason", strings.Join(unknown, ", "), PrinterPrintDocumentOperation)
 	}
 	if account := normalizeAccount(mutation.Account); account != PrinterAccount {
 		return printDocument{}, fmt.Errorf("account must be %q (the only printer), not %q", PrinterAccount, account)
+	}
+	sides, err := PrintDocumentSides(raw)
+	if err != nil {
+		return printDocument{}, err
 	}
 	name, _ := raw["filename"].(string)
 	if strings.TrimSpace(name) == "" || len(name) > 255 || name == "." || name == ".." || strings.ContainsAny(name, "/\\") || strings.ContainsFunc(name, func(r rune) bool { return r < 32 || r == 127 }) {
@@ -98,7 +120,7 @@ func printDocumentFromInput(mutation MutationInput) (printDocument, error) {
 	sum := sha256.Sum256(data)
 	return printDocument{
 		Filename: name, Encoded: encoded, Size: len(data), SHA256: hex.EncodeToString(sum[:]),
-		PageCount: pages, Copies: copies,
+		PageCount: pages, Copies: copies, Sides: sides,
 	}, nil
 }
 
@@ -151,18 +173,22 @@ func printDocumentPayload(doc printDocument) map[string]any {
 		"sha256":       doc.SHA256,
 		"page_count":   doc.PageCount,
 		"copies":       doc.Copies,
-		"sides":        printDocumentSides,
+		"sides":        doc.Sides,
 	}
 }
 
 func printDocumentPreview(doc printDocument) map[string]any {
+	sheetsPerCopy := doc.PageCount
+	if doc.Sides != PrintOneSided {
+		sheetsPerCopy = (doc.PageCount + 1) / 2
+	}
 	return map[string]any{
 		"printer":    printDocumentPrinter,
 		"filename":   doc.Filename,
 		"page_count": doc.PageCount,
 		"copies":     doc.Copies,
-		"sheets":     doc.PageCount * doc.Copies,
-		"sides":      printDocumentSides,
+		"sheets":     sheetsPerCopy * doc.Copies,
+		"sides":      doc.Sides,
 		"paper":      "US Letter",
 		"size_bytes": doc.Size,
 		"sha256":     doc.SHA256,

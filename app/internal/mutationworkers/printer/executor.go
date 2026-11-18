@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutationworkers/queue"
 )
 
@@ -97,6 +98,10 @@ func (e *Executor) Execute(mutation queue.Mutation) queue.Result {
 		return retryable("PRINTER_URI is not set; nothing was sent")
 	}
 	payload := mutation.Payload
+	sides, err := mutations.PrintDocumentSides(payload)
+	if err != nil {
+		return terminal(err.Error()+"; nothing was sent", nil)
+	}
 	data, err := base64.StdEncoding.Strict().DecodeString(stringValue(payload["data_base64"]))
 	if err != nil || len(data) == 0 {
 		return terminal("payload has no readable data_base64; nothing was sent", nil)
@@ -112,7 +117,7 @@ func (e *Executor) Execute(mutation queue.Mutation) queue.Result {
 	}
 	result := map[string]any{
 		"printer_uri": e.uri, "sha256": stringValue(payload["sha256"]),
-		"page_count": wantPages, "copies": copies,
+		"page_count": wantPages, "copies": copies, "sides": sides,
 	}
 
 	dir, err := os.MkdirTemp("", "pdw-print-")
@@ -137,9 +142,14 @@ func (e *Executor) Execute(mutation queue.Mutation) queue.Result {
 	if pages != wantPages {
 		return terminal(fmt.Sprintf("the PDF has %d pages, not the %d the request showed; nothing was sent", pages, wantPages), result)
 	}
+	duplex := strconv.FormatBool(sides != mutations.PrintOneSided)
+	// The home Brother reports pwg-raster-document-sheet-back=rotated.
+	// Ghostscript rotates the back of long-edge sheets for that feed path.
 	if out, err := e.runFor(renderTimeout, "gs", "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE",
 		"-sDEVICE=pwgraster", "-r600", "-sPAPERSIZE=letter", "-dFIXEDMEDIA", "-dPDFFitPage",
 		"-dcupsColorSpace=18", "-dcupsBitsPerColor=8",
+		"-dDuplex="+duplex, "-scupsBackSideOrientation=Rotated",
+		"-dTumble="+strconv.FormatBool(sides == mutations.PrintShortEdge),
 		"-sOutputFile="+pwg, pdf); err != nil {
 		return terminal("Ghostscript cannot render the PDF ("+commandError(err, out)+"); nothing was sent", result)
 	}
@@ -148,6 +158,7 @@ func (e *Executor) Execute(mutation queue.Mutation) queue.Result {
 	result["job_name"] = jobName
 	out, err := e.runFor(sendTimeout, "ipptool", "-t", "-L", "-T", "60",
 		"-d", "job_name="+jobName, "-d", "copies="+strconv.Itoa(copies),
+		"-d", "sides="+sides, "-d", "fidelity="+duplex,
 		"-f", pwg, e.uri, printTest)
 	report := parseReport(out)
 	if err != nil || report.Status == "" || report.Attrs["job-id"] == "" {

@@ -90,6 +90,41 @@ func TestPrintDocumentTitleNamesPagesAndCopies(t *testing.T) {
 	}
 }
 
+func TestProposePrintDocumentStoresReviewedSidesAndSheets(t *testing.T) {
+	for _, tc := range []struct {
+		sides  string
+		pages  int
+		sheets int
+	}{
+		{"one-sided", 3, 9},
+		{"two-sided-long-edge", 4, 6},
+		{"two-sided-short-edge", 3, 6},
+		{"two-sided-long-edge", 1, 3},
+	} {
+		t.Run(tc.sides, func(t *testing.T) {
+			service, store := printService(t)
+			_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+				Title: "Print a handout", Reason: "paper copy",
+				Mutations: []map[string]any{printEntry(map[string]any{
+					"sides": tc.sides, "page_count": tc.pages, "copies": 3,
+				})},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err := normalizeForStorage(store.createCalls[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := stored[0]
+			preview, _ := got.Preview["print_document"].(map[string]any)
+			if got.Payload["sides"] != tc.sides || preview["sides"] != tc.sides || preview["sheets"] != tc.sheets {
+				t.Fatalf("stored sides = %v, preview = %#v", got.Payload["sides"], preview)
+			}
+		})
+	}
+}
+
 func TestProposePrintDocumentRefusesWhatCannotPrint(t *testing.T) {
 	big := base64.StdEncoding.EncodeToString(append([]byte("%PDF-"), make([]byte, maxPrintDocumentBytes)...))
 	for _, tc := range []struct {
@@ -109,7 +144,9 @@ func TestProposePrintDocumentRefusesWhatCannotPrint(t *testing.T) {
 		{map[string]any{"page_count": 1.5}, "page_count must be"},
 		{map[string]any{"copies": float64(0)}, "copies must be a whole number from 1 to 20"},
 		{map[string]any{"copies": float64(21)}, "copies must be"},
-		{map[string]any{"sides": "two-sided-long-edge"}, "unknown field(s) sides"},
+		{map[string]any{"sides": "two-sided"}, "sides must be"},
+		{map[string]any{"sides": ""}, "sides must be"},
+		{map[string]any{"sides": true}, "sides must be"},
 		{map[string]any{"url": "https://example.test/a.pdf"}, "unknown field(s) url"},
 	} {
 		service, store := printService(t)
@@ -140,7 +177,7 @@ func TestMutationHelpDocumentsPrinting(t *testing.T) {
 		t.Fatalf("help: %#v err=%v", help, err)
 	}
 	entry := help.Mutations[0]
-	for _, field := range []string{"filename", "content_type", "data_base64", "page_count", "copies"} {
+	for _, field := range []string{"filename", "content_type", "data_base64", "page_count", "copies", "sides"} {
 		found := false
 		for _, arg := range entry.Fields {
 			found = found || arg.Name == field

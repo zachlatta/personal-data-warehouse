@@ -732,19 +732,23 @@ other Gmail mutation.
 ## Printing (printer.print_document)
 
 `printer.print_document` prints one PDF on the home Brother MFC-L2710DW, the
-machine the scanner service also talks to. One-sided, black and white, US Letter (pages are
-fitted to it).
+machine the scanner service also talks to. It prints in black and white on US Letter and
+fits the document to that paper size.
 
 - **Proposal** (`app/internal/mutations/printer.go`): `filename`, `content_type`
   (`application/pdf` only), `data_base64` (at most 20 MiB decoded, must start with `%PDF-`),
-  `page_count` (1 to 200, what the agent counted) and optional `copies` (1 to 20, default 1).
-  The account is always `home-brother` and may be omitted; unknown fields (`sides`, a URL)
-  are refused. The bytes are stored inline like an email attachment, so what is approved is
-  what prints; the payload also stores their `sha256` and size.
+  `page_count` (1 to 200, what the agent counted), optional `copies` (1 to 20, default 1)
+  and optional `sides`. Use `one-sided` (the default), `two-sided-long-edge` to flip along
+  the long edge, or `two-sided-short-edge` to flip along the short edge. Send these fields
+  in a mutation entry through `propose_mutation` on MCP or `pdw call propose_mutation` on
+  the CLI. Both surfaces document the field through `propose_mutation_help`. The account
+  is always `home-brother` and may be omitted. The bytes are stored inline like an email
+  attachment. The payload stores their `sha256` and size.
 - **Review.** Review reads (`GetRequest`, so the web and phone review, the push alert and
-  the proposal response) drop `data_base64` (`hydratePrintDocuments`); the generic card
-  shows the payload and `preview.print_document`: file, pages, copies, sheets, sides, paper,
-  size and sha256. There is no PDF viewer in the review yet.
+  the proposal response) drop `data_base64` (`hydratePrintDocuments`). The web and phone
+  show the selected `sides` in the payload. The web also shows `preview.print_document`,
+  including the sheet count. For duplex, the count rounds up the sheets in each copy
+  before multiplying by the number of copies.
 - **Execution** (`app/internal/mutationworkers/printer`): `pdw mutations printer`, a
   resident queue worker in the `printer` service of the Coolify app
   `personal-data-warehouse-scanner` on mew-coolify (`app/scanner-compose.yaml` +
@@ -756,8 +760,13 @@ fitted to it).
   For each row it checks the bytes against the stored sha256, counts pages with `pdfinfo`
   (a different count fails terminal, nothing sent), renders 600 dpi 8-bit grey PWG raster
   with Ghostscript (`-sDEVICE=pwgraster`; the printer takes no PDF) and sends one IPP
-  Print-Job named `pdw-<mutation id>` with `ipptool -t -L` (`print_job.test`, embedded). It
-  then reads the job with Get-Job-Attributes (`job_status.test`) every 5 s for up to 5
+  Print-Job named `pdw-<mutation id>` with `ipptool -t -L` (`print_job.test`, embedded).
+  The selected `sides` sets the raster's duplex and tumble flags and the IPP job's `sides`.
+  The Brother advertises `pwg-raster-document-sheet-back=rotated`, so Ghostscript rotates
+  the backs for long-edge binding.
+  Duplex jobs request strict attribute fidelity to prevent silent substitution. Existing
+  jobs with no `sides` print one-sided. The worker reads the job with Get-Job-Attributes
+  (`job_status.test`) every 5 s for up to 5
   minutes: `completed` is `succeeded` (`verified: true`), `canceled`/`aborted` is
   `failed_terminal`, still going is `succeeded` with `verified: false`. No CUPS daemon, so
   no spool can hold or resend a job behind the worker.
@@ -777,8 +786,11 @@ fitted to it).
   (`PDW_TEST_POSTGRES_URL`: proposal, approval, the claim, the result) and
   `realtools_test.go`, which runs the real pdfinfo, Ghostscript and ipptool against a fake
   printer named by `PDW_PRINTER_TEST_URI`. Run it in the printer image with
-  `ippeveprinter` (cups-ipp-utils; it needs avahi and IPv6, and listens on localhost only,
+  `ippeveprinter -2` (cups-ipp-utils; it needs avahi and IPv6, and listens on localhost only,
   so share its network namespace); never point it at the Brother.
+
+Deploy the printer worker before enabling duplex proposals in the app. The previous worker
+submits every job as one-sided.
 
 ## Deleting a screen capture (screen_timelapse.purge_moment)
 

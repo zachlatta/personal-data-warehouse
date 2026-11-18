@@ -156,9 +156,11 @@ authoritative when this list and it disagree.
 - **Print a PDF:** `printer.print_document` with `filename`, `content_type`
   `application/pdf`, `data_base64` (the PDF, at most 20 MiB) and `page_count` (count it, e.g.
   with `pdfinfo`; a different real count is refused at print time), optional `copies` (1 to
-  20). One-sided, black and white, US Letter, on the home Brother; render anything else to
-  PDF first. Say in `reason` what the document is. The review shows file, pages, copies and
-  sha256, not the pages themselves. One approval prints at most once: a job that may have
+  20) and optional `sides`. Omit `sides` for `one-sided`. Use `two-sided-long-edge` for
+  book-style binding or `two-sided-short-edge` to flip along the short edge. The home Brother
+  prints in black and white on US Letter. Render other formats to PDF first. Say in `reason`
+  what the document is. The review shows the file, page count, copies, sides and sha256.
+  One approval prints at most once: a job that may have
   printed fails "check the printer" and is never resent; to reprint, propose again with a
   different title or reason (an identical proposal returns the old request).
 - **Change the thermostat:** `resideo.set_thermostat` with `device_id` (from

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -65,13 +66,14 @@ const (
 var testPDF = []byte("%PDF-1.4 test\n")
 
 type fakeCommands struct {
-	pages    string
-	gsErr    error
-	print    string
-	printErr error
-	statuses []string
-	calls    []string
-	printArg []string
+	pages     string
+	gsErr     error
+	print     string
+	printErr  error
+	statuses  []string
+	calls     []string
+	printArg  []string
+	renderArg []string
 }
 
 func (f *fakeCommands) run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -83,6 +85,7 @@ func (f *fakeCommands) run(_ context.Context, name string, args ...string) ([]by
 		}
 		return []byte("Producer:       test\nPages:          " + f.pages + "\nPage size:      612 x 792 pts (letter)\n"), nil
 	case "gs":
+		f.renderArg = args
 		return nil, f.gsErr
 	case "ipptool":
 		for _, arg := range args {
@@ -138,9 +141,58 @@ func TestAPrintThatCompletesSucceedsWithItsJob(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 	args := strings.Join(commands.printArg, " ")
-	for _, want := range []string{"-d job_name=pdw-mut-1", "-d copies=3", testURI, "-L"} {
+	for _, want := range []string{"-d job_name=pdw-mut-1", "-d copies=3", "-d sides=one-sided", testURI, "-L"} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("print args %q lack %q", args, want)
+		}
+	}
+}
+
+func TestPrintSendsTheReviewedSides(t *testing.T) {
+	for _, tc := range []struct {
+		sides      string
+		rasterArgs []string
+		fidelity   string
+	}{
+		{"two-sided-long-edge", []string{"-dDuplex=true", "-dTumble=false", "-scupsBackSideOrientation=Rotated"}, "fidelity=true"},
+		{"two-sided-short-edge", []string{"-dDuplex=true", "-dTumble=true", "-scupsBackSideOrientation=Rotated"}, "fidelity=true"},
+		{"one-sided", []string{"-dDuplex=false", "-dTumble=false"}, "fidelity=false"},
+	} {
+		t.Run(tc.sides, func(t *testing.T) {
+			mutation := printMutation()
+			if tc.sides == "one-sided" {
+				// Older payloads can omit sides.
+				delete(mutation.Payload, "sides")
+			} else {
+				mutation.Payload["sides"] = tc.sides
+			}
+			commands := &fakeCommands{pages: "2", print: printPass, statuses: []string{statusCompleted}}
+			result := testExecutor(commands).Execute(mutation)
+			if result.Status != queue.StatusSucceeded || result.ResultJSON["sides"] != tc.sides {
+				t.Fatalf("result = %#v", result)
+			}
+			for _, want := range []string{"sides=" + tc.sides, tc.fidelity} {
+				if !slices.Contains(commands.printArg, want) {
+					t.Fatalf("print args %q lack %q", commands.printArg, want)
+				}
+			}
+			for _, want := range tc.rasterArgs {
+				if !slices.Contains(commands.renderArg, want) {
+					t.Fatalf("raster args %q lack %q", commands.renderArg, want)
+				}
+			}
+		})
+	}
+}
+
+func TestInvalidSidesPrintNothing(t *testing.T) {
+	for _, value := range []any{"two-sided", "", nil, true} {
+		mutation := printMutation()
+		mutation.Payload["sides"] = value
+		commands := &fakeCommands{}
+		result := testExecutor(commands).Execute(mutation)
+		if result.Status != queue.StatusFailedTerminal || !strings.Contains(result.Error, "sides must be") || len(commands.calls) != 0 {
+			t.Fatalf("sides = %#v, result = %#v calls = %v", value, result, commands.calls)
 		}
 	}
 }

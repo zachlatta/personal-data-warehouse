@@ -43,7 +43,7 @@ func TestIntegrationAnApprovedPrintIsClaimedOnlyByThePrinterWorker(t *testing.T)
 	encoded := base64.StdEncoding.EncodeToString(testPDF)
 	raw := map[string]any{
 		"type": mutations.PrinterPrintDocumentOperation, "filename": "a.pdf", "content_type": "application/pdf",
-		"data_base64": encoded, "page_count": float64(2), "copies": float64(1),
+		"data_base64": encoded, "page_count": float64(2), "copies": float64(1), "sides": "two-sided-long-edge",
 	}
 	request, err := app.CreateRequest(ctx, mutations.CreateRequestInput{
 		Title: fmt.Sprintf("%s %d", t.Name(), time.Now().UnixNano()), Reason: "integration test", RequestedBy: "test",
@@ -56,7 +56,8 @@ func TestIntegrationAnApprovedPrintIsClaimedOnlyByThePrinterWorker(t *testing.T)
 	if _, ok := request.Mutations[0].Payload["data_base64"]; ok {
 		t.Fatalf("review read carries the PDF: %#v", request.Mutations[0].Payload)
 	}
-	if preview, _ := request.Mutations[0].Preview["print_document"].(map[string]any); preview["sha256"] == nil {
+	if preview, _ := request.Mutations[0].Preview["print_document"].(map[string]any); preview["sha256"] == nil ||
+		preview["sides"] != raw["sides"] || preview["sheets"] != float64(1) {
 		t.Fatalf("preview = %#v", request.Mutations[0].Preview)
 	}
 	if _, err := app.ApproveRequest(ctx, request.ID, "test-reviewer"); err != nil {
@@ -108,7 +109,7 @@ func TestIntegrationAnApprovedPrintIsClaimedOnlyByThePrinterWorker(t *testing.T)
 		t.Fatalf("read request: %v", err)
 	}
 	got := read.Mutations[0]
-	if got.Status != "succeeded" || got.Result["job_id"] != "41" || got.Result["verified"] != true {
+	if got.Status != "succeeded" || got.Result["job_id"] != "41" || got.Result["verified"] != true || got.Result["sides"] != raw["sides"] {
 		t.Fatalf("mutation after the pass = %s %#v", got.Status, got.Result)
 	}
 }
