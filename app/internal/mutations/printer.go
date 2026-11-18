@@ -25,6 +25,7 @@ import (
 // human approves is exactly what prints. Review reads drop the bytes
 // (hydratePrintDocuments) and show the sha256, size and page count instead,
 // so a 20 MiB request does not land in a review page or a push alert.
+
 const (
 	maxPrintDocumentBytes = 20 << 20
 	maxPrintPages         = 200

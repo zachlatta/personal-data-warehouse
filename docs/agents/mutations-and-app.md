@@ -789,8 +789,9 @@ fits the document to that paper size.
   `ippeveprinter -2` (cups-ipp-utils; it needs avahi and IPv6, and listens on localhost only,
   so share its network namespace); never point it at the Brother.
 
-Deploy the printer worker before enabling duplex proposals in the app. The previous worker
-submits every job as one-sided.
+Nothing gates `sides` on the worker's version: a printer worker built before `sides`
+existed ignores it and prints one-sided. Before approving the first duplex job after a
+deploy, check that `personal-data-warehouse-scanner` has redeployed too.
 
 ## Deleting a screen capture (screen_timelapse.purge_moment)
 
