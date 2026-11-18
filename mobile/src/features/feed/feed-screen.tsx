@@ -770,177 +770,180 @@ export default function FeedScreen() {
           {searchBusy ? <ActivityIndicator style={styles.searchSpinner} /> : null}
         </View>
       ) : null}
-      <FlatList
-        ref={list}
-        contentContainerStyle={{ paddingBottom: tabSpace }}
-        data={shown}
-        extraData={[savedIds, likedIds]}
-        keyExtractor={(item) => item.item_id}
-        renderItem={renderItem}
-        onScroll={onScroll}
-        {...scrollHandlers}
-        keyboardShouldPersistTaps="handled"
-        keyboardDismissMode="on-drag"
-        onScrollToTop={() => recordUi('scroll_to_top', { metadata: { view: view.current } })}
-        onEndReachedThreshold={0.2}
-        onEndReached={() => {
-          if (endLogged.current || !shown.length) return;
-          endLogged.current = true;
-          recordUi('end_reached', { metadata: { cards: shown.length, view: view.current } });
-        }}
-        scrollEventThrottle={16}
-        onLayout={(e) => {
-          viewport.current = { ...viewport.current, height: e.nativeEvent.layout.height };
-          measure();
-        }}
-        refreshControl={
-          searching ? undefined : <RefreshControl
-            refreshing={refreshing}
-            onRefresh={() => {
-              recordUi('refresh', { metadata: { view: view.current } });
-              void load('pull');
-            }}
-          />
-        }
-        windowSize={11}
-        initialNumToRender={6}
-        ListHeaderComponent={
-          <View
-            onLayout={(e) => {
-              headerHeight.current = e.nativeEvent.layout.height;
-              measure();
-            }}>
-            {searching ? null : bubbles.length > 1 || savedIds.length > 0 || only === SAVED ? (
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.rail}>
-                {savedIds.length > 0 || only === SAVED ? (
-                  <Pressable
-                    style={[styles.bubble, only !== null && only !== SAVED && styles.bubbleDim]}
-                    onPress={() => {
-                      pause();
-                      const next = only === SAVED ? null : SAVED;
-                      recordUi('filter', { metadata: { from: viewName(only), to: viewName(next), saved: savedIds.length } });
-                      setOnly(next);
-                    }}
-                    accessibilityLabel={`Saved for later, ${savedIds.length}`}>
-                    <View style={[styles.savedBubble, only === SAVED && styles.savedBubbleOn]}>
-                      <Icon name="bookmark.fill" tintColor="#fff" size={24} />
-                      {savedIds.length ? (
-                        <View style={styles.savedCount}>
-                          <ThemedText style={styles.savedCountText}>{savedIds.length}</ThemedText>
-                        </View>
-                      ) : null}
-                    </View>
-                    <ThemedText style={[styles.bubbleLabel, only === SAVED && styles.bubbleLabelOn]} numberOfLines={1}>
-                      Saved
-                    </ThemedText>
-                  </Pressable>
-                ) : null}
-                {[{ source: '', label: 'All', unseen: 0, total: items.length }, ...bubbles].map((b) => {
-                  const active = (only ?? '') === b.source;
-                  return (
+      {/* Anchor the overlay to the list, below the launcher's in-screen header. */}
+      <View style={styles.fill}>
+        <FlatList
+          ref={list}
+          contentContainerStyle={{ paddingBottom: tabSpace }}
+          data={shown}
+          extraData={[savedIds, likedIds]}
+          keyExtractor={(item) => item.item_id}
+          renderItem={renderItem}
+          onScroll={onScroll}
+          {...scrollHandlers}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+          onScrollToTop={() => recordUi('scroll_to_top', { metadata: { view: view.current } })}
+          onEndReachedThreshold={0.2}
+          onEndReached={() => {
+            if (endLogged.current || !shown.length) return;
+            endLogged.current = true;
+            recordUi('end_reached', { metadata: { cards: shown.length, view: view.current } });
+          }}
+          scrollEventThrottle={16}
+          onLayout={(e) => {
+            viewport.current = { ...viewport.current, height: e.nativeEvent.layout.height };
+            measure();
+          }}
+          refreshControl={
+            searching ? undefined : <RefreshControl
+              refreshing={refreshing}
+              onRefresh={() => {
+                recordUi('refresh', { metadata: { view: view.current } });
+                void load('pull');
+              }}
+            />
+          }
+          windowSize={11}
+          initialNumToRender={6}
+          ListHeaderComponent={
+            <View
+              onLayout={(e) => {
+                headerHeight.current = e.nativeEvent.layout.height;
+                measure();
+              }}>
+              {searching ? null : bubbles.length > 1 || savedIds.length > 0 || only === SAVED ? (
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.rail}>
+                  {savedIds.length > 0 || only === SAVED ? (
                     <Pressable
-                      key={b.source || '*'}
-                      style={[styles.bubble, !active && only !== null && styles.bubbleDim]}
+                      style={[styles.bubble, only !== null && only !== SAVED && styles.bubbleDim]}
                       onPress={() => {
                         pause();
-                        const next = b.source && !active ? b.source : null;
-                        recordUi('filter', { metadata: { from: viewName(only), to: viewName(next), unseen: b.unseen, total: b.total } });
+                        const next = only === SAVED ? null : SAVED;
+                        recordUi('filter', { metadata: { from: viewName(only), to: viewName(next), saved: savedIds.length } });
                         setOnly(next);
                       }}
-                      accessibilityLabel={b.source ? `Only ${b.label}` : 'Everything'}>
-                      <SourceAvatar name={b.source ? b.label : '*'} size={58} ring={b.unseen > 0 || active} />
-                      <ThemedText style={[styles.bubbleLabel, active && styles.bubbleLabelOn]} numberOfLines={1}>
-                        {b.label}
+                      accessibilityLabel={`Saved for later, ${savedIds.length}`}>
+                      <View style={[styles.savedBubble, only === SAVED && styles.savedBubbleOn]}>
+                        <Icon name="bookmark.fill" tintColor="#fff" size={24} />
+                        {savedIds.length ? (
+                          <View style={styles.savedCount}>
+                            <ThemedText style={styles.savedCountText}>{savedIds.length}</ThemedText>
+                          </View>
+                        ) : null}
+                      </View>
+                      <ThemedText style={[styles.bubbleLabel, only === SAVED && styles.bubbleLabelOn]} numberOfLines={1}>
+                        Saved
                       </ThemedText>
                     </Pressable>
-                  );
-                })}
-              </ScrollView>
-            ) : null}
-            {searching && searchError ? (
-              <View style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
-                <ThemedText style={styles.bannerText}>Could not search: {searchError}</ThemedText>
+                  ) : null}
+                  {[{ source: '', label: 'All', unseen: 0, total: items.length }, ...bubbles].map((b) => {
+                    const active = (only ?? '') === b.source;
+                    return (
+                      <Pressable
+                        key={b.source || '*'}
+                        style={[styles.bubble, !active && only !== null && styles.bubbleDim]}
+                        onPress={() => {
+                          pause();
+                          const next = b.source && !active ? b.source : null;
+                          recordUi('filter', { metadata: { from: viewName(only), to: viewName(next), unseen: b.unseen, total: b.total } });
+                          setOnly(next);
+                        }}
+                        accessibilityLabel={b.source ? `Only ${b.label}` : 'Everything'}>
+                        <SourceAvatar name={b.source ? b.label : '*'} size={58} ring={b.unseen > 0 || active} />
+                        <ThemedText style={[styles.bubbleLabel, active && styles.bubbleLabelOn]} numberOfLines={1}>
+                          {b.label}
+                        </ThemedText>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+              ) : null}
+              {searching && searchError ? (
+                <View style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
+                  <ThemedText style={styles.bannerText}>Could not search: {searchError}</ThemedText>
+                </View>
+              ) : null}
+              {offline && !searching ? (
+                <Pressable accessibilityRole="button" accessibilityLabel="Retry loading feed" onPress={() => void load('pull')} style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
+                  <ThemedText style={styles.bannerText}>
+                    {pageAt ? `You're offline · cards from ${offlineAge(pageAt)}` : "You're offline"}. Downloaded articles and photos still open.
+                  </ThemedText>
+                  <ThemedText type="smallBold">Tap to retry</ThemedText>
+                </Pressable>
+              ) : null}
+              {error && !offline && !searching ? (
+                <Pressable accessibilityRole="button" accessibilityLabel="Retry loading feed" onPress={() => void load('pull')} style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
+                  <ThemedText style={styles.bannerText}>Could not refresh: {error}</ThemedText>
+                  <ThemedText type="smallBold">Tap to retry</ThemedText>
+                </Pressable>
+              ) : null}
+            </View>
+          }
+          ListEmptyComponent={
+            searching ? (
+              <View style={styles.empty}>
+                {searchError ? null : results === null ? (
+                  <ActivityIndicator />
+                ) : (
+                  <>
+                    <ThemedText style={styles.emptyTitle}>{query.trim() ? 'No matches' : 'Nothing seen yet'}</ThemedText>
+                    <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
+                      {query.trim() ? 'No card you have seen has all of those words.' : 'Cards show up here once you have seen them in the feed.'}
+                    </ThemedText>
+                  </>
+                )}
               </View>
-            ) : null}
-            {offline && !searching ? (
-              <Pressable accessibilityRole="button" accessibilityLabel="Retry loading feed" onPress={() => void load('pull')} style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
-                <ThemedText style={styles.bannerText}>
-                  {pageAt ? `You're offline · cards from ${offlineAge(pageAt)}` : "You're offline"}. Downloaded articles and photos still open.
+            ) : only === SAVED ? (
+              <View style={styles.empty}>
+                <ThemedText style={styles.emptyTitle}>Nothing saved</ThemedText>
+                <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
+                  Tap the bookmark on a card, or swipe it right, to keep it here until you get to it.
                 </ThemedText>
-                <ThemedText type="smallBold">Tap to retry</ThemedText>
-              </Pressable>
-            ) : null}
-            {error && !offline && !searching ? (
-              <Pressable accessibilityRole="button" accessibilityLabel="Retry loading feed" onPress={() => void load('pull')} style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
-                <ThemedText style={styles.bannerText}>Could not refresh: {error}</ThemedText>
-                <ThemedText type="smallBold">Tap to retry</ThemedText>
-              </Pressable>
-            ) : null}
-          </View>
-        }
-        ListEmptyComponent={
-          searching ? (
+              </View>
+            ) : (
             <View style={styles.empty}>
-              {searchError ? null : results === null ? (
-                <ActivityIndicator />
-              ) : (
+              {disabled ? (
                 <>
-                  <ThemedText style={styles.emptyTitle}>{query.trim() ? 'No matches' : 'Nothing seen yet'}</ThemedText>
+                  <ThemedText style={styles.emptyTitle}>The feed is turned off</ThemedText>
                   <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
-                    {query.trim() ? 'No card you have seen has all of those words.' : 'Cards show up here once you have seen them in the feed.'}
+                    This PDW server does not have the Feed module on (PDW_FEED_ENABLED).
                   </ThemedText>
                 </>
+              ) : (
+                // Only before the first card is ever pushed: once there are cards
+                // the server resurfaces seen ones instead of an empty feed.
+                error || offline ? <ThemedText themeColor="textSecondary">Your feed will appear when PDW is reachable.</ThemedText> : <ThemedText themeColor="textSecondary">No cards yet. Pull down to refresh.</ThemedText>
               )}
             </View>
-          ) : only === SAVED ? (
-            <View style={styles.empty}>
-              <ThemedText style={styles.emptyTitle}>Nothing saved</ThemedText>
-              <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
-                Tap the bookmark on a card, or swipe it right, to keep it here until you get to it.
-              </ThemedText>
-            </View>
-          ) : (
-          <View style={styles.empty}>
-            {disabled ? (
-              <>
-                <ThemedText style={styles.emptyTitle}>The feed is turned off</ThemedText>
-                <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
-                  This PDW server does not have the Feed module on (PDW_FEED_ENABLED).
-                </ThemedText>
-              </>
-            ) : (
-              // Only before the first card is ever pushed: once there are cards
-              // the server resurfaces seen ones instead of an empty feed.
-              error || offline ? <ThemedText themeColor="textSecondary">Your feed will appear when PDW is reachable.</ThemedText> : <ThemedText themeColor="textSecondary">No cards yet. Pull down to refresh.</ThemedText>
-            )}
-          </View>
-          )
-        }
-      />
-      {arrivals.length && only === null && !searching ? (
-        <Pressable
-          style={({ pressed }) => [styles.pill, pressed && styles.pillPressed]}
-          onPress={() => {
-            recordUi('new_pill', { metadata: { count: arrivals.length, from_y: Math.round(viewport.current.top) } });
-            if (pendingItems.current) {
-              pause();
-              loadedIds.current = pendingItems.current.map((item) => item.item_id);
-              setItems(pendingItems.current);
-              pendingItems.current = null;
-            }
-            setArrivals([]);
-            list.current?.scrollToOffset({ offset: 0, animated: true });
-          }}
-          accessibilityLabel={`${arrivals.length} new cards, scroll to top`}>
-          <Icon name="arrow.up" tintColor="#fff" size={14} />
-          {[...new Set(arrivals.map((i) => i.site || i.source))].slice(0, 3).map((name, n) => (
-            <View key={name} style={[styles.pillFace, n > 0 && styles.pillFaceOverlap]}>
-              <SourceAvatar name={name} url={arrivals.find((i) => (i.site || i.source) === name)?.url} size={22} />
-            </View>
-          ))}
-          <ThemedText style={styles.pillText}>{arrivals.length} new</ThemedText>
-        </Pressable>
-      ) : null}
+            )
+          }
+        />
+        {arrivals.length && only === null && !searching ? (
+          <Pressable
+            style={({ pressed }) => [styles.pill, pressed && styles.pillPressed]}
+            onPress={() => {
+              recordUi('new_pill', { metadata: { count: arrivals.length, from_y: Math.round(viewport.current.top) } });
+              if (pendingItems.current) {
+                pause();
+                loadedIds.current = pendingItems.current.map((item) => item.item_id);
+                setItems(pendingItems.current);
+                pendingItems.current = null;
+              }
+              setArrivals([]);
+              list.current?.scrollToOffset({ offset: 0, animated: true });
+            }}
+            accessibilityLabel={`${arrivals.length} new cards, scroll to top`}>
+            <Icon name="arrow.up" tintColor="#fff" size={14} />
+            {[...new Set(arrivals.map((i) => i.site || i.source))].slice(0, 3).map((name, n) => (
+              <View key={name} style={[styles.pillFace, n > 0 && styles.pillFaceOverlap]}>
+                <SourceAvatar name={name} url={arrivals.find((i) => (i.site || i.source) === name)?.url} size={22} />
+              </View>
+            ))}
+            <ThemedText style={styles.pillText}>{arrivals.length} new</ThemedText>
+          </Pressable>
+        ) : null}
+      </View>
       {undo ? (
         <View style={[styles.undo, { bottom: tabSpace + 8, backgroundColor: theme.text }]}>
           <ThemedText style={[styles.undoText, { color: theme.background }]} numberOfLines={1}>
