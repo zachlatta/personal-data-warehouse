@@ -202,6 +202,11 @@ break from a Mac that only ever runs the iOS simulator:
   `handleNotificationResponse` is the same for both. Check a phone with
   `base_android_notifications.events`: chats on channel `messages`, category
   `msg`, `is_conversation = 1`; other alerts on channel `default`, tag `pdw-alert`.
+  Every alert's status-bar small icon is `assets/images/notification-icon.png`,
+  which the expo-notifications plugin (`app.json`) installs as
+  `@drawable/notification_icon` for Expo, FCM and `PdwMessagingService` alike.
+  Android draws only its alpha, so it must stay white on transparent: the app
+  icon there rendered as a white square (`messaging-plugin.test.mjs` checks it).
 
 - **PDW web links open in the app** (Android App Links). The intent filter in
   `app.json` claims `https://personal-data-warehouse.zachlatta.com` under
