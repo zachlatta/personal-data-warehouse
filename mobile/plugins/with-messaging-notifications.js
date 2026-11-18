@@ -336,7 +336,8 @@ object PdwNotifications {
     val open = NotificationsService.createNotificationResponseIntent(context, tap,
       NotificationAction(NotificationResponse.DEFAULT_ACTION_IDENTIFIER, null, true))
     val builder = NotificationCompat.Builder(context, channelId)
-      .setSmallIcon(smallIcon(context))
+      // The same drawable expo-notifications assigns to Expo and FCM in the manifest.
+      .setSmallIcon(R.drawable.notification_icon)
       .setContentIntent(open)
       .setAutoCancel(true)
       .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -464,11 +465,7 @@ object PdwNotifications {
     context.packageManager.getApplicationInfo(context.packageName, PackageManager.GET_META_DATA).metaData
   }.getOrNull()
 
-  // The icon and colour the expo-notifications config plugin installed.
-  private fun smallIcon(context: Context): Int =
-    metaData(context)?.getInt("expo.modules.notifications.default_notification_icon", 0)?.takeIf { it != 0 }
-      ?: context.applicationInfo.icon
-
+  // The accent colour installed by the expo-notifications config plugin.
   private fun accentColor(context: Context): Int? =
     metaData(context)?.getInt("expo.modules.notifications.default_notification_color", 0)?.takeIf { it != 0 }
       ?.let { runCatching { context.getColor(it) }.getOrNull() }

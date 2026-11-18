@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const require = createRequire(import.meta.url);
+const { PNG } = require('pngjs');
 const plugin = require('../../plugins/with-messaging-notifications.js');
 const mobile = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -26,6 +27,36 @@ test('the app module compiles against Firebase messaging, once', () => {
   const once = plugin.applyGradle(gradle);
   assert.equal(plugin.applyGradle(once), once);
   assert.match(once, /dependencies \{\n {4}implementation 'com\.google\.firebase:firebase-messaging:[\d.]+'/);
+});
+
+test('Android alerts use the shared white-on-transparent notification drawable', () => {
+  const app = JSON.parse(readFileSync(path.join(mobile, 'app.json'), 'utf8')).expo;
+  const [, { icon, color }] = app.plugins.find((entry) => entry[0] === 'expo-notifications');
+  assert.notEqual(icon, app.icon);
+  assert.match(color, /^#[0-9a-f]{6}$/i);
+
+  const { width, height, data } = PNG.sync.read(readFileSync(path.resolve(mobile, icon)));
+  assert.equal(width, 96);
+  assert.equal(height, 96);
+  let hasOpaqueWhite = false;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const pixel = (y * width + x) * 4;
+      const alpha = data[pixel + 3];
+      if (x < 4 || x >= width - 4 || y < 4 || y >= height - 4) {
+        assert.equal(alpha, 0, 'the glyph needs transparent padding on all sides');
+      }
+      if (alpha > 0) {
+        assert.deepEqual([...data.subarray(pixel, pixel + 3)], [255, 255, 255]);
+        hasOpaqueWhite ||= alpha === 255;
+      }
+    }
+  }
+  assert.ok(hasOpaqueWhite);
+
+  const kotlin = plugin.KOTLIN(app.android.package);
+  assert.match(kotlin, /\.setSmallIcon\(R\.drawable\.notification_icon\)/);
+  assert.doesNotMatch(kotlin, /applicationInfo\.icon/);
 });
 
 // The service subclasses expo-notifications internals. If an Expo upgrade
