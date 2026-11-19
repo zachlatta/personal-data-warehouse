@@ -10,6 +10,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/common"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/recordingupload"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/voicememo"
 )
 
 // DefaultSettleAge is how long a finished recording's file must sit unchanged
@@ -49,6 +50,7 @@ type Runner struct {
 	SettleAge         time.Duration
 	Limit             int
 	BeforeUploadCheck func() string
+	RecoveryIDs       map[string]bool // nil for regular sync; otherwise only these recovered rows
 }
 
 func (r *Runner) Sync() (Summary, error) {
@@ -76,11 +78,29 @@ func (r *Runner) Sync() (Summary, error) {
 	shared := recordingupload.Runner[Recording]{State: r.State, Now: r.Now, SettleAge: r.SettleAge, Limit: r.Limit, BeforeUploadCheck: r.BeforeUploadCheck, Logger: r.Logger,
 		Read: func() ([]recordingupload.Item[Recording], int, error) {
 			records, err := ReadRecordings(r.RecorderDir, scratch)
+			if err != nil {
+				return nil, 0, err
+			}
+			cutoff := r.Now().Add(-voicememo.WorkflowWindowHours * time.Hour)
 			items := make([]recordingupload.Item[Recording], 0, len(records))
 			for _, v := range records {
+				if r.RecoveryIDs != nil {
+					if !r.RecoveryIDs[v.UUID] {
+						continue
+					}
+					if v.State != 4 || !v.CreatedAt.Before(cutoff) || !v.FileExists || v.SizeBytes == 0 || v.DurationMS <= 0 {
+						return nil, 0, fmt.Errorf("%s: recovery requires state 4, positive duration, local audio and a recording older than %dh", v.UUID, voicememo.WorkflowWindowHours)
+					}
+					// Use the completed representation so this sidecar and a
+					// subsequent state-3 sync share the same ledger identity.
+					v.State = CompletedState
+				}
 				items = append(items, recordingupload.Item[Recording]{Key: v.UUID, Path: v.Path, SizeBytes: v.SizeBytes, ModifiedAt: v.ModifiedAt, SettleAt: v.ModifiedAt, Ready: v.State == CompletedState, Exists: v.FileExists, Value: v})
 			}
-			return items, 0, err
+			if r.RecoveryIDs != nil && len(items) != len(r.RecoveryIDs) {
+				return nil, 0, errors.New("some recovery UUIDs are missing from Recorder's database")
+			}
+			return items, 0, nil
 		},
 		BuildMetadata: func(v Recording, sha string, now time.Time) map[string]any {
 			return BuildMetadata(r.accountFor(v), r.Device, v, sha, now)

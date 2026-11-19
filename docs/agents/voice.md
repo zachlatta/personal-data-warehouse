@@ -388,7 +388,7 @@ a Mac or on iCloud: from the end of a recording every second is PDW's, and
 `marts_ops.voice_memo_landing_health` judges `google_recorder` from the end of the
 recording against the same 30 s p50.
 
-- **What it sends.** Each recording whose `recording_state` is 3 (finished), as the
+- **What it sends.** The ordinary uploader sends each recording whose `recording_state` is 3 (finished), as the
   `.m4a` Recorder wrote plus a sidecar: Recorder's uuid (`recording_id`), title,
   `created_time` (epoch milliseconds, UTC, so there is no zone to guess, unlike the Apple
   filename stamp), duration in ms, place name and coordinates, account and device. The app
@@ -397,6 +397,12 @@ recording against the same 30 s p50.
   `google_recorder_drive_inbox_sensor` / the landing worker promote them into
   `base_google_recorder.recordings`. From there the mart, transcription, enrichment,
   continuity and the timeline treat it like every other source.
+- **Recovering state-4 recordings.** Pass `--recover-state4-file <path>` with one reviewed
+  Recorder UUID per line. Recovery selects only those state-4 recordings with local audio
+  and original timestamps more than 48 hours old, outside the live workflow feed window.
+  It preserves each original UUID and timestamp and sends a state-3 sidecar. Use the same
+  ledger as ordinary sync so a retry or later Recorder promotion does not resend unchanged
+  audio or metadata.
 - **It never opens Recorder's live database.** Recorder holds it in WAL mode under its
   own uid; a root reader that created the `-shm` or `-wal` beside it would leave a file
   Recorder cannot write. The uploader copies the database and its WAL (not the `-shm`)

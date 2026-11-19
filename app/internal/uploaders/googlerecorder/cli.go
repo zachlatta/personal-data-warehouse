@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
@@ -39,6 +41,8 @@ FLAGS
   --limit N              Recordings sent per run, newest first (default 50).
   --max-run-seconds N    Exit 124 when a run takes longer; 0 disables (default 900).
   --dry-run              List what would be sent; sends nothing and records nothing.
+  --recover-state4-file  One UUID per line. Only recover these state-4 recordings,
+                         using their original recording time outside the workflow feed window.
   --state-file PATH      Upload ledger (default: the state directory).
   --lock-file PATH       Nonblocking lock against overlapping runs
                          (default: beside the state file).
@@ -55,6 +59,24 @@ const ExitCodeRunDeadline = 124
 
 const defaultMaxRunSeconds = 900
 
+var recoveryUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+func readRecoveryIDs(path string) (map[string]bool, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	ids := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(string(contents)), "\n") {
+		id := strings.TrimSpace(line)
+		if !recoveryUUID.MatchString(id) || ids[id] {
+			return nil, fmt.Errorf("recovery file must contain unique UUIDs, one per line")
+		}
+		ids[id] = true
+	}
+	return ids, nil
+}
+
 // exitProcess is replaced in tests.
 var exitProcess = os.Exit
 
@@ -69,6 +91,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	limit := fs.Int("limit", DefaultLimit, "")
 	maxRunSeconds := fs.Int("max-run-seconds", defaultMaxRunSeconds, "")
 	dryRun := fs.Bool("dry-run", false, "")
+	recoverFile := fs.String("recover-state4-file", "", "")
 	if _, code, done := common.ParseArgs(fs, args, Usage, stdout, stderr); done {
 		return code
 	}
@@ -77,6 +100,15 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	if *maxRunSeconds < 0 {
 		return common.UsageError(fs, stderr, "--max-run-seconds must be 0 or more")
+	}
+	var recoveryIDs map[string]bool
+	if *recoverFile != "" {
+		var err error
+		recoveryIDs, err = readRecoveryIDs(*recoverFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "pdw ingest google-recorder: recovery file: %v\n", err)
+			return common.ExitFailure
+		}
 	}
 	env, err := common.LoadProjectDotenv(getenv)
 	if err != nil {
@@ -145,6 +177,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Logger:            logger,
 		Limit:             *limit,
 		BeforeUploadCheck: guard,
+		RecoveryIDs:       recoveryIDs,
 	}).Sync()
 	fmt.Fprintf(stdout, "Google Recorder upload complete: seen=%d audio=%d sidecars=%d already_landed=%d in_progress=%d unsettled=%d missing_audio=%d remaining=%d deferred=%t dry_run=%t\n",
 		summary.Seen, summary.AudioUploaded, summary.MetadataUploaded, summary.Skipped, summary.InProgress,

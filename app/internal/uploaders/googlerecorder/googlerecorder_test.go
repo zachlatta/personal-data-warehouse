@@ -4,14 +4,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/externalfeeds"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/common"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/voicememo"
 )
 
 // The tables and columns below are Recorder's own (com.google.android.apps.recorder
@@ -199,6 +202,57 @@ func TestReadRecordingsReadsRowsThatLiveOnlyInTheWAL(t *testing.T) {
 	// found under the configured data directory instead.
 	if r.Path != filepath.Join(f.dir, "files", "recordings", "0e3f45d8.m4a") || r.SizeBytes != 3 {
 		t.Fatalf("path = %q size %d", r.Path, r.SizeBytes)
+	}
+}
+
+func TestRecoveryWindowMatchesExternalFeed(t *testing.T) {
+	feed, ok := externalfeeds.Lookup("feed:voice-memos")
+	if !ok {
+		t.Fatal("voice memo feed is missing")
+	}
+	cutoff := fmt.Sprintf("recorded_at >= now() - interval '%d hours'", voicememo.WorkflowWindowHours)
+	if !strings.Contains(feed.SourceSQL, cutoff) {
+		t.Fatalf("voice memo feed cutoff does not match recovery: want %q", cutoff)
+	}
+}
+
+func TestRecoveryOnlySendsSelectedOldState4AndSharesTheFinishedLedger(t *testing.T) {
+	f := newFixture(t)
+	created := f.now.Add(-49 * time.Hour)
+	f.add(recordingRow{uuid: "selected", created: created, durationMS: 1000, state: 4, audio: "memo"})
+	f.add(recordingRow{uuid: "unselected", created: created, durationMS: 1000, state: 4, audio: "other"})
+	f.add(recordingRow{uuid: "normal", created: created, durationMS: 1000, audio: "normal"})
+	f.add(recordingRow{uuid: "fresh", created: f.now.Add(-47 * time.Hour), durationMS: 1000, state: 4, audio: "fresh"})
+	client := &fakeUploader{}
+	runner := f.runner(client, f.state())
+	runner.RecoveryIDs = map[string]bool{"selected": true, "fresh": true}
+	if _, err := runner.Sync(); err == nil || len(client.audio) != 0 {
+		t.Fatalf("fresh recovery selection must fail before any upload, got err=%v uploads=%d", err, len(client.audio))
+	}
+	runner.RecoveryIDs = map[string]bool{"selected": true}
+	if _, err := runner.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.audio) != 1 || len(client.metadata) != 1 {
+		t.Fatalf("uploads=%d audio, %d sidecars", len(client.audio), len(client.metadata))
+	}
+	payload := client.metadata[0]["recording"].(map[string]any)
+	if payload["recording_id"] != "selected" || payload["recording_state"] != int64(CompletedState) ||
+		client.params[0]["recorded_at"] != common.ISOFormat(created) {
+		t.Fatalf("unexpected sidecar: %+v", payload)
+	}
+	if _, err := runner.Sync(); err != nil || len(client.audio) != 1 || len(client.metadata) != 1 {
+		t.Fatalf("recovery rerun must deduplicate, got err=%v uploads=%d/%d", err, len(client.audio), len(client.metadata))
+	}
+	if _, err := f.db.Exec("UPDATE recording_meta SET recording_state=3 WHERE uuid='selected'"); err != nil {
+		t.Fatal(err)
+	}
+	runner.RecoveryIDs = nil
+	if _, err := runner.Sync(); err != nil || len(client.audio) != 2 || len(client.metadata) != 2 {
+		t.Fatalf("ordinary sync should only send the normal row, got err=%v uploads=%d/%d", err, len(client.audio), len(client.metadata))
+	}
+	if v := client.metadata[1]["recording"].(map[string]any)["recording_id"]; v != "normal" {
+		t.Fatalf("ordinary sync uploaded %v, want normal", v)
 	}
 }
 

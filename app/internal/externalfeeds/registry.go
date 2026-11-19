@@ -4,7 +4,10 @@ package externalfeeds
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/voicememo"
 )
 
 type Definition struct {
@@ -20,7 +23,7 @@ type Definition struct {
 // cursor delivery, usage accounting and the management UI consume this registry.
 var definitions = []Definition{{
 	Scope: "feed:voice-memos", Path: "/api/external-feeds/voice-memos", DisplayName: "Voice memos",
-	Description: "Recordings from the last 48 hours after transcription and current recording enrichment. Stopped-and-restarted recordings may arrive as separate parts; session joining does not hold them back.",
+	Description: fmt.Sprintf("Recordings from the last %d hours after transcription and current recording enrichment. Stopped-and-restarted recordings may arrive as separate parts; session joining does not hold them back.", voicememo.WorkflowWindowHours),
 	SourceSQL:   voiceFeedSQL, Handler: NewHandler,
 }}
 
@@ -47,6 +50,8 @@ func (UnavailableStore) Page(context.Context, Definition, uint64, int) ([]map[st
 
 // One unified source query; never return storage URLs or audio credentials.
 // The version must be at least as new as the transcription it consumed.
+// Keep the SQL literal for the warehouse integration test.
+// TestRecoveryWindowMatchesExternalFeed verifies the cutoff against the uploader.
 const voiceFeedSQL = `SELECT jsonb_build_array(m.source,m.account,m.recording_id)::text AS item_key,
  m.recorded_at, to_jsonb(m)::text AS payload_json FROM (
  SELECT source, account, recording_id, content_sha256,
