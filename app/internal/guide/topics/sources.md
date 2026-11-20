@@ -80,6 +80,10 @@ and state the window and freshness.
   `transcript`, `participants_json` and `action_items_json`; `recording_ids` lists the members.
 - `base_google_recorder.recordings` — the Pixel's Recorder rows, with Recorder's own place
   name in `location_name`; read transcripts through the mart (`source = 'google_recorder'`).
+- `marts_voice_memos.start_screenshots` — the phone screen Zach was looking at as he
+  started a Pixel memo (taken by the volume-up gesture; absent when the phone was locked):
+  join on `(source, account, recording_id)`, open the image with `get_object(storage_file_id)`.
+  It may be unrelated to the memo.
 - `recorded_at` is when recording started, as an absolute time. Before 2026-10-16 Apple
   memos stored the phone's local clock as UTC (4-5 h early); memos still on the Mac were
   corrected, so an old memo that reads oddly early may be one that was not.

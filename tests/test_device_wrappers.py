@@ -270,6 +270,7 @@ def test_the_android_scripts_are_plain_sh_for_android() -> None:
         *sorted(SCREEN_TIME_MODULE.iterdir()),
         *sorted(PHOTOS_MODULE.iterdir()),
         SCREEN_TIMELAPSE_MODULE / "service.sh",
+        SCREEN_TIMELAPSE_MODULE / "screen-timelapse-upload-wake",
     ]
     for script in scripts:
         text = script.read_text()
@@ -488,6 +489,28 @@ def test_android_screen_batches_leave_time_for_the_service_deadline() -> None:
     assert "--limit 40" in text
     service = (SCREEN_TIMELAPSE_MODULE / "service.sh").read_text()
     assert "timeout 360" in service
+
+
+def test_a_screen_capture_can_ask_for_an_upload_run_now() -> None:
+    # The screenshot pichu takes when a voice memo starts must reach the
+    # warehouse before the memo's transcript (about 30 s after a short memo
+    # ends), so the voice memo workflow can look at it. The capture runs the
+    # wake handler; the loop runs the wrapper once the file has settled.
+    service = (SCREEN_TIMELAPSE_MODULE / "service.sh").read_text()
+    wake = (SCREEN_TIMELAPSE_MODULE / "screen-timelapse-upload-wake").read_text()
+    state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
+    assert f": > {state}/due" in wake
+    assert "/sys/power/wake_lock" in wake
+    assert '"$STATE/due"' in service
+    settle = int(re.search(r"(?m)^DUE_DELAY=(\d+)$", service).group(1))
+    text = _wrapper("screen-timelapse-upload-android")
+    wrapper_settle = int(re.search(r"--settle-age (\d+)s", text).group(1))
+    # A run started before the capture has settled sends nothing.
+    assert settle > wrapper_settle
+    # The phone renames each file into place whole, tree before screenshot,
+    # so a tree-less screenshot never waits ten minutes for one.
+    assert re.search(r"--no-tree-wait \d+s", text)
+    assert int(re.search(r"(?m)^\s*sleep (\d+)$", service.split("while :; do", 1)[1]).group(1)) <= 2
 
 
 def test_the_android_service_runs_the_wrapper_on_every_recorder_write_and_holds_the_phone_awake() -> None:

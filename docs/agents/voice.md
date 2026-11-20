@@ -452,6 +452,40 @@ On the phone (`ssh pichu`): logs and heartbeat in
 stop uploads, and a manual run is
 `sh /data/adb/modules/pdw-google-recorder/bin/google-recorder-upload-android`.
 
+## The screen as a Pixel memo starts
+
+Zach (2026-11-19): when he starts a memo on the phone, take a screenshot so whoever
+processes the memo can see what he was looking at, which may or may not be related.
+
+- **Capture (phone, sysadmin repository).** The volume-up gesture
+  (`pixel-volume-memo`) runs the screen timelapse loop's one-shot capture
+  (`pixel-screen-timelapse/service.sh capture-now`) as it starts a recording, only
+  when the screen was awake and unlocked. Recorder records on a hidden display, so the
+  main screen is still Zach's app. The one-shot capture applies every timelapse
+  privacy rule (Telegram, incognito, the `paused` switch) and writes an ordinary
+  `phone-screenshot-<stamp>` moment with its tree.
+- **Upload.** The capture runs `bin/screen-timelapse-upload-wake` of the
+  `pdw-screen-timelapse` module (`ops/android/pdw-screen-timelapse/`), which leaves
+  `due` in its state directory; the service runs the uploader 7 s later instead of at
+  its five-minute floor. The Android wrapper passes `--settle-age 5s --no-tree-wait 5s`
+  (the Mac's two- and ten-minute waits exist because it gzips its tree in place after
+  the image; the phone renames each file into place whole, the tree first), so the
+  frame and its card-number guard run within seconds, well before a memo's
+  transcript lands.
+- **Link.** `marts_voice_memos.start_screenshots` pairs each `google_recorder`
+  recording with the newest frame of its `device` from 15 s before `recorded_at` up
+  to it (the gesture came 0.6-2.6 s before Recorder's `created_time` on 2026-11-19;
+  stamps are truncated to the second). A frame after the start is never used. A memo
+  started locked, with the screen off or from Recorder's own screen has no row and is
+  processed exactly as before. The periodic frames alone often leave no frame in the
+  seconds before a memo, which is why the gesture captures its own.
+- **Consumer.** The Intelligence "Voice Memo Received" workflow's prompt tells its
+  orchestrator to look the recording up there and open the image
+  (`get_object(storage_file_id)`), as context only.
+- The frame is screen timelapse data like any other: deleting it is
+  `screen_timelapse.purge_moment`, and it never leaves the warehouse except to the
+  agent reading it.
+
 ## Local Voice Memos Upload Scheduler
 
 This Mac is intended to run the local Voice Memos uploader through a user LaunchAgent:

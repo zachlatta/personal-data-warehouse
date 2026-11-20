@@ -55,9 +55,14 @@ if [ -z "$PDW" ]; then
 else
   # Keep serial compression/uploads within the service's 360s timeout.
   # The CLI default of 300 files can take much longer on the phone.
+  # The capture loop renames each file into place whole, the tree before its
+  # screenshot, so seconds are enough to settle and a screenshot with no tree
+  # then never gets one (the defaults, 2 and 10 minutes, are for the Mac).
   pdw_run_stoppable "$HEARTBEAT_FILE" "$LOG_FILE" "android screen timelapse" \
     "$PDW" ingest screen-timelapse \
     --limit 40 \
+    --settle-age 5s \
+    --no-tree-wait 5s \
     --sources "$SOURCES" \
     --compress-png \
     --delete-after-upload \

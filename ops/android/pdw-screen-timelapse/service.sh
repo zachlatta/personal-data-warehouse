@@ -10,6 +10,11 @@
 # phone (~37 KB/frame average, ~10-18 MB/day) and uploading screenshots and
 # accessibility trees directly to PDW over Wi-Fi or cellular.
 #
+# A capture that must land quickly (the screenshot taken when a voice memo
+# starts) runs bin/screen-timelapse-upload-wake, which leaves `due` in $STATE:
+# the loop then runs the wrapper once DUE_DELAY seconds have passed, longer
+# than the wrapper's --settle-age, so the new file is sent on that run.
+#
 # Switches (files in $STATE):
 #   `paused`    stops uploads.
 #   `wifi-only` defers uploads when the active default network is not Wi-Fi.
@@ -31,6 +36,7 @@ STATE=/data/misc_ce/0/pdw-screen-timelapse
 LOG=$STATE/logs/service.log
 WAKE=pdw_screen_timelapse_run
 FLOOR=300
+DUE_DELAY=7
 
 umask 077
 
@@ -54,7 +60,7 @@ fi
 echo $$ > "$STATE/supervisor.pid"
 
 note() { echo "$(date '+%Y-%m-%d %H:%M:%S%z') $*" >> "$LOG"; }
-note "started (every ${FLOOR}s)"
+note "started (every ${FLOOR}s, and ${DUE_DELAY}s after a capture asks)"
 
 last=0
 while :; do
@@ -62,7 +68,12 @@ while :; do
   if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 262144 ]; then
     mv -f "$LOG" "$LOG.1"
   fi
-  if [ ! -f "$STATE/paused" ] && [ $((now - last)) -ge $FLOOR ]; then
+  due_age=-1
+  if [ -f "$STATE/due" ]; then
+    due_age=$((now - $(stat -c %Y "$STATE/due" 2>/dev/null || echo "$now")))
+  fi
+  if [ ! -f "$STATE/paused" ] && { [ "$due_age" -ge $DUE_DELAY ] || [ $((now - last)) -ge $FLOOR ]; }; then
+    rm -f "$STATE/due"
     # Hold the kernel wakelock 30s past the 360s timeout so it stays active
     # while screen-timelapse-upload-android traps TERM and waits for pdw to exit.
     echo "$WAKE 390000000000" > /sys/power/wake_lock 2>/dev/null
@@ -72,5 +83,5 @@ while :; do
     [ "$code" -ne 0 ] && note "upload run exited $code (see logs/screen-timelapse-upload.run.log)"
     last=$(date +%s)
   fi
-  sleep 30
+  sleep 2
 done

@@ -1,0 +1,10 @@
+#!/system/bin/sh
+# Asks the pdw-screen-timelapse service for an upload run now, rather than at
+# its five-minute floor. The sysadmin repository's pixel-screen-timelapse
+# capture loop runs it after the screenshot it takes when a voice memo starts
+# (pixel-volume-memo), so that frame reaches the warehouse before the memo's
+# transcript does. Marks a run due and keeps the phone awake for a minute so
+# the service's loop gets to it before the phone suspends (see service.sh).
+: > /data/misc_ce/0/pdw-screen-timelapse/due
+echo "pdw_screen_timelapse_due 60000000000" > /sys/power/wake_lock 2>/dev/null
+exit 0

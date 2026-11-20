@@ -601,6 +601,78 @@ def test_voice_memo_mart_carries_a_pixel_recording_like_any_other(
     assert pixel["transcript"] is None
 
 
+def _screenshot(wh: PostgresWarehouse, device: str, captured_at: datetime, file_id: str) -> None:
+    wh._command(
+        """
+        INSERT INTO @screen_timelapse_screenshots (device, captured_at, display_index,
+            source_filename, content_sha256, mime_type, size_bytes, storage_backend,
+            storage_key, storage_file_id, storage_url, ingested_at)
+        VALUES (%s, %s, 1, %s, %s, 'image/webp', 1000, 'google_drive', %s, %s, '', %s)
+        """,
+        (device, captured_at, f"{file_id}.webp", f"sha-{file_id}", f"key-{file_id}", file_id, TS),
+    )
+
+
+def _pixel_recording(wh: PostgresWarehouse, recording_id: str, recorded_at: datetime) -> None:
+    wh.insert_google_recorder_recordings(
+        [
+            _row(
+                GOOGLE_RECORDER_RECORDING_COLUMNS,
+                table="google_recorder_recordings",
+                account="zach",
+                recording_id=recording_id,
+                device="pichu",
+                recorded_at=recorded_at,
+                content_sha256=f"sha-{recording_id}",
+                raw_metadata_json="{}",
+                ingested_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+
+
+def test_a_pixel_memo_carries_the_screenshot_taken_as_it_started(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Holding volume up on pichu screenshots the main screen before Recorder
+    starts on its hidden display: 0.6-2.6 s before Recorder's created_time on
+    2026-11-19, and the stamp is truncated to the second. The newest pichu
+    frame from 15 s before the start up to the start is what Zach was looking
+    at; a frame after the start, another device's, or an older one is not."""
+    warehouse.ensure_google_recorder_tables()
+    _pixel_recording(warehouse, "with-shot", TS)
+    _pixel_recording(warehouse, "without-shot", TS + timedelta(hours=1))
+    # A recording with no known start is the epoch, and matches nothing.
+    _pixel_recording(warehouse, "no-start", EPOCH)
+    _screenshot(warehouse, "pichu", TS - timedelta(seconds=40), "periodic-old")
+    _screenshot(warehouse, "pichu", TS - timedelta(seconds=2), "memo-start")
+    _screenshot(warehouse, "pichu", TS - timedelta(seconds=9), "periodic-recent")
+    _screenshot(warehouse, "pichu", TS + timedelta(seconds=1), "after-start")
+    _screenshot(warehouse, "crobat", TS - timedelta(seconds=1), "the-mac")
+    _screenshot(warehouse, "pichu", EPOCH, "epoch-frame")
+    _screenshot(
+        warehouse, "pichu", TS + timedelta(hours=1) - timedelta(seconds=16), "too-early"
+    )
+
+    rows = _dicts(warehouse, "marts_voice_memos_start_screenshots", "recording_id")
+    assert [(r["recording_id"], r["storage_file_id"]) for r in rows] == [("with-shot", "memo-start")]
+    row = rows[0]
+    assert row["source"] == "google_recorder"
+    assert row["account"] == "zach"
+    assert row["device"] == "pichu"
+    assert row["recorded_at"] == TS
+    assert row["captured_at"] == TS - timedelta(seconds=2)
+    assert float(row["seconds_before_start"]) == 2.0
+    assert row["mime_type"] == "image/webp"
+    assert row["storage_backend"] == "google_drive"
+    assert row["storage_key"] == "key-memo-start"
+    assert row["content_sha256"] == "sha-memo-start"
+    # The memo itself is untouched: a memo with no screenshot is an ordinary memo.
+    ids = {r["recording_id"] for r in _dicts(warehouse, "marts_voice_memos_recordings")}
+    assert {"with-shot", "without-shot", "no-start"} <= ids
+
+
 def test_voice_memo_mart_resolves_the_latest_completed_enrichment_once(
     warehouse: PostgresWarehouse,
 ) -> None:

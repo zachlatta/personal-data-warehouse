@@ -19,6 +19,7 @@ USAGE
   pdw ingest screen-timelapse [--sources device=folder,...] [--limit N]
                               [--compress-png] [--quality Q] [--max-edge PX]
                               [--delete-after-upload] [--wifi-only]
+                              [--settle-age D] [--no-tree-wait D]
                               [--dry-run] [--state-file PATH] [--lock-file PATH]
 
 Sends every capture file the screen timelapse loops wrote -- each periodic
@@ -26,7 +27,7 @@ screenshot (one per display) and each accessibility tree -- to the app's
 /ingest/screen-timelapse/file endpoint, newest first, one moment (a device's
 screenshots and tree of one instant) at a time. The app stores the bytes and
 writes the file's row before it answers; a file is then remembered and not
-sent again unless it changes. Files younger than two minutes are left for the
+sent again unless it changes. Files younger than two minutes (--settle-age) are left for the
 next run, since a capture loop may still be writing them, and a moment's
 screenshots wait for its tree to settle (at most ten minutes more when it has
 none). A run stops at the first failed upload and exits non-zero.
@@ -57,6 +58,14 @@ FLAGS
                           guard).
   --wifi-only             On Android, defer uploads when the active default
                           network is not Wi-Fi (exits 0 so frames wait on disk).
+  --settle-age D          How long a file must sit unmodified before it is sent
+                          (default 2m). The Android phone's loop renames each
+                          file into place whole, so its wrapper passes seconds.
+  --no-tree-wait D        How long past the settle age a screenshot with no tree
+                          waits for one (default 10m; the Mac gzips its tree in
+                          place after the image lands). The phone renames its
+                          tree into place before the screenshot, so a phone
+                          screenshot with no tree after settling never gets one.
   --dry-run               List what would be sent; sends nothing and records nothing.
   --state-file PATH       Upload ledger (default: the Application Support state database).
   --lock-file PATH        Nonblocking lock used to avoid overlapping LaunchAgent runs
@@ -91,11 +100,19 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	deleteAfterUpload := fs.Bool("delete-after-upload", false, "")
 	wifiOnly := fs.Bool("wifi-only", false, "")
 	dryRun := fs.Bool("dry-run", false, "")
+	settleAge := fs.Duration("settle-age", DefaultSettleAge, "")
+	noTreeWait := fs.Duration("no-tree-wait", DefaultNoTreeWait, "")
 	if _, code, done := common.ParseArgs(fs, args, Usage, stdout, stderr); done {
 		return code
 	}
 	if *limit <= 0 {
 		return common.UsageError(fs, stderr, "--limit must be greater than 0")
+	}
+	if *settleAge <= 0 {
+		return common.UsageError(fs, stderr, "--settle-age must be greater than 0")
+	}
+	if *noTreeWait <= 0 {
+		return common.UsageError(fs, stderr, "--no-tree-wait must be greater than 0")
 	}
 	env, err := common.LoadProjectDotenv(getenv)
 	if err != nil {
@@ -173,6 +190,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		State:             state,
 		Logger:            logger,
 		Limit:             *limit,
+		SettleAge:         *settleAge,
+		NoTreeWait:        *noTreeWait,
 		CompressPNG:       enableCompress,
 		CompressQuality:   compressQuality,
 		CompressMaxEdge:   compressMaxEdge,

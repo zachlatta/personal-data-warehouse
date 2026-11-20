@@ -2356,6 +2356,18 @@
       "comment": "One row per event. Back-to-back recordings an agent judged one event (a memo stopped and restarted) are merged: all transcripts in order, one title, summary, participants and action items. A lone recording is a session of one; recording_ids lists the members; merge_status is single, pending or merged."
     },
     {
+      "id": "marts_voice_memos_start_screenshots",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "voice_memos",
+      "schema": "marts_voice_memos",
+      "name": "start_screenshots",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "What was on Zach's phone screen when he started a Pixel voice memo: one row per google_recorder recording with a pichu screen timelapse frame from the 15 s up to its start (the volume-up gesture takes one just before Recorder starts; a recording with none is absent). Join marts_voice_memos.recordings on (source, account, recording_id); fetch the image with get_object(storage_file_id). The screen may or may not relate to the memo."
+    },
+    {
       "id": "screen_timelapse_descriptions",
       "kind": "table",
       "layer": "derived",

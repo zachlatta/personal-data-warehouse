@@ -21222,6 +21222,67 @@ class PostgresWarehouse:
         # afterwards.
         self._ensure_calendar_transcript_views()
         self._ensure_voice_memo_landing_health_view()
+        self._ensure_voice_memo_start_screenshots_view()
+
+    def _ensure_voice_memo_start_screenshots_view(self) -> None:
+        """marts_voice_memos.start_screenshots: the phone screen as a memo started.
+
+        Holding volume up on pichu (the sysadmin repository's pixel-volume-memo
+        module) asks the pixel-screen-timelapse loop for one frame of the main
+        screen before Recorder starts on its hidden display, so the frame shows
+        what Zach was looking at, not Recorder. The frame lands in
+        base_screen_timelapse.screenshots like any other, quickly (the phone's
+        uploader runs seconds after such a capture), and this view links it to
+        the recording by device and time: the newest frame of the recording's
+        device from 15 s before Recorder's created_time up to it. Measured on
+        2026-11-19, the gesture came 0.6-2.6 s before created_time and the
+        frame's stamp is truncated to the second; the rest of the window covers
+        a slow start on the main-screen fallback. A periodic frame inside the
+        window is as good a picture of that moment. A frame after the start is
+        never taken: on the fallback it can show Recorder itself.
+
+        Driven from base_google_recorder.recordings, the one voice source that
+        knows its device, so a lookup by recording_id reaches the primary keys
+        instead of materializing the whole recordings mart. A memo started
+        locked, with the screen off, from Recorder's own screen or with capture
+        paused has no row here and is processed exactly as before.
+        """
+        self._ensure_table_group(["google_recorder_recordings", "screen_timelapse_screenshots"])
+        self._ensure_view(
+            "marts_voice_memos_start_screenshots",
+            """
+            CREATE OR REPLACE VIEW @marts_voice_memos_start_screenshots AS
+            SELECT
+                'google_recorder'::text AS source,
+                g.account,
+                g.recording_id,
+                g.recorded_at,
+                g.device,
+                s.captured_at,
+                EXTRACT(EPOCH FROM g.recorded_at - s.captured_at)::numeric AS seconds_before_start,
+                s.display_index,
+                s.mime_type,
+                s.size_bytes,
+                s.content_sha256,
+                s.storage_backend,
+                s.storage_key,
+                s.storage_file_id
+            FROM @google_recorder_recordings g
+            CROSS JOIN LATERAL (
+                SELECT f.captured_at, f.display_index, f.mime_type, f.size_bytes,
+                       f.content_sha256, f.storage_backend, f.storage_key, f.storage_file_id
+                FROM @screen_timelapse_screenshots f
+                WHERE f.device = g.device
+                  AND f.captured_at <= g.recorded_at
+                  AND f.captured_at >= g.recorded_at - interval '15 seconds'
+                ORDER BY f.captured_at DESC, f.display_index
+                LIMIT 1
+            ) s
+            -- The epoch is "no known start"; it must match nothing.
+            WHERE g.recorded_at > TIMESTAMPTZ '1970-01-01 00:00:00+00'
+              AND g.device <> ''
+            """,
+        )
 
     def _ensure_voice_memo_sessions_view(self) -> None:
         """marts_voice_memos.sessions: back-to-back recordings of one event, as one.
