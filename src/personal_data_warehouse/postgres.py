@@ -21234,12 +21234,13 @@ class PostgresWarehouse:
         base_screen_timelapse.screenshots like any other, quickly (the phone's
         uploader runs seconds after such a capture), and this view links it to
         the recording by device and time: the newest frame of the recording's
-        device from 15 s before Recorder's created_time up to it. Measured on
-        2026-11-19, the gesture came 0.6-2.6 s before created_time and the
-        frame's stamp is truncated to the second; the rest of the window covers
-        a slow start on the main-screen fallback. A periodic frame inside the
-        window is as good a picture of that moment. A frame after the start is
-        never taken: on the fallback it can show Recorder itself.
+        device from 15 s before Recorder's created_time to 2 s after it. The
+        frame's stamp is whole seconds: on the first live tests (2026-11-19
+        22:38 and 22:52 ET) it read 0.10 and 0.14 s after created_time, so
+        seconds_before_start can be slightly negative. Recorder is on its
+        hidden display then, so the main screen is still Zach's. A later frame
+        is never taken: on the main-screen fallback it can show Recorder. A
+        periodic frame inside the window is as good a picture of the moment.
 
         Driven from base_google_recorder.recordings, the one voice source that
         knows its device, so a lookup by recording_id reaches the primary keys
@@ -21273,7 +21274,7 @@ class PostgresWarehouse:
                        f.content_sha256, f.storage_backend, f.storage_key, f.storage_file_id
                 FROM @screen_timelapse_screenshots f
                 WHERE f.device = g.device
-                  AND f.captured_at <= g.recorded_at
+                  AND f.captured_at <= g.recorded_at + interval '2 seconds'
                   AND f.captured_at >= g.recorded_at - interval '15 seconds'
                 ORDER BY f.captured_at DESC, f.display_index
                 LIMIT 1

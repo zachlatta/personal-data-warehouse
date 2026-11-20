@@ -635,11 +635,12 @@ def _pixel_recording(wh: PostgresWarehouse, recording_id: str, recorded_at: date
 def test_a_pixel_memo_carries_the_screenshot_taken_as_it_started(
     warehouse: PostgresWarehouse,
 ) -> None:
-    """Holding volume up on pichu screenshots the main screen before Recorder
-    starts on its hidden display: 0.6-2.6 s before Recorder's created_time on
-    2026-11-19, and the stamp is truncated to the second. The newest pichu
-    frame from 15 s before the start up to the start is what Zach was looking
-    at; a frame after the start, another device's, or an older one is not."""
+    """Holding volume up on pichu screenshots the main screen while Recorder
+    starts on its hidden display, and the frame's stamp is whole seconds. On
+    the first live tests (2026-11-19 22:38 and 22:52 ET) the stamp read 0.10
+    and 0.14 s after Recorder's created_time, so the newest pichu frame from
+    15 s before the start to 2 s after it is what Zach was looking at; a later
+    frame, another device's, or an older one is not."""
     warehouse.ensure_google_recorder_tables()
     _pixel_recording(warehouse, "with-shot", TS)
     _pixel_recording(warehouse, "without-shot", TS + timedelta(hours=1))
@@ -648,7 +649,11 @@ def test_a_pixel_memo_carries_the_screenshot_taken_as_it_started(
     _screenshot(warehouse, "pichu", TS - timedelta(seconds=40), "periodic-old")
     _screenshot(warehouse, "pichu", TS - timedelta(seconds=2), "memo-start")
     _screenshot(warehouse, "pichu", TS - timedelta(seconds=9), "periodic-recent")
-    _screenshot(warehouse, "pichu", TS + timedelta(seconds=1), "after-start")
+    _screenshot(warehouse, "pichu", TS + timedelta(seconds=3), "too-late")
+    # The live case: Recorder's created_time has milliseconds, the stamp none.
+    live_start = TS + timedelta(hours=2) - timedelta(milliseconds=135)
+    _pixel_recording(warehouse, "stamp-after-start", live_start)
+    _screenshot(warehouse, "pichu", TS + timedelta(hours=2), "live-gesture")
     _screenshot(warehouse, "crobat", TS - timedelta(seconds=1), "the-mac")
     _screenshot(warehouse, "pichu", EPOCH, "epoch-frame")
     _screenshot(
@@ -656,8 +661,12 @@ def test_a_pixel_memo_carries_the_screenshot_taken_as_it_started(
     )
 
     rows = _dicts(warehouse, "marts_voice_memos_start_screenshots", "recording_id")
-    assert [(r["recording_id"], r["storage_file_id"]) for r in rows] == [("with-shot", "memo-start")]
-    row = rows[0]
+    assert [(r["recording_id"], r["storage_file_id"]) for r in rows] == [
+        ("stamp-after-start", "live-gesture"),
+        ("with-shot", "memo-start"),
+    ]
+    assert float(rows[0]["seconds_before_start"]) == -0.135
+    row = rows[1]
     assert row["source"] == "google_recorder"
     assert row["account"] == "zach"
     assert row["device"] == "pichu"

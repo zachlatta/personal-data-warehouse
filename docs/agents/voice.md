@@ -473,9 +473,11 @@ processes the memo can see what he was looking at, which may or may not be relat
   frame and its card-number guard run within seconds, well before a memo's
   transcript lands.
 - **Link.** `marts_voice_memos.start_screenshots` pairs each `google_recorder`
-  recording with the newest frame of its `device` from 15 s before `recorded_at` up
-  to it (the gesture came 0.6-2.6 s before Recorder's `created_time` on 2026-11-19;
-  stamps are truncated to the second). A frame after the start is never used. A memo
+  recording with the newest frame of its `device` from 15 s before `recorded_at` to
+  2 s after it. Stamps are whole seconds, and on the first live tests (2026-11-19)
+  the gesture frame's stamp read 0.10-0.14 s after Recorder's `created_time`, so
+  `seconds_before_start` can be slightly negative; Recorder is on its hidden display
+  then. A later frame is never used. A memo
   started locked, with the screen off or from Recorder's own screen has no row and is
   processed exactly as before. The periodic frames alone often leave no frame in the
   seconds before a memo, which is why the gesture captures its own.
