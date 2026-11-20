@@ -2365,7 +2365,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "What was on Zach's phone screen when he started a Pixel voice memo: one row per google_recorder recording with a pichu screen timelapse frame from the 15 s up to its start (the volume-up gesture takes one just before Recorder starts; a recording with none is absent). Join marts_voice_memos.recordings on (source, account, recording_id); fetch the image with get_object(storage_file_id). The screen may or may not relate to the memo."
+      "comment": "Phone screen at memo start. What was on Zach's phone screen as he started a Pixel voice memo: one row per google_recorder recording with a pichu screen timelapse frame from the 15 s up to its start (the volume-up gesture takes one just before Recorder starts; a recording with none is absent). Join marts_voice_memos.recordings on (source, account, recording_id); fetch the image with get_object(storage_file_id). The screen may or may not relate to the memo."
     },
     {
       "id": "screen_timelapse_descriptions",
