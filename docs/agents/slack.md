@@ -625,6 +625,26 @@ Slack's sharpest trap is already handled there: an unauthorized `files.slack.com
 **200 with an HTML login page**, not a 4xx, and the store rejects that rather than returning it
 as content.
 
+**Fail-closed token egress policy:** Both `app/internal/objectstore/slack.go` (`SlackFileStore`)
+and `src/personal_data_warehouse/slack_file_fingerprints.py` (`SlackThumbnailFetcher` /
+`SlackFileFingerprintRunner`) enforce the same fail-closed guard before attaching a Slack
+bearer token to any download URL:
+
+- Reject any external/remote file metadata (`is_external`, `mode` in `external`/`remote`,
+  non-empty `external_type`/`external_url`, or malformed metadata), even if one URL looks
+  trusted.
+- Permit only parsed `https` URLs on the exact allowlisted hostname `files.slack.com` (no
+  wildcards/suffixes, no userinfo, no IP literals, only default port 443 or omitted, no
+  parser-ambiguous syntax such as backslashes, percent-encoded authority, trailing dots,
+  multiple slashes, or whitespace/control chars).
+- Disable automatic redirects on the authenticated download client (`allow_redirects=False`
+  in Python, `CheckRedirect -> http.ErrUseLastResponse` in Go); any 3xx response is treated
+  as `blocked:redirect` and never triggers a second authenticated request.
+- Policy blocks in `derived_slack.file_fingerprints` are recorded as terminal `status = 'blocked'`
+  with sanitized reason codes (`blocked:external`, `blocked:host`, etc.) and never retried.
+- Kill switches: `SLACK_FILE_FINGERPRINTS_ENABLED=0` (Dagster fingerprinter) and
+  `SLACK_FILE_FETCH_ENABLED=0` (Go app `SlackFileStore`).
+
 ### Identifying an image: fingerprints, then plain SQL
 
 Slack image files are fingerprinted with the same 256-bit dhash the photos pipeline uses, into

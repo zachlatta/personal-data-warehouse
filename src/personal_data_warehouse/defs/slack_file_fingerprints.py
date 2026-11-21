@@ -37,6 +37,7 @@ from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 SLACK_FILE_FINGERPRINTS_POSTGRES_LOCK_ID = 8_407_112_473
+SLACK_FILE_FINGERPRINTS_ENABLED_ENV = "SLACK_FILE_FINGERPRINTS_ENABLED"
 SLACK_FILE_FINGERPRINT_LIMIT_ENV = "SLACK_FILE_FINGERPRINT_LIMIT"
 SLACK_FILE_FINGERPRINT_RUN_SECONDS_ENV = "SLACK_FILE_FINGERPRINT_RUN_SECONDS"
 SLACK_FILE_FINGERPRINT_SPACING_SECONDS_ENV = "SLACK_FILE_FINGERPRINT_SPACING_SECONDS"
@@ -47,6 +48,11 @@ SLACK_FILE_FINGERPRINT_MAX_FULL_DOWNLOADS_ENV = "SLACK_FILE_FINGERPRINT_MAX_FULL
 DEFAULT_LIMIT = 600
 DEFAULT_RUN_SECONDS = 1500
 DEFAULT_SPACING_SECONDS = 1.0
+
+
+def slack_file_fingerprints_enabled() -> bool:
+    raw = os.getenv(SLACK_FILE_FINGERPRINTS_ENABLED_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 def slack_file_fingerprint_limit() -> int:
@@ -78,6 +84,14 @@ def slack_tokens_by_account(settings) -> dict[str, str]:
     retry_policy=RetryPolicy(max_retries=1, delay=120),
 )
 def slack_file_fingerprints(context) -> MaterializeResult:
+    if not slack_file_fingerprints_enabled():
+        context.log.warning(
+            "Skipping Slack file fingerprints: disabled by %s",
+            SLACK_FILE_FINGERPRINTS_ENABLED_ENV,
+        )
+        return MaterializeResult(
+            metadata={"skipped": MetadataValue.text("disabled by SLACK_FILE_FINGERPRINTS_ENABLED")}
+        )
     settings = load_settings(require_gmail=False, require_slack=False)
     tokens = slack_tokens_by_account(settings)
     if not tokens:
@@ -114,6 +128,7 @@ def slack_file_fingerprints(context) -> MaterializeResult:
             "fingerprinted": MetadataValue.int(summary.fingerprinted if summary else 0),
             "undecodable": MetadataValue.int(summary.undecodable if summary else 0),
             "too_large": MetadataValue.int(summary.too_large if summary else 0),
+            "blocked": MetadataValue.int(summary.blocked if summary else 0),
             "missing": MetadataValue.int(summary.missing if summary else 0),
             "failed": MetadataValue.int(summary.failed if summary else 0),
             "full_downloads": MetadataValue.int(summary.full_downloads if summary else 0),

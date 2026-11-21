@@ -361,6 +361,34 @@ func TestLoadFromEnvNoSlackAccounts(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvSlackFileFetchEnabledFlag(t *testing.T) {
+	base := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgres://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":      "0123456789abcdef0123456789abcdef",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return base[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv: %v", err)
+	}
+	if !cfg.SlackFileFetchEnabled {
+		t.Fatal("SlackFileFetchEnabled should default to true")
+	}
+	for _, raw := range []string{"0", "false", "FALSE", "no", "off"} {
+		env := map[string]string{
+			"POSTGRES_DATABASE_URL":    base["POSTGRES_DATABASE_URL"],
+			"MCP_SECRET_TOKEN":         base["MCP_SECRET_TOKEN"],
+			"SLACK_FILE_FETCH_ENABLED": raw,
+		}
+		cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+		if err != nil {
+			t.Fatalf("LoadFromEnv(%q): %v", raw, err)
+		}
+		if cfg.SlackFileFetchEnabled {
+			t.Fatalf("SlackFileFetchEnabled(%q) = true, want false", raw)
+		}
+	}
+}
+
 func TestLoadFromEnvDriveSourceTokensByAccount(t *testing.T) {
 	env := map[string]string{
 		"POSTGRES_DATABASE_URL": "postgres://default:secret@example.com/default",

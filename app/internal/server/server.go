@@ -393,13 +393,17 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 	extra = append(extra, notifyTool(notifier, authSvc, baseURL, cfg.ObjectStoreURLTTL, storeEnabled, time.Now))
 	extra = append(extra, cliAuthorizeTool(tokenSvc, baseURL))
 	if tokens := cfg.SlackTokens(); len(tokens) > 0 {
-		slackStore := objectstore.NewSlackFileStore(objectstore.SlackFileStoreOptions{Tokens: tokens})
-		if storeEnabled {
-			store = objectstore.WithSlackFiles(store, slackStore)
+		if !cfg.SlackFileFetchEnabled {
+			logger.Warn("slack file fetching disabled by SLACK_FILE_FETCH_ENABLED", "accounts", len(cfg.SlackAccounts))
 		} else {
-			store, storeEnabled = slackStore, true
+			slackStore := objectstore.NewSlackFileStore(objectstore.SlackFileStoreOptions{Tokens: tokens})
+			if storeEnabled {
+				store = objectstore.WithSlackFiles(store, slackStore)
+			} else {
+				store, storeEnabled = slackStore, true
+			}
+			logger.Info("slack file fetching enabled", "accounts", len(cfg.SlackAccounts))
 		}
-		logger.Info("slack file fetching enabled", "accounts", len(cfg.SlackAccounts))
 	}
 	driveStores, err := driveSourceStoresFromConfig(cfg)
 	if err != nil {

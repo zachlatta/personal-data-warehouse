@@ -17,6 +17,7 @@ from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse
 from personal_data_warehouse.photo_fingerprint import HASH_VERSION
 from personal_data_warehouse.slack_file_fingerprints import (
     NO_RETRY,
+    STATUS_BLOCKED,
     STATUS_FAILED,
     STATUS_OK,
     STATUS_TOO_LARGE,
@@ -183,15 +184,46 @@ def test_a_file_shared_into_two_conversations_is_one_download(warehouse):
 
 
 def test_finished_files_are_not_re_fetched(warehouse):
-    insert_files(warehouse, [file_row(), file_row(file_id="F_BIG")])
+    insert_files(
+        warehouse,
+        [file_row(), file_row(file_id="F_BIG"), file_row(file_id="F_BLOCKED")],
+    )
     warehouse.upsert_slack_file_fingerprints(
         [
             _link(status=STATUS_OK, content_sha256="a" * 64),
             _link(file_id="F_BIG", status=STATUS_TOO_LARGE),
+            _link(file_id="F_BLOCKED", status=STATUS_BLOCKED, last_error="blocked:external"),
         ]
     )
 
     assert candidates(warehouse) == []
+
+
+def test_candidates_carry_external_and_mode_metadata(warehouse):
+    insert_files(
+        warehouse,
+        [
+            file_row(
+                file_id="F_EXT",
+                url_private="https://external.example/doc.png",
+                raw_json='{"is_external": true, "mode": "external", "external_type": "gdrive",'
+                ' "thumb_360": "https://files.slack.com/files-tmb/x/e_360.png"}',
+            ),
+            file_row(
+                file_id="F_HOSTED",
+                raw_json='{"is_external": false, "mode": "hosted",'
+                ' "thumb_360": "https://files.slack.com/files-tmb/x/h_360.png"}',
+            ),
+        ],
+    )
+
+    by_id = {row["file_id"]: row for row in candidates(warehouse)}
+    assert by_id["F_EXT"]["is_external"] == 1
+    assert by_id["F_EXT"]["file_mode"] == "external"
+    assert by_id["F_EXT"]["external_type"] == "gdrive"
+    assert by_id["F_HOSTED"]["is_external"] == 0
+    assert by_id["F_HOSTED"]["file_mode"] == "hosted"
+    assert by_id["F_HOSTED"]["external_type"] == ""
 
 
 def test_a_backed_off_failure_is_skipped_until_its_time_then_returns(warehouse):

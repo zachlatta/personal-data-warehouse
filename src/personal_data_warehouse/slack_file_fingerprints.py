@@ -33,16 +33,21 @@ Two deliberate choices:
 from __future__ import annotations
 
 import hashlib
+import ipaddress
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from personal_data_warehouse.photo_fingerprint import HASH_VERSION, ImageTooLargeError, compute_dhash
 
 __all__ = [
+    "ALLOWED_SLACK_FILE_HOSTS",
     "SlackThumbnailFetcher",
+    "SlackFileBlockedError",
     "SlackFileFetchError",
     "SlackFileMissingError",
     "SlackFileRateLimitedError",
@@ -52,6 +57,7 @@ __all__ = [
     "DEFAULT_MAX_PIXELS",
     "MAX_ATTEMPTS",
     "NO_RETRY",
+    "STATUS_BLOCKED",
     "STATUS_FAILED",
     "STATUS_MISSING",
     "STATUS_OK",
@@ -60,18 +66,30 @@ __all__ = [
     "SlackFileFingerprintRunner",
     "SlackFileFingerprintSummary",
     "TERMINAL_STATUSES",
+    "validate_slack_file_download",
+    "validate_slack_file_url",
 ]
 
 STATUS_OK = "ok"
 STATUS_UNDECODABLE = "undecodable"
 STATUS_TOO_LARGE = "too_large"
+STATUS_BLOCKED = "blocked"
 STATUS_MISSING = "missing"
 STATUS_FAILED = "failed"
 
 #: Statuses that will never change on their own, so they are never re-fetched.
 #: ``missing`` and ``failed`` stay retryable (with backoff) because Slack
-#: outages and transient scope problems do resolve.
-TERMINAL_STATUSES = (STATUS_OK, STATUS_UNDECODABLE, STATUS_TOO_LARGE)
+#: outages and transient scope problems do resolve. ``blocked`` is terminal so
+#: policy-rejected external/disallowed URLs never spend retry budget.
+TERMINAL_STATUSES = (STATUS_OK, STATUS_UNDECODABLE, STATUS_TOO_LARGE, STATUS_BLOCKED)
+
+#: Exact allowlist of Slack file hostnames permitted to receive a Slack bearer
+#: token. Verified against production base_slack.files (100% of hosted files and
+#: thumbnails use files.slack.com). No wildcard or suffix matching.
+ALLOWED_SLACK_FILE_HOSTS = frozenset({"files.slack.com"})
+_DISALLOWED_SLACK_FILE_MODES = frozenset({"external", "remote"})
+_FALSY_EXTERNAL_STRINGS = frozenset({"", "false", "0", "f"})
+_TRUTHY_EXTERNAL_STRINGS = frozenset({"true", "1", "t", "yes"})
 
 DEFAULT_LIMIT = 500
 MAX_ATTEMPTS = 5
@@ -101,6 +119,18 @@ NO_RETRY = datetime(1970, 1, 1, tzinfo=UTC)
 
 class SlackFileFetchError(Exception):
     """Any failure to turn a file row into bytes."""
+
+
+class SlackFileBlockedError(SlackFileFetchError):
+    """Download refused by the Slack token egress policy.
+
+    Carries only a sanitized policy reason code (e.g. ``blocked:external``,
+    ``blocked:host``), never the URL or any credential.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class SlackFileMissingError(SlackFileFetchError):
@@ -136,6 +166,28 @@ def _looks_like_an_image(head: bytes) -> bool:
     return head[4:8] == b"ftyp"
 
 
+def _parse_is_external(value: Any) -> tuple[bool, bool]:
+    """Return ``(is_external, ambiguous)`` for a raw metadata flag."""
+    if value is None or value is False:
+        return False, False
+    if value is True:
+        return True, False
+    if isinstance(value, int):
+        if value == 0:
+            return False, False
+        if value == 1:
+            return True, False
+        return False, True
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in _FALSY_EXTERNAL_STRINGS:
+            return False, False
+        if norm in _TRUTHY_EXTERNAL_STRINGS:
+            return True, False
+        return False, True
+    return False, True
+
+
 @dataclass(frozen=True)
 class SlackFileRef:
     """The parts of a candidate row needed to fetch something to hash."""
@@ -148,6 +200,11 @@ class SlackFileRef:
     size: int = 0
     url_private: str = ""
     thumbnail_url: str = ""
+    is_external: bool = False
+    file_mode: str = ""
+    external_type: str = ""
+    external_url: str = ""
+    metadata_ambiguous: bool = False
 
     @property
     def needs_full_download(self) -> bool:
@@ -155,6 +212,40 @@ class SlackFileRef:
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "SlackFileRef":
+        is_ext, ambiguous = _parse_is_external(row.get("is_external"))
+        file_mode = str(row.get("file_mode") or row.get("mode") or "")
+        external_type = str(row.get("external_type") or "")
+        external_url = str(row.get("external_url") or "")
+
+        raw_json = row.get("raw_json")
+        if raw_json is not None and raw_json != "":
+            if isinstance(raw_json, Mapping):
+                parsed_raw: Any = raw_json
+            elif isinstance(raw_json, str):
+                try:
+                    parsed_raw = json.loads(raw_json)
+                except ValueError:
+                    parsed_raw = None
+                    ambiguous = True
+            else:
+                parsed_raw = None
+                ambiguous = True
+
+            if parsed_raw is not None:
+                if not isinstance(parsed_raw, Mapping):
+                    ambiguous = True
+                else:
+                    raw_ext, raw_ambiguous = _parse_is_external(parsed_raw.get("is_external"))
+                    is_ext = is_ext or raw_ext
+                    ambiguous = ambiguous or raw_ambiguous
+                    raw_mode = str(parsed_raw.get("mode") or "")
+                    if raw_mode.strip().lower() in _DISALLOWED_SLACK_FILE_MODES or not file_mode:
+                        file_mode = raw_mode
+                    if not external_type and parsed_raw.get("external_type"):
+                        external_type = str(parsed_raw.get("external_type") or "")
+                    if not external_url and parsed_raw.get("external_url"):
+                        external_url = str(parsed_raw.get("external_url") or "")
+
         return cls(
             account=str(row.get("account") or ""),
             team_id=str(row.get("team_id") or ""),
@@ -164,7 +255,123 @@ class SlackFileRef:
             size=int(row.get("size") or 0),
             url_private=str(row.get("url_private") or ""),
             thumbnail_url=str(row.get("thumbnail_url") or ""),
+            is_external=is_ext,
+            file_mode=file_mode,
+            external_type=external_type,
+            external_url=external_url,
+            metadata_ambiguous=ambiguous,
         )
+
+
+def validate_slack_file_url(raw_url: str) -> str:
+    """Validate that ``raw_url`` is an unambiguous HTTPS URL on an allowed Slack file host.
+
+    Fails closed on any parser ambiguity, unexpected scheme, non-default port,
+    userinfo, IP literal, non-ASCII authority, or non-allowlisted host.
+    Raises ``SlackFileBlockedError`` with a sanitized reason code (never the URL).
+    """
+    if not isinstance(raw_url, str) or not raw_url:
+        raise SlackFileBlockedError("blocked:url_empty")
+
+    for ch in raw_url:
+        code = ord(ch)
+        if code <= 0x1F or code == 0x7F or ch.isspace():
+            raise SlackFileBlockedError("blocked:url_chars")
+
+    if "\\" in raw_url:
+        raise SlackFileBlockedError("blocked:url_ambiguous")
+
+    sep = raw_url.find("://")
+    if sep <= 0:
+        raise SlackFileBlockedError("blocked:scheme")
+    raw_scheme = raw_url[:sep]
+    if not raw_scheme.isascii() or raw_scheme.lower() != "https":
+        raise SlackFileBlockedError("blocked:scheme")
+
+    rest = raw_url[sep + 3 :]
+    if not rest:
+        raise SlackFileBlockedError("blocked:url_malformed")
+    if rest.startswith("/"):
+        raise SlackFileBlockedError("blocked:url_ambiguous")
+
+    auth_end = len(rest)
+    for delim in ("/", "?", "#"):
+        idx = rest.find(delim)
+        if idx != -1 and idx < auth_end:
+            auth_end = idx
+    authority = rest[:auth_end]
+    if not authority:
+        raise SlackFileBlockedError("blocked:url_malformed")
+
+    if "@" in authority:
+        raise SlackFileBlockedError("blocked:userinfo")
+    if "%" in authority:
+        raise SlackFileBlockedError("blocked:url_ambiguous")
+    if "[" in authority or "]" in authority:
+        raise SlackFileBlockedError("blocked:ip_literal")
+    if not authority.isascii():
+        raise SlackFileBlockedError("blocked:host")
+
+    if ":" in authority:
+        if authority.count(":") != 1:
+            raise SlackFileBlockedError("blocked:port")
+        raw_host, raw_port = authority.split(":", 1)
+        if raw_port != "443":
+            raise SlackFileBlockedError("blocked:port")
+    else:
+        raw_host = authority
+
+    if not raw_host or raw_host.startswith(".") or raw_host.endswith(".") or ".." in raw_host:
+        raise SlackFileBlockedError("blocked:host")
+
+    try:
+        ipaddress.ip_address(raw_host)
+    except ValueError:
+        pass
+    else:
+        raise SlackFileBlockedError("blocked:ip_literal")
+
+    host = raw_host.lower()
+    if host not in ALLOWED_SLACK_FILE_HOSTS:
+        raise SlackFileBlockedError("blocked:host")
+
+    try:
+        parsed = urlsplit(raw_url)
+    except ValueError as exc:
+        raise SlackFileBlockedError("blocked:url_malformed") from exc
+
+    if parsed.scheme.lower() != "https":
+        raise SlackFileBlockedError("blocked:scheme")
+    if parsed.username is not None or parsed.password is not None:
+        raise SlackFileBlockedError("blocked:userinfo")
+    if (parsed.hostname or "").lower() != host:
+        raise SlackFileBlockedError("blocked:url_ambiguous")
+    try:
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise SlackFileBlockedError("blocked:port") from exc
+    if parsed_port not in (None, 443):
+        raise SlackFileBlockedError("blocked:port")
+    if not parsed.path or not parsed.path.startswith("/"):
+        raise SlackFileBlockedError("blocked:url_malformed")
+
+    return raw_url
+
+
+def validate_slack_file_download(ref: SlackFileRef) -> str:
+    """Validate file metadata and the selected download URL before attaching a Slack token.
+
+    Rejects external/remote files even if one metadata URL looks trusted.
+    Returns the validated URL to fetch, or raises ``SlackFileBlockedError``.
+    """
+    if ref.metadata_ambiguous:
+        raise SlackFileBlockedError("blocked:metadata")
+    if ref.is_external or ref.external_type.strip() or ref.external_url.strip():
+        raise SlackFileBlockedError("blocked:external")
+    if ref.file_mode.strip().lower() in _DISALLOWED_SLACK_FILE_MODES:
+        raise SlackFileBlockedError("blocked:external_mode")
+    selected_url = ref.thumbnail_url or ref.url_private
+    return validate_slack_file_url(selected_url)
 
 
 class SlackThumbnailFetcher:
@@ -188,12 +395,10 @@ class SlackThumbnailFetcher:
         self._timeout = timeout
 
     def fetch(self, ref: SlackFileRef) -> bytes:
+        url = validate_slack_file_download(ref)
         token = self._tokens.get(ref.account)
         if not token:
             raise SlackFileFetchError(f"no Slack token for account {ref.account!r}")
-        url = ref.thumbnail_url or ref.url_private
-        if not url:
-            raise SlackFileFetchError(f"{ref.file_id} has neither a thumbnail nor url_private")
         # The row already knows the original's size; only a full download pays it.
         if ref.needs_full_download and ref.size and ref.size > self._max_bytes:
             raise SlackFileTooLargeError(
@@ -207,10 +412,13 @@ class SlackThumbnailFetcher:
             },
             stream=True,
             timeout=self._timeout,
+            allow_redirects=False,
         )
         try:
             status = int(getattr(response, "status_code", 0))
             headers = getattr(response, "headers", {}) or {}
+            if 300 <= status < 400:
+                raise SlackFileBlockedError("blocked:redirect")
             if status == 429:
                 retry_after = int(str(headers.get("Retry-After") or "60").strip() or 60)
                 raise SlackFileRateLimitedError(f"Slack rate limited {ref.file_id}", retry_after=retry_after)
@@ -252,6 +460,7 @@ class SlackFileFingerprintSummary:
     fingerprinted: int = 0
     undecodable: int = 0
     too_large: int = 0
+    blocked: int = 0
     missing: int = 0
     failed: int = 0
     bytes_downloaded: int = 0
@@ -261,7 +470,14 @@ class SlackFileFingerprintSummary:
 
     @property
     def attempted(self) -> int:
-        return self.fingerprinted + self.undecodable + self.too_large + self.missing + self.failed
+        return (
+            self.fingerprinted
+            + self.undecodable
+            + self.too_large
+            + self.blocked
+            + self.missing
+            + self.failed
+        )
 
 
 def _backoff(prior_attempts: int) -> timedelta:
@@ -324,6 +540,20 @@ class SlackFileFingerprintRunner:
 
             ref = SlackFileRef.from_row(row)
             prior_attempts = int(row.get("attempts") or 0)
+            try:
+                validate_slack_file_download(ref)
+            except SlackFileBlockedError as exc:
+                summary.blocked += 1
+                self._logger.warning("Blocked Slack file %s (%s)", ref.file_id, exc.reason)
+                self._record(
+                    row,
+                    now,
+                    sync_version,
+                    status=STATUS_BLOCKED,
+                    error=exc,
+                    prior_attempts=prior_attempts,
+                )
+                continue
             if ref.needs_full_download:
                 if summary.full_downloads >= self._max_full_downloads:
                     # Left unrecorded, so a later run takes it within its own cap.
@@ -334,6 +564,18 @@ class SlackFileFingerprintRunner:
             fetched_any = True
             try:
                 content = self._fetcher.fetch(ref)
+            except SlackFileBlockedError as exc:
+                summary.blocked += 1
+                self._logger.warning("Blocked Slack file %s (%s)", ref.file_id, exc.reason)
+                self._record(
+                    row,
+                    now,
+                    sync_version,
+                    status=STATUS_BLOCKED,
+                    error=exc,
+                    prior_attempts=prior_attempts,
+                )
+                continue
             except SlackFileRateLimitedError as exc:
                 # End the slice. The file keeps its retry budget: it never got
                 # a fair try, and the next run picks it up unchanged.
@@ -422,11 +664,12 @@ class SlackFileFingerprintRunner:
 
         self._logger.info(
             "Slack file fingerprints: %s candidates, %s fingerprinted, %s undecodable, "
-            "%s too large, %s missing, %s failed, %.1f MB downloaded (%s full downloads)%s",
+            "%s too large, %s blocked, %s missing, %s failed, %.1f MB downloaded (%s full downloads)%s",
             summary.candidates,
             summary.fingerprinted,
             summary.undecodable,
             summary.too_large,
+            summary.blocked,
             summary.missing,
             summary.failed,
             summary.bytes_downloaded / 1_048_576,

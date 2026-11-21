@@ -17,18 +17,22 @@ from PIL import Image
 
 from personal_data_warehouse.photo_fingerprint import HASH_VERSION
 from personal_data_warehouse.slack_file_fingerprints import (
+    ALLOWED_SLACK_FILE_HOSTS,
+    SlackFileBlockedError,
     SlackThumbnailFetcher,
     SlackFileFetchError,
     SlackFileMissingError,
     SlackFileRateLimitedError,
     SlackFileRef,
     SlackFileTooLargeError,
+    STATUS_BLOCKED,
     STATUS_FAILED,
     STATUS_MISSING,
     STATUS_OK,
     STATUS_TOO_LARGE,
     STATUS_UNDECODABLE,
     SlackFileFingerprintRunner,
+    validate_slack_file_download,
 )
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
@@ -377,8 +381,17 @@ class FakeHTTP:
         self._responses = list(responses)
         self.gets = []
 
-    def get(self, url, *, headers=None, stream=False, timeout=None):
-        self.gets.append({"url": url, "headers": dict(headers or {}), "stream": stream})
+    def get(self, url, *, headers=None, stream=False, timeout=None, allow_redirects=True):
+        self.gets.append(
+            {
+                "url": url,
+                "headers": dict(headers or {}),
+                "stream": stream,
+                "allow_redirects": allow_redirects,
+            }
+        )
+        if not self._responses:
+            raise AssertionError(f"unexpected HTTP request: {url}")
         result = self._responses.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -486,7 +499,14 @@ def test_an_account_without_a_token_is_a_fetch_error():
 
 def test_full_downloads_are_capped_per_run_so_they_never_burst():
     """The rare image with no thumbnail costs an audited download; a run takes few."""
-    rows = [candidate(file_id=f"F{i}", thumbnail_url="", url_private=f"https://x/F{i}") for i in range(5)]
+    rows = [
+        candidate(
+            file_id=f"F{i}",
+            thumbnail_url="",
+            url_private=f"https://files.slack.com/files-pri/T09-F{i}/img.png",
+        )
+        for i in range(5)
+    ]
     rows.append(candidate(file_id="F_THUMB"))
     runner, warehouse, fetcher = make_runner(
         rows,
@@ -500,3 +520,233 @@ def test_full_downloads_are_capped_per_run_so_they_never_burst():
     assert summary.full_downloads == 2
     # The skipped ones are not recorded, so the next run picks them up.
     assert {row["file_id"] for row in warehouse.links} == {"F0", "F1", "F_THUMB"}
+
+
+# --- fail-closed URL & metadata policy --------------------------------------
+
+
+def test_allowlist_is_exact_slack_file_host():
+    assert ALLOWED_SLACK_FILE_HOSTS == frozenset({"files.slack.com"})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_reason"),
+    [
+        # External / remote metadata must be blocked even when a URL looks trusted.
+        ({"is_external": True}, "blocked:external"),
+        ({"is_external": 1}, "blocked:external"),
+        ({"is_external": "true"}, "blocked:external"),
+        ({"is_external": "maybe"}, "blocked:metadata"),
+        ({"file_mode": "external"}, "blocked:external_mode"),
+        ({"file_mode": "remote"}, "blocked:external_mode"),
+        ({"file_mode": "REMOTE"}, "blocked:external_mode"),
+        ({"external_type": "gdrive"}, "blocked:external"),
+        ({"external_url": "https://external.example/doc"}, "blocked:external"),
+        ({"raw_json": '{"is_external": true}'}, "blocked:external"),
+        ({"raw_json": '{"mode": "external"}'}, "blocked:external_mode"),
+        ({"raw_json": "not-json"}, "blocked:metadata"),
+        ({"raw_json": "[]"}, "blocked:metadata"),
+        # Scheme checks.
+        (
+            {"thumbnail_url": "http://files.slack.com/files-tmb/T01-F01/a.png"},
+            "blocked:scheme",
+        ),
+        (
+            {"thumbnail_url": "ftp://files.slack.com/files-tmb/T01-F01/a.png"},
+            "blocked:scheme",
+        ),
+        (
+            {"thumbnail_url": "//files.slack.com/files-tmb/T01-F01/a.png"},
+            "blocked:scheme",
+        ),
+        (
+            {"thumbnail_url": "javascript:alert(1)"},
+            "blocked:scheme",
+        ),
+        # Hostname checks (exact match only; no wildcard/suffix/trailing-dot/non-ASCII).
+        (
+            {"thumbnail_url": "", "url_private": "https://external.example/files-pri/T01-F01/a.png"},
+            "blocked:host",
+        ),
+        (
+            {"thumbnail_url": "https://sub.files.slack.com/files-tmb/T01-F01/a.png"},
+            "blocked:host",
+        ),
+        (
+            {"thumbnail_url": "https://evil-files.slack.com/files-tmb/T01-F01/a.png"},
+            "blocked:host",
+        ),
+        (
+            {"thumbnail_url": "https://files.slack.com.evil.example/files-tmb/T01-F01/a.png"},
+            "blocked:host",
+        ),
+        (
+            {"thumbnail_url": "https://files.slack.com./files-tmb/T01-F01/a.png"},
+            "blocked:host",
+        ),
+        (
+            {"thumbnail_url": "https://fıles.slack.com/files-tmb/T01-F01/a.png"},
+            "blocked:host",
+        ),
+        # IP literals.
+        (
+            {"thumbnail_url": "https://127.0.0.1/files-tmb/T01-F01/a.png"},
+            "blocked:ip_literal",
+        ),
+        (
+            {"thumbnail_url": "https://[::1]/files-tmb/T01-F01/a.png"},
+            "blocked:ip_literal",
+        ),
+        # Ports (only default 443 or omitted).
+        (
+            {"thumbnail_url": "https://files.slack.com:8443/files-tmb/T01-F01/a.png"},
+            "blocked:port",
+        ),
+        (
+            {"thumbnail_url": "https://files.slack.com:80/files-tmb/T01-F01/a.png"},
+            "blocked:port",
+        ),
+        (
+            {"thumbnail_url": "https://files.slack.com:/files-tmb/T01-F01/a.png"},
+            "blocked:port",
+        ),
+        (
+            {"thumbnail_url": "https://files.slack.com:0443/files-tmb/T01-F01/a.png"},
+            "blocked:port",
+        ),
+        # Userinfo / @ tricks.
+        (
+            {"thumbnail_url": "https://files.slack.com@external.example/a.png"},
+            "blocked:userinfo",
+        ),
+        (
+            {"thumbnail_url": "https://user:pass@files.slack.com/files-tmb/T01-F01/a.png"},
+            "blocked:userinfo",
+        ),
+        # Parser ambiguity: backslashes, percent-encoded host, multiple //, whitespace/control chars, missing path.
+        (
+            {"thumbnail_url": "https://files.slack.com\\@external.example/a.png"},
+            "blocked:url_ambiguous",
+        ),
+        (
+            {"thumbnail_url": "https://files.slack.com%2e/files-tmb/T01-F01/a.png"},
+            "blocked:url_ambiguous",
+        ),
+        (
+            {"thumbnail_url": "https:///files.slack.com/files-tmb/T01-F01/a.png"},
+            "blocked:url_ambiguous",
+        ),
+        (
+            {"thumbnail_url": " https://files.slack.com/files-tmb/T01-F01/a.png"},
+            "blocked:url_chars",
+        ),
+        (
+            {"thumbnail_url": "https://files.slack.com/files-tmb/T01-F01/a.png\n"},
+            "blocked:url_chars",
+        ),
+        (
+            {"thumbnail_url": "https://files.slack.com/files-tmb/T01-F01/\x00a.png"},
+            "blocked:url_chars",
+        ),
+        (
+            {"thumbnail_url": "https://files.slack.com"},
+            "blocked:url_malformed",
+        ),
+        (
+            {"thumbnail_url": "", "url_private": ""},
+            "blocked:url_empty",
+        ),
+    ],
+)
+def test_fetcher_blocks_disallowed_metadata_or_url_with_zero_requests(overrides, expected_reason):
+    fetcher, http = make_thumb_fetcher([])  # fails loudly if any request is made
+    ref = candidate_ref(**overrides)
+
+    with pytest.raises(SlackFileBlockedError) as excinfo:
+        fetcher.fetch(ref)
+
+    assert excinfo.value.reason == expected_reason
+    assert str(excinfo.value) == expected_reason
+    assert http.gets == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://files.slack.com/files-tmb/T01-F01-abc/img_1024.png",
+        "https://FILES.SLACK.COM/files-tmb/T01-F01-abc/img_1024.png",
+        "HTTPS://files.slack.com:443/files-pri/T01-F01/img.png",
+    ],
+)
+def test_valid_hosted_urls_pass_policy_and_disable_redirects(url):
+    fetcher, http = make_thumb_fetcher([FakeResp(body=PNG)])
+    ref = candidate_ref(thumbnail_url=url, file_mode="hosted", is_external=False)
+
+    assert fetcher.fetch(ref) == PNG
+    assert len(http.gets) == 1
+    assert http.gets[0]["allow_redirects"] is False
+
+
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+def test_redirect_response_is_blocked_and_never_followed(status_code):
+    fetcher, http = make_thumb_fetcher(
+        [FakeResp(status_code=status_code, headers={"Location": "https://external.example/steal"})]
+    )
+
+    with pytest.raises(SlackFileBlockedError) as excinfo:
+        fetcher.fetch(candidate_ref())
+
+    assert excinfo.value.reason == "blocked:redirect"
+    assert len(http.gets) == 1
+    assert http.gets[0]["allow_redirects"] is False
+
+
+def test_runner_records_policy_block_as_terminal_without_fetching_or_burning_full_quota():
+    rows = [
+        candidate(
+            file_id="F_EXT",
+            thumbnail_url="",
+            url_private="https://external.example/secret-leak?sig=123",
+            is_external=True,
+            file_mode="external",
+        ),
+        candidate(
+            file_id="F_BADHOST",
+            thumbnail_url="https://other.example/thumb.png",
+        ),
+        candidate(
+            file_id="F_FULL_OK",
+            thumbnail_url="",
+            url_private="https://files.slack.com/files-pri/T09-F_FULL_OK/a.png",
+        ),
+        candidate(file_id="F_THUMB_OK"),
+    ]
+    runner, warehouse, fetcher = make_runner(
+        rows,
+        {"F_FULL_OK": png_bytes(), "F_THUMB_OK": png_bytes(color=(10, 120, 200))},
+        max_full_downloads=1,
+    )
+
+    summary = runner.run()
+
+    assert fetcher.fetched == ["F_FULL_OK", "F_THUMB_OK"]
+    assert summary.blocked == 2
+    assert summary.fingerprinted == 2
+    assert summary.full_downloads == 1
+
+    ext_link = warehouse.link_for("F_EXT")
+    assert ext_link["status"] == STATUS_BLOCKED
+    assert ext_link["last_error"] == "blocked:external"
+    assert "external.example" not in ext_link["last_error"]
+    assert ext_link["next_attempt_at"] == datetime(1970, 1, 1, tzinfo=UTC)
+
+    badhost_link = warehouse.link_for("F_BADHOST")
+    assert badhost_link["status"] == STATUS_BLOCKED
+    assert badhost_link["last_error"] == "blocked:host"
+    assert "other.example" not in badhost_link["last_error"]
+    assert badhost_link["next_attempt_at"] == datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def test_validate_slack_file_download_returns_selected_url_for_hosted_file():
+    ref = candidate_ref()
+    assert validate_slack_file_download(ref) == ref.thumbnail_url

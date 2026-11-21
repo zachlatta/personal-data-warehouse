@@ -280,9 +280,12 @@ func TestObjectDownloadServesSlackFileViaRouter(t *testing.T) {
 
 // slackAPIFake simulates files.info and the url_private download for a single file.
 type slackAPIFake struct {
-	fileID     string
-	urlPrivate string
-	content    []byte
+	fileID        string
+	urlPrivate    string
+	isExternal    bool
+	mode          string
+	content       []byte
+	downloadCalls int
 }
 
 func (f *slackAPIFake) Do(req *http.Request) (*http.Response, error) {
@@ -296,9 +299,11 @@ func (f *slackAPIFake) Do(req *http.Request) (*http.Response, error) {
 		payload, _ := json.Marshal(map[string]any{"ok": true, "file": map[string]any{
 			"id": f.fileID, "name": "notes.pdf", "mimetype": "application/pdf",
 			"size": len(f.content), "url_private": f.urlPrivate,
+			"is_external": f.isExternal, "mode": f.mode,
 		}})
 		return slackFakeJSON(string(payload)), nil
 	}
+	f.downloadCalls++
 	if req.URL.String() != f.urlPrivate {
 		return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found"))}, nil
 	}
@@ -307,6 +312,35 @@ func (f *slackAPIFake) Do(req *http.Request) (*http.Response, error) {
 		Header:     http.Header{"Content-Type": []string{"application/pdf"}},
 		Body:       io.NopCloser(bytes.NewReader(f.content)),
 	}, nil
+}
+
+func TestObjectDownloadBlocksExternalSlackFileWithZeroDownloadRequests(t *testing.T) {
+	const fileID = "F0123ABCDEF"
+	fake := &slackAPIFake{
+		fileID:     fileID,
+		urlPrivate: "https://external.example/secret-doc.pdf",
+		isExternal: true,
+		mode:       "external",
+		content:    []byte("should-never-fetch"),
+	}
+	slackStore := objectstore.NewSlackFileStore(objectstore.SlackFileStoreOptions{
+		Tokens:     []string{"tok"},
+		HTTPClient: fake,
+	})
+	store := objectstore.WithSlackFiles(&fakeObjectStore{notFound: true}, slackStore)
+	rec := serveObjectRequest(t, store, 1024, http.MethodGet, signedObjectPath(fileID, objectsTestNow.Add(time.Hour)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body %q, want 403", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "blocked:external") {
+		t.Fatalf("body = %q, want sanitized blocked:external reason", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "external.example") {
+		t.Fatalf("body leaked URL/host: %q", rec.Body.String())
+	}
+	if fake.downloadCalls != 0 {
+		t.Fatalf("downloadCalls = %d, want 0", fake.downloadCalls)
+	}
 }
 
 func slackFakeJSON(body string) *http.Response {

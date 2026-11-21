@@ -16598,7 +16598,12 @@ class PostgresWarehouse:
         # set on every run would cost far more than the slice.
         rows = self._query_dicts(
             """
-            SELECT c.*, COALESCE(t.thumbnail_url, '') AS thumbnail_url
+            SELECT
+                c.*,
+                COALESCE(t.thumbnail_url, '') AS thumbnail_url,
+                COALESCE(t.is_external, 0) AS is_external,
+                COALESCE(t.file_mode, '') AS file_mode,
+                COALESCE(t.external_type, '') AS external_type
             FROM (
             SELECT
                 f.account,
@@ -16622,7 +16627,7 @@ class PostgresWarehouse:
               AND (
                     l.file_id IS NULL
                     OR (
-                        l.status NOT IN ('ok', 'undecodable', 'too_large')
+                        l.status NOT IN ('ok', 'undecodable', 'too_large', 'blocked')
                         AND l.attempts < %s
                         AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= %s)
                     )
@@ -16632,14 +16637,19 @@ class PostgresWarehouse:
             LIMIT %s
             ) AS c
             LEFT JOIN LATERAL (
-                SELECT a.thumbnail_url
+                SELECT
+                    COALESCE(max(NULLIF(a.thumbnail_url, '')), '') AS thumbnail_url,
+                    COALESCE(max(a.is_external), 0) AS is_external,
+                    CASE
+                        WHEN bool_or(lower(a.file_mode) IN ('external', 'remote')) THEN 'external'
+                        ELSE COALESCE(max(NULLIF(a.file_mode, '')), '')
+                    END AS file_mode,
+                    COALESCE(max(NULLIF(a.external_type, '')), '') AS external_type
                 FROM @marts_files_attachments a
                 WHERE a.source = 'slack'
                   AND a.account = c.account
                   AND a.storage_key = c.team_id
                   AND a.attachment_id = c.file_id
-                  AND a.thumbnail_url <> ''
-                LIMIT 1
             ) AS t ON true
             ORDER BY c.created_at DESC
             """,
@@ -20688,6 +20698,30 @@ class PostgresWarehouse:
             + ", ".join(f"NULLIF(x.j->>'thumb_{size}', '')" for size in SLACK_FINGERPRINT_THUMB_SIZES)
             + ") FROM (SELECT NULLIF(a.raw_json, '')::jsonb AS j) AS x)"
         )
+        slack_is_external = (
+            "(SELECT (CASE "
+            "WHEN x.j IS NULL THEN 0 "
+            "WHEN jsonb_typeof(x.j) <> 'object' THEN 1 "
+            "WHEN lower(COALESCE(x.j->>'is_external', '')) NOT IN ('', 'false', '0', 'f') THEN 1 "
+            "WHEN COALESCE(x.j->>'external_url', '') <> '' THEN 1 "
+            "ELSE 0 END)::bigint "
+            "FROM (SELECT NULLIF(a.raw_json, '')::jsonb AS j) AS x)"
+        )
+        slack_file_mode = (
+            "(SELECT CASE "
+            "WHEN x.j IS NULL THEN ''::text "
+            "WHEN jsonb_typeof(x.j) <> 'object' THEN 'ambiguous'::text "
+            "ELSE COALESCE(x.j->>'mode', '') END "
+            "FROM (SELECT NULLIF(a.raw_json, '')::jsonb AS j) AS x)"
+        )
+        slack_external_type = (
+            "(SELECT CASE "
+            "WHEN x.j IS NULL THEN ''::text "
+            "WHEN jsonb_typeof(x.j) <> 'object' THEN 'ambiguous'::text "
+            "ELSE COALESCE(NULLIF(x.j->>'external_type', ''), "
+            "CASE WHEN COALESCE(x.j->>'external_url', '') <> '' THEN 'external_url' ELSE '' END) END "
+            "FROM (SELECT NULLIF(a.raw_json, '')::jsonb AS j) AS x)"
+        )
         self._ensure_view(
             "marts_files_attachments",
             f"""
@@ -20710,7 +20744,10 @@ class PostgresWarehouse:
                 -- A source-made thumbnail, when the source has one (Slack). The
                 -- image fingerprint backfill hashes it instead of downloading
                 -- the file, because Slack audits full downloads.
-                ''::text AS thumbnail_url
+                ''::text AS thumbnail_url,
+                0::bigint AS is_external,
+                ''::text AS file_mode,
+                ''::text AS external_type
             FROM @gmail_attachments a
             UNION ALL
             SELECT
@@ -20727,6 +20764,9 @@ class PostgresWarehouse:
                 NULLIF(a.message_at, {epoch}),
                 a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
                 NULLIF(a.ingested_at, {epoch}),
+                ''::text,
+                0::bigint,
+                ''::text,
                 ''::text
             FROM @whatsapp_media_items a
             UNION ALL
@@ -20744,6 +20784,9 @@ class PostgresWarehouse:
                 NULLIF(a.created_at, {epoch}),
                 a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
                 NULLIF(a.ingested_at, {epoch}),
+                ''::text,
+                0::bigint,
+                ''::text,
                 ''::text
             FROM @apple_message_attachments a
             UNION ALL
@@ -20761,6 +20804,9 @@ class PostgresWarehouse:
                 NULLIF(a.message_at, {epoch}),
                 a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
                 NULLIF(a.ingested_at, {epoch}),
+                ''::text,
+                0::bigint,
+                ''::text,
                 ''::text
             FROM @android_message_attachments a
             UNION ALL
@@ -20778,6 +20824,9 @@ class PostgresWarehouse:
                 NULLIF(r.modified_at, {epoch}),
                 a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
                 NULLIF(a.ingested_at, {epoch}),
+                ''::text,
+                0::bigint,
+                ''::text,
                 ''::text
             FROM @apple_note_attachments a
             LEFT JOIN @apple_note_revisions r
@@ -20798,6 +20847,9 @@ class PostgresWarehouse:
                 NULLIF(a.scanned_at, {epoch}),
                 a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
                 NULLIF(a.synced_at, {epoch}),
+                ''::text,
+                0::bigint,
+                ''::text,
                 ''::text
             FROM @scan_documents a
             UNION ALL
@@ -20818,7 +20870,10 @@ class PostgresWarehouse:
                 a.file_id,
                 a.url_private,
                 NULLIF(a.synced_at, {epoch}),
-                COALESCE({slack_thumb}, '')
+                COALESCE({slack_thumb}, ''),
+                COALESCE({slack_is_external}, 0::bigint),
+                COALESCE({slack_file_mode}, ''),
+                COALESCE({slack_external_type}, '')
             FROM @slack_files a
             """,
         )

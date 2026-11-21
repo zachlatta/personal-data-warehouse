@@ -71,3 +71,17 @@ def test_defaults_fetch_thumbnails_gently_and_cap_audited_downloads(monkeypatch)
     assert fingerprint_defs.slack_file_fingerprint_spacing_seconds() == 2.5
     monkeypatch.setenv(fingerprint_defs.SLACK_FILE_FINGERPRINT_MAX_FULL_DOWNLOADS_ENV, "0")
     assert fingerprint_defs.slack_file_fingerprint_max_full_downloads() == 0
+
+
+def test_enable_flag_defaults_on_and_can_disable_backfill(monkeypatch) -> None:
+    from personal_data_warehouse.defs import slack_file_fingerprints as fingerprint_defs
+
+    monkeypatch.delenv(fingerprint_defs.SLACK_FILE_FINGERPRINTS_ENABLED_ENV, raising=False)
+    assert fingerprint_defs.slack_file_fingerprints_enabled() is True
+
+    for raw in ("0", "false", "FALSE", "no", "off"):
+        monkeypatch.setenv(fingerprint_defs.SLACK_FILE_FINGERPRINTS_ENABLED_ENV, raw)
+        assert fingerprint_defs.slack_file_fingerprints_enabled() is False
+
+    monkeypatch.setenv(fingerprint_defs.SLACK_FILE_FINGERPRINTS_ENABLED_ENV, "1")
+    assert fingerprint_defs.slack_file_fingerprints_enabled() is True

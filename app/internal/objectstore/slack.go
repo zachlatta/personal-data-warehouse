@@ -6,13 +6,54 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const defaultSlackAPIBaseURL = "https://slack.com/api"
+
+// allowedSlackFileHosts is the exact allowlist of Slack file hostnames
+// permitted to receive a Slack bearer token. Verified against production
+// base_slack.files (100% of hosted files use files.slack.com). No wildcard or
+// suffix matching.
+var allowedSlackFileHosts = map[string]struct{}{
+	"files.slack.com": {},
+}
+
+// SlackFileBlockedError is returned when a Slack file download is refused by
+// the fail-closed token egress policy. It carries only a sanitized reason code
+// (e.g. "blocked:external", "blocked:host"), never the URL or any credential.
+type SlackFileBlockedError struct {
+	Reason string
+}
+
+func (e *SlackFileBlockedError) Error() string {
+	return "slack file download blocked by policy: " + e.Reason
+}
+
+func (e *SlackFileBlockedError) Unwrap() error {
+	return ErrPolicyBlocked
+}
+
+func noRedirect(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+func noRedirectHTTPClient(doer httpDoer) httpDoer {
+	if doer == nil {
+		return &http.Client{CheckRedirect: noRedirect}
+	}
+	if hc, ok := doer.(*http.Client); ok {
+		clone := *hc
+		clone.CheckRedirect = noRedirect
+		return &clone
+	}
+	return doer
+}
 
 // slackFileIDPattern matches Slack file ids (slack_files.file_id): an "F"
 // followed by uppercase alphanumerics, e.g. "F0123ABCDEF". The length cap
@@ -48,10 +89,7 @@ type SlackFileStore struct {
 
 // NewSlackFileStore builds a Slack-API-backed ObjectStore.
 func NewSlackFileStore(opts SlackFileStoreOptions) *SlackFileStore {
-	client := opts.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client := noRedirectHTTPClient(opts.HTTPClient)
 	apiBaseURL := strings.TrimRight(opts.APIBaseURL, "/")
 	if apiBaseURL == "" {
 		apiBaseURL = defaultSlackAPIBaseURL
@@ -63,14 +101,135 @@ func (s *SlackFileStore) Backend() string { return "slack" }
 
 // slackFile is the subset of the files.info response the store reads.
 type slackFile struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Mimetype   string `json:"mimetype"`
-	Size       int64  `json:"size"`
-	Created    int64  `json:"created"`
-	URLPrivate string `json:"url_private"`
-	Permalink  string `json:"permalink"`
-	IsDeleted  bool   `json:"is_deleted"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Mimetype     string `json:"mimetype"`
+	Size         int64  `json:"size"`
+	Created      int64  `json:"created"`
+	URLPrivate   string `json:"url_private"`
+	Permalink    string `json:"permalink"`
+	IsDeleted    bool   `json:"is_deleted"`
+	IsExternal   bool   `json:"is_external"`
+	Mode         string `json:"mode"`
+	ExternalType string `json:"external_type"`
+	ExternalURL  string `json:"external_url"`
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// validateSlackFileURL enforces the fail-closed Slack file download URL policy.
+// Only unambiguous HTTPS URLs on an exact allowlisted Slack file host with no
+// userinfo and no non-default port (only omitted or :443) are permitted.
+func validateSlackFileURL(rawURL string) error {
+	if rawURL == "" {
+		return &SlackFileBlockedError{Reason: "blocked:url_empty"}
+	}
+	for _, r := range rawURL {
+		if r <= 0x1F || r == 0x7F || unicode.IsSpace(r) {
+			return &SlackFileBlockedError{Reason: "blocked:url_chars"}
+		}
+	}
+	if strings.ContainsRune(rawURL, '\\') {
+		return &SlackFileBlockedError{Reason: "blocked:url_ambiguous"}
+	}
+	sep := strings.Index(rawURL, "://")
+	if sep <= 0 {
+		return &SlackFileBlockedError{Reason: "blocked:scheme"}
+	}
+	rawScheme := rawURL[:sep]
+	if !isASCII(rawScheme) || strings.ToLower(rawScheme) != "https" {
+		return &SlackFileBlockedError{Reason: "blocked:scheme"}
+	}
+	rest := rawURL[sep+3:]
+	if rest == "" {
+		return &SlackFileBlockedError{Reason: "blocked:url_malformed"}
+	}
+	if strings.HasPrefix(rest, "/") {
+		return &SlackFileBlockedError{Reason: "blocked:url_ambiguous"}
+	}
+	authEnd := strings.IndexAny(rest, "/?#")
+	authority := rest
+	if authEnd >= 0 {
+		authority = rest[:authEnd]
+	}
+	if authority == "" {
+		return &SlackFileBlockedError{Reason: "blocked:url_malformed"}
+	}
+	if strings.ContainsRune(authority, '@') {
+		return &SlackFileBlockedError{Reason: "blocked:userinfo"}
+	}
+	if strings.ContainsRune(authority, '%') {
+		return &SlackFileBlockedError{Reason: "blocked:url_ambiguous"}
+	}
+	if strings.ContainsAny(authority, "[]") {
+		return &SlackFileBlockedError{Reason: "blocked:ip_literal"}
+	}
+	if !isASCII(authority) {
+		return &SlackFileBlockedError{Reason: "blocked:host"}
+	}
+
+	rawHost := authority
+	if strings.ContainsRune(authority, ':') {
+		if strings.Count(authority, ":") != 1 {
+			return &SlackFileBlockedError{Reason: "blocked:port"}
+		}
+		var rawPort string
+		rawHost, rawPort, _ = strings.Cut(authority, ":")
+		if rawPort != "443" {
+			return &SlackFileBlockedError{Reason: "blocked:port"}
+		}
+	}
+	if rawHost == "" || strings.HasPrefix(rawHost, ".") || strings.HasSuffix(rawHost, ".") || strings.Contains(rawHost, "..") {
+		return &SlackFileBlockedError{Reason: "blocked:host"}
+	}
+	if _, err := netip.ParseAddr(rawHost); err == nil {
+		return &SlackFileBlockedError{Reason: "blocked:ip_literal"}
+	}
+	host := strings.ToLower(rawHost)
+	if _, ok := allowedSlackFileHosts[host]; !ok {
+		return &SlackFileBlockedError{Reason: "blocked:host"}
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return &SlackFileBlockedError{Reason: "blocked:url_malformed"}
+	}
+	if strings.ToLower(parsed.Scheme) != "https" {
+		return &SlackFileBlockedError{Reason: "blocked:scheme"}
+	}
+	if parsed.User != nil {
+		return &SlackFileBlockedError{Reason: "blocked:userinfo"}
+	}
+	if strings.ToLower(parsed.Hostname()) != host {
+		return &SlackFileBlockedError{Reason: "blocked:url_ambiguous"}
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return &SlackFileBlockedError{Reason: "blocked:port"}
+	}
+	if parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/") {
+		return &SlackFileBlockedError{Reason: "blocked:url_malformed"}
+	}
+	return nil
+}
+
+// validateSlackFileDownload rejects external/remote Slack files and validates
+// url_private before any authenticated download request can be made.
+func validateSlackFileDownload(file slackFile) error {
+	if file.IsExternal || strings.TrimSpace(file.ExternalType) != "" || strings.TrimSpace(file.ExternalURL) != "" {
+		return &SlackFileBlockedError{Reason: "blocked:external"}
+	}
+	mode := strings.ToLower(strings.TrimSpace(file.Mode))
+	if mode == "external" || mode == "remote" {
+		return &SlackFileBlockedError{Reason: "blocked:external_mode"}
+	}
+	return validateSlackFileURL(file.URLPrivate)
 }
 
 // fileInfo resolves a file id via files.info, trying each token until one
@@ -145,6 +304,9 @@ func (s *SlackFileStore) GetMetadata(ctx context.Context, ref StoredObject) (Obj
 	if err != nil {
 		return ObjectMetadata{}, err
 	}
+	if err := validateSlackFileDownload(file); err != nil {
+		return ObjectMetadata{}, err
+	}
 	meta := ObjectMetadata{
 		Backend:       s.Backend(),
 		StorageFileID: file.ID,
@@ -164,8 +326,8 @@ func (s *SlackFileStore) GetObject(ctx context.Context, ref StoredObject) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	if file.URLPrivate == "" {
-		return nil, fmt.Errorf("slack file %s has no url_private", file.ID)
+	if err := validateSlackFileDownload(file); err != nil {
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, file.URLPrivate, nil)
 	if err != nil {
@@ -177,6 +339,9 @@ func (s *SlackFileStore) GetObject(ctx context.Context, ref StoredObject) ([]byt
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, &SlackFileBlockedError{Reason: "blocked:redirect"}
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrNotFound
 	}

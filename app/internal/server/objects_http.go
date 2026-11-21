@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -69,6 +70,11 @@ func objectDownloadHandler(store objectstore.ObjectStore, driveStores map[string
 			http.Error(w, "object no longer exists in storage", http.StatusNotFound)
 			return
 		}
+		if errors.Is(err, objectstore.ErrPolicyBlocked) {
+			logger.WarnContext(r.Context(), "object metadata blocked by policy", "path", r.URL.Path, "error", err)
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 		if err != nil {
 			logger.ErrorContext(r.Context(), "object metadata fetch failed", "path", r.URL.Path, "error", err)
 			http.Error(w, "object store error", http.StatusBadGateway)
@@ -101,6 +107,11 @@ func objectDownloadHandler(store objectstore.ObjectStore, driveStores map[string
 			return
 		}
 		data, err := selectedStore.GetObject(r.Context(), ref)
+		if errors.Is(err, objectstore.ErrPolicyBlocked) {
+			logger.WarnContext(r.Context(), "object download blocked by policy", "path", r.URL.Path, "error", err)
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 		if err != nil {
 			logger.ErrorContext(r.Context(), "object download failed", "path", r.URL.Path, "error", err)
 			http.Error(w, "object store error", http.StatusBadGateway)

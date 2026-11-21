@@ -21,6 +21,9 @@ var ErrNotImplemented = errors.New("objectstore: operation not implemented")
 // ErrNotFound is returned when an object referenced by a StoredObject is missing.
 var ErrNotFound = errors.New("objectstore: object not found")
 
+// ErrPolicyBlocked is returned when a download is refused by an egress safety policy.
+var ErrPolicyBlocked = errors.New("objectstore: blocked by policy")
+
 // StoredObject is the durable, backend-neutral reference persisted in the
 // warehouse. Its JSON shape matches the Python StoredObject and the warehouse
 // storage_* columns so references written by either runtime interoperate.

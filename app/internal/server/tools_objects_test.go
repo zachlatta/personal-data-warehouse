@@ -333,3 +333,32 @@ func TestGetObjectAnswersAMutationRequestIDWithItsStatusQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestGetObjectToolBlocksExternalSlackFileAndDoesNotMintDownloadURL(t *testing.T) {
+	const fileID = "F0123ABCDEF"
+	fake := &slackAPIFake{
+		fileID:     fileID,
+		urlPrivate: "https://external.example/secret-doc.pdf",
+		isExternal: true,
+		mode:       "external",
+		content:    []byte("should-never-fetch"),
+	}
+	slackStore := objectstore.NewSlackFileStore(objectstore.SlackFileStoreOptions{
+		Tokens:     []string{"tok"},
+		HTTPClient: fake,
+	})
+	store := objectstore.WithSlackFiles(&fakeObjectStore{notFound: true}, slackStore)
+	out := invokeGetObject(t, store, getObjectInput{StorageFileID: fileID})
+	if out.Error == "" || !strings.Contains(out.Error, "blocked:external") {
+		t.Fatalf("expected blocked:external error, got %+v", out)
+	}
+	if out.DownloadURL != "" {
+		t.Fatalf("must not mint download_url for blocked Slack file: %+v", out)
+	}
+	if strings.Contains(out.Error, "external.example") {
+		t.Fatalf("error leaked host/URL: %q", out.Error)
+	}
+	if fake.downloadCalls != 0 {
+		t.Fatalf("downloadCalls = %d, want 0", fake.downloadCalls)
+	}
+}
