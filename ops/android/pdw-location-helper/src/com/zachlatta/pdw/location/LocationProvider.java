@@ -56,23 +56,38 @@ public final class LocationProvider extends ContentProvider {
                     || !manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
                 throw new LocationCapture.CaptureException("location_disabled", "network location provider disabled");
             }
-            return LocationCapture.capture(callback -> {
-                CancellationSignal cancellation = new CancellationSignal();
-                // Provider selection is explicit. There is deliberately no fallback to GPS,
-                // fused high accuracy, requestLocationUpdates, or last-known-location polling.
-                manager.getCurrentLocation(LocationManager.NETWORK_PROVIDER, cancellation, Runnable::run,
-                        location -> callback.accept(location == null ? null : new LocationCapture.Fix(
-                                location.getLatitude(), location.getLongitude(), location.getAccuracy(),
-                                location.getTime(), location.getElapsedRealtimeNanos())));
-                return cancellation::cancel;
-            }, new File(getContext().getFilesDir(), "spool"), SystemClock.elapsedRealtimeNanos(), 30_000, directory -> {
-                try {
-                    java.io.FileDescriptor fd = android.system.Os.open(directory.getPath(),
-                            android.system.OsConstants.O_RDONLY, 0);
-                    try { android.system.Os.fsync(fd); } finally { android.system.Os.close(fd); }
-                } catch (android.system.ErrnoException e) { throw new java.io.IOException(e); }
-            });
+            return LocationCapture.captureWithCached(
+                    () -> toFix(manager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)),
+                    callback -> {
+                        CancellationSignal cancellation = new CancellationSignal();
+                        // Provider selection is explicit: coarse network provider only (no GPS,
+                        // fused high accuracy, or continuous requestLocationUpdates). A bounded
+                        // (<=15 min), deduplicated getLastKnownLocation check runs first because
+                        // AOSP LocationProviderManager clamps COARSE-only active requests to
+                        // MIN_COARSE_INTERVAL_MS (10 min).
+                        manager.getCurrentLocation(LocationManager.NETWORK_PROVIDER, cancellation, Runnable::run,
+                                location -> callback.accept(toFix(location)));
+                        return cancellation::cancel;
+                    },
+                    new File(getContext().getFilesDir(), "spool"),
+                    new File(getContext().getFilesDir(), "last-elapsed-nanos"),
+                    SystemClock.elapsedRealtimeNanos(),
+                    15 * 60 * 1000L,
+                    30_000,
+                    directory -> {
+                        try {
+                            java.io.FileDescriptor fd = android.system.Os.open(directory.getPath(),
+                                    android.system.OsConstants.O_RDONLY, 0);
+                            try { android.system.Os.fsync(fd); } finally { android.system.Os.close(fd); }
+                        } catch (android.system.ErrnoException e) { throw new java.io.IOException(e); }
+                    });
         } finally { busy.set(false); }
+    }
+    private static LocationCapture.Fix toFix(android.location.Location location) {
+        if (location == null) return null;
+        return new LocationCapture.Fix(
+                location.getLatitude(), location.getLongitude(), location.getAccuracy(),
+                location.getTime(), location.getElapsedRealtimeNanos());
     }
     @Override public String getType(Uri uri) { return "application/json"; }
     @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) { throw new UnsupportedOperationException(); }

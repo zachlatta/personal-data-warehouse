@@ -13,7 +13,6 @@ fi
 
 MODDIR=${0%/*}
 STATE=/data/misc_ce/0/pdw-android-location
-PKG=com.zachlatta.pdw.location
 LOG=$STATE/logs/service.log
 WAKE=pdw_android_location_run
 FLOOR=900
@@ -41,30 +40,7 @@ echo $$ > "$STATE/supervisor.pid"
 
 note() { echo "$(date '+%Y-%m-%d %H:%M:%S%z') $*" >> "$LOG"; }
 
-# LocationManagerService throttles background getCurrentLocation requests to
-# location_background_throttle_interval_ms (10 min), so most 30s requests time out
-# without an allowlist. This supervisor already enforces the 15-minute cadence (FLOOR);
-# allowlist the helper package so its one-shot request runs immediately without
-# granting fine location, GPS, or a global Doze exemption.
-ensure_throttle_allowlist() {
-  current=$(settings get global location_background_throttle_package_whitelist 2>/dev/null || true)
-  case "$current" in
-    ""|null) updated="$PKG" ;;
-    *)
-      case ",$current," in
-        *",$PKG,"*) return 0 ;;
-        *) updated="$current,$PKG" ;;
-      esac
-      ;;
-  esac
-  settings put global location_background_throttle_package_whitelist "$updated" >/dev/null 2>&1
-}
-
-if ensure_throttle_allowlist; then
-  note "started (network provider only; background throttle allowlisted; target ${FLOOR}s, Android may defer)"
-else
-  note "started (network provider only; WARNING: could not update background throttle allowlist; target ${FLOOR}s)"
-fi
+note "started (network provider only; target ${FLOOR}s, Android may defer)"
 
 runpid=""
 stop() {

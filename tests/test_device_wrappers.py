@@ -359,61 +359,9 @@ def test_call_recordings_service_waits_for_credential_encrypted_storage() -> Non
     assert '[ -d "$STATE" ]' in wait.group(1)
 
 
-def test_android_location_service_allowlists_background_location_throttling(tmp_path: Path) -> None:
+def test_android_location_service_does_not_set_ineffective_throttle_allowlist() -> None:
     service = (REPO_ROOT / "ops" / "android" / "pdw-android-location" / "service.sh").read_text()
-    assert "location_background_throttle_package_whitelist" in service
-    assert "com.zachlatta.pdw.location" in service
-    assert "ensure_throttle_allowlist" in service
-
-    # Extract ensure_throttle_allowlist() and exercise it with a fake `settings` binary.
-    match = re.search(r"(?ms)^ensure_throttle_allowlist\(\) \{.*?^\}", service)
-    assert match is not None, "ensure_throttle_allowlist() helper missing from service.sh"
-    fn_src = match.group(0)
-
-    state_file = tmp_path / "setting.txt"
-    put_log = tmp_path / "puts.log"
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_settings = fake_bin / "settings"
-    fake_settings.write_text(
-        "#!/bin/sh\n"
-        f'STATE="{state_file}"\n'
-        f'LOG="{put_log}"\n'
-        'if [ "$1" = get ] && [ "$2" = global ] && [ "$3" = location_background_throttle_package_whitelist ]; then\n'
-        '  cat "$STATE"\n'
-        '  exit 0\n'
-        'fi\n'
-        'if [ "$1" = put ] && [ "$2" = global ] && [ "$3" = location_background_throttle_package_whitelist ]; then\n'
-        '  printf "%s\\n" "$4" > "$STATE"\n'
-        '  printf "%s\\n" "$4" >> "$LOG"\n'
-        '  exit 0\n'
-        'fi\n'
-        'exit 2\n'
-    )
-    fake_settings.chmod(0o755)
-
-    def run_fn(initial: str) -> tuple[str, list[str]]:
-        state_file.write_text(initial)
-        if put_log.exists():
-            put_log.unlink()
-        env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
-        script = f'PKG=com.zachlatta.pdw.location\n{fn_src}\nensure_throttle_allowlist\n'
-        res = subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True, check=True)
-        assert res.returncode == 0
-        puts = put_log.read_text().splitlines() if put_log.exists() else []
-        return state_file.read_text().strip(), puts
-
-    assert run_fn("null\n") == ("com.zachlatta.pdw.location", ["com.zachlatta.pdw.location"])
-    assert run_fn("") == ("com.zachlatta.pdw.location", ["com.zachlatta.pdw.location"])
-    assert run_fn("com.example.other\n") == (
-        "com.example.other,com.zachlatta.pdw.location",
-        ["com.example.other,com.zachlatta.pdw.location"],
-    )
-    assert run_fn("com.zachlatta.pdw.location\n") == ("com.zachlatta.pdw.location", [])
-    assert run_fn("com.example.a,com.zachlatta.pdw.location,com.example.b\n") == (
-        "com.example.a,com.zachlatta.pdw.location,com.example.b",
-        [],
-    )
+    assert "location_background_throttle_package_whitelist" not in service
 
 
 @pytest.mark.parametrize("module", sorted(ANDROID_UPLOADERS))

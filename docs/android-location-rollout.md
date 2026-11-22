@@ -14,7 +14,7 @@ Doze cadence, accuracy or battery use. Those remain unmeasured until the trial b
 Read-only inspection during the build found Android API 37 on the Pixel, existing messages,
 notifications, Recorder and screen-time PDW modules, and no location helper/module. Nothing
 was enabled. The inspected server images used public revision `1c6829b`; rollout moves them
-to this reviewed change. The phone moves from no location helper/module to helper version 1
+to this reviewed change. The phone moves from no location helper/module to helper version 3
 and module version 1; existing modules and their configurations stay in place. Do not log
 coordinates, credentials, or actual account values into public evidence.
 
@@ -126,10 +126,12 @@ ssh pichu 'unlink /data/misc_ce/0/pdw-android-location/paused'
 ```
 
 This is the first activation of tracking. Expect one bounded network fix per run, about every
-900 seconds while scheduling permits. On start, `service.sh` adds `com.zachlatta.pdw.location`
-to `settings global location_background_throttle_package_whitelist` (preserving any existing
-entries) so `LocationManagerService` does not clamp the 30-second one-shot request to the
-10-minute background throttle interval. The helper returns structured error codes
+900 seconds while scheduling permits. Because AOSP `LocationProviderManager` unconditionally
+clamps COARSE-only active requests to `MIN_COARSE_INTERVAL_MS` (10 min) and rejects cached fixes
+older than `MAX_CURRENT_LOCATION_AGE_MS` (30 s), the helper checks a bounded (≤15 min),
+deduplicated `getLastKnownLocation(NETWORK_PROVIDER)` first (preserving its original
+`measured_at_ms` and deduplicating by `elapsedRealtimeNanos`) before falling back to a 30 s
+`getCurrentLocation(NETWORK_PROVIDER)` request. The helper returns structured error codes
 (`timeout`, `no_fresh_fix`, `busy`, `permission_denied`, `location_disabled`, `storage_error`):
 hard errors fail immediately, while transient provider misses exit 0 for up to
 `ANDROID_LOCATION_TRANSIENT_FAILURE_THRESHOLD` (`N`, default 18) consecutive runs before runs
