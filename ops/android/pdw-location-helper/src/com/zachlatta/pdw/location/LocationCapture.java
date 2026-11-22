@@ -17,6 +17,13 @@ public final class LocationCapture {
     public interface Callback { void accept(Fix fix); }
     public interface Source { Runnable request(Callback callback); }
     public interface DirectorySync { void sync(File directory) throws IOException; }
+    public static final class CaptureException extends IOException {
+        public final String code;
+        public CaptureException(String code, String message) {
+            super(message);
+            this.code = code;
+        }
+    }
     public static final class Fix {
         public final double latitude, longitude, accuracy;
         public final long measuredAtMs, elapsedNanos;
@@ -39,7 +46,9 @@ public final class LocationCapture {
         AtomicReference<Fix> result = new AtomicReference<>();
         Runnable cancel = source.request(fix -> { result.set(fix); ready.countDown(); });
         try {
-            if (!ready.await(timeoutMs, TimeUnit.MILLISECONDS)) throw new IOException("network location timeout");
+            if (!ready.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                throw new CaptureException("timeout", "network location timeout");
+            }
         } finally {
             cancel.run();
         }
@@ -51,7 +60,7 @@ public final class LocationCapture {
                 || f.measuredAtMs <= 0 || !Double.isFinite(f.latitude) || Math.abs(f.latitude) > 90
                 || !Double.isFinite(f.longitude) || Math.abs(f.longitude) > 180
                 || !Double.isFinite(f.accuracy) || f.accuracy <= 0) {
-            throw new IOException("no fresh valid network location");
+            throw new CaptureException("no_fresh_fix", "no fresh valid network location");
         }
         String id = UUID.randomUUID().toString();
         String json = String.format(Locale.ROOT,
@@ -59,14 +68,18 @@ public final class LocationCapture {
                 + "\"accuracy_m\":%.3f,\"measured_at_ms\":%d,\"helper_received_at_ms\":%d,\"provider\":\"network\"}\n",
                 id, f.latitude, f.longitude, f.accuracy, f.measuredAtMs, System.currentTimeMillis());
         File tmp = new File(spool, ".tmp");
-        if (!tmp.isDirectory() && !tmp.mkdirs()) throw new IOException("cannot create private spool");
+        if (!tmp.isDirectory() && !tmp.mkdirs()) {
+            throw new CaptureException("storage_error", "cannot create private spool");
+        }
         String name = f.measuredAtMs + "-" + id + ".json";
         File partial = new File(tmp, name), complete = new File(spool, name);
         try (FileOutputStream out = new FileOutputStream(partial)) {
             out.write(json.getBytes(StandardCharsets.UTF_8));
             out.getFD().sync();
         }
-        if (!partial.renameTo(complete)) throw new IOException("cannot commit location sample");
+        if (!partial.renameTo(complete)) {
+            throw new CaptureException("storage_error", "cannot commit location sample");
+        }
         // Persist the renamed directory entry too, not just the file contents.
         sync.sync(spool);
         // No deletion/retention here: only the authenticated uploader's ack removes a sample.

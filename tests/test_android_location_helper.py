@@ -31,9 +31,13 @@ public class CaptureTest {
     return new LocationCapture.Fix(1.25, -2.5, 250, 1700000000000L, elapsed);
   }
   static void check(boolean value) { if (!value) throw new AssertionError(); }
-  static void fails(LocationCapture.Source source, File dir) throws Exception {
+  static void fails(LocationCapture.Source source, File dir, String expectedCode) throws Exception {
     try { LocationCapture.capture(source, dir, now, 5); throw new AssertionError("accepted invalid fix"); }
-    catch (IOException expected) { }
+    catch (LocationCapture.CaptureException expected) {
+      if (!expectedCode.equals(expected.code)) {
+        throw new AssertionError("expected code " + expectedCode + ", got " + expected.code);
+      }
+    }
   }
   public static void main(String[] args) throws Exception {
     File dir = new File(args[0], "spool");
@@ -54,13 +58,13 @@ public class CaptureTest {
     check(!first.equals(second) && first.exists() && second.exists());
     check(new File(dir, ".tmp").list().length == 0);
     AtomicInteger timeoutCancel = new AtomicInteger();
-    fails(callback -> () -> timeoutCancel.incrementAndGet(), dir);
+    fails(callback -> () -> timeoutCancel.incrementAndGet(), dir, "timeout");
     check(timeoutCancel.get() == 1);
-    fails(callback -> { callback.accept(null); return () -> {}; }, dir);
-    fails(callback -> { callback.accept(fix(now - 121_000_000_000L)); return () -> {}; }, dir);
-    fails(callback -> { callback.accept(fix(now + 1_000_000_000L)); return () -> {}; }, dir);
-    fails(callback -> { callback.accept(new LocationCapture.Fix(Double.NaN, 0, 2, 1, now)); return () -> {}; }, dir);
-    fails(callback -> { callback.accept(new LocationCapture.Fix(0, 0, 0, 1, now)); return () -> {}; }, dir);
+    fails(callback -> { callback.accept(null); return () -> {}; }, dir, "no_fresh_fix");
+    fails(callback -> { callback.accept(fix(now - 121_000_000_000L)); return () -> {}; }, dir, "no_fresh_fix");
+    fails(callback -> { callback.accept(fix(now + 1_000_000_000L)); return () -> {}; }, dir, "no_fresh_fix");
+    fails(callback -> { callback.accept(new LocationCapture.Fix(Double.NaN, 0, 2, 1, now)); return () -> {}; }, dir, "no_fresh_fix");
+    fails(callback -> { callback.accept(new LocationCapture.Fix(0, 0, 0, 1, now)); return () -> {}; }, dir, "no_fresh_fix");
     check(dir.list((d, name) -> name.endsWith(".json")).length == 2);
     // Permission/provider errors fail closed and keep the existing offline queue.
     try { LocationCapture.capture(callback -> { throw new SecurityException("denied"); }, dir, now, 5);
@@ -91,3 +95,8 @@ def test_location_helper_permissions_are_coarse_and_shell_only():
     adapter = (HELPER / "src/com/zachlatta/pdw/location/LocationProvider.java").read_text()
     assert "getCurrentLocation(LocationManager.NETWORK_PROVIDER" in adapter
     assert "cancellation::cancel" in adapter
+    assert "error_code" in adapter
+    assert "permission_denied" in adapter
+    assert "location_disabled" in adapter
+    assert "isLocationEnabled()" in adapter
+    assert "isProviderEnabled(LocationManager.NETWORK_PROVIDER)" in adapter

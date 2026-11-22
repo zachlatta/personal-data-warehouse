@@ -23,23 +23,39 @@ public final class LocationProvider extends ContentProvider {
         try {
             ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createReliablePipe();
             new Thread(() -> {
-                try {
-                    ParcelFileDescriptor.AutoCloseOutputStream out =
-                            new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]);
-                    File sample = capture();
-                    out.write(("{\"queued\":\"" + sample.getName() + "\"}\n").getBytes(StandardCharsets.UTF_8));
-                    out.close();
-                } catch (Exception e) {
-                    try { pipe[1].closeWithError("location acquisition failed: " + e); } catch (Exception ignored) { }
-                }
+                try (ParcelFileDescriptor.AutoCloseOutputStream out =
+                        new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])) {
+                    try {
+                        File sample = capture();
+                        out.write(("{\"queued\":\"" + sample.getName() + "\"}\n").getBytes(StandardCharsets.UTF_8));
+                    } catch (SecurityException e) {
+                        writeError(out, "permission_denied", "location permission denied");
+                    } catch (LocationCapture.CaptureException e) {
+                        writeError(out, e.code, e.getMessage());
+                    } catch (Exception e) {
+                        writeError(out, "error", e.getClass().getSimpleName());
+                    }
+                } catch (Exception ignored) { }
             }, "pdw-network-location").start();
             return pipe[0];
         } catch (Exception e) { throw new FileNotFoundException(e.toString()); }
     }
+    private static void writeError(ParcelFileDescriptor.AutoCloseOutputStream out, String code, String message)
+            throws java.io.IOException {
+        String safeCode = code == null || code.isEmpty() ? "error" : code.replace("\"", "");
+        String safeMsg = message == null || message.isEmpty() ? safeCode : message.replace("\\", "\\\\").replace("\"", "'").replace("\n", " ");
+        out.write(("{\"error_code\":\"" + safeCode + "\",\"error\":\"" + safeMsg + "\"}\n").getBytes(StandardCharsets.UTF_8));
+    }
     private File capture() throws Exception {
-        if (!busy.compareAndSet(false, true)) throw new java.io.IOException("acquisition already in progress");
+        if (!busy.compareAndSet(false, true)) {
+            throw new LocationCapture.CaptureException("busy", "acquisition already in progress");
+        }
         try {
             LocationManager manager = (LocationManager) getContext().getSystemService(Context.LOCATION_SERVICE);
+            if (manager == null || !manager.isLocationEnabled()
+                    || !manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                throw new LocationCapture.CaptureException("location_disabled", "network location provider disabled");
+            }
             return LocationCapture.capture(callback -> {
                 CancellationSignal cancellation = new CancellationSignal();
                 // Provider selection is explicit. There is deliberately no fallback to GPS,

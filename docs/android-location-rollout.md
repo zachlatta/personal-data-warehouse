@@ -126,7 +126,15 @@ ssh pichu 'unlink /data/misc_ce/0/pdw-android-location/paused'
 ```
 
 This is the first activation of tracking. Expect one bounded network fix per run, about every
-900 seconds while scheduling permits. A provider timeout is an error, not a fabricated fix.
+900 seconds while scheduling permits. On start, `service.sh` adds `com.zachlatta.pdw.location`
+to `settings global location_background_throttle_package_whitelist` (preserving any existing
+entries) so `LocationManagerService` does not clamp the 30-second one-shot request to the
+10-minute background throttle interval. The helper returns structured error codes
+(`timeout`, `no_fresh_fix`, `busy`, `permission_denied`, `location_disabled`, `storage_error`):
+hard errors fail immediately, while transient provider misses exit 0 for up to
+`ANDROID_LOCATION_TRANSIENT_FAILURE_THRESHOLD` (`N`, default 18) consecutive runs before runs
+start failing — so with the server's 6-consecutive-failure push threshold, a persistent outage
+alerts after `N+6` runs (24 runs ≈ 6 hours) while flights and dead zones do not page.
 No continuous GPS subscription is created. An outage retains queued samples for retry.
 
 ## Final verification and trial

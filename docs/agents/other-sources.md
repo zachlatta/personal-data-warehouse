@@ -383,8 +383,15 @@ filling), the tail's log is `logs/system-log-tail.log`, and a manual run is
 The opt-in Android location collector reuses the on-phone PDW binary, existing ingest
 credentials and Drive transport. The helper has coarse and background location permissions;
 it requests a bounded network-provider fix, never GPS or continuous tracking. The root service
-aims for one sample every 900 seconds after first unlock. Doze and provider availability can
-delay or prevent a fix; hardware cadence and battery cost have not yet been measured.
+aims for one sample every 900 seconds after first unlock and adds `com.zachlatta.pdw.location`
+to `settings global location_background_throttle_package_whitelist` on start so Android does
+not clamp the 30-second one-shot `getCurrentLocation` request to the 10-minute background
+throttle interval, where most runs would time out. The helper
+returns structured `error_code` JSON (`timeout`, `no_fresh_fix`, `busy` vs hard errors like
+`permission_denied`, `location_disabled`, `storage_error`): hard errors fail immediately, while
+transient provider misses exit 0 for up to 18 consecutive runs (`N=18`) before runs fail, so the
+server's 6-consecutive-failure alert pushes after `N+6 = 24` runs (~6 h) — long enough for flights
+or dead zones while prolonged outages still alert.
 
 Each sample is durably queued in credential-encrypted app storage before export. The root
 uploader deletes only acknowledged files, so offline runs retry safely. Server receipt time
