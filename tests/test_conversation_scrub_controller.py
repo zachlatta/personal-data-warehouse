@@ -87,6 +87,11 @@ def test_apply_passes_the_group_cap_so_a_retry_can_isolate_a_session(tmp_path, m
     assert cards[cards.index('--max-canonical-rows')+1] == '7061'
     with pytest.raises(ValueError):
         m.apply(tmp_path,max_canonical_rows=10001)
+    calls.clear()
+    m.apply(tmp_path,max_canonical_rows=5000,max_source_rows=12000,max_plan_rows=400000)
+    cards=next(c for c in calls if 'personal_data_warehouse.scrub_conversation_cards' in c)
+    assert cards[cards.index('--max-source-rows')+1] == '12000'
+    assert cards[cards.index('--max-plan-rows')+1] == '400000'
 
 
 def test_verify_removes_the_runtime_environment_only_after_clean_scans(tmp_path, monkeypatch):

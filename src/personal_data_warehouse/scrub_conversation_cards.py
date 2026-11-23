@@ -647,7 +647,9 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     if 'discovery' in plan and not allow_partial: raise ValueError('partition discovery incomplete')
     if plan['scope']!=_scope(warehouse) or plan.get('selector',ScrubSelector().specification)!=(selector or ScrubSelector()).specification:
         raise ValueError('plan scope or selector differs')
-    if sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])>min(500,max_source_rows) or len(plan['candidates'])>min(20000,max_plan_rows):
+    # Plan-wide gates are the explicit flags (defaults 500 / 20,000); each group
+    # stays bounded by the canonical-row cap and its transaction deadline.
+    if sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])>max_source_rows or len(plan['candidates'])>max_plan_rows:
         raise ValueError('candidate gate exceeded')
     if any(not c['session'] for c in plan['candidates']):
         raise ValueError('cannot group unidentified session')
@@ -674,7 +676,7 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
         time.sleep(gap_seconds)  # workers LIVE, including after a resumed run
         candidates=[c for c in plan['candidates'] if tuple(c['session']) in sessions]
         if not planned_only: candidates=_attach_related(warehouse,candidates,warehouse._connection)
-        if len(candidates)>min(20000,max_plan_rows):
+        if len(candidates)>max_plan_rows:
             raise ValueError('group candidate gate exceeded; no maintenance started')
         subset={k:v for k,v in plan.items() if k not in ('discovery','batches')}
         subset.update(candidates=candidates,counts=_details(candidates))

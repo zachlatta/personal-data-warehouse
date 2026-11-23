@@ -111,7 +111,7 @@ def restore(directory):
     if failures: raise RuntimeError('writer restoration failed; rerun restore using the saved state')
 
 
-def apply(directory, max_canonical_rows=10000):
+def apply(directory, max_canonical_rows=10000, max_source_rows=500, max_plan_rows=20000):
     # A group that overruns its 60-second transaction rolls back; rerunning
     # apply with a cap just above the largest session isolates it.
     if not 0<max_canonical_rows<=10000: raise ValueError('--max-canonical-rows must be 1..10000')
@@ -123,7 +123,8 @@ def apply(directory, max_canonical_rows=10000):
     try:
         docker(['stop','--time','30',*[w['Id'] for w in state['writers']]])
         runtime(directory,state,'cards','--apply','--session-batches','--planned-only',
-                '--writers-paused','--max-canonical-rows',str(max_canonical_rows),'--window-seconds','60')
+                '--writers-paused','--max-canonical-rows',str(max_canonical_rows),'--window-seconds','60',
+                '--max-source-rows',str(max_source_rows),'--max-plan-rows',str(max_plan_rows))
     finally:
         restore(directory)
 
@@ -187,6 +188,8 @@ def main():
                                         'archive-plan','archive-apply','archive-verify'))
     parser.add_argument('--state-dir',type=Path,required=True)
     parser.add_argument('--max-canonical-rows',type=int,default=10000,help='apply only: canonical rows per session group')
+    parser.add_argument('--max-source-rows',type=int,default=500,help='apply only: matching source rows the whole plan may hold')
+    parser.add_argument('--max-plan-rows',type=int,default=20000,help='apply only: source and derived rows the whole plan may hold')
     parser.add_argument('--exported-from')
     parser.add_argument('--exported-before')
     parser.add_argument('--max-objects',type=int,default=70000)
@@ -200,7 +203,7 @@ def main():
         plan(directory,['--exported-from',args.exported_from,'--exported-before',args.exported_before,
                         '--max-objects',str(args.max_objects),'--max-bytes',str(args.max_bytes)])
     elif args.phase.startswith('archive-'): archive(directory,args.phase.removeprefix('archive-'))
-    elif args.phase=='apply': apply(directory,args.max_canonical_rows)
+    elif args.phase=='apply': apply(directory,args.max_canonical_rows,args.max_source_rows,args.max_plan_rows)
     else: globals()[args.phase](directory)
 
 

@@ -632,7 +632,12 @@ Apply records a new `before-stop.json` before the first stop. It executes
 with `--session-batches --planned-only --writers-paused --max-canonical-rows 10000`.
 If a group overruns its transaction, it rolls back and the writers restart;
 rerun `apply --max-canonical-rows <largest session's rows>` so that session runs
-alone (completed groups are skipped).
+alone (completed groups are skipped). The whole plan may hold at most 500 matching
+source rows and 20,000 source plus derived rows unless `apply --max-source-rows N
+--max-plan-rows M` raises them; set both from the reviewed plan counts, never
+blind. Each group stays bounded by `--max-canonical-rows` and its 60-second
+transaction, but writers stay stopped for the whole run, so size the downtime
+from the plan's group count before a large credential backfill.
 Each DB transaction retains the 60-second rollback deadline and row gates.
 Restoration is registered **before** stopping anything: even a partial stop or
 failed apply starts the app, then Dagster, in `finally` (`plan` accepts only running writers).

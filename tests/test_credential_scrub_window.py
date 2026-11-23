@@ -7,6 +7,7 @@ import pytest
 from tests.test_conversation_card_storage import event, warehouse
 from tests.test_credential_scrub_scope import TOKEN, MASKED, CARD
 from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
+from personal_data_warehouse.card_scrub_selector import ScrubSelector
 
 
 def test_large_session_planned_batches_never_scan_delta(warehouse, tmp_path, monkeypatch):
@@ -102,3 +103,22 @@ def test_batch_cli_commits_and_global_verify_still_finds_unrelated_session(wareh
     assert warehouse._query("SELECT text FROM @claude_code_events WHERE session_id='test-session'")[0][0] == MASKED
     remaining=m.discover(warehouse,selector=selector)
     assert {tuple(c['session']) for c in remaining['candidates']} == {('claude_code','unrelated')}
+
+
+def test_plan_wide_row_gates_follow_the_explicit_flags(tmp_path, monkeypatch):
+    import personal_data_warehouse.scrub_conversation_cards as module
+    candidates = [dict(table='claude_code_events', key=['claude_code', f's{i}', f'e{i}'], session=['claude_code', f's{i}'],
+                       month='2026-11', source='claude_code', matches=1) for i in range(501)]
+    plan = dict(version=2, scope=['db', None, None, 'public'], watermarks={'timeline_events': 0, 'search_chunks': '', 'snapshot': '1:1:'},
+                candidates=candidates, counts=module._details(candidates), selector=ScrubSelector('credentials').specification, left_alone=0)
+    path = tmp_path / 'plan.json'
+    path.write_text(json.dumps(plan))
+    monkeypatch.setattr(module, '_scope', lambda warehouse: plan['scope'])
+    monkeypatch.setattr(module, '_planned_rows', lambda warehouse, candidates, **k: [])
+    monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, sessions, limit: {})
+    from contextlib import nullcontext
+    with pytest.raises(ValueError, match='candidate gate exceeded'):
+        module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True)
+    result = module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'),
+                                  planned_only=True, max_source_rows=501, max_plan_rows=501)
+    assert result['batches']['completed'] == []
