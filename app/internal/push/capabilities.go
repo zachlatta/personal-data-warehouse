@@ -14,9 +14,16 @@ import (
 // getting ordinary alerts; that stored value now normalizes away.
 const CapabilityAndroidNativeAlerts = "android_native_alerts"
 
-// AndroidMessagesChannelID is the channel the native renderer posts chat
-// alerts on ("Messages"); the app also creates it in mobile/src/lib/push.ts.
-const AndroidMessagesChannelID = "messages"
+// Per-source Android notification channels created by both mobile/src/lib/push.ts
+// and PdwMessagingService (mobile/plugins/with-messaging-notifications.js).
+const (
+	AndroidMessagesChannelID  = "messages"
+	AndroidSlackChannelID     = "slack"
+	AndroidWhatsAppChannelID  = "whatsapp"
+	AndroidMailChannelID      = "mail"
+	AndroidCalendarChannelID  = "calendar"
+	AndroidMutationsChannelID = "mutations"
+)
 
 var knownCapabilities = map[string]bool{CapabilityAndroidNativeAlerts: true}
 

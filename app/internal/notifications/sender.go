@@ -58,7 +58,8 @@ func (t *Transport) Send(ctx context.Context, d Delivery) Result {
 		return Result{Status: "failed", Error: "invalid stored web push endpoint"}
 	}
 	a = webAlert(a)
-	a.Android = nil // the browser draws its own alert; the style is Android-native only
+	a.Android = nil      // the browser draws its own alert; the style is Android-native only
+	a.AndroidAlert = nil // same for non-chat Android native style
 	raw, err := json.Marshal(a)
 	if err != nil || len(raw) > 3800 {
 		return Result{Status: "failed", Error: "web push payload exceeds safe encrypted-payload budget"}
@@ -106,6 +107,11 @@ func expoMessage(token, platform, capabilities string, d Delivery) push.Message 
 		// The title and body ride inside the style: they are also what the
 		// phone posts as a plain notification if the conversation cannot be drawn.
 		style["title"], style["body"] = a.Title, a.Body
+		if a.OccurredAtMs > 0 {
+			if _, ok := style["occurred_at_ms"]; !ok {
+				style["occurred_at_ms"] = a.OccurredAtMs
+			}
+		}
 		data["android_style"] = style
 		return push.Message{To: token, Priority: "high", Data: data}
 	}
@@ -128,7 +134,28 @@ func expoMessage(token, platform, capabilities string, d Delivery) push.Message 
 		m.RichContent = &push.RichContent{Image: a.Icon}
 	}
 	if native {
-		return m.AndroidDataOnly()
+		out := m.AndroidDataOnly()
+		if alertMap, ok := out.Data[push.AndroidAlertKey].(map[string]any); ok {
+			if a.AndroidAlert != nil {
+				// Static source icons (a.Icon) are iOS/web thumbnails; on Android,
+				// only a real content image goes into image_url (BigPictureStyle),
+				// while contact faces go into avatar_url (circular largeIcon).
+				delete(alertMap, "image_url")
+				raw, _ := json.Marshal(a.AndroidAlert)
+				var extra map[string]any
+				if json.Unmarshal(raw, &extra) == nil {
+					for k, v := range extra {
+						alertMap[k] = v
+					}
+				}
+			}
+			if a.OccurredAtMs > 0 {
+				if _, ok := alertMap["occurred_at_ms"]; !ok {
+					alertMap["occurred_at_ms"] = a.OccurredAtMs
+				}
+			}
+		}
+		return out
 	}
 	return m
 }

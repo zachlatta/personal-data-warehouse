@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"html"
 	"net/url"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/notifications"
@@ -32,11 +34,20 @@ func notificationText(s string, limit int) string {
 	return s
 }
 
-var notificationSources = map[string]struct{ label, icon string }{
-	"slack": {"Slack", "slack"}, "gmail": {"Gmail", "gmail"},
-	"apple_messages": {"Messages", "messages"}, "android_messages": {"Messages", "messages"}, "whatsapp": {"WhatsApp", "whatsapp"},
-	"google_drive": {"Google Drive", "drive"}, "calendar": {"Google Calendar", "calendar"},
-	"scans": {"Scanner", "pdw"},
+type notificationSourceMeta struct {
+	label, icon, channel, color, category string
+}
+
+var notificationSources = map[string]notificationSourceMeta{
+	"slack":            {label: "Slack", icon: "slack", channel: push.AndroidSlackChannelID, color: "#4A154B", category: "msg"},
+	"gmail":            {label: "Gmail", icon: "gmail", channel: push.AndroidMailChannelID, color: "#D93025", category: "email"},
+	"apple_messages":   {label: "Messages", icon: "messages", channel: push.AndroidMessagesChannelID, color: "#1A73E8", category: "msg"},
+	"android_messages": {label: "Messages", icon: "messages", channel: push.AndroidMessagesChannelID, color: "#1A73E8", category: "msg"},
+	"whatsapp":         {label: "WhatsApp", icon: "whatsapp", channel: push.AndroidWhatsAppChannelID, color: "#25D366", category: "msg"},
+	"google_drive":     {label: "Google Drive", icon: "drive", channel: push.AndroidChannelID, color: "#0F9D58"},
+	"calendar":         {label: "Google Calendar", icon: "calendar", channel: push.AndroidCalendarChannelID, color: "#039BE5", category: "event"},
+	"scans":            {label: "Scanner", icon: "pdw", channel: push.AndroidChannelID, color: "#5F6368"},
+	"github":           {label: "GitHub", icon: "pdw", channel: push.AndroidChannelID, color: "#24292F"},
 }
 
 // notificationThreadID is what the phone stacks alerts under. iOS groups by
@@ -142,8 +153,7 @@ func renderTimelineNotification(row map[string]any, baseURL string, env timeline
 	source := linkString(row, "source")
 	brand, ok := notificationSources[source]
 	if !ok {
-		brand.label = source
-		brand.icon = "pdw"
+		brand = notificationSourceMeta{label: source, icon: "pdw", channel: push.AndroidChannelID}
 	}
 	actor := notificationText(linkString(row, "actor"), 60)
 	title := notificationText(linkString(row, "title"), 90)
@@ -182,7 +192,9 @@ func renderTimelineNotification(row map[string]any, baseURL string, env timeline
 		a.Icon = strings.TrimRight(baseURL, "/") + "/app/notification-icons/" + brand.icon + ".png"
 	}
 	if notificationChatSources[source] {
-		a.Android = androidChatStyle(row, brand.label, headline, a.ThreadID)
+		a.Android = androidChatStyle(row, brand, headline, a.ThreadID)
+	} else {
+		a.AndroidAlert = androidAlertStyle(row, brand, actor, title)
 	}
 	return a
 }
@@ -196,19 +208,22 @@ var notificationChatSources = map[string]bool{"android_messages": true, "apple_m
 // androidChatStyle names the conversation the way the source's own app does:
 // a 1:1 chat is the person, a group is its name (or its people, for an unnamed
 // iMessage group, which appleGroupContext has already put in context).
-func androidChatStyle(row map[string]any, label, sender, threadID string) *notifications.AndroidStyle {
+func androidChatStyle(row map[string]any, brand notificationSourceMeta, sender, threadID string) *notifications.AndroidStyle {
 	source := linkString(row, "source")
 	pk := decodeLinkJSON(row["source_pk"])
 	meta := decodeLinkJSON(row["metadata"])
 	context := notificationText(linkString(row, "context"), 90)
 	group := false
 	title := context
+	groupKey := "pdw:" + source
 	switch source {
 	case "android_messages":
 		group = meta["group"] == true
 		title = notificationText(linkString(meta, "chat_name"), 90)
+		groupKey = "pdw:messages"
 	case "apple_messages":
 		group = strings.Contains(linkString(meta, "chat_id"), ";+;")
+		groupKey = "pdw:messages"
 	case "whatsapp":
 		group = strings.HasSuffix(linkString(pk, "chat_id"), "@g.us")
 	case "slack":
@@ -217,44 +232,115 @@ func androidChatStyle(row map[string]any, label, sender, threadID string) *notif
 		conversation := linkString(pk, "conversation_id")
 		group = conversation != "" && !strings.HasPrefix(conversation, "D")
 	}
-	style := &notifications.AndroidStyle{Source: label, ConversationID: threadID, Group: group,
-		SenderName: sender, SenderKey: source + ":" + sender, EventID: linkString(row, "event_id")}
+	style := &notifications.AndroidStyle{
+		Source:         brand.label,
+		SourceKey:      source,
+		ChannelID:      brand.channel,
+		Color:          brand.color,
+		GroupKey:       groupKey,
+		ConversationID: threadID,
+		Group:          group,
+		SenderName:     sender,
+		SenderKey:      source + ":" + sender,
+		EventID:        linkString(row, "event_id"),
+	}
 	if group {
 		if title == "" {
-			title = label + " group"
+			title = brand.label + " group"
 		}
 		style.ConversationTitle = title
 	}
 	return style
 }
 
-// avatarLookup finds an https photo of an alert's sender. It runs on the
-// worker's claim of the outbox row, so withAvatar bounds it.
-type avatarLookup func(ctx context.Context, row map[string]any) (string, error)
+// androidAlertStyle builds native Android presentation for non-chat sources
+// (Gmail, Calendar, Google Drive, Scans, GitHub): per-source channel, accent
+// color, category, grouping, email subject, and sender monogram fallback.
+func androidAlertStyle(row map[string]any, brand notificationSourceMeta, actor, title string) *notifications.AndroidAlertStyle {
+	source := linkString(row, "source")
+	style := &notifications.AndroidAlertStyle{
+		Source:     brand.label,
+		SourceKey:  source,
+		ChannelID:  brand.channel,
+		Color:      brand.color,
+		Category:   brand.category,
+		GroupKey:   "pdw:" + source,
+		GroupTitle: brand.label,
+	}
+	if source == "gmail" && title != "" {
+		style.Subject = title
+	}
+	// Sources with a human sender/organizer get a circular contact face or
+	// colored monogram as the largeIcon, just like Gmail/Calendar on Android.
+	if actor != "" && source != "scans" {
+		style.AvatarName = actor
+	}
+	return style
+}
 
-// withAvatar adds the sender's photo to a chat alert. A failed, empty or slow
-// lookup leaves the avatar empty (the phone draws the sender's initial); it
-// never delays the alert past the timeout and never drops it.
-func withAvatar(a notifications.Alert, row map[string]any, lookup avatarLookup, timeout time.Duration) notifications.Alert {
-	if a.Android == nil || lookup == nil {
+// notificationMedia holds resolved authenticated avatar and/or image attachment
+// URLs for one notification event.
+type notificationMedia struct {
+	AvatarURL      string
+	AvatarCacheKey string
+	ImageURL       string
+	ImageMimeType  string
+}
+
+// mediaLookup finds an authenticated avatar URL and/or image attachment URL
+// for an alert's event. It runs on the worker's claim of the outbox row, so
+// withMedia bounds it.
+type mediaLookup func(ctx context.Context, row map[string]any) (notificationMedia, error)
+
+// withMedia attaches the sender's face and any inline image attachment to an
+// alert. A failed, empty or slow lookup leaves the initial avatar and text-only
+// body; it never delays the alert past the timeout and never drops it.
+func withMedia(a notifications.Alert, row map[string]any, lookup mediaLookup, timeout time.Duration) notifications.Alert {
+	if (a.Android == nil && a.AndroidAlert == nil) || lookup == nil {
 		return a
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	found := make(chan string, 1)
+	found := make(chan notificationMedia, 1)
 	go func() {
-		url, err := lookup(ctx, row)
+		media, err := lookup(ctx, row)
 		if err != nil {
-			url = ""
+			media = notificationMedia{}
 		}
-		found <- url
+		found <- media
 	}()
 	select {
-	case url := <-found:
-		if strings.HasPrefix(url, "https://") && len(url) <= 600 {
+	case media := <-found:
+		avatarURL := ""
+		if strings.HasPrefix(media.AvatarURL, "https://") && len(media.AvatarURL) <= 600 {
+			avatarURL = media.AvatarURL
+		}
+		imageURL := ""
+		if strings.HasPrefix(media.ImageURL, "https://") && len(media.ImageURL) <= 600 {
+			imageURL = media.ImageURL
+		}
+		if a.Android != nil && (avatarURL != "" || imageURL != "") {
 			style := *a.Android
-			style.AvatarURL = url
+			if avatarURL != "" {
+				style.AvatarURL = avatarURL
+				style.AvatarCacheKey = media.AvatarCacheKey
+			}
+			if imageURL != "" {
+				style.ImageURL = imageURL
+				style.ImageMimeType = media.ImageMimeType
+			}
 			a.Android = &style
+		}
+		if a.AndroidAlert != nil && (avatarURL != "" || imageURL != "") {
+			style := *a.AndroidAlert
+			if avatarURL != "" {
+				style.AvatarURL = avatarURL
+				style.AvatarCacheKey = media.AvatarCacheKey
+			}
+			if imageURL != "" {
+				style.ImageURL = imageURL
+			}
+			a.AndroidAlert = &style
 		}
 	case <-ctx.Done():
 	}
@@ -263,34 +349,182 @@ func withAvatar(a notifications.Alert, row map[string]any, lookup avatarLookup, 
 
 var googlePhotoSize = regexp.MustCompile(`=s\d+(-c)?$`)
 
-// notificationAvatar is the production avatarLookup: a Slack sender's profile
-// image, or the contact card photo of a messages or WhatsApp sender, matched
-// by phone number where the source has one and by name otherwise. Google's
-// generated letter placeholders (`default: true`) are skipped: the phone draws
-// a better initial itself.
-func notificationAvatar(db *sql.DB) avatarLookup {
-	return func(ctx context.Context, row map[string]any) (string, error) {
-		pk := decodeLinkJSON(row["source_pk"])
-		var url string
-		switch linkString(row, "source") {
-		case "slack":
-			err := db.QueryRowContext(ctx, warehouse.ExpandRelations(notificationSlackAvatarSQL),
-				linkString(pk, "account"), linkString(pk, "team_id"), linkString(pk, "conversation_id"), linkString(pk, "message_ts")).Scan(&url)
-			return url, err
-		case "android_messages", "apple_messages", "whatsapp":
-			phone := ""
-			if linkString(row, "source") == "android_messages" {
-				var address string
-				if db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT sender_address FROM @android_messages WHERE account=$1 AND device=$2 AND message_key=$3`),
-					linkString(pk, "account"), linkString(pk, "device"), linkString(pk, "message_key")).Scan(&address) == nil {
-					phone = notificationPhoneDigits(address)
-				}
-			}
-			err := db.QueryRowContext(ctx, warehouse.ExpandRelations(notificationContactPhotoSQL), phone, strings.TrimSpace(linkString(row, "actor"))).Scan(&url)
-			return googlePhotoSize.ReplaceAllString(url, "=s256-c"), err
-		}
-		return "", nil
+// notificationMediaLookup is the production mediaLookup: resolves the sender's
+// avatar across Slack, Google Contacts (by phone, email, or display name), and
+// Slack-by-email (for Gmail/Calendar/iMessage), mints a short-lived signed
+// /api/notifications/avatar link, and resolves any stored image attachment as
+// a signed /objects/ link.
+func notificationMediaLookup(db *sql.DB, baseURL string, signer *pdwauth.Service, now func() time.Time) mediaLookup {
+	if now == nil {
+		now = time.Now
 	}
+	signObj := func(fileID string) string {
+		if !strings.HasPrefix(baseURL, "https://") || signer == nil || fileID == "" {
+			return ""
+		}
+		exp := now().Add(notificationAvatarTTL)
+		sig := signer.SignObjectDownload(fileID, "", exp)
+		return fmt.Sprintf("%s/objects/%s?exp=%d&sig=%s", strings.TrimRight(baseURL, "/"), url.PathEscape(fileID), exp.Unix(), url.QueryEscape(sig))
+	}
+	return func(ctx context.Context, row map[string]any) (notificationMedia, error) {
+		var out notificationMedia
+		key, rawURL := resolveAvatarKeyForRow(ctx, db, row)
+		if key != "" {
+			if signed := signAvatarURL(baseURL, signer, now, key); signed != "" {
+				out.AvatarURL = signed
+				out.AvatarCacheKey = avatarCacheKey(key)
+			} else if strings.HasPrefix(rawURL, "https://") {
+				// Fallback when baseURL is non-https (dev/tests without signer).
+				out.AvatarURL = rawURL
+				out.AvatarCacheKey = avatarCacheKey(key)
+			}
+		}
+		fileID, mimeType := resolveImageAttachmentForRow(ctx, db, row)
+		if fileID != "" {
+			if signed := signObj(fileID); signed != "" {
+				out.ImageURL = signed
+				out.ImageMimeType = mimeType
+			}
+		}
+		return out, nil
+	}
+}
+
+func resolveAvatarKeyForRow(ctx context.Context, db *sql.DB, row map[string]any) (key, rawURL string) {
+	if db == nil {
+		return "", ""
+	}
+	source := linkString(row, "source")
+	pk := decodeLinkJSON(row["source_pk"])
+	actor := strings.TrimSpace(linkString(row, "actor"))
+	switch source {
+	case "slack":
+		var account, teamID, userID, imgURL string
+		if db.QueryRowContext(ctx, warehouse.ExpandRelations(notificationSlackAvatarKeySQL),
+			linkString(pk, "account"), linkString(pk, "team_id"), linkString(pk, "conversation_id"), linkString(pk, "message_ts")).
+			Scan(&account, &teamID, &userID, &imgURL) == nil && imgURL != "" {
+			return fmt.Sprintf("slack|%s|%s|%s", account, teamID, userID), imgURL
+		}
+		return "", ""
+	case "android_messages":
+		var address string
+		_ = db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT sender_address FROM @android_messages WHERE account=$1 AND device=$2 AND message_key=$3`),
+			linkString(pk, "account"), linkString(pk, "device"), linkString(pk, "message_key")).Scan(&address)
+		return lookupPersonAvatarKey(ctx, db, notificationPhoneDigits(address), notificationEmail(address), actor)
+	case "apple_messages":
+		var address string
+		_ = db.QueryRowContext(ctx, warehouse.ExpandRelations(`
+SELECT COALESCE(NULLIF(h.address, ''), m.handle_id)
+FROM @apple_messages m
+LEFT JOIN @apple_message_handles h ON h.account = m.account AND h.handle_id = m.handle_id
+WHERE m.account = $1 AND m.message_id = $2
+LIMIT 1`),
+			linkString(pk, "account"), linkString(pk, "message_id")).Scan(&address)
+		return lookupPersonAvatarKey(ctx, db, notificationPhoneDigits(address), notificationEmail(address), actor)
+	case "whatsapp":
+		var senderJID string
+		_ = db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT sender_jid FROM @whatsapp_messages WHERE account=$1 AND chat_id=$2 AND message_id=$3`),
+			linkString(pk, "account"), linkString(pk, "chat_id"), linkString(pk, "message_id")).Scan(&senderJID)
+		phone := ""
+		if strings.HasSuffix(senderJID, "@s.whatsapp.net") {
+			phone = notificationPhoneDigits(strings.SplitN(senderJID, "@", 2)[0])
+		}
+		return lookupPersonAvatarKey(ctx, db, phone, "", actor)
+	case "gmail":
+		var fromAddr string
+		_ = db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT from_address FROM @gmail_messages WHERE account=$1 AND message_id=$2`),
+			linkString(pk, "account"), linkString(pk, "message_id")).Scan(&fromAddr)
+		email := notificationEmail(fromAddr)
+		if email == "" {
+			email = notificationEmail(actor)
+		}
+		return lookupPersonAvatarKey(ctx, db, "", email, actor)
+	case "calendar", "google_drive":
+		return lookupPersonAvatarKey(ctx, db, "", notificationEmail(actor), actor)
+	default:
+		return "", ""
+	}
+}
+
+// lookupPersonAvatarKey finds a contact photo (by phone, email, or display
+// name) or a Slack user avatar (by indexed email) and returns its opaque
+// avatar key and upstream URL.
+func lookupPersonAvatarKey(ctx context.Context, db *sql.DB, phone, email, displayName string) (key, rawURL string) {
+	var cSource, cAccount, cKind, cBook, cCard, photoURL string
+	if db.QueryRowContext(ctx, warehouse.ExpandRelations(notificationContactPhotoKeySQL), phone, email, displayName).
+		Scan(&cSource, &cAccount, &cKind, &cBook, &cCard, &photoURL) == nil && photoURL != "" {
+		return fmt.Sprintf("contact|%s|%s|%s|%s|%s", cSource, cAccount, cKind, cBook, cCard), googlePhotoSize.ReplaceAllString(photoURL, "=s256-c")
+	}
+	if email != "" {
+		var sAccount, sTeam, sUser, imgURL string
+		if db.QueryRowContext(ctx, warehouse.ExpandRelations(notificationSlackAvatarByEmailSQL), email).
+			Scan(&sAccount, &sTeam, &sUser, &imgURL) == nil && imgURL != "" {
+			return fmt.Sprintf("slack|%s|%s|%s", sAccount, sTeam, sUser), imgURL
+		}
+	}
+	return "", ""
+}
+
+func resolveImageAttachmentForRow(ctx context.Context, db *sql.DB, row map[string]any) (fileID, mimeType string) {
+	if db == nil {
+		return "", ""
+	}
+	pk := decodeLinkJSON(row["source_pk"])
+	switch linkString(row, "source") {
+	case "android_messages":
+		_ = db.QueryRowContext(ctx, warehouse.ExpandRelations(`
+SELECT storage_file_id, content_type
+FROM @android_message_attachments
+WHERE account = $1 AND device = $2 AND message_key = $3
+  AND content_type LIKE 'image/%' AND storage_file_id <> '' AND is_missing = 0
+ORDER BY part_key
+LIMIT 1`),
+			linkString(pk, "account"), linkString(pk, "device"), linkString(pk, "message_key")).Scan(&fileID, &mimeType)
+	case "apple_messages":
+		_ = db.QueryRowContext(ctx, warehouse.ExpandRelations(`
+SELECT storage_file_id, COALESCE(NULLIF(content_type, ''), mime_type)
+FROM @apple_message_attachments
+WHERE account = $1 AND message_id = $2
+  AND (content_type LIKE 'image/%' OR mime_type LIKE 'image/%') AND storage_file_id <> '' AND is_missing = 0
+ORDER BY attachment_id
+LIMIT 1`),
+			linkString(pk, "account"), linkString(pk, "message_id")).Scan(&fileID, &mimeType)
+	case "whatsapp":
+		_ = db.QueryRowContext(ctx, warehouse.ExpandRelations(`
+SELECT storage_file_id, mime_type
+FROM @whatsapp_media_items
+WHERE account = $1 AND chat_id = $2 AND message_id = $3
+  AND mime_type LIKE 'image/%' AND storage_file_id <> '' AND is_missing = 0
+LIMIT 1`),
+			linkString(pk, "account"), linkString(pk, "chat_id"), linkString(pk, "message_id")).Scan(&fileID, &mimeType)
+	case "slack":
+		_ = db.QueryRowContext(ctx, warehouse.ExpandRelations(`
+SELECT file_id, mimetype
+FROM @slack_files
+WHERE account = $1 AND team_id = $2 AND conversation_id = $3 AND message_ts = $4
+  AND mimetype LIKE 'image/%' AND is_deleted = 0 AND file_id <> ''
+ORDER BY file_id
+LIMIT 1`),
+			linkString(pk, "account"), linkString(pk, "team_id"), linkString(pk, "conversation_id"), linkString(pk, "message_ts")).Scan(&fileID, &mimeType)
+	}
+	return fileID, mimeType
+}
+
+// notificationEmail extracts a normalized lowercase email address if s looks
+// like one (or contains <email@domain>).
+func notificationEmail(s string) string {
+	s = strings.TrimSpace(s)
+	if start := strings.LastIndexByte(s, '<'); start >= 0 {
+		if end := strings.IndexByte(s[start:], '>'); end > 1 {
+			s = strings.TrimSpace(s[start+1 : start+end])
+		}
+	}
+	s = strings.ToLower(strings.Trim(s, "\"' "))
+	at := strings.IndexByte(s, '@')
+	if at <= 0 || at == len(s)-1 || strings.ContainsAny(s, " \t\r\n") || !strings.Contains(s[at+1:], ".") {
+		return ""
+	}
+	return s
 }
 
 // notificationPhoneDigits matches marts_contacts.contact_points.normalized_value:
@@ -312,26 +546,43 @@ func notificationPhoneDigits(address string) string {
 	return digits
 }
 
-const notificationSlackAvatarSQL = `
-SELECT COALESCE(NULLIF(u.raw_json, '')::jsonb->'profile'->>'image_192', NULLIF(u.raw_json, '')::jsonb->'profile'->>'image_72', '')
+const notificationSlackAvatarKeySQL = `
+SELECT u.account, u.team_id, u.user_id,
+       COALESCE(NULLIF(u.raw_json, '')::jsonb->'profile'->>'image_192', NULLIF(u.raw_json, '')::jsonb->'profile'->>'image_72', '')
 FROM @slack_messages m
 JOIN @slack_users u ON u.account = m.account AND u.team_id = m.team_id AND u.user_id = m.user_id
 WHERE m.account = $1 AND m.team_id = $2 AND m.conversation_id = $3 AND m.message_ts = $4
 LIMIT 1`
 
-const notificationContactPhotoSQL = `
-SELECT url FROM (
-    SELECT photo->>'url' AS url, 0 AS rank
+const notificationSlackAvatarByEmailSQL = `
+SELECT u.account, u.team_id, u.user_id,
+       COALESCE(NULLIF(u.raw_json, '')::jsonb->'profile'->>'image_192', NULLIF(u.raw_json, '')::jsonb->'profile'->>'image_72', '')
+FROM @slack_users u
+WHERE u.email <> '' AND lower(u.email) = lower($1)
+  AND COALESCE(NULLIF(u.raw_json, '')::jsonb->'profile'->>'image_192', NULLIF(u.raw_json, '')::jsonb->'profile'->>'image_72', '') LIKE 'https://%'
+ORDER BY u.is_deleted ASC, u.synced_at DESC
+LIMIT 1`
+
+const notificationContactPhotoKeySQL = `
+SELECT source, account, source_kind, address_book_id, card_id, url FROM (
+    SELECT c.source, c.account, c.source_kind, c.address_book_id, c.card_id, photo->>'url' AS url, 0 AS rank
     FROM @clean_contact_points cp
     JOIN @clean_contacts c ON c.source = cp.source AND c.account = cp.account AND c.card_id = cp.card_id
     CROSS JOIN LATERAL jsonb_array_elements(c.photos) photo
     WHERE $1 <> '' AND cp.point_type = 'phone' AND cp.normalized_value = $1
       AND photo->>'url' LIKE 'https://%' AND NOT COALESCE((photo->>'default')::boolean, false)
     UNION ALL
-    SELECT photo->>'url', 1
+    SELECT c.source, c.account, c.source_kind, c.address_book_id, c.card_id, photo->>'url' AS url, 1 AS rank
+    FROM @clean_contact_points cp
+    JOIN @clean_contacts c ON c.source = cp.source AND c.account = cp.account AND c.card_id = cp.card_id
+    CROSS JOIN LATERAL jsonb_array_elements(c.photos) photo
+    WHERE $2 <> '' AND cp.point_type = 'email' AND cp.normalized_value = $2
+      AND photo->>'url' LIKE 'https://%' AND NOT COALESCE((photo->>'default')::boolean, false)
+    UNION ALL
+    SELECT c.source, c.account, c.source_kind, c.address_book_id, c.card_id, photo->>'url' AS url, 2 AS rank
     FROM @clean_contacts c
     CROSS JOIN LATERAL jsonb_array_elements(c.photos) photo
-    WHERE $2 <> '' AND lower(c.display_name) = lower($2)
+    WHERE $3 <> '' AND lower(c.display_name) = lower($3)
       AND photo->>'url' LIKE 'https://%' AND NOT COALESCE((photo->>'default')::boolean, false)
 ) found
 ORDER BY rank
@@ -339,7 +590,7 @@ LIMIT 1`
 
 // NewTimelineNotifications shares the timeline's link builder, not a second
 // set of per-source URL guesses. This worker never uses the read-only SQL role.
-func NewTimelineNotifications(cfg config.Config, publicKey, privateKey, subscriber string) (*notifications.Service, error) {
+func NewTimelineNotifications(cfg config.Config, authSvc *pdwauth.Service, publicKey, privateKey, subscriber string) (*notifications.Service, error) {
 	if err := notifications.ValidateVAPID(publicKey, privateKey); err != nil {
 		return nil, err
 	}
@@ -379,7 +630,7 @@ func NewTimelineNotifications(cfg config.Config, publicKey, privateKey, subscrib
 			}
 			return names
 		})
-		return withAvatar(renderTimelineNotification(row, cfg.BaseURL, env), row, notificationAvatar(svc.DB), time.Second)
+		return withMedia(renderTimelineNotification(row, cfg.BaseURL, env), row, notificationMediaLookup(svc.DB, cfg.BaseURL, authSvc, time.Now), time.Second)
 	}
 	return svc, nil
 }
@@ -399,5 +650,13 @@ func renderPolicyOutcome(row map[string]any) notifications.Alert {
 		Kind:      linkString(row, "kind"),
 		RequestID: linkString(row, "request_id"),
 		Quiet:     quiet,
+		AndroidAlert: &notifications.AndroidAlertStyle{
+			Source:     "Approvals",
+			SourceKey:  "mutations",
+			ChannelID:  push.AndroidMutationsChannelID,
+			Color:      "#6750A4",
+			GroupKey:   "pdw:mutations",
+			GroupTitle: "Approvals",
+		},
 	}
 }

@@ -174,39 +174,82 @@ func TestChatAlertsCarryTheConversationForAndroid(t *testing.T) {
 	}
 }
 
-// The avatar lookup runs while the worker holds the outbox row: a failing,
-// empty, non-https or hung lookup leaves the initial avatar and never holds
-// the alert past its timeout.
+// The media lookup runs while the worker holds the outbox row: a failing,
+// empty, non-https or hung lookup leaves the initial avatar and text-only body
+// and never holds the alert past its timeout.
 func TestAvatarLookupNeverDelaysOrDropsAnAlert(t *testing.T) {
 	row := map[string]any{"source": "apple_messages", "actor": "Sam", "snippet": "Hi"}
 	alert := renderTimelineNotification(row, "", timelineLinkEnv{})
-	found := func(url string, err error) avatarLookup {
-		return func(context.Context, map[string]any) (string, error) { return url, err }
+	found := func(media notificationMedia, err error) mediaLookup {
+		return func(context.Context, map[string]any) (notificationMedia, error) { return media, err }
 	}
-	if got := withAvatar(alert, row, found("https://photos.example/sam.jpg", nil), time.Second); got.Android.AvatarURL != "https://photos.example/sam.jpg" {
-		t.Fatalf("avatar not attached: %+v", got.Android)
+	got := withMedia(alert, row, found(notificationMedia{
+		AvatarURL:      "https://pdw.example/api/notifications/avatar?k=contact&exp=1&sig=s",
+		AvatarCacheKey: "abc123",
+		ImageURL:       "https://pdw.example/objects/file1?exp=1&sig=s",
+		ImageMimeType:  "image/jpeg",
+	}, nil), time.Second)
+	if got.Android.AvatarURL == "" || got.Android.AvatarCacheKey != "abc123" || got.Android.ImageURL == "" || got.Android.ImageMimeType != "image/jpeg" {
+		t.Fatalf("media not attached: %+v", got.Android)
 	}
-	if alert.Android.AvatarURL != "" {
-		t.Fatal("withAvatar mutated the alert it was given")
+	if alert.Android.AvatarURL != "" || alert.Android.ImageURL != "" {
+		t.Fatal("withMedia mutated the alert it was given")
 	}
-	for name, lookup := range map[string]avatarLookup{
-		"error":     found("https://photos.example/sam.jpg", errors.New("db down")),
-		"not https": found("http://photos.example/sam.jpg", nil),
-		"empty":     found("", nil),
-		"hung": func(context.Context, map[string]any) (string, error) {
+	for name, lookup := range map[string]mediaLookup{
+		"error":     found(notificationMedia{AvatarURL: "https://photos.example/sam.jpg"}, errors.New("db down")),
+		"not https": found(notificationMedia{AvatarURL: "http://photos.example/sam.jpg", ImageURL: "http://photos.example/img.jpg"}, nil),
+		"empty":     found(notificationMedia{}, nil),
+		"hung": func(context.Context, map[string]any) (notificationMedia, error) {
 			time.Sleep(2 * time.Second)
-			return "https://photos.example/late.jpg", nil
+			return notificationMedia{AvatarURL: "https://photos.example/late.jpg"}, nil
 		},
 	} {
 		start := time.Now()
-		got := withAvatar(alert, row, lookup, 50*time.Millisecond)
-		if got.Android == nil || got.Android.AvatarURL != "" || got.Title != "Sam" || time.Since(start) > time.Second {
+		got := withMedia(alert, row, lookup, 50*time.Millisecond)
+		if got.Android == nil || got.Android.AvatarURL != "" || got.Android.ImageURL != "" || got.Title != "Sam" || time.Since(start) > time.Second {
 			t.Errorf("%s: %+v after %s", name, got.Android, time.Since(start))
 		}
 	}
-	plain := renderTimelineNotification(map[string]any{"source": "gmail", "actor": "Sam"}, "", timelineLinkEnv{})
-	if got := withAvatar(plain, row, found("https://photos.example/sam.jpg", nil), time.Second); got.Android != nil {
-		t.Fatal("a non-chat alert gained a chat style")
+	// Non-chat alerts (Gmail) also receive contact faces via AndroidAlert, without gaining a chat style.
+	gmail := renderTimelineNotification(map[string]any{"source": "gmail", "actor": "Sam", "title": "Quarterly update", "snippet": "Attached"}, "https://pdw.example", timelineLinkEnv{})
+	if gmail.Android != nil || gmail.AndroidAlert == nil {
+		t.Fatalf("expected AndroidAlert on gmail: %+v", gmail)
+	}
+	if gmail.AndroidAlert.ChannelID != "mail" || gmail.AndroidAlert.Category != "email" || gmail.AndroidAlert.Color != "#D93025" || gmail.AndroidAlert.Subject != "Quarterly update" || gmail.AndroidAlert.AvatarName != "Sam" {
+		t.Fatalf("unexpected gmail AndroidAlert: %+v", gmail.AndroidAlert)
+	}
+	gotGmail := withMedia(gmail, map[string]any{"source": "gmail"}, found(notificationMedia{AvatarURL: "https://pdw.example/api/notifications/avatar?k=slack&exp=1&sig=s", AvatarCacheKey: "k1"}, nil), time.Second)
+	if gotGmail.Android != nil || gotGmail.AndroidAlert.AvatarURL == "" || gotGmail.AndroidAlert.AvatarCacheKey != "k1" {
+		t.Fatalf("gmail avatar not attached: %+v", gotGmail.AndroidAlert)
+	}
+}
+
+func TestNotificationEmailExtraction(t *testing.T) {
+	for in, want := range map[string]string{
+		"Sam Example <Sam@Example.COM>": "sam@example.com",
+		"alex@example.org":              "alex@example.org",
+		"  \"Alex\" <alex@test.org> ":   "alex@test.org",
+		"not-an-email":                  "",
+		"+15555550100":                  "",
+	} {
+		if got := notificationEmail(in); got != want {
+			t.Errorf("%q: %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPerSourceAndroidChannelsColorsAndGrouping(t *testing.T) {
+	slack := renderTimelineNotification(map[string]any{"source": "slack", "actor": "Sam", "source_pk": map[string]any{"team_id": "T1", "conversation_id": "D1"}}, "https://pdw.example", timelineLinkEnv{})
+	if slack.Android.ChannelID != "slack" || slack.Android.Color != "#4A154B" || slack.Android.GroupKey != "pdw:slack" {
+		t.Fatalf("slack style: %+v", slack.Android)
+	}
+	wa := renderTimelineNotification(map[string]any{"source": "whatsapp", "actor": "Sam", "source_pk": map[string]any{"account": "me", "chat_id": "123@s.whatsapp.net"}}, "https://pdw.example", timelineLinkEnv{})
+	if wa.Android.ChannelID != "whatsapp" || wa.Android.Color != "#25D366" || wa.Android.GroupKey != "pdw:whatsapp" {
+		t.Fatalf("whatsapp style: %+v", wa.Android)
+	}
+	cal := renderTimelineNotification(map[string]any{"source": "calendar", "actor": "Organizer", "title": "Standup"}, "https://pdw.example", timelineLinkEnv{})
+	if cal.AndroidAlert == nil || cal.AndroidAlert.ChannelID != "calendar" || cal.AndroidAlert.Category != "event" || cal.AndroidAlert.Color != "#039BE5" || cal.AndroidAlert.AvatarName != "Organizer" {
+		t.Fatalf("calendar style: %+v", cal.AndroidAlert)
 	}
 }
 

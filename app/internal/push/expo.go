@@ -68,6 +68,9 @@ func (m Message) AndroidDataOnly() Message {
 			alert[key] = value
 		}
 	}
+	if m.ChannelID != "" && m.ChannelID != AndroidChannelID {
+		alert["channel_id"] = m.ChannelID
+	}
 	if m.RichContent != nil && m.RichContent.Image != "" {
 		alert["image_url"] = m.RichContent.Image
 	}

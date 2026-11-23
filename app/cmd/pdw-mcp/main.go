@@ -76,7 +76,7 @@ func main() {
 		SlackAccounts:           cfg.SlackMutationAccounts,
 	})
 	logger.Info("mutation review enabled", "path", mutations.ReviewPath, "api", mutations.APIPath)
-	notificationSvc, err := server.NewTimelineNotifications(cfg, os.Getenv("PDW_WEB_PUSH_PUBLIC_KEY"), os.Getenv("PDW_WEB_PUSH_PRIVATE_KEY"), cfg.BaseURL)
+	notificationSvc, err := server.NewTimelineNotifications(cfg, authSvc, os.Getenv("PDW_WEB_PUSH_PUBLIC_KEY"), os.Getenv("PDW_WEB_PUSH_PRIVATE_KEY"), cfg.BaseURL)
 	if err != nil {
 		logger.Error("notification worker initialization failed", "error", err)
 		os.Exit(1)

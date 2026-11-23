@@ -274,6 +274,54 @@ func TestAMutationAlertCollapsesWithTheRequestsOtherAlerts(t *testing.T) {
 	}
 }
 
+// A non-chat timeline alert with AndroidAlertStyle (e.g. Gmail) drops the
+// static app icon from image_url so Android does not blow it up into
+// BigPictureStyle, and instead carries the contact face, channel, category,
+// subject, accent color, grouping and real event timestamp.
+func TestNativeAndroidNonChatAlertCarriesRichStyleWithoutStaticLogoBanner(t *testing.T) {
+	d := Delivery{
+		ID:             "d1",
+		NotificationID: "n1",
+		Alert: Alert{
+			Title:        "Sam Example",
+			Subtitle:     "Gmail · Quarterly update",
+			Body:         "Here are the numbers.",
+			Icon:         "https://pdw.example/app/notification-icons/gmail.png",
+			Route:        "/timeline/gmail_message/1",
+			OccurredAtMs: 1700000000123,
+			AndroidAlert: &AndroidAlertStyle{
+				Source:         "Gmail",
+				SourceKey:      "gmail",
+				ChannelID:      push.AndroidMailChannelID,
+				Color:          "#D93025",
+				Category:       "email",
+				GroupKey:       "pdw:gmail",
+				GroupTitle:     "Gmail",
+				Subject:        "Quarterly update",
+				AvatarURL:      "https://pdw.example/api/notifications/avatar?k=slack&exp=1&sig=s",
+				AvatarName:     "Sam Example",
+				AvatarCacheKey: "abc123",
+			},
+		},
+	}
+	m := expoMessage("ExponentPushToken[px]", "android", push.CapabilityAndroidNativeAlerts, d)
+	alert, ok := m.Data[push.AndroidAlertKey].(map[string]any)
+	if !ok {
+		t.Fatalf("missing android_alert: %+v", m.Data)
+	}
+	if _, hasImg := alert["image_url"]; hasImg {
+		t.Fatalf("static app icon leaked into image_url: %+v", alert)
+	}
+	if alert["channel_id"] != "mail" || alert["color"] != "#D93025" || alert["category"] != "email" ||
+		alert["subject"] != "Quarterly update" || alert["avatar_name"] != "Sam Example" ||
+		alert["avatar_cache_key"] != "abc123" || alert["group_key"] != "pdw:gmail" {
+		t.Fatalf("wrong android_alert fields: %+v", alert)
+	}
+	if alert["occurred_at_ms"] != int64(1700000000123) {
+		t.Fatalf("wrong occurred_at_ms: %#v", alert["occurred_at_ms"])
+	}
+}
+
 // A web push for a mutation alert opens the web review, not the phone's
 // /mutations/<id> route, which the web app does not serve.
 func TestAMutationAlertOpensTheWebReviewInABrowser(t *testing.T) {

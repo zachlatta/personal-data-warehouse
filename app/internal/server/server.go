@@ -220,6 +220,9 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 	mux := http.NewServeMux()
 	if notificationSvc != nil {
 		notificationSvc.Register(mux, authSvc.RequireStaticBearer())
+		if authSvc != nil {
+			mux.Handle(notificationAvatarPath, newAvatarProxy(notificationSvc.DB, authSvc, slog.Default()))
+		}
 	}
 	baseURL := cfg.BaseURL
 	if baseURL == "" {

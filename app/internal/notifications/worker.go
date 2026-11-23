@@ -40,11 +40,20 @@ type Alert struct {
 	Kind      string `json:"kind,omitempty"`
 	RequestID string `json:"request_id,omitempty"`
 	Quiet     bool   `json:"quiet,omitempty"`
+	// OccurredAtMs is the real-world event timestamp in Unix milliseconds,
+	// populated from the outbox's event_ts so Android shows when the event
+	// happened rather than when the delayed push arrived.
+	OccurredAtMs int64 `json:"occurred_at_ms,omitempty"`
 	// Android is set for chat alerts (messages, WhatsApp, Slack). An Android
 	// device that reports push.CapabilityAndroidNativeAlerts is sent it as a
 	// data-only push its native code draws as a conversation; every other
 	// device gets the ordinary alert and ignores it.
 	Android *AndroidStyle `json:"android_style,omitempty"`
+	// AndroidAlert carries native Android styling for non-chat alerts (Gmail,
+	// Calendar, Drive, Scans, mutation outcomes): per-source channel, accent
+	// color, category, sender avatar, email subject, content image, and
+	// per-source grouping. Ignored by iOS and web push.
+	AndroidAlert *AndroidAlertStyle `json:"android_alert_style,omitempty"`
 }
 
 // AndroidStyle is what NotificationCompat.MessagingStyle needs and the plain
@@ -54,7 +63,11 @@ type AndroidStyle struct {
 	// Source names the app the message came from ("Messages", "Slack"); the
 	// phone shows it in the notification header, where Expo's dropped
 	// subtitle used to carry it.
-	Source string `json:"source"`
+	Source    string `json:"source"`
+	SourceKey string `json:"source_key,omitempty"`
+	ChannelID string `json:"channel_id,omitempty"`
+	Color     string `json:"color,omitempty"`
+	GroupKey  string `json:"group_key,omitempty"`
 	// ConversationID is the alert's thread id: one notification, and one
 	// conversation shortcut, per chat.
 	ConversationID    string `json:"conversation_id"`
@@ -62,10 +75,34 @@ type AndroidStyle struct {
 	Group             bool   `json:"group"`
 	SenderName        string `json:"sender_name"`
 	SenderKey         string `json:"sender_key"`
-	// AvatarURL is an https photo of the sender, or empty for an initial.
-	AvatarURL string `json:"avatar_url,omitempty"`
+	// AvatarURL is an authenticated https photo of the sender, or empty for an initial.
+	AvatarURL      string `json:"avatar_url,omitempty"`
+	AvatarCacheKey string `json:"avatar_cache_key,omitempty"`
+	// ImageURL + ImageMimeType attach an inline image to the MessagingStyle
+	// message via FileProvider, just like native messaging apps.
+	ImageURL      string `json:"image_url,omitempty"`
+	ImageMimeType string `json:"image_mime_type,omitempty"`
+	OccurredAtMs  int64  `json:"occurred_at_ms,omitempty"`
 	// EventID keeps a redelivered message from being added to a chat twice.
 	EventID string `json:"event_id"`
+}
+
+// AndroidAlertStyle carries native Android presentation for non-chat alerts
+// (email, calendar, drive, scans, mutations) under data.android_alert.
+type AndroidAlertStyle struct {
+	Source         string `json:"source,omitempty"`
+	SourceKey      string `json:"source_key,omitempty"`
+	ChannelID      string `json:"channel_id,omitempty"`
+	Color          string `json:"color,omitempty"`
+	Category       string `json:"category,omitempty"`
+	GroupKey       string `json:"group_key,omitempty"`
+	GroupTitle     string `json:"group_title,omitempty"`
+	Subject        string `json:"subject,omitempty"`
+	AvatarURL      string `json:"avatar_url,omitempty"`
+	AvatarName     string `json:"avatar_name,omitempty"`
+	AvatarCacheKey string `json:"avatar_cache_key,omitempty"`
+	ImageURL       string `json:"image_url,omitempty"`
+	OccurredAtMs   int64  `json:"occurred_at_ms,omitempty"`
 }
 
 // MutationAdapter is the outbox adapter of mutation alerts (policy outcomes,
@@ -304,10 +341,11 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	var id string
+	var eventTS time.Time
 	var payload []byte
 	var phoneHoldUntil time.Time
 	var muted bool
-	err = tx.QueryRowContext(ctx, s.q(`SELECT id,payload,greatest(now(),`+phoneWitnessAnchor+`+$1::interval),`+sourceMuted+` FROM @notification_events n WHERE status='pending' AND `+timelineGate+` ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`), interval(PhoneWitnessHold)).Scan(&id, &payload, &phoneHoldUntil, &muted)
+	err = tx.QueryRowContext(ctx, s.q(`SELECT id,event_ts,payload,greatest(now(),`+phoneWitnessAnchor+`+$1::interval),`+sourceMuted+` FROM @notification_events n WHERE status='pending' AND `+timelineGate+` ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`), interval(PhoneWitnessHold)).Scan(&id, &eventTS, &payload, &phoneHoldUntil, &muted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -328,6 +366,19 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 	}
 	alert := s.Render(row)
 	alert.NotificationID = id
+	if eventTS.UnixMilli() > 0 && alert.OccurredAtMs == 0 {
+		alert.OccurredAtMs = eventTS.UnixMilli()
+		if alert.Android != nil && alert.Android.OccurredAtMs == 0 {
+			style := *alert.Android
+			style.OccurredAtMs = alert.OccurredAtMs
+			alert.Android = &style
+		}
+		if alert.AndroidAlert != nil && alert.AndroidAlert.OccurredAtMs == 0 {
+			style := *alert.AndroidAlert
+			style.OccurredAtMs = alert.OccurredAtMs
+			alert.AndroidAlert = &style
+		}
+	}
 	// capabilities is read through to_jsonb so a fan-out that runs before
 	// either ensure path has added the column sends ordinary alerts instead
 	// of failing (the Go app deploys before the Python ensure runs).
