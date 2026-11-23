@@ -43,6 +43,28 @@ jobs:
       - name: Ruff
         run: uvx ruff@0.14.1 check .
 
+  formal-models:
+    name: Formal models
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Exhaustive state-space checks of the concurrent workers (tests/formal/).
+      # Each exits non-zero with a counterexample trace; the contract suite also
+      # runs them with the past bugs they replay (tests/test_*_model.py).
+      - name: Mutation worker model
+        run: uv run python -m tests.formal.mutation_worker_model
+
   contracts:
     name: Contract suites
     runs-on: ubuntu-latest
