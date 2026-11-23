@@ -20,6 +20,11 @@ test('the manifest swaps Expo FCM service for the one that draws alerts', () => 
     ['.PdwMessagingService', null],
   ]);
   assert.equal(services[1]['intent-filter'][0].action[0].$['android:name'], 'com.google.firebase.MESSAGING_EVENT');
+  const providers = manifest.manifest.application[0].provider;
+  assert.equal(providers.length, 1);
+  assert.equal(providers[0].$['android:name'], plugin.FILE_PROVIDER);
+  assert.equal(providers[0].$['android:authorities'], '${applicationId}' + plugin.FILE_PROVIDER_AUTHORITY_SUFFIX);
+  assert.equal(providers[0].$['android:grantUriPermissions'], 'true');
 });
 
 test('the app module compiles against Firebase messaging, once', () => {
@@ -85,7 +90,7 @@ test('the native renderer and the server agree on the channels and payload keys'
   const kotlin = plugin.KOTLIN('com.zachlatta.pdw');
   const goPush = readFileSync(path.join(mobile, '../app/internal/push/capabilities.go'), 'utf8');
   const goSender = readFileSync(path.join(mobile, '../app/internal/notifications/sender.go'), 'utf8');
-  const channel = /AndroidMessagesChannelID = "(\w+)"/.exec(goPush)[1];
+  const channel = /AndroidMessagesChannelID\s*=\s*"(\w+)"/.exec(goPush)[1];
   assert.match(kotlin, new RegExp(`CHANNEL_ID = "${channel}"`));
   assert.match(goSender, /data\["android_style"\]/);
   assert.match(kotlin, /STYLE_KEY = "android_style"/);
@@ -103,8 +108,14 @@ test('the native renderer and the server agree on the channels and payload keys'
   assert.match(pushTs, new RegExp(`ANDROID_CHANNEL_ID = '${alertChannel}'`));
   const dataOnly = goExpo.slice(goExpo.indexOf('func (m Message) AndroidDataOnly'), goExpo.indexOf('// RichContent is the media'));
   const fields = [...dataOnly.matchAll(/"(\w+)":/g), ...dataOnly.matchAll(/alert\["(\w+)"\]/g)].map((m) => m[1]);
-  assert.deepEqual([...fields].sort(), ['body', 'collapse_id', 'image_url', 'silent', 'subtitle', 'title']);
+  assert.deepEqual([...fields].sort(), ['body', 'channel_id', 'collapse_id', 'image_url', 'silent', 'subtitle', 'title']);
   for (const field of fields) assert.match(kotlin, new RegExp(`opt\\w+\\("${field}"\\)`), `the phone does not read ${field}`);
+
+  // Every per-source channel declared in Go exists in both Kotlin and push.ts.
+  for (const [, name, id] of goPush.matchAll(/Android(\w+)ChannelID\s*=\s*"(\w+)"/g)) {
+    assert.match(kotlin, new RegExp(`"${id}"`), `Kotlin missing channel ${name} (${id})`);
+    assert.match(pushTs, new RegExp(`'${id}'`), `push.ts missing channel ${name} (${id})`);
+  }
 });
 
 // The phone's notification listener uploads string extras. Stamping the
@@ -138,13 +149,27 @@ test('a non-chat alert goes through the same eviction, pacing and tap as a chat'
   assert.match(kotlin, /compareBy<StatusBarNotification> \{ it\.tag == NOTIFICATION_TAG \}/);
   // An alert without a collapse id must not replace the previous one.
   assert.match(kotlin, /optString\("collapse_id"\)\.ifBlank \{ tap\.notificationRequest\.identifier \}/);
-  assert.match(kotlin, /base\(context, tap, ALERT_CHANNEL_ID\)/);
+  assert.match(kotlin, /base\(context, tap, channelId, color\)/);
   assert.match(kotlin, /setSilent\(alert\.optBoolean\("silent"\)\)/);
   // One place builds the tap, so handleNotificationResponse sees one kind of alert.
   assert.equal(kotlin.match(/createNotificationResponseIntent/g).length, 1);
   // A native-drawn alert has no action buttons: an Approve with no running JS waits for the next launch.
   assert.doesNotMatch(kotlin, /addAction/);
   assert.match(kotlin, /if \(chat\) PdwNotifications\.postPlain\(context, data, tap\)\s+else PdwNotifications\.postAlertPlain\(/);
+});
+
+test('rich native features: disk avatar cache, FileProvider inline media, bold email subject, per-source InboxStyle group summaries, event timestamps', () => {
+  const kotlin = plugin.KOTLIN('com.zachlatta.pdw');
+  assert.match(kotlin, /pdw_avatars/);
+  assert.match(kotlin, /pdw_notif_media/);
+  assert.match(kotlin, /FileProvider\.getUriForFile/);
+  assert.match(kotlin, /message\.setData\(mimeType, uri\)/);
+  assert.match(kotlin, /optLong\("occurred_at_ms", 0L\)/);
+  assert.match(kotlin, /optString\("subject"\)/);
+  assert.match(kotlin, /StyleSpan\(Typeface\.BOLD\)/);
+  assert.match(kotlin, /NotificationCompat\.InboxStyle\(\)/);
+  assert.match(kotlin, /setGroupSummary\(true\)/);
+  assert.match(kotlin, /GROUP_ALERT_CHILDREN/);
 });
 
 test('notifications evict above the 30-notification shade ceiling, merge 5s bursts, cache avatars, pace notify, and serialize event_ids as a string', () => {

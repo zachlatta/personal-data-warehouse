@@ -38,25 +38,35 @@ function projectId(): string | undefined {
 export const ANDROID_CHANNEL_ID = 'default';
 
 // Every alert is drawn by the native PdwMessagingService
-// (plugins/with-messaging-notifications.js), which also creates both channels
-// for an alert before first launch. Chat alerts (messages, WhatsApp, Slack) are
-// conversations on their own channel, so they can be tuned apart from other
-// alerts in Android settings.
+// (plugins/with-messaging-notifications.js), which also creates every channel
+// lazily for an alert before first launch. Creating them here on launch lets
+// users tune each source in Android notification settings immediately.
 export const ANDROID_MESSAGES_CHANNEL_ID = 'messages';
+export const ANDROID_SLACK_CHANNEL_ID = 'slack';
+export const ANDROID_WHATSAPP_CHANNEL_ID = 'whatsapp';
+export const ANDROID_MAIL_CHANNEL_ID = 'mail';
+export const ANDROID_CALENDAR_CHANNEL_ID = 'calendar';
+export const ANDROID_MUTATIONS_CHANNEL_ID = 'mutations';
 
 async function ensureAndroidChannel(): Promise<void> {
   if (Platform.OS !== 'android') return;
-  await Notifications.setNotificationChannelAsync(ANDROID_CHANNEL_ID, {
-    name: 'Alerts',
-    importance: Notifications.AndroidImportance.HIGH,
-    showBadge: true,
-  });
-  await Notifications.setNotificationChannelAsync(ANDROID_MESSAGES_CHANNEL_ID, {
-    name: 'Messages',
-    description: 'Messages, WhatsApp and Slack, shown as conversations',
-    importance: Notifications.AndroidImportance.HIGH,
-    showBadge: true,
-  });
+  const specs = [
+    { id: ANDROID_CHANNEL_ID, name: 'Alerts', description: 'General PDW alerts' },
+    { id: ANDROID_MESSAGES_CHANNEL_ID, name: 'Messages', description: 'SMS, MMS, RCS and iMessage conversations' },
+    { id: ANDROID_SLACK_CHANNEL_ID, name: 'Slack', description: 'Slack DMs, channels and threads' },
+    { id: ANDROID_WHATSAPP_CHANNEL_ID, name: 'WhatsApp', description: 'WhatsApp chats and groups' },
+    { id: ANDROID_MAIL_CHANNEL_ID, name: 'Mail', description: 'Gmail messages' },
+    { id: ANDROID_CALENDAR_CHANNEL_ID, name: 'Calendar', description: 'Calendar invites and reminders' },
+    { id: ANDROID_MUTATIONS_CHANNEL_ID, name: 'Approvals', description: 'PDW mutation approvals and policy outcomes' },
+  ];
+  for (const spec of specs) {
+    await Notifications.setNotificationChannelAsync(spec.id, {
+      name: spec.name,
+      description: spec.description,
+      importance: Notifications.AndroidImportance.HIGH,
+      showBadge: true,
+    });
+  }
 }
 
 // Ask for permission, get the Expo push token, and tell the warehouse about
