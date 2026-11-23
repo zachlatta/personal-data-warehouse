@@ -67,7 +67,6 @@ class FakeWarehouse:
         *,
         ensure_tables: bool = True,
         providers=None,
-        exclude_providers=None,
     ) -> int:
         self.approved_count_ensure_flags.append(ensure_tables)
         return self.approved_count
@@ -140,7 +139,6 @@ class FakeWarehouse:
         limit: int,
         claimed_by: str,
         providers=None,
-        exclude_providers=None,
         ensure_tables=True,
     ):
         self.calls.append("claim")

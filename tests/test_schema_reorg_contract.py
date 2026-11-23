@@ -1293,7 +1293,6 @@ def test_guide_only_names_columns_that_exist_on_their_relations(
     )
 
 
-
 def test_every_ensure_path_adds_a_column_its_spec_gained_to_a_table_that_already_exists(
     warehouse: PostgresWarehouse,
 ) -> None:
