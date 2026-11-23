@@ -288,3 +288,17 @@ func TestGuideWalksTheLayersTimelineFirst(t *testing.T) {
 		}
 	}
 }
+
+// `request_id` on ops.upstream_mutation_requests was a top-three failure shape
+// in the week of 2026-11-16 (six sessions): the key is `id`.
+func TestBriefNamesTheMutationStatusKey(t *testing.T) {
+	for _, surface := range []Surface{SurfaceCLI, SurfaceMCP} {
+		brief := mustRender(t, surface, "")
+		for _, want := range []string{"ops.upstream_mutation_requests.id", "not `request_id`", "context_json", "result_json", "`operation`"} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("%s brief does not say %q", surface, want)
+			}
+		}
+	}
+}
+

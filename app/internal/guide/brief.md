@@ -86,6 +86,8 @@ Not commands: `pdw query` (it is `pdw sql`), `pdw tools` / `pdw connections` (`p
   `base_slack.conversations`. `search_text()` rows name the sender `who` (not `actor`); agent `events`
   have `role`, `occurred_at` (no `actor`, `created_at`). Regex repeat counts max out at 255: use `.{0,255}`, or `substr(col, greatest(1, strpos(col, x) - 300), 600)`.
 - `ops.*` is unreadable by the query role; `marts_ops.*` is the health surface (topic `ops`).
+  A mutation's status: `ops.upstream_mutation_requests.id` (not `request_id`), with `context_json`
+  and `result_json`; its operations carry `request_id` and the type in `operation`.
 
 ## Where things live
 
