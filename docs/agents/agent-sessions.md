@@ -642,6 +642,13 @@ run stops after N groups, restores the writers and exits nonzero with the number
 of planned sessions left; rerun `apply` to resume from the checkpoint. Size N and
 the number of outages from the credential report's `sessions` block (affected
 sessions, their canonical rows, the largest session and those over 10,000 rows).
+A session over 10,000 rows always runs in its own group; `apply
+--large-session-window-seconds S` (at most 300) gives that group a longer
+transaction deadline, and every other group keeps 60 seconds. Writers are stopped
+throughout, so the longer deadline only lengthens that outage. The in-window
+session recheck and the post-apply verification read only rows that pass the
+scan's prefilter, and the credential selector runs full confirmation only where a
+rule's anchor appears.
 Each DB transaction retains the 60-second rollback deadline and row gates.
 Restoration is registered **before** stopping anything: even a partial stop or
 failed apply starts the app, then Dagster, in `finally` (`plan` accepts only running writers).
@@ -685,8 +692,9 @@ New selected source keys **within a planned session** abort for rediscovery.
 Timeline reads use `(adapter,event_id)` and canonical chunks use their indexed
 `anchor`; late-built chunks for rebuilt events are removed too. Chunk/embedding
 deletes and saved-key confirmation are batched. Complete-session groups accept
-up to 10,000 canonical rows, so a session larger than the legacy 5,000-row cap
-can be repaired without splitting its canonical regeneration. Oversized groups
+up to 30,000 canonical rows (`--max-canonical-rows`, default 10,000), so a session
+larger than the legacy 5,000-row cap can be repaired without splitting its
+canonical regeneration. Oversized groups
 still fail the CLI as incomplete. This explicit mode repairs the plan, **not
 unrelated sessions**: it makes no global in-window absence claim. The mandatory
 full post-restore DB scan and the credential report above establish DB completion;

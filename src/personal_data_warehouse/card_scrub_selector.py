@@ -132,7 +132,11 @@ class ScrubSelector:
 
     def count(self, value):
         if self.scope=='all': return cr.sensitive_count(value)
-        if self.scope=='credentials': return credential_redaction.credential_count(value)
+        if self.scope=='credentials':
+            # The superset prefilter rejects most values in one regex search;
+            # full confirmation runs only where a rule's anchor is present.
+            if not credential_redaction.might_contain_credential(value): return 0
+            return credential_redaction.credential_count(value)
         return sum('[card ' in r for _,_,r in self._edits(value))
 
     def count_row(self, row):

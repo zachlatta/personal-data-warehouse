@@ -145,3 +145,65 @@ def test_session_groups_can_be_applied_a_bounded_number_at_a_time(tmp_path, monk
     assert len(applied) == 3 and len(second['batches']['completed']) == 3
     with pytest.raises(ValueError, match='budget'):
         module.apply_batches(None, path, max_canonical_rows=30001, **{k: v for k, v in kwargs.items() if k != 'max_canonical_rows'})
+
+
+def test_credential_selector_skips_full_confirmation_without_an_anchor(monkeypatch):
+    from personal_data_warehouse import credential_redaction
+    selector = ScrubSelector('credentials')
+    calls = []
+    original = credential_redaction.credential_edits
+    monkeypatch.setattr(credential_redaction, 'credential_edits', lambda value: calls.append(1) or original(value))
+    assert selector.count_row({'text': 'ordinary prose ' * 500, 'raw_json': {'k': 'v'}, 'seq': 1}) == 0
+    assert calls == []
+    assert selector.count_row({'text': 'use ' + TOKEN}) == 1 and calls
+
+
+def test_planned_session_recheck_reads_only_prefiltered_rows(warehouse):
+    from personal_data_warehouse import scrub_conversation_cards as m
+    from personal_data_warehouse.card_prefilter import ConfirmationPool
+    selector = ScrubSelector('credentials')
+    rows = [dict(event(), event_uuid=f'p{i}', seq=i + 1, text='plain words', raw_json='{}') for i in range(5)]
+    rows.append(dict(event(), event_uuid='dirty', seq=99, text='use ' + TOKEN, raw_json='{}'))
+    warehouse._insert_rows('claude_code_events', rows, AGENT_SESSION_EVENT_COLUMNS)
+    read = []
+    original = warehouse._query_dicts
+    warehouse._query_dicts = lambda sql, params=None: read.extend(r := original(sql, params)) or r
+    plan = dict(candidates=[dict(table='claude_code_events', key=['claude_code', 'test-session', 'dirty'],
+                                 session=['claude_code', 'test-session'], month='2026-11', source='claude_code', matches=1)])
+    with ConfirmationPool(1, selector) as pool:
+        selected = m._session_candidates(warehouse, plan, pool)
+    assert [s['key'][2] for s in selected] == ['dirty']
+    assert [r['event_uuid'] for r in read] == ['dirty']
+
+
+def test_planned_rows_can_read_only_prefiltered_rows(warehouse):
+    from personal_data_warehouse import scrub_conversation_cards as m
+    rows = [dict(event(), event_uuid=f'p{i}', seq=i + 1, text='plain words', raw_json='{}') for i in range(3)]
+    rows.append(dict(event(), event_uuid='dirty', seq=99, text='use ' + TOKEN, raw_json='{}'))
+    warehouse._insert_rows('claude_code_events', rows, AGENT_SESSION_EVENT_COLUMNS)
+    candidates = [dict(table='claude_code_events', key=['claude_code', 'test-session', r['event_uuid']]) for r in rows]
+    assert len(m._planned_rows(warehouse, candidates)) == 4
+    assert [r['event_uuid'] for _, r in m._planned_rows(warehouse, candidates, prefilter_scope='credentials')] == ['dirty']
+
+
+def test_a_large_session_runs_alone_under_its_own_deadline(tmp_path, monkeypatch):
+    import personal_data_warehouse.scrub_conversation_cards as module
+    sessions = {('claude_code', 'big'): 25000, ('claude_code', 'a'): 100, ('claude_code', 'b'): 200}
+    candidates = [dict(table='claude_code_events', key=['claude_code', s, 'e'], session=['claude_code', s],
+                       month='2026-11', source='claude_code', matches=1) for _, s in sessions]
+    plan = dict(version=2, scope=['db', None, None, 'public'], watermarks={'timeline_events': 0, 'search_chunks': '', 'snapshot': '1:1:'},
+                candidates=candidates, counts=module._details(candidates), selector=ScrubSelector('credentials').specification, left_alone=0)
+    path = tmp_path / 'plan.json'
+    path.write_text(json.dumps(plan))
+    windows = {}
+    monkeypatch.setattr(module, '_scope', lambda warehouse: plan['scope'])
+    monkeypatch.setattr(module, '_planned_rows', lambda warehouse, candidates, **k: [])
+    monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, s, limit: {k: sessions[k] for k in s})
+    monkeypatch.setattr(module, 'scrub', lambda warehouse, plan, **k: windows.update(
+        {tuple(sorted(c['session'][1] for c in plan['candidates'])): k['window_seconds']}))
+    module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True,
+                         max_canonical_rows=30000, window_seconds=60, gap_seconds=0, large_session_window_seconds=180)
+    assert windows == {('big',): 180, ('a', 'b'): 60}
+    with pytest.raises(ValueError, match='budget'):
+        module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'),
+                             planned_only=True, large_session_window_seconds=301)
