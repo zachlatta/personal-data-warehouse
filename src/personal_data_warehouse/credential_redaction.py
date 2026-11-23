@@ -35,16 +35,20 @@ _BASE64_CHAR = re.compile(r'[A-Za-z0-9+/]')
 _BEARER = re.compile(r'(?i)bearer[ \t]+([A-Za-z0-9._~+/=-]{16,})')
 _LABEL = (r'(?:secret[ _-]?access[ _-]?key|client[ _-]?secret|secret[ _-]?key|private[ _-]?key|'
           r'api[ _-]?key|apikey|passphrase|password|passwd|secret|token)')
-_LABELLED = re.compile(r'(?i)([A-Za-z0-9_.-]*?' + _LABEL + r')[ \t]*\\*["\']?[ \t]*[:=][ \t]*\\*["\']?[ \t]*'
+# The label is matched alone and its identifier found by a bounded walk back:
+# a lazy identifier prefix in the pattern is quadratic on long base64 runs.
+_LABELLED = re.compile(r'(?i)(' + _LABEL + r')[ \t]*\\*["\']?[ \t]*[:=][ \t]*\\*["\']?[ \t]*'
                        r'([^ \t\n\r\f\v"\'\\`,;&|<>(){}\[\]]+)')
 _LABEL_KEY = re.compile(r'(?i)[A-Za-z0-9_. -]*?' + _LABEL)
 _NOT_SECRET_LABEL = re.compile(r'(?i)(?:^|[_. -])(?:page|next|prev|previous|continuation|sync|cursor|csrf|xsrf|'
                                r'idempotency|pagination|max|min|num|total|input|output|cache|count|reasoning|'
                                r'completion|prompt)[ _-]?token$')
-_ENV_NAME = re.compile(r'[A-Z0-9_]*_[A-Z0-9_]*')
+_ENV_CHARS = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')
 _PLACEHOLDER_WORDS = ('...', '***', 'xxxx', 'redacted', 'example', 'placeholder', 'changeme', 'your', 'dummy')
 _PLACEHOLDER_PASSWORDS = frozenset(('password', 'pass', 'passwd', 'pwd', 'secret', 'changeme', 'admin', 'root', 'guest'))
 _WORD = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_')
+_IDENTIFIER = _WORD | frozenset('.-')
+_IDENTIFIER_WALK = 128
 _MARKER_KIND = re.compile(r'\[REDACTED:([a-z_]+):[0-9a-f]{6}\]')
 
 
@@ -83,7 +87,7 @@ def _placeholder(value):
 
 def _secret_value(value):
     return (len(value) >= 8 and _has_letter_and_digit(value) and not _placeholder(value) and
-            not _ENV_NAME.fullmatch(value))
+            not ('_' in value and all(c in _ENV_CHARS for c in value)))
 
 
 def _boundary(value, start, extra=''):
@@ -125,7 +129,10 @@ def _text_edits(value):
         if _boundary(value, m.start()) and _secret_value(m[1]):
             candidates.append((m.start(1), m.end(1), 'bearer_token'))
     for m in _LABELLED.finditer(value):
-        label, secret = m[1], m[2]
+        start = m.start(1)
+        while start > max(0, m.start(1) - _IDENTIFIER_WALK) and value[start - 1] in _IDENTIFIER:
+            start -= 1
+        label, secret = value[start:m.end(1)], m[2]
         if (_NOT_SECRET_LABEL.search(label) or not _secret_value(secret) or
                 m.end() < len(value) and value[m.end()] == '('):
             continue
@@ -151,7 +158,7 @@ def credential_edits(value: str):
         inner = credential_edits(decoded)
         if not inner and index >= 2 and tokens[index - 1][0] == ':' and tokens[index - 2][0].startswith('"'):
             key = json.loads(tokens[index - 2][0])
-            if (_LABEL_KEY.fullmatch(key) and not _NOT_SECRET_LABEL.search(key) and
+            if (len(key) <= _IDENTIFIER_WALK and _LABEL_KEY.fullmatch(key) and not _NOT_SECRET_LABEL.search(key) and
                     not any(c in _WS for c in decoded) and _secret_value(decoded)):
                 inner = [(0, len(decoded), marker('password' if 'pass' in key.lower() else 'secret', decoded))]
         if inner:

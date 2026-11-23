@@ -64,3 +64,12 @@ def test_redact_row_masks_every_column():
     assert slack not in json.dumps(cleaned)
     assert cleaned['seq'] == 3
     assert all(re.search(r'\[REDACTED:slack_token:[0-9a-f]{6}\]', json.dumps(cleaned[k])) for k in ('text', 'tool_input_json', 'raw_json'))
+
+
+def test_long_identifier_runs_are_linear():
+    import time
+    blob = ('aB3dE5_token.Secret-' * 50000) + ' password'
+    started = time.monotonic()
+    for value in (blob, json.dumps({'tool_result': blob}), 'token=' + blob):
+        credential_edits(value)
+    assert time.monotonic() - started < 3

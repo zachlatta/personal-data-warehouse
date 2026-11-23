@@ -21,6 +21,8 @@ import (
 	"unicode/utf8"
 )
 
+const credentialIdentifierWalk = 128
+
 const credentialLabel = `(?:secret[ _-]?access[ _-]?key|client[ _-]?secret|secret[ _-]?key|private[ _-]?key|` +
 	`api[ _-]?key|apikey|passphrase|password|passwd|secret|token)`
 
@@ -37,7 +39,9 @@ var (
 	credentialPEMTail  = regexp.MustCompile(`^[A-Za-z0-9+/=\r\n\\]*`)
 	credentialBase64   = regexp.MustCompile(`[A-Za-z0-9+/]`)
 	credentialBearer   = regexp.MustCompile(`(?i)bearer[ \t]+([A-Za-z0-9._~+/=-]{16,})`)
-	credentialLabelled = regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*?` + credentialLabel + `)[ \t]*\\*["']?[ \t]*[:=][ \t]*\\*["']?[ \t]*` +
+	// The label is matched alone and its identifier found by a bounded walk
+	// back, as Python does (a lazy prefix is quadratic in Python's engine).
+	credentialLabelled = regexp.MustCompile(`(?i)(` + credentialLabel + `)[ \t]*\\*["']?[ \t]*[:=][ \t]*\\*["']?[ \t]*` +
 		"([^ \\t\\n\\r\\f\\v\"'\\\\`,;&|<>(){}\\[\\]]+)")
 	credentialLabelKey    = regexp.MustCompile(`(?i)^(?:[A-Za-z0-9_. -]*?` + credentialLabel + `)$`)
 	credentialNotSecret   = regexp.MustCompile(`(?i)(?:^|[_. -])(?:page|next|prev|previous|continuation|sync|cursor|csrf|xsrf|idempotency|pagination|max|min|num|total|input|output|cache|count|reasoning|completion|prompt)[ _-]?token$`)
@@ -165,7 +169,11 @@ func credentialTextEdits(s string) []cardEdit {
 		}
 	}
 	for _, m := range credentialLabelled.FindAllStringSubmatchIndex(s, -1) {
-		label, secret := s[m[2]:m[3]], s[m[4]:m[5]]
+		start := m[2]
+		for start > 0 && start > m[2]-credentialIdentifierWalk && (cardWordByte(s[start-1]) || s[start-1] == '.' || s[start-1] == '-') {
+			start--
+		}
+		label, secret := s[start:m[3]], s[m[4]:m[5]]
 		if credentialNotSecret.MatchString(label) || !credentialSecretValue(secret) || m[1] < len(s) && s[m[1]] == '(' {
 			continue
 		}
@@ -210,7 +218,7 @@ func credentialEdits(s string) []cardEdit {
 		if len(inner) == 0 && i >= 2 && s[tokens[i-1][0]:tokens[i-1][1]] == ":" && strings.HasPrefix(s[tokens[i-2][0]:tokens[i-2][1]], `"`) {
 			var key string
 			_ = json.Unmarshal([]byte(s[tokens[i-2][0]:tokens[i-2][1]]), &key)
-			if credentialLabelKey.MatchString(key) && !credentialNotSecret.MatchString(key) &&
+			if len(key) <= credentialIdentifierWalk && credentialLabelKey.MatchString(key) && !credentialNotSecret.MatchString(key) &&
 				!strings.ContainsAny(decoded, " \t\n\r\f\v") && credentialSecretValue(decoded) {
 				kind := "secret"
 				if strings.Contains(strings.ToLower(key), "pass") {
