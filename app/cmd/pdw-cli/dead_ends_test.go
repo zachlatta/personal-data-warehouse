@@ -20,6 +20,10 @@ func TestUnknownFlagNamesTheFlagThatWorks(t *testing.T) {
 		// --query: 5 calls in 5 sessions; the query is the positional argument.
 		{[]string{"search", "--query", "Howden"}, "pdw search [flags] '<words>'"},
 		{[]string{"search", "--table", "base_gmail.messages", "Howden"}, "--source"},
+		// --after: 7 sessions in the week to 2026-11-23. Only --since exists (C9).
+		{[]string{"search", "--after", "2026-11-01", "Howden"}, "use --since"},
+		{[]string{"search", "--from", "7d", "Howden"}, "--since"},
+		{[]string{"search", "--start", "2026-11-01", "Howden"}, "--since"},
 		// A near-miss spelling is answered with the closest real flag.
 		{[]string{"search", "Howden", "--priorty", "self"}, "--priority"},
 	} {

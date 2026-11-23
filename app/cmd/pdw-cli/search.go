@@ -287,6 +287,8 @@ func flagsFirst(fs *flag.FlagSet, args []string, command string) ([]string, erro
 // 2026-10-12: `pdw search --query`
 // 5 times in 5 sessions, `pdw search --table` twice. (`pdw sql --format` is
 // now an alias of --output.)
+const sinceFlagHint = "use --since for the event-time lower bound: a date (--since 2026-08-01) or a window (--since 7d, 12h, 2w)"
+
 var unknownFlagHints = map[string]map[string]string{
 	"sql": {
 		"--query": "the SQL is the positional argument: pdw sql [-q '<question>'] '<sql>' (-q is the plain-English question)",
@@ -299,6 +301,10 @@ var unknownFlagHints = map[string]map[string]string{
 		"-q":       "the query is the positional argument: pdw search [flags] '<words>'",
 		"--q":      "the query is the positional argument: pdw search [flags] '<words>'",
 		"--table":  "search spans the timeline; scope it with --source <token> (gmail, slack, calendar, imessage, ...; an unknown token is answered with the full list), or read one table with pdw sql",
+		// --after: 7 sessions in the week to 2026-11-23. One spelling (C9), no alias.
+		"--after": sinceFlagHint,
+		"--from":  sinceFlagHint,
+		"--start": sinceFlagHint,
 	},
 	"context": {
 		"--format": "use --output json",
