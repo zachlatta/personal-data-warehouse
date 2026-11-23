@@ -51,14 +51,10 @@ Development practices:
   rebuilds the view, about a minute after the push on 2026-10-20 (the Feed `saved` column).
   For a surface people are using, land the view change first, or have the Go read tolerate
   its absence.
-* **`uv run pytest` does not run `go test ./...`, and CI does.** Anything under `app/` — and
-  anything that *generates* into it, which in practice means
-  `src/personal_data_warehouse/warehouse_catalog.json` — is verified locally only by the Python
-  contract tests and by Go tests only after a push. A catalog edit is one JSON file plus
-  `scripts/generate_go_warehouse_catalog.py`, so it looks purely Python and is not: on
+* **`uv run pytest` runs `go test ./...` too** (`tests/test_go_suite.py`, Go on `PATH`
+  required). A catalog edit generates into `app/`, so it looks purely Python and is not: on
   2026-08-28 a new mart's catalog comment pushed `TestOverviewGuidanceStaysWithinBudget` past
-  its byte cap and reached `main` red behind a fully green `uv run pytest`. Run both when a
-  change touches the catalog or `app/`.
+  its byte cap and reached `main` red behind a fully green `uv run pytest`.
 
 ## The contracts
 
