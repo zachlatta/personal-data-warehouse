@@ -248,7 +248,8 @@ order in `mobile/src/lib/android-chat.ts`):
   members; an RCS group's (`rcs-group:<id>`) is opaque and Google Messages exposes no way to open
   one by id, so `recipients` is empty and the module opens Google Messages' conversation list.
 
-A group chat's link has an empty `url`: iOS and the web show no button for it, and Android opens
+A group chat's link has an empty `url`: iOS (`canOpenDeepLink`) and the web inspector
+(`browserLink` in `app/internal/webapp/static/format.js`) show no button for it, and Android opens
 it only through the target. A missing app (or an APK built before the module) makes the module
 report false; the app then tries `app_url`/`url` and, failing those, a tapped alert opens its PDW
 route. Both sides validate the target (two apps, a guid or address shape), because it comes from
