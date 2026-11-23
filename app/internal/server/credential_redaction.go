@@ -47,7 +47,7 @@ var (
 	credentialLabelled = regexp.MustCompile(`(?i)(` + credentialLabel + `)[ \t]*\\*["']?[ \t]*[:=][ \t]*\\*["']?[ \t]*` +
 		"([^ \\t\\n\\r\\f\\v\"'\\\\`,;&|<>(){}\\[\\]]+)")
 	credentialLabelKey  = regexp.MustCompile(`(?i)^(?:[A-Za-z0-9_. -]*?` + credentialLabel + `)$`)
-	credentialNotSecret = regexp.MustCompile(`(?i)(?:^|[_. -])(?:page|next|prev|previous|continuation|sync|cursor|csrf|xsrf|idempotency|pagination|max|min|num|total|input|output|cache|count|reasoning|completion|prompt|email|visit|client|set)[ _-]?token$`)
+	credentialNotSecret = regexp.MustCompile(`(?i)(?:^|[_. 0-9-])(?:page|next|prev|previous|continuation|sync|cursor|csrf|xsrf|idempotency|pagination|max|min|num|total|input|output|cache|count|reasoning|completion|prompt|email|visit|client|set)[ _-]?token$`)
 	// camelCase identifiers (nextPageToken) are split before the check above.
 	credentialCamel = regexp.MustCompile(`([a-z0-9])([A-Z])`)
 	// RFC 2606 example hosts: a URL pointing at one is an example, not a login.

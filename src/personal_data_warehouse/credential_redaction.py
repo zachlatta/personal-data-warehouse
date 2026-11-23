@@ -40,10 +40,11 @@ _LABEL = (r'(?:secret[ _-]?access[ _-]?key|client[ _-]?secret|secret[ _-]?key|pr
 _LABELLED = re.compile(r'(?i)(' + _LABEL + r')[ \t]*\\*["\']?[ \t]*[:=][ \t]*\\*["\']?[ \t]*'
                        r'([^ \t\n\r\f\v"\'\\`,;&|<>(){}\[\]]+)')
 _LABEL_KEY = re.compile(r'(?i)[A-Za-z0-9_. -]*?' + _LABEL)
-_NOT_SECRET_LABEL = re.compile(r'(?i)(?:^|[_. -])(?:page|next|prev|previous|continuation|sync|cursor|csrf|xsrf|'
+_NOT_SECRET_LABEL = re.compile(r'(?i)(?:^|[_. 0-9-])(?:page|next|prev|previous|continuation|sync|cursor|csrf|xsrf|'
                                r'idempotency|pagination|max|min|num|total|input|output|cache|count|reasoning|'
                                r'completion|prompt|email|visit|client|set)[ _-]?token$')
-# camelCase identifiers (nextPageToken) are split before the check above.
+# camelCase identifiers (nextPageToken) are split before the check above; a
+# digit may precede the word too (an escaped '&' reads as \u0026email_token).
 _CAMEL = re.compile(r'([a-z0-9])([A-Z])')
 # RFC 2606 example hosts: a URL pointing at one is an example, not a login.
 _URL_HOST = re.compile(r'[^:/?#@ \t\n\r\f\v\'"<>\[\]\\]*')
