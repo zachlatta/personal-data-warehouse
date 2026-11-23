@@ -119,7 +119,7 @@ def test_verify_removes_the_runtime_environment_only_after_clean_scans(tmp_path,
     assert not (tmp_path/'runtime.env').exists()
 
 
-def test_jsonl_token_cli_reports_remaining_secret(tmp_path,monkeypatch):
+def test_jsonl_credential_cli_reports_remaining_secret(tmp_path,monkeypatch):
     import sys
     from personal_data_warehouse import scrub_conversation_jsonl as m
     from tests.test_credential_scrub_scope import TOKEN

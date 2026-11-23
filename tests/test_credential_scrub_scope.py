@@ -17,7 +17,7 @@ CARD = 'card: 4111111111111111 CVV: 987'
 
 
 @pytest.mark.parametrize('depth', range(5))
-def test_tokens_preserve_every_other_byte(depth):
+def test_credentials_preserve_every_other_byte(depth):
     selector = ScrubSelector('credentials')
     value = '{ "card":4111111111111111,"cvv":987,"n":1e400,"text":"' + TOKEN + '" }'
     expected = value.replace(TOKEN, MASKED)
@@ -29,7 +29,7 @@ def test_tokens_preserve_every_other_byte(depth):
     assert selector.redact(CARD) == CARD
 
 
-def test_token_scope_cli_and_plan_identity():
+def test_credential_scope_cli_and_plan_identity():
     parser = argparse.ArgumentParser()
     add_selector_arguments(parser)
     assert parser.parse_args(['--scope', 'credentials']).scope == 'credentials'
@@ -38,7 +38,7 @@ def test_token_scope_cli_and_plan_identity():
         ScrubSelector('credentials', seed_rows=('unused',))
 
 
-def test_token_prefilter_includes_nested_unicode(warehouse):
+def test_credential_prefilter_includes_nested_unicode(warehouse):
     from personal_data_warehouse.card_prefilter import sql_prefilter
     selector = ScrubSelector('credentials')
     encoded = '"' + ''.join(r'\u%04x' % ord(c) for c in TOKEN) + '"'
@@ -53,7 +53,7 @@ def test_token_prefilter_includes_nested_unicode(warehouse):
 
 
 @pytest.mark.parametrize('dirty', ['source', 'timeline', 'chunk'])
-def test_tokens_rebuild_all_database_copies(warehouse, dirty, tmp_path):
+def test_credentials_rebuild_all_database_copies(warehouse, dirty, tmp_path):
     from personal_data_warehouse.scrub_conversation_cards import discover, scrub, write_plan, read_plan
     from personal_data_warehouse.search_index import SearchChunkBuilder
     from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
@@ -98,7 +98,7 @@ def test_tokens_rebuild_all_database_copies(warehouse, dirty, tmp_path):
         engine.close()
 
 
-def test_token_archives_and_host_jsonl(tmp_path, monkeypatch):
+def test_credential_archives_and_host_jsonl(tmp_path, monkeypatch):
     from personal_data_warehouse.scrub_conversation_objects import discover_objects, scrub_objects
     from personal_data_warehouse.scrub_conversation_jsonl import scrub_jsonl
     monkeypatch.chdir(tmp_path)
@@ -119,7 +119,7 @@ def test_token_archives_and_host_jsonl(tmp_path, monkeypatch):
     assert scrub_jsonl(tmp_path, 'session', selector=selector)['matches'] == 0
 
 
-def test_token_db_verify_cli_fails_until_clean(warehouse, monkeypatch):
+def test_credential_db_verify_cli_fails_until_clean(warehouse, monkeypatch):
     import sys
     import personal_data_warehouse.scrub_conversation_cards as module
     monkeypatch.setattr(module, 'PostgresWarehouse', lambda *a, **k: warehouse)
@@ -133,7 +133,7 @@ def test_token_db_verify_cli_fails_until_clean(warehouse, monkeypatch):
     module.main()
 
 
-def test_token_object_verify_cli_fails_until_clean(monkeypatch):
+def test_credential_object_verify_cli_fails_until_clean(monkeypatch):
     import sys
     import personal_data_warehouse.config as config
     import personal_data_warehouse.defs.agent_sessions_drive_ingest as ingest

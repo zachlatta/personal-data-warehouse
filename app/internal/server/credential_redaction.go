@@ -268,10 +268,6 @@ func credentialEdits(s string) []cardEdit {
 	return edits
 }
 
-func credentialCount(s string) int { return len(credentialEdits(s)) }
-
-func redactCredentials(s string) string { return applyCardEdits(s, credentialEdits(s)) }
-
 // withCredentials composes card edits with credential edits: a credential owns
 // its whole span, so overlapping card edits are dropped.
 func withCredentials(s string, cards []cardEdit) []cardEdit {

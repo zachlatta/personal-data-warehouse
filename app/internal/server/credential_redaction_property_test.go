@@ -125,6 +125,10 @@ func testCredentialWrap(kind, text string, expected bool) string {
 	panic(kind)
 }
 
+func credentialCount(s string) int { return len(credentialEdits(s)) }
+
+func redactCredentials(s string) string { return applyCardEdits(s, credentialEdits(s)) }
+
 type credentialCorpusItem struct{ name, input, expected string }
 
 func (f credentialFixture) corpus() []credentialCorpusItem {
