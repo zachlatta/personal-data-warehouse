@@ -12,7 +12,11 @@ import pytest
 
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
-from personal_data_warehouse.defs.upstream_mutations import process_upstream_mutation_batch
+from personal_data_warehouse.defs.upstream_mutations import (
+    CLOUD_MUTATION_PROVIDERS,
+    CloudMutationExecutors,
+    process_upstream_mutation_batch,
+)
 from personal_data_warehouse.postgres import PostgresWarehouse, _jsonb_param
 from personal_data_warehouse.upstream_mutation_schedule import precondition_failure
 
@@ -31,7 +35,9 @@ def warehouse():
         cleanup_test_warehouse(wh)
 
 
-def _seed(wh: PostgresWarehouse, *, not_before=None, not_after=None, precondition=None, status="approved") -> str:
+def _seed(
+    wh: PostgresWarehouse, *, not_before=None, not_after=None, precondition=None, status="approved", provider="resideo"
+) -> str:
     request_id = "req_" + uuid.uuid4().hex[:12]
     now = datetime.now(tz=UTC)
     epoch = datetime(1970, 1, 1, tzinfo=UTC)
@@ -48,11 +54,11 @@ def _seed(wh: PostgresWarehouse, *, not_before=None, not_after=None, preconditio
         INSERT INTO @upstream_mutations (id, request_id, request_index, provider, operation, account, status, title, reason,
                                          payload_json, idempotency_key, requested_by, approved_by, created_at, updated_at,
                                          approved_at, not_before, not_after, precondition_json)
-        VALUES (%s, %s, 0, 'resideo', 'resideo.set_thermostat', 'home', %s, 'Away', 'leaving', %s, '', 'agent', 'app:test',
+        VALUES (%s, %s, 0, %s, 'resideo.set_thermostat', 'home', %s, 'Away', 'leaving', %s, '', 'agent', 'app:test',
                 %s, %s, %s, %s, %s, %s)
         """,
         (
-            request_id + "_m0", request_id, status,
+            request_id + "_m0", request_id, provider, status,
             _jsonb_param({"device_id": "DEV1", "heat_setpoint": 55.0, "hold": "permanent"}),
             now, now, now, not_before or epoch, not_after or epoch, _jsonb_param(precondition or {}),
         ),
@@ -109,17 +115,19 @@ def test_a_failed_precondition_skips_the_step_without_a_write(warehouse, monkeyp
     request_id = _seed(warehouse, precondition={"kind": "not_home", "within_minutes": 120})
     summary = process_upstream_mutation_batch(
         warehouse=warehouse,
-        gmail_executor=_NoWrites(),
-        contact_executor=_NoWrites(),
-        calendar_executor=_NoWrites(),
-        slack_executor=_NoWrites(),
-        drive_executor=_NoWrites(),
-        screen_timelapse_executor=_NoWrites(),
-        resideo_executor=_NoWrites(),
+        executors=CloudMutationExecutors(
+            gmail=_NoWrites(),
+            google_people=_NoWrites(),
+            calendar=_NoWrites(),
+            slack=_NoWrites(),
+            screen_timelapse=_NoWrites(),
+            resideo=_NoWrites(),
+            google_drive=_NoWrites(),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=10,
         claimed_by=CLAIMER,
         ensure_tables=False,
-        on_gmail_settings_changed=None,
     )
     assert summary.claimed == 1
     status, error, request_status = _status(warehouse, request_id)
@@ -192,3 +200,37 @@ def test_the_sensor_waits_for_a_scheduled_step_instead_of_starting_empty_runs(wa
         (request_id,),
     )
     assert isinstance(_sensor(warehouse, monkeypatch), RunRequest)
+
+
+@pytest.mark.local_integration
+def test_the_cloud_worker_leaves_a_provider_it_has_no_executor_for_unclaimed(warehouse) -> None:
+    # de20a4b: a worker that claimed a provider it could not execute deferred
+    # it, was woken by its own status change and claimed it again, 68 times
+    # in 12 seconds. A provider without an executor is now never claimed.
+    unknown = _seed(warehouse, provider="future_provider")
+    local_only = _seed(warehouse, provider="apple_notes")
+    summary = process_upstream_mutation_batch(
+        warehouse=warehouse,
+        executors=CloudMutationExecutors(
+            gmail=_NoWrites(),  # type: ignore[arg-type]
+            google_people=_NoWrites(),  # type: ignore[arg-type]
+            calendar=_NoWrites(),  # type: ignore[arg-type]
+            slack=_NoWrites(),  # type: ignore[arg-type]
+            screen_timelapse=_NoWrites(),  # type: ignore[arg-type]
+            resideo=_NoWrites(),  # type: ignore[arg-type]
+            google_drive=_NoWrites(),  # type: ignore[arg-type]
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
+        limit=10,
+        claimed_by=CLAIMER,
+        ensure_tables=False,
+    )
+    assert summary.claimed == 0
+    rows = warehouse._query_dicts(
+        "SELECT request_id, status, attempt_count FROM @upstream_mutations WHERE request_id = ANY(%s) ORDER BY request_id",
+        ([unknown, local_only],),
+    )
+    assert [(row["status"], row["attempt_count"]) for row in rows] == [("approved", 0), ("approved", 0)]
+    # The sensor counts the same providers the worker claims, so these rows
+    # never start a fallback run that would claim nothing.
+    assert warehouse.approved_upstream_mutation_count(ensure_tables=False, providers=CLOUD_MUTATION_PROVIDERS) == 0

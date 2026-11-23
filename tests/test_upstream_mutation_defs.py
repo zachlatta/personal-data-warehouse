@@ -409,15 +409,17 @@ def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> N
     contact_executor = FakeExecutor([])
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=executor,
-        contact_executor=contact_executor,
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=executor,
+            google_people=contact_executor,
+            calendar=FakeExecutor([]),
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=5,
         claimed_by="worker-1",
     )
@@ -437,15 +439,17 @@ def test_process_upstream_mutation_batch_claims_before_any_observation_work() ->
     warehouse = FakeWarehouse(claimed=[])
 
     upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=FakeGmailExecutor([]),
-        contact_executor=FakeExecutor([]),
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=FakeGmailExecutor([]),
+            google_people=FakeExecutor([]),
+            calendar=FakeExecutor([]),
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=5,
         claimed_by="worker-1",
     )
@@ -480,15 +484,17 @@ def test_process_upstream_mutation_batch_reclaims_stale_executing_rows_before_cl
     warehouse = FakeWarehouse(reclaimed=3)
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=FakeGmailExecutor([]),
-        contact_executor=FakeExecutor([]),
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=FakeGmailExecutor([]),
+            google_people=FakeExecutor([]),
+            calendar=FakeExecutor([]),
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=10,
         claimed_by="worker-1",
         reclaim_after=timedelta(minutes=30),
@@ -537,15 +543,17 @@ def test_process_upstream_mutation_batch_batches_gmail_archive_rows() -> None:
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=gmail_executor,
-        contact_executor=FakeExecutor([]),
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=gmail_executor,
+            google_people=FakeExecutor([]),
+            calendar=FakeExecutor([]),
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=100,
         claimed_by="worker-1",
     )
@@ -646,15 +654,17 @@ def test_process_upstream_mutation_batch_batches_matching_gmail_label_changes_se
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=gmail_executor,
-        contact_executor=FakeExecutor([]),
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=gmail_executor,
+            google_people=FakeExecutor([]),
+            calendar=FakeExecutor([]),
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=100,
         claimed_by="worker-1",
     )
@@ -733,15 +743,17 @@ def test_process_upstream_mutation_batch_falls_back_when_batch_modify_has_no_mes
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=gmail_executor,
-        contact_executor=FakeExecutor([]),
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=gmail_executor,
+            google_people=FakeExecutor([]),
+            calendar=FakeExecutor([]),
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=100,
         claimed_by="worker-1",
     )
@@ -786,15 +798,17 @@ def test_process_upstream_mutation_batch_records_retryable_batch_failure_progres
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=gmail_executor,
-        contact_executor=FakeExecutor([]),
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=gmail_executor,
+            google_people=FakeExecutor([]),
+            calendar=FakeExecutor([]),
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=100,
         claimed_by="worker-1",
     )
@@ -829,15 +843,17 @@ def test_process_upstream_mutation_batch_routes_contact_mutations_to_contact_exe
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=gmail_executor,
-        contact_executor=contact_executor,
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=gmail_executor,
+            google_people=contact_executor,
+            calendar=FakeExecutor([]),
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=5,
         claimed_by="worker-1",
     )
@@ -846,33 +862,6 @@ def test_process_upstream_mutation_batch_routes_contact_mutations_to_contact_exe
     assert gmail_executor.seen == []
     assert warehouse.completed == [("mut-contact", {"operation_results": []}, "worker-1")]
     assert summary.succeeded == 1
-
-
-def test_process_upstream_mutation_batch_defers_unknown_provider() -> None:
-    mutation = {"id": "mut-unknown", "provider": "future_provider", "operation": "future.op"}
-    warehouse = FakeWarehouse(claimed=[mutation])
-
-    summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
-        warehouse=warehouse,
-        gmail_executor=FakeExecutor([]),
-        contact_executor=FakeExecutor([]),
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
-        limit=5,
-        claimed_by="worker-1",
-    )
-
-    assert warehouse.completed == []
-    assert len(warehouse.failed) == 1
-    failed_id, status, error, _, _ = warehouse.failed[0]
-    assert failed_id == "mut-unknown"
-    assert status == "failed_retryable"
-    assert "unsupported provider" in error
-    assert summary.failed_retryable == 1
 
 
 def test_process_upstream_mutation_batch_routes_calendar_mutations_to_calendar_executor() -> None:
@@ -887,15 +876,17 @@ def test_process_upstream_mutation_batch_routes_calendar_mutations_to_calendar_e
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=FakeExecutor([]),
-        contact_executor=FakeExecutor([]),
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=calendar_executor,
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=FakeExecutor([]),
+            google_people=FakeExecutor([]),
+            calendar=calendar_executor,
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=5,
         claimed_by="worker-1",
     )
@@ -922,15 +913,17 @@ def test_process_upstream_mutation_batch_routes_slack_mark_read_to_slack_executo
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=FakeExecutor([]),
-        contact_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
-        slack_executor=slack_executor,
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=FakeExecutor([]),
+            google_people=FakeExecutor([]),
+            calendar=FakeExecutor([]),
+            slack=slack_executor,
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=5,
         claimed_by="worker-1",
     )
@@ -970,15 +963,17 @@ def test_process_upstream_mutation_batch_routes_slack_send_to_slack_executor() -
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
-        on_gmail_settings_changed=None,
         warehouse=warehouse,
-        gmail_executor=FakeExecutor([]),
-        contact_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
-        slack_executor=slack_executor,
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=FakeExecutor([]),
+            google_people=FakeExecutor([]),
+            calendar=FakeExecutor([]),
+            slack=slack_executor,
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=5,
         claimed_by="worker-1",
     )
@@ -1065,16 +1060,18 @@ def test_gmail_label_and_filter_changes_run_before_thread_batches_and_resync_the
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
         warehouse=warehouse,
-        gmail_executor=gmail_executor,
-        contact_executor=FakeExecutor([]),
-        slack_executor=FakeExecutor([]),
-        screen_timelapse_executor=FakeExecutor([]),
-        resideo_executor=FakeExecutor([]),
-        drive_executor=FakeExecutor([]),
-        calendar_executor=FakeExecutor([]),
+        executors=upstream_mutation_defs.CloudMutationExecutors(
+            gmail=gmail_executor,
+            google_people=FakeExecutor([]),
+            calendar=FakeExecutor([]),
+            slack=FakeExecutor([]),
+            screen_timelapse=FakeExecutor([]),
+            resideo=FakeExecutor([]),
+            google_drive=FakeExecutor([]),
+            on_gmail_settings_changed=resynced.append,
+        ),
         limit=100,
         claimed_by="worker-1",
-        on_gmail_settings_changed=resynced.append,
     )
 
     assert order == ["gmail.create_label", "gmail.create_filter", "batch:" + GMAIL_MODIFY_THREAD_LABELS_OPERATION]

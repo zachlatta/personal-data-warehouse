@@ -585,8 +585,10 @@ the reviewer saw it going, once. Nothing is posted before a human approves the r
   without the Slack executor, so it claimed each approved Slack mutation, deferred it as an
   unknown provider, was woken by its own status change and claimed it again. That
   happened 68 times in 12 seconds for that first send, and 709 times for one mark-read
-  batch, until the Dagster fallback job won the lock. `slack_executor` is now a required
-  argument of `process_upstream_mutation_batch`, so a worker cannot be built without it.
+  batch, until the Dagster fallback job won the lock. Both workers now take every executor
+  from one `build_cloud_mutation_executors` (`CloudMutationExecutors`, one required field per
+  provider), and a worker claims only the providers that dataclass names, so a provider it
+  cannot execute is never claimed.
 ## Slack file bytes and "who sent this image?"
 
 ### Getting a Slack file's bytes: `get_object` already does this

@@ -454,12 +454,13 @@ heading and, on update, rewrites the existing first line.
 
 ### Why the cloud worker must not claim these
 
-`LOCAL_ONLY_MUTATION_PROVIDERS` in `defs/upstream_mutations.py` excludes `apple_notes` from
-both the sensor's count and the worker's claim. Without that exclusion the cloud worker
-claims the row, fails it as unknown-provider, and bumps `attempt_count` every ten seconds
-while the Mac that could have applied it never sees an approved row. Any future source
-whose upstream is a local app belongs in that tuple **and** needs a local worker, or its
-rows sit approved forever with nothing reporting that they are stuck.
+The cloud worker and its sensor claim and count only the providers `CloudMutationExecutors`
+(`defs/upstream_mutations.py`) holds an executor for. Before that, the cloud worker claimed
+every provider not excluded, failed one it could not execute as unknown-provider, and bumped
+`attempt_count` every ten seconds while the Mac that could have applied it never saw an
+approved row. A local-app source belongs in `LOCAL_ONLY_MUTATION_PROVIDERS` **and** needs a
+local worker: `test_every_provider_the_go_proposal_api_writes_has_a_python_worker_route`
+fails for a provider the Go proposal API writes that no worker route names.
 
 A create is also never reclaimed from a stale `executing` claim: replaying it makes a
 second note. Only `apple_notes.update_note` is in the reclaim set.
