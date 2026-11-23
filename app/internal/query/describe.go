@@ -347,10 +347,7 @@ func rankedDisplayNames(refs []tableRef) string {
 	for _, ref := range refs {
 		names = append(names, ref.DisplayName())
 	}
-	if len(names) > 8 {
-		return strings.Join(names[:8], ", ") + ", ..."
-	}
-	return strings.Join(names, ", ")
+	return joinDisplayNames(names)
 }
 
 func displayNames(refs []tableRef) string {
@@ -359,6 +356,11 @@ func displayNames(refs []tableRef) string {
 		names = append(names, ref.DisplayName())
 	}
 	sort.Strings(names)
+	return joinDisplayNames(names)
+}
+
+// joinDisplayNames shows at most eight names, in the order given.
+func joinDisplayNames(names []string) string {
 	if len(names) > 8 {
 		return strings.Join(names[:8], ", ") + ", ..."
 	}

@@ -37,6 +37,9 @@ func (e *refreshError) Error() string {
 	return "upstream authorization failed (" + e.cause + "); reconnect in Connections"
 }
 
+// refreshCauseLimit caps the stored last_error.
+const refreshCauseLimit = 300
+
 // lastError is the redacted text stored outside the encrypted payload.
 func (e *refreshError) lastError() string {
 	if e.transient {
@@ -62,7 +65,7 @@ func classifyRefreshError(err error, secrets ...string) *refreshError {
 		if retrieve.ErrorDescription != "" {
 			parts = append(parts, retrieve.ErrorDescription)
 		}
-		cause := redactCause(strings.Join(parts, " "), secrets...)
+		cause := redactCause(strings.Join(parts, " "), refreshCauseLimit, secrets...)
 		transient := status >= http.StatusInternalServerError || status == http.StatusTooManyRequests
 		return &refreshError{transient: transient, cause: cause}
 	}
@@ -74,21 +77,7 @@ func classifyRefreshError(err error, secrets ...string) *refreshError {
 	} else if err != nil {
 		cause += ": " + err.Error()
 	}
-	return &refreshError{transient: true, cause: redactCause(cause, secrets...)}
-}
-
-func redactCause(cause string, secrets ...string) string {
-	for _, secret := range secrets {
-		if secret != "" {
-			cause = strings.ReplaceAll(cause, secret, "[REDACTED]")
-		}
-	}
-	cause = causeURL.ReplaceAllString(cause, "[URL]")
-	cause = causeToken.ReplaceAllString(cause, "[REDACTED]")
-	if len(cause) > 300 {
-		cause = cause[:300] + "…"
-	}
-	return cause
+	return &refreshError{transient: true, cause: redactCause(cause, refreshCauseLimit, secrets...)}
 }
 
 // setStatus records a status change and when it happened; a connected

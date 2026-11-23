@@ -149,7 +149,10 @@ const pipelinesPageHTML = `<!doctype html>
     // newest item against the newest in base_*, and every source's stated SLA
     // with its detector or the reason it has none.
     ["sources", "source vs PDW — has the newest item the SOURCE reports landed (marts_ops.source_upstream_health)"],
-    ["source_slas", "source SLAs — every source's stated SLA, and the detector that checks it against the source itself"]
+    ["source_slas", "source SLAs — every source's stated SLA, and the detector that checks it against the source itself"],
+    // A proxied MCP connection whose provider revoked its refresh grant was
+    // visible only in agent transcripts for ~11 hours on 2026-11-22..23.
+    ["mcp_connections", "MCP connections — can PDW still reach each connected server (a revoked grant is failing)"]
   ];
 
   var state = {
@@ -931,7 +934,7 @@ const pipelinesPageHTML = `<!doctype html>
       });
     renderSection("slack", LEVELS[7][1], state.slack, slackConversationNode);
     renderSection("plaid", LEVELS[8][1], state.plaid, plaidItemNode);
-    renderSection("mcp_connections", "MCP connections — can PDW still reach each connected server (a revoked grant is failing)", state.mcp_connections, mcpConnectionNode);
+    renderSection("mcp_connections", LEVELS[12][1], state.mcp_connections, mcpConnectionNode);
     renderSection("sources", LEVELS[10][1], state.sources, sourceUpstreamNode);
     renderSection("source_slas", LEVELS[11][1], state.source_slas, sourceSLANode);
     // The database's own collation row first: it is the finding the other rows

@@ -27,6 +27,7 @@ const (
 	pipelinesSlackMaxRows     = 100
 	pipelinesSourcesMaxRows   = 200
 	pipelinesPlaidMaxRows     = 200
+	pipelinesMCPMaxRows       = 200
 	pipelinesBackupMaxRows    = 20
 	pipelinesPriorityMaxRows  = 500
 	pipelinesAgentsMaxRows    = 50
@@ -285,7 +286,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	agents := s.optionalRows(r, "agent usage", pipelineAgentUsageSQL, pipelinesAgentsMaxRows)
 	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
 	plaid := s.optionalRows(r, "plaid item health", pipelinePlaidItemHealthSQL, pipelinesPlaidMaxRows)
-	mcpConnections := s.optionalRows(r, "MCP connection health", pipelineMCPConnectionHealthSQL, pipelinesPlaidMaxRows)
+	mcpConnections := s.optionalRows(r, "MCP connection health", pipelineMCPConnectionHealthSQL, pipelinesMCPMaxRows)
 	sources := s.optionalRows(r, "source upstream health", pipelineSourceUpstreamHealthSQL, pipelinesSourcesMaxRows)
 	sourceSLAs := s.optionalRows(r, "source SLAs", pipelineSourceSLASQL, pipelinesSourcesMaxRows)
 	notifications := s.optionalRows(r, "notification health", pipelineNotificationHealthSQL, 1)
