@@ -128,6 +128,12 @@ jobs:
           "
           docker exec pdw-postgres psql -U postgres -d pdw -c "\dx"
 
+      # tests/test_go_suite.py runs go test ./... inside the suite.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
