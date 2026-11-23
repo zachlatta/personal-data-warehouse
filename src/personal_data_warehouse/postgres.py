@@ -617,6 +617,20 @@ BM25_PROBE_QUERY = "meeting order email update warehouse magazine budget photo c
 #: 2x file is the shape to catch.
 BM25_INDEX_BLOAT_LIVE_FLOOR = 0.6
 
+#: Shared-buffer residency of the search index set below which
+#: `marts_ops.search_health` reads `attention` for `cache_residency` (and the
+#: cold-cache guard re-warms). The good-latency days 2026-11-05..07 (real
+#: p90 3.4 s) read 0.21-0.51; from 2026-11-08, with p90 6-22 s, 0.05-0.20.
+#: Until 2026-11-23 only exactly 0 read attention, so the gauge said ok at 9.9%.
+SEARCH_CACHE_RESIDENCY_FLOOR = 0.20
+#: The same for `timeline_heap_residency`, the whole timeline heap's share.
+#: The attention-tier rows the warm loads sit on ~14% of its pages, so a warm
+#: heap reads 15-20% (16.5% right after the 2026-11-12 warm); 5.0% was the
+#: cold reading behind 2.6-3.8 s scoped searches on 2026-11-11. Below 10% most
+#: attention pages are on disk. The gauge has existed since 2026-11-11, so the
+#: 11-05..07 window has no reading of it.
+TIMELINE_HEAP_RESIDENCY_FLOOR = 0.10
+
 _BM25_SUMMARY_TOTAL = re.compile(
     r"Total:\s*(?P<segments>\d+)\s+segments?,\s*(?P<pages>\d+)\s+pages"
 )
@@ -7523,7 +7537,13 @@ class PostgresWarehouse:
                             ELSE interval '30 minutes' END THEN 'unknown'
                      WHEN configured = 0 OR pgvector_available = 0 THEN 'failing'
                      WHEN last_error IS NOT NULL THEN 'failing'
-                     WHEN component = 'cache_residency' AND resident_fraction <= 0 THEN 'attention'
+                     -- A cold working set is the usual cause of a slow search
+                     -- (C6), so the gauge reads attention below the floor the
+                     -- good-latency days held, not only at zero.
+                     WHEN component = 'cache_residency'
+                      AND resident_fraction < {SEARCH_CACHE_RESIDENCY_FLOOR} THEN 'attention'
+                     WHEN component = 'timeline_heap_residency'
+                      AND resident_fraction < {TIMELINE_HEAP_RESIDENCY_FLOOR} THEN 'attention'
                      -- bm25_index_bloat: resident_bytes is the LIVE segment size and
                      -- total_bytes the on-disk file; below the floor the file is mostly
                      -- displaced pages every warm still reads (13.4 GB for 6.4 GB live, 2026-09-20).

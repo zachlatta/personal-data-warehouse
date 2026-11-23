@@ -15,6 +15,7 @@ from personal_data_warehouse.postgres import (
     SEARCH_EMBEDDING_DIMENSIONS,
     PostgresWarehouse,
 )
+from personal_data_warehouse.postgres import TIMELINE_HEAP_RESIDENCY_FLOOR
 from personal_data_warehouse.search_index import (
     CHUNK_MAX_CHARS,
     EmbedStats,
@@ -851,6 +852,37 @@ def test_cache_residency_is_visible_and_zero_is_attention(
     assert float(row["resident_fraction"]) == 0.25
 
 
+@pytest.mark.parametrize(
+    ("component", "fraction", "expected"),
+    [
+        # 2026-11-23: 40% of real searches over 2 s while both gauges read ok
+        # at 9.9% and 1.9% resident. 2026-11-05..07 (p90 3.4 s) read 0.21-0.51.
+        ("cache_residency", 0.10, "attention"),
+        ("cache_residency", 0.21, "ok"),
+        ("timeline_heap_residency", 0.019, "attention"),
+        ("timeline_heap_residency", 0.15, "ok"),
+    ],
+)
+def test_search_residency_below_its_floor_reads_attention(
+    warehouse: PostgresWarehouse, component: str, fraction: float, expected: str
+) -> None:
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.write_search_health(
+        component,
+        caught_up=1,
+        pending_count=0,
+        processed_rows=1,
+        resident_bytes=int(fraction * 10_000),
+        total_bytes=10_000,
+        resident_fraction=fraction,
+        last_success_at=datetime.now(tz=UTC),
+    )
+    row = warehouse._query_dicts(
+        "SELECT * FROM @marts_search_health WHERE component = %s", (component,)
+    )[0]
+    assert row["status"] == expected
+
+
 def test_record_search_cache_residency_refreshes_the_living_health_row() -> None:
     class Warehouse:
         def __init__(self) -> None:
@@ -937,7 +969,9 @@ def test_timeline_heap_residency_is_measured_and_shown_beside_the_indexes(
     row = warehouse._query_dicts(
         "SELECT * FROM @marts_search_health WHERE component = 'timeline_heap_residency'"
     )[0]
-    assert row["status"] == "ok"
+    # The test heap is whatever the cache holds: the view judges the floor.
+    floor = TIMELINE_HEAP_RESIDENCY_FLOOR
+    assert row["status"] == ("ok" if measured["resident_fraction"] >= floor else "attention")
 
 
 def test_should_rewarm_only_when_cold_and_not_recently_warmed() -> None:

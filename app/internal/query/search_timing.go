@@ -167,8 +167,9 @@ type SearchTiming struct {
 	HasSources    bool
 	Rows          int
 	Duration      time.Duration
-	// Hybrid is false for keyword and exact searches; their leg fields are
-	// then meaningless and stored as -1.
+	// Hybrid is false for keyword and exact searches. Those are one leg each
+	// (lexical, exact): the search's own duration is that leg's timing and
+	// the other legs are stored as -1. See LegMillis.
 	Hybrid     bool
 	Embed      time.Duration
 	Lexical    time.Duration
@@ -179,6 +180,44 @@ type SearchTiming struct {
 	// DegradedLegs is the comma-separated legs the answer went without
 	// ("exact" when the literal leg was cut); empty when all three answered.
 	DegradedLegs string
+}
+
+// LegMillis is one leg's timing as stored, -1 for a leg the search did not
+// run. A hybrid search measured all of them; a keyword search ran only the
+// lexical leg and an exact search only the exact one. Leaving those
+// single-leg searches unmeasured hid 267 slow exact searches in a week
+// (2026-11-23) as "unmeasured" in search_request_latency's leg mix.
+func (t SearchTiming) LegMillis(leg string) int64 {
+	var d time.Duration
+	switch leg {
+	case "embed":
+		d = t.Embed
+	case "lexical":
+		d = t.Lexical
+	case "exact":
+		d = t.Exact
+	case "semantic":
+		d = t.Semantic
+	case "fuse":
+		d = t.Fuse
+	default:
+		return -1
+	}
+	if t.Hybrid || singleSearchLeg(t.Mode) == leg {
+		return d.Milliseconds()
+	}
+	return -1
+}
+
+// singleSearchLeg names the one leg a non-hybrid mode runs.
+func singleSearchLeg(mode string) string {
+	switch mode {
+	case SearchModeExact:
+		return "exact"
+	case SearchModeKeyword:
+		return "lexical"
+	}
+	return ""
 }
 
 // TimingRecorder receives every search the service ran, after the response
@@ -225,6 +264,13 @@ func (s *Service) recordSearch(ctx context.Context, req SearchRequest, resp Sear
 		timing.Semantic, timing.Fuse = timings.Semantic, timings.Fuse
 		timing.SlowestLeg = timings.slowestLeg()
 		timing.DegradedLegs = strings.Join(timings.DegradedLegs, ",")
+	} else if leg := singleSearchLeg(resp.Mode); leg != "" {
+		timing.SlowestLeg = leg
+		if leg == "exact" {
+			timing.Exact = duration
+		} else {
+			timing.Lexical = duration
+		}
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {

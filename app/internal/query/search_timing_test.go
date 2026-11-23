@@ -85,6 +85,30 @@ func TestAFailedSearchIsRecordedAsAnErrorWithItsDuration(t *testing.T) {
 	}
 }
 
+// An exact or keyword search is one leg: its duration is that leg's timing,
+// so a slow one is not "unmeasured" in search_request_latency's leg mix.
+func TestASingleLegSearchRecordsItsLegTiming(t *testing.T) {
+	runner := &fakeSearchRunner{
+		argsResults: map[string]RawResult{searchExactSQL: searchHit(), searchTextSQL: searchHit()},
+		delays:      map[string]time.Duration{searchExactSQL: 15 * time.Millisecond, searchTextSQL: 15 * time.Millisecond},
+	}
+	recorder := &capturingRecorder{}
+	svc := NewService(runner, Options{TimingRecorder: recorder})
+
+	svc.Search(searchContext("api", "pdw"), SearchRequest{Query: "hack.af/z", Mode: SearchModeExact})
+	svc.Search(searchContext("api", "pdw"), SearchRequest{Query: "offer letter", Mode: SearchModeKeyword})
+	if len(recorder.timings) != 2 {
+		t.Fatalf("recorded %d timings, want 2", len(recorder.timings))
+	}
+	exact, keyword := recorder.timings[0], recorder.timings[1]
+	if exact.SlowestLeg != "exact" || exact.Exact < 15*time.Millisecond || exact.LegMillis("exact") < 15 || exact.LegMillis("lexical") != -1 {
+		t.Fatalf("exact timing = %+v", exact)
+	}
+	if keyword.SlowestLeg != "lexical" || keyword.LegMillis("lexical") < 15 || keyword.LegMillis("exact") != -1 || keyword.LegMillis("semantic") != -1 {
+		t.Fatalf("keyword timing = %+v", keyword)
+	}
+}
+
 func TestARejectedRequestRanNoSearchAndRecordsNothing(t *testing.T) {
 	recorder := &capturingRecorder{}
 	svc := NewService(&fakeSearchRunner{}, Options{TimingRecorder: recorder})

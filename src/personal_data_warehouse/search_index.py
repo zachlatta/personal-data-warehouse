@@ -36,6 +36,7 @@ from typing import Any
 from psycopg2.extras import execute_values
 
 from personal_data_warehouse.postgres import (
+    SEARCH_CACHE_RESIDENCY_FLOOR,
     SEARCH_EMBEDDING_DEFAULT_MODEL,
     SEARCH_EMBEDDING_DIMENSIONS,
     PostgresWarehouse,
@@ -101,7 +102,7 @@ VECTOR_RECONCILE_BATCH_ROWS = 200_000
 #: Shared-buffer residency below which the search working set is treated as
 #: cold and re-warmed. 38% was the reading right after the 2026-09-10 rebuild
 #: and prewarm; 10% was three days of 3-4s unscoped hybrid searches.
-SEARCH_RESIDENCY_REWARM_FLOOR = 0.20
+SEARCH_RESIDENCY_REWARM_FLOOR = SEARCH_CACHE_RESIDENCY_FLOOR
 #: A forced warm is never repeated within this window: if one did not stick,
 #: something else is evicting the cache, and re-reading ~20 GB every five
 #: minutes would be that something. Find the evictor in pg_stat_statements

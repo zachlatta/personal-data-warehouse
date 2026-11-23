@@ -309,13 +309,6 @@ func (s *searchTimingStore) ensure(ctx context.Context) error {
 	return nil
 }
 
-func searchTimingMillis(hybrid bool, d time.Duration) int64 {
-	if !hybrid {
-		return -1
-	}
-	return d.Milliseconds()
-}
-
 func searchTimingFlag(b bool) int64 {
 	if b {
 		return 1
@@ -339,9 +332,9 @@ func (s *searchTimingStore) insert(ctx context.Context, t query.SearchTiming, p 
 		ON CONFLICT (occurred_at, request_id) DO NOTHING`,
 		t.OccurredAt.UTC(), t.RequestID, t.Surface, t.Client, t.Mode, t.Status,
 		searchTimingFlag(t.HasPriorities), searchTimingFlag(t.HasSources), int64(t.Rows), t.Duration.Milliseconds(),
-		searchTimingMillis(t.Hybrid, t.Embed), searchTimingMillis(t.Hybrid, t.Lexical),
-		searchTimingMillis(t.Hybrid, t.Exact), searchTimingMillis(t.Hybrid, t.Semantic),
-		searchTimingMillis(t.Hybrid, t.Fuse), t.SlowestLeg,
+		t.LegMillis("embed"), t.LegMillis("lexical"),
+		t.LegMillis("exact"), t.LegMillis("semantic"),
+		t.LegMillis("fuse"), t.SlowestLeg,
 		p.IOFullAvg10, p.CPUSomeAvg10, p.Load1m, int64(p.CPUCount),
 		t.DegradedLegs,
 	)

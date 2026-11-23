@@ -496,8 +496,9 @@ or `api`, the latter being the pdw CLI, web and phone app), `client` (the authen
 label such as `pdw`, `web` or `search-benchmark`, never a token), the resolved `mode`, `status`
 (`error` for a search that failed, so a timeout counts as the slow search it was),
 `has_priorities` / `has_sources`, `result_rows`, `duration_ms`, the hybrid leg timings
-(`embed_ms`, `lexical_ms`, `exact_ms`, `semantic_ms`, `fuse_ms`, `slowest_leg`; -1 for a
-keyword or exact search) and the host's `io_pressure_full_avg10`, `cpu_pressure_some_avg10`,
+(`embed_ms`, `lexical_ms`, `exact_ms`, `semantic_ms`, `fuse_ms`, `slowest_leg`; a keyword
+search is its one `lexical` leg and an exact search its one `exact` leg, since 2026-11-23,
+and the legs it did not run are -1) and the host's `io_pressure_full_avg10`, `cpu_pressure_some_avg10`,
 `load_1m` and `cpu_count` sampled for **every** search, so a fast one is the baseline a slow one
 is compared against (-1 when unreadable: 0 would read as an idle host). It never stores the
 query text, the priority or source values, or the error text: a query can be private, and the
@@ -688,6 +689,11 @@ guest saw as idle. Three plan faults, fixed in the functions themselves, and a c
   per pooled row after that. The warm's statement budget is 180 s, inside the five-minute
   `search_chunks` tick after a chunk build of up to 240 s, and `search_chunks_job`
   carries a 30-minute `dagster/max_runtime`.
+  **Since 2026-11-23 both gauges read `attention` below a floor**, not only at zero
+  (`SEARCH_CACHE_RESIDENCY_FLOOR` 0.20, `TIMELINE_HEAP_RESIDENCY_FLOOR` 0.10 in
+  `postgres.py`): on 2026-11-23 40% of real searches took over 2 s while `cache_residency`
+  read `ok` at 9.9% and the heap at 1.9%. The index floor is the low end of the
+  2026-11-05..07 readings (0.21-0.51, real p90 3.4 s), and the cold-cache re-warm uses it.
 
 What it did not fix is the read wait itself. Cold reads ran 0.5-0.7 ms each because the
 guest's disk is a qcow2 on mew's `md0` RAID1 (a Samsung 970 EVO Plus and a Viper VPN100),
