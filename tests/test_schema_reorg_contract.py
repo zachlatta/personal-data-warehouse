@@ -268,7 +268,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # inventory against landed calls.
             # +1 marts: marts_voice_memos.start_screenshots, the phone screen
             # as a Pixel memo started.
-            "marts": 79,  # daily script pilot usage
+            # +1 marts: marts_ops.mcp_connection_health, one row per proxied MCP
+            # connection with its status and redacted last error.
+            "marts": 80,  # daily script pilot usage
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

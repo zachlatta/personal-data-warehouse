@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
@@ -75,6 +76,36 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	}
 
 	versionBefore := rows[0].Version
+
+	// The status, when it changed and the redacted cause are readable beside
+	// the sealed payload, for marts_ops.mcp_connection_health.
+	if err := store.Update(ctx, "skills", func(c *record) error {
+		c.Enabled = true
+		setStatus(c, statusAuthorizationFailed)
+		c.LastError = "token endpoint answered 400 invalid_grant"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var plainStatus, plainError string
+	var changedAt time.Time
+	if err := store.db.QueryRowContext(ctx, `SELECT status, status_changed_at, last_error FROM `+store.relation+` WHERE name='skills'`).Scan(&plainStatus, &changedAt, &plainError); err != nil {
+		t.Fatal(err)
+	}
+	if plainStatus != "authorization_failed" || plainError != "token endpoint answered 400 invalid_grant" || time.Since(changedAt) > time.Minute {
+		t.Fatalf("plain status = %q %v %q", plainStatus, changedAt, plainError)
+	}
+	// Disabled again, so the discovery sweep below leaves it alone.
+	if err := store.Update(ctx, "skills", func(c *record) error { c.Enabled = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT status FROM `+store.relation+` WHERE name='skills'`).Scan(&plainStatus); err != nil || plainStatus != "disabled" {
+		t.Fatalf("plain status of a disabled connection = %q (%v)", plainStatus, err)
+	}
+	if rows, err = store.List(ctx); err != nil {
+		t.Fatal(err)
+	}
+	versionBefore = rows[0].Version
 
 	// A master secret rotation: the new secret current, the old one previous.
 	rotated, err := NewPostgresStore(url, "rotated-encryption-key", "test-encryption-key")

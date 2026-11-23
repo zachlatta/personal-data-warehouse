@@ -47,16 +47,22 @@ type record struct {
 	Clients    []string
 	// Loopback redirects OAuth to loopbackRedirectURL instead of PDW's
 	// callback, for providers that accept only local clients' redirects.
-	Loopback               bool
-	Deleted                bool
-	Version                int64
-	Token                  oauth2.Token
-	OAuth                  oauth2.Config
-	Resource               string
-	Issuer                 string
-	Pending                *pendingAuth
-	Tools                  []*mcp.Tool
-	Status                 string
+	Loopback bool
+	Deleted  bool
+	Version  int64
+	Token    oauth2.Token
+	OAuth    oauth2.Config
+	Resource string
+	Issuer   string
+	Pending  *pendingAuth
+	Tools    []*mcp.Tool
+	Status   string
+	// StatusChangedAt is when Status last changed; LastError is the redacted
+	// cause of the last failure (a "transient:" prefix leaves Status alone).
+	// Both are also written in plain text beside the sealed payload, with
+	// Status, so marts_ops.mcp_connection_health can read them.
+	StatusChangedAt        time.Time
+	LastError              string
 	UpdatedAt              time.Time
 	LastDiscoveryAttemptAt time.Time
 	LastDiscoveredAt       time.Time
@@ -111,6 +117,18 @@ func NewPostgresStore(databaseURL, secret string, previous ...string) (*Postgres
 	return &PostgresStore{db: db, boxes: boxes, schema: warehouse.SchemaOf("mcp_connections"), relation: warehouse.SQLRelation("mcp_connections")}, nil
 }
 func (s *PostgresStore) Close() error { return s.db.Close() }
+
+// plainStatus is the status stored in plain text: a deleted or disabled
+// connection says so, whatever its last runtime status was.
+func plainStatus(c record) string {
+	switch {
+	case c.Deleted:
+		return "deleted"
+	case !c.Enabled:
+		return "disabled"
+	}
+	return c.Status
+}
 func newCipher(secret string) cipher.AEAD {
 	key := sha256.Sum256([]byte("pdw/mcp-connections/v1\x00" + secret))
 	block, _ := aes.NewCipher(key[:])
@@ -191,7 +209,11 @@ func (s *PostgresStore) ensure(ctx context.Context) error {
 	if s.initialized {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `CREATE SCHEMA IF NOT EXISTS `+warehouse.QuoteIdent(s.schema)+`; CREATE TABLE IF NOT EXISTS `+s.relation+` (name text PRIMARY KEY, payload text NOT NULL DEFAULT '', updated_at timestamptz NOT NULL DEFAULT now()); REVOKE ALL ON `+s.relation+` FROM PUBLIC`)
+	// The plain status columns are added here as well as by the Python
+	// ensure path, because the app deploys before that path runs.
+	_, err := s.db.ExecContext(ctx, `CREATE SCHEMA IF NOT EXISTS `+warehouse.QuoteIdent(s.schema)+`; CREATE TABLE IF NOT EXISTS `+s.relation+` (name text PRIMARY KEY, payload text NOT NULL DEFAULT '', updated_at timestamptz NOT NULL DEFAULT now()); `+
+		`ALTER TABLE `+s.relation+` ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS status_changed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00', ADD COLUMN IF NOT EXISTS last_error text NOT NULL DEFAULT ''; `+
+		`REVOKE ALL ON `+s.relation+` FROM PUBLIC`)
 	if err == nil {
 		s.initialized = true
 	}
@@ -305,7 +327,11 @@ func (s *PostgresStore) update(ctx context.Context, id string, fn func(*record) 
 	if err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE `+s.relation+` SET payload=$2,updated_at=now() WHERE name=$1`, id, payload); err != nil {
+	changedAt := c.StatusChangedAt
+	if changedAt.IsZero() {
+		changedAt = time.Unix(0, 0).UTC()
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE `+s.relation+` SET payload=$2,updated_at=now(),status=$3,status_changed_at=$4,last_error=$5 WHERE name=$1`, id, payload, plainStatus(c), changedAt, c.LastError); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

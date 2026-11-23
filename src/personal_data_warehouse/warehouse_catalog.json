@@ -2886,6 +2886,18 @@
       "comment": "First-class hybrid-search health: timeline seq versus chunk cursor, active embedding model/configuration, exact caught-up state, independent orphaned-chunk completeness, bounded backlog signal, BM25 scan integrity, HNSW + BM25 shared-buffer residency, last success, and errors. Residency explicitly measures PostgreSQL shared buffers, not the separate OS page cache. A fresh write timestamp alone is not health."
     },
     {
+      "id": "marts_ops_mcp_connection_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "mcp_connection_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "One row per connected MCP server (pdw list): failing on authorization_failed (reconnect it in Connections), with when the status changed and the redacted last_error; a 'transient:' error leaves the status alone."
+    },
+    {
       "id": "marts_ops_plaid_item_health",
       "kind": "view",
       "layer": "marts",

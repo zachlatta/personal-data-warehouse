@@ -168,7 +168,15 @@ revealing it. OAuth values are `<key id>.<body>.<sig>` and a download link's `si
 Three uses stay on the raw secret by design: upload signatures (every uploader holds the
 secret and signs with it, in Go and in `ingest_client.py`; the `object-upload` prefix
 keeps those MACs apart), the static bearer, and the consent page.
-`private.mcp_connections` keeps its own derived AES key.
+`private.mcp_connections` keeps its own derived AES key. Since 2026-11-23 three columns
+beside the sealed payload are plain text: `status`, `status_changed_at` and `last_error`
+(the redacted cause of the last failure, never a credential), which
+`marts_ops.mcp_connection_health` reads. A token refresh the provider refuses (a 4xx such
+as `invalid_grant`, or a 401) sets `authorization_failed` and sends one push alert as the
+connection enters it; an unreachable token endpoint, a 5xx or a 429 is retried once and
+then reported as `transient:` without changing the status. Before this, every refresh
+error read "upstream authorization expired" and flipped the status, with the cause
+dropped.
 
 `PDW_SECRET_TOKEN_PREVIOUS` opens a rotation window. While it is set, the previous
 secret still verifies everywhere the current one does (OAuth tokens and client ids,

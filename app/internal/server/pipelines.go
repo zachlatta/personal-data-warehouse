@@ -109,6 +109,15 @@ SELECT account, team_id, conversation_type, conversation_count, archived_count,
 FROM ` + warehouse.SQLRelation("marts_ops_slack_conversation_health") + `
 ORDER BY status, conversation_type`
 
+// One row per proxied MCP connection: a refresh grant the provider revoked is
+// authorization_failed here with its cause (2026-11-22..23 it was ~11 hours
+// visible only in agent transcripts). Optional: the app deploys before the
+// Python ensure path creates the view.
+var pipelineMCPConnectionHealthSQL = `
+SELECT connection, status, connection_status, status_changed_at, status_age_seconds, last_error, updated_at
+FROM ` + warehouse.SQLRelation("marts_ops_mcp_connection_health") + `
+ORDER BY status, connection`
+
 var pipelinePlaidItemHealthSQL = `
 SELECT account, item_id, institution_name, linked_at, synced_at,
        error_code, error_type, error_message, status, account_count,
@@ -276,28 +285,30 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	agents := s.optionalRows(r, "agent usage", pipelineAgentUsageSQL, pipelinesAgentsMaxRows)
 	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
 	plaid := s.optionalRows(r, "plaid item health", pipelinePlaidItemHealthSQL, pipelinesPlaidMaxRows)
+	mcpConnections := s.optionalRows(r, "MCP connection health", pipelineMCPConnectionHealthSQL, pipelinesPlaidMaxRows)
 	sources := s.optionalRows(r, "source upstream health", pipelineSourceUpstreamHealthSQL, pipelinesSourcesMaxRows)
 	sourceSLAs := s.optionalRows(r, "source SLAs", pipelineSourceSLASQL, pipelinesSourcesMaxRows)
 	notifications := s.optionalRows(r, "notification health", pipelineNotificationHealthSQL, 1)
 	backups := s.optionalRows(r, "backup health", pipelineBackupHealthSQL, pipelinesBackupMaxRows)
 	writeJSON(w, map[string]any{
-		"pipelines":      nonNilRows(pipelines.Rows),
-		"tables":         nonNilRows(tables.Rows),
-		"marts":          marts,
-		"adapters":       adapters,
-		"collation":      collation,
-		"search":         search,
-		"benchmark":      benchmark,
-		"search_latency": searchLatency,
-		"priority":       priorityMix,
-		"agents":         agents,
-		"slack":          slack,
-		"plaid":          plaid,
-		"sources":        sources,
-		"source_slas":    sourceSLAs,
-		"backups":        backups,
-		"notifications":  notifications,
-		"server_now":     s.now().UTC().Format(time.RFC3339Nano),
+		"pipelines":       nonNilRows(pipelines.Rows),
+		"tables":          nonNilRows(tables.Rows),
+		"marts":           marts,
+		"adapters":        adapters,
+		"collation":       collation,
+		"search":          search,
+		"benchmark":       benchmark,
+		"search_latency":  searchLatency,
+		"priority":        priorityMix,
+		"agents":          agents,
+		"slack":           slack,
+		"plaid":           plaid,
+		"mcp_connections": mcpConnections,
+		"sources":         sources,
+		"source_slas":     sourceSLAs,
+		"backups":         backups,
+		"notifications":   notifications,
+		"server_now":      s.now().UTC().Format(time.RFC3339Nano),
 	})
 }
 

@@ -73,3 +73,7 @@ changed tools replace the snapshot automatically; Refresh tools uses the same di
 path for an immediate check. Disabled connections are not polled. `/connections` shows
 discovery status and last success separately from call status; `/pipelines` reports
 the sweep heartbeat and failures. Clients caching definitions may need to reconnect.
+`marts_ops.mcp_connection_health` is one row per connection: `failing` with the cause in
+`last_error` means the provider refused the refresh grant (reconnect it in Connections);
+an error starting `transient:` is a token endpoint that was briefly down, and a call
+failing that way says so: retry it shortly rather than reconnecting.

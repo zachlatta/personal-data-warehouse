@@ -220,7 +220,7 @@ func (s *Service) beginOAuth(ctx context.Context, id string, app bool) (authURL,
 		c.Resource = resource.Resource
 		c.Issuer = metadata.Issuer
 		c.Pending = pending
-		c.Status = "awaiting_authorization"
+		setStatus(c, "awaiting_authorization")
 		authURL = cfg.AuthCodeURL(pending.State, oauth2.S256ChallengeOption(pending.Verifier), oauth2.SetAuthURLParam("resource", resource.Resource))
 		if app {
 			handoff = id + "." + randomSecret()
@@ -300,24 +300,24 @@ func (s *Service) completeOAuth(ctx context.Context, state, code, issuer string,
 		}
 		c.Pending = nil // Consume even if the provider rejects the exchange.
 		if code == "" {
-			c.Status = "authorization_denied"
+			setStatus(c, "authorization_denied")
 			exchangeErr = errors.New("upstream authorization was denied")
 			return nil
 		}
 		oauthCtx := context.WithValue(ctx, oauth2.HTTPClient, s.client)
 		token, err := c.OAuth.Exchange(oauthCtx, code, oauth2.VerifierOption(p.Verifier), oauth2.SetAuthURLParam("resource", c.Resource))
 		if err != nil || token.AccessToken == "" {
-			c.Status = "authorization_failed"
+			setStatus(c, statusAuthorizationFailed)
 			exchangeErr = errors.New("upstream token exchange failed; reconnect")
 			return nil
 		}
 		if token.Type() != "Bearer" {
-			c.Status = "authorization_failed"
+			setStatus(c, statusAuthorizationFailed)
 			exchangeErr = errors.New("only bearer upstream tokens are supported")
 			return nil
 		}
 		c.Token = *token
-		c.Status = "authorized"
+		setStatus(c, "authorized")
 		return nil
 	})
 	if err != nil {

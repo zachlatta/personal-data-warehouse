@@ -571,6 +571,10 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 				}()
 			}
 			proxy = mcpproxy.New(store, baseURL, nil)
+			proxy.OnAuthorizationFailed(func(connection, cause string) {
+				logger.Warn("MCP connection authorization failed", "connection", connection, "cause", cause)
+				notifier.NotifyAsync(mcpAuthorizationFailedNotification(connection, cause))
+			})
 			proxy.Register(mux, authSvc.RequireStaticBearer())
 			cleanup = func() { _ = store.Close() }
 			if ctx != nil {

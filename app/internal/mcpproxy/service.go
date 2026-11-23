@@ -29,6 +29,9 @@ type Service struct {
 	baseURL string
 	client  *http.Client
 	pool    sessionPool
+	// onAuthorizationFailed is called when a connection enters
+	// authorization_failed; see OnAuthorizationFailed.
+	onAuthorizationFailed func(connection, cause string)
 }
 
 func New(store Store, baseURL string, client *http.Client) *Service {
@@ -97,8 +100,19 @@ func (s *Service) authorizedClient(ctx context.Context, c *record) (*http.Client
 		oauthClient.Transport = resourceTransport{base: base, endpoint: c.OAuth.Endpoint.TokenURL, resource: c.Resource}
 		oauthCtx := context.WithValue(ctx, oauth2.HTTPClient, &oauthClient)
 		token, err := c.OAuth.TokenSource(oauthCtx, &c.Token).Token()
+		var classified *refreshError
 		if err != nil {
-			return nil, errors.New("upstream authorization expired; reconnect in Connections")
+			classified = classifyRefreshError(err, c.Token.AccessToken, c.Token.RefreshToken)
+			if classified.transient && ctx.Err() == nil {
+				// One retry: a token endpoint blip is not worth a failed call.
+				token, err = c.OAuth.TokenSource(oauthCtx, &c.Token).Token()
+				if err != nil {
+					classified = classifyRefreshError(err, c.Token.AccessToken, c.Token.RefreshToken)
+				}
+			}
+		}
+		if err != nil {
+			return nil, classified
 		}
 		c.Token = *token
 	}
@@ -115,6 +129,7 @@ func (s *Service) prepare(ctx context.Context, id string, check func(*record) er
 	var prepared record
 	var client *http.Client
 	var authErr error
+	entered := ""
 	err := s.store.Update(ctx, id, func(c *record) error {
 		if err := exists(c); err != nil {
 			return err
@@ -127,8 +142,20 @@ func (s *Service) prepare(ctx context.Context, id string, check func(*record) er
 		var err error
 		client, err = s.authorizedClient(ctx, c)
 		if err != nil {
-			c.Status = "authorization_failed"
 			authErr = err
+			var refresh *refreshError
+			if !errors.As(err, &refresh) {
+				// errUnavailable: no credential was ever stored.
+				setStatus(c, statusAuthorizationFailed)
+				return nil
+			}
+			c.LastError = refresh.lastError()
+			if !refresh.transient {
+				if c.Status != statusAuthorizationFailed {
+					entered = refresh.cause
+				}
+				setStatus(c, statusAuthorizationFailed)
+			}
 			return nil
 		}
 		prepared = *c
@@ -136,6 +163,9 @@ func (s *Service) prepare(ctx context.Context, id string, check func(*record) er
 	})
 	if err != nil {
 		return record{}, nil, err
+	}
+	if entered != "" && s.onAuthorizationFailed != nil {
+		s.onAuthorizationFailed(id, entered)
 	}
 	return prepared, client, authErr
 }
@@ -153,7 +183,7 @@ func (s *Service) status(ctx context.Context, original record, status string) {
 		if c.Deleted || c.Generation != original.Generation || c.URL != original.URL {
 			return errUnavailable
 		}
-		c.Status = status
+		setStatus(c, status)
 		return nil
 	})
 }
@@ -221,7 +251,7 @@ func (s *Service) Refresh(ctx context.Context, id string) (refreshErr error) {
 			return errUnavailable
 		}
 		current.Tools = defs
-		current.Status = "connected"
+		setStatus(current, statusConnected)
 		current.DiscoveryStatus = "ok"
 		current.LastDiscoveredAt = time.Now().UTC()
 		return nil

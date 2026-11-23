@@ -61,6 +61,7 @@ const pipelinesPageHTML = `<!doctype html>
   <div id="agents"></div>
   <div id="slack"></div>
   <div id="plaid"></div>
+  <div id="mcp_connections"></div>
   <div id="sources"></div>
   <div id="source_slas"></div>
   <div id="collation"></div>
@@ -154,7 +155,7 @@ const pipelinesPageHTML = `<!doctype html>
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
     pipelines: [], tables: [], marts: [], adapters: [], search: [], slack: [], plaid: [], collation: [],
-    sources: [], source_slas: [],
+    sources: [], source_slas: [], mcp_connections: [],
     backups: [], notifications: [], priority: [], agents: [], benchmark: [], search_latency: [],
     skew: 0, filter: "", attentionOnly: false, open: {}
   };
@@ -276,6 +277,7 @@ const pipelinesPageHTML = `<!doctype html>
       .concat(state.search_latency)
       .concat(state.slack)
       .concat(state.plaid)
+      .concat(state.mcp_connections)
       .concat(state.sources)
       .concat(state.collation);
   }
@@ -857,6 +859,15 @@ const pipelinesPageHTML = `<!doctype html>
         : ""));
   }
 
+  function mcpConnectionNode(c) {
+    return healthRow(c, c.connection, c.connection_status || "no status recorded yet",
+      [
+        ["since", c.status_changed_at ? ago(ageOf(c.status_changed_at)) + " ago" : "unknown",
+          "when this connection last changed status", false]
+      ],
+      c.last_error || (c.status === "failing" ? "reconnect it on the Connections page" : ""));
+  }
+
   function sourceUpstreamNode(o) {
     var missing = o.missing_seconds === null || o.missing_seconds === undefined
       ? "landed" : ago(Number(o.missing_seconds)) + " missing";
@@ -920,6 +931,7 @@ const pipelinesPageHTML = `<!doctype html>
       });
     renderSection("slack", LEVELS[7][1], state.slack, slackConversationNode);
     renderSection("plaid", LEVELS[8][1], state.plaid, plaidItemNode);
+    renderSection("mcp_connections", "MCP connections — can PDW still reach each connected server (a revoked grant is failing)", state.mcp_connections, mcpConnectionNode);
     renderSection("sources", LEVELS[10][1], state.sources, sourceUpstreamNode);
     renderSection("source_slas", LEVELS[11][1], state.source_slas, sourceSLANode);
     // The database's own collation row first: it is the finding the other rows
@@ -1035,6 +1047,7 @@ const pipelinesPageHTML = `<!doctype html>
       state.agents = body.agents || [];
       state.slack = body.slack || [];
       state.plaid = body.plaid || [];
+      state.mcp_connections = body.mcp_connections || [];
       state.sources = body.sources || [];
       // A source with no detector has no detector status: it reads exempt.
       state.source_slas = (body.source_slas || []).map(function (p) {

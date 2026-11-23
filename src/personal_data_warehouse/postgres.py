@@ -1439,7 +1439,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "github_events": TableSpec(GITHUB_EVENT_COLUMNS, ("account", "event_id")),
     "github_sync_state": TableSpec(GITHUB_SYNC_STATE_COLUMNS, ("account", "stream"), "updated_at"),
     # Owner-managed gateway configuration, encrypted by the Go app.
-    "mcp_connections": TableSpec(("name", "payload", "updated_at"), ("name",), "updated_at"),
+    # status, status_changed_at and last_error are written by the app in plain
+    # text beside the sealed payload (never a credential: last_error is the
+    # redacted cause), so marts_ops.mcp_connection_health can read them.
+    "mcp_connections": TableSpec(
+        ("name", "payload", "updated_at", "status", "status_changed_at", "last_error"), ("name",), "updated_at"
+    ),
     # PK (account, session_key) is load-bearing: the app's publish endpoint
     # upserts this same table with ON CONFLICT (account, session_key). See
     # app/internal/slacksession/store.go.
@@ -3471,6 +3476,7 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    "status_changed_at",
     "newest_finished_at",
     "measured_at", "received_at",
     # comma.ai
@@ -6792,6 +6798,34 @@ class PostgresWarehouse:
         facts, the views turn them into a live status.
         """
         self._ensure_table_group(["mcp_connections"])
+        # One row per MCP connection the app proxies. Until 2026-11-23 the
+        # status lived only inside the sealed payload, so a connection whose
+        # refresh grant was revoked (about 11 hours on 2026-11-22..23) showed
+        # nowhere outside agent transcripts. A `transient:` last_error is a
+        # token endpoint that was briefly down, which leaves the status alone.
+        epoch = "'1970-01-01 00:00:00+00'::timestamptz"
+        self._ensure_view(
+            "marts_ops_mcp_connection_health",
+            f"""
+            CREATE OR REPLACE VIEW @marts_ops_mcp_connection_health AS
+            SELECT name AS connection,
+                   CASE
+                     WHEN status IN ('authorization_failed', 'authorization_denied') THEN 'failing'
+                     WHEN status IN ('connection_failed', 'discovery_failed', 'call_failed') THEN 'attention'
+                     WHEN status IN ('connected', 'authorized') THEN 'ok'
+                     WHEN status = 'disabled' THEN 'paused'
+                     ELSE 'unknown'
+                   END AS status,
+                   NULLIF(status, '') AS connection_status,
+                   NULLIF(status_changed_at, {epoch}) AS status_changed_at,
+                   (EXTRACT(EPOCH FROM now() - NULLIF(status_changed_at, {epoch})))::bigint
+                       AS status_age_seconds,
+                   NULLIF(last_error, '') AS last_error,
+                   NULLIF(updated_at, {epoch}) AS updated_at
+            FROM @mcp_connections
+            WHERE status <> 'deleted'
+            """,
+        )
         # The weekly benchmark records how much of the HNSW + BM25 working set
         # is resident in Postgres shared buffers. pg_buffercache ships with the
         # official image's contrib modules, but is per-database like pg_trgm.
