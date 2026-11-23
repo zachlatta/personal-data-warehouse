@@ -449,3 +449,38 @@ func TestDescribeRecoveryHintsNameBothSurfaces(t *testing.T) {
 		}
 	}
 }
+
+// Nine sessions in the week to 2026-11-23 ran `pdw columns
+// marts_calendar.events` and were offered Android notification and screen
+// time relations, alphabetically first among the tables named events.
+func TestDescribeTableMartsCalendarEventsNamesTheCalendarRelations(t *testing.T) {
+	svc := NewService(fakeRunner{results: map[string]RawResult{}}, Options{MaxRows: 5, MaxFieldChars: 100})
+	err := svc.DescribeTable(context.Background(), "marts_calendar.events").Results[0].Error
+	if !strings.Contains(err, "base_google_calendar.events") || !strings.Contains(err, "marts_calendar.events_with_voice_memos") {
+		t.Fatalf("marts_calendar.events should point at the calendar relations, got: %s", err)
+	}
+}
+
+func TestDescribeTableRanksNearMatchesFromTheRequestedDomainFirst(t *testing.T) {
+	runner := fakeRunner{results: map[string]RawResult{
+		relationsNamedSQL("meetings"): {Columns: []string{"schema", "name"}},
+		relationsLikeSQL("%meetings%"): {
+			Columns: []string{"schema", "name"},
+			Rows: []map[string]any{
+				{"schema": "base_android_notifications", "name": "meetings_seen"},
+				{"schema": "base_android_screen_time", "name": "meetings_apps"},
+				{"schema": "base_google_calendar", "name": "meetings"},
+				{"schema": "marts_calendar", "name": "meetings_with_voice_memos"},
+			},
+		},
+	}}
+	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	err := svc.DescribeTable(context.Background(), "marts_calendar.meetings").Results[0].Error
+	calendar := strings.Index(err, "base_google_calendar.meetings")
+	mart := strings.Index(err, "marts_calendar.meetings_with_voice_memos")
+	android := strings.Index(err, "base_android_notifications.meetings_seen")
+	if calendar < 0 || mart < 0 || android < 0 || calendar > android || mart > android {
+		t.Fatalf("calendar-domain matches should come first, got: %s", err)
+	}
+}

@@ -1029,6 +1029,8 @@ var tableRemaps = map[string]string{
 	"gmail_emails":                  "base_gmail.messages",
 	"gmail.emails":                  "base_gmail.messages",
 	"base_gmail.emails":             "base_gmail.messages",
+	// Nine sessions in the week to 2026-11-23: there is no calendar events mart.
+	"marts_calendar.events": "base_google_calendar.events (meetings with transcripts: marts_calendar.events_with_voice_memos)",
 }
 
 func init() {

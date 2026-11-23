@@ -160,8 +160,8 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 	if remap, ok := tableRemaps[strings.ToLower(name)]; ok {
 		return tableRef{}, fmt.Sprintf("there is no %s relation — use %s.", trimmed, remap)
 	}
-	if near := s.relationsLike(ctx, name); len(near) > 0 {
-		return tableRef{}, fmt.Sprintf("no relation named %s. Closest matches: %s.", trimmed, displayNames(near))
+	if near := rankByDomain(s.relationsLike(ctx, name), schema); len(near) > 0 {
+		return tableRef{}, fmt.Sprintf("no relation named %s. Closest matches: %s.", trimmed, rankedDisplayNames(near))
 	}
 	if len(matches) > 0 {
 		return tableRef{}, fmt.Sprintf("no relation named %s — %s exists as %s.", trimmed, name, displayNames(matches))
@@ -229,6 +229,38 @@ func (s *Service) relationsLike(ctx context.Context, name string) []tableRef {
 		"WHERE table_schema = ANY(" + queryableSchemaArraySQL() + ") AND table_name LIKE " + warehouse.SQLString(pattern) + " " +
 		"ORDER BY table_schema, table_name"
 	return s.relationLookup(ctx, sql)
+}
+
+// rankByDomain puts near matches from the requested schema's domain first:
+// marts_calendar.x is far likelier to mean base_google_calendar.x than
+// base_android_notifications.x, which sorts first alphabetically.
+func rankByDomain(refs []tableRef, schema string) []tableRef {
+	domain := schemaDomain(schema)
+	if domain == "" {
+		return refs
+	}
+	ranked := make([]tableRef, 0, len(refs))
+	var others []tableRef
+	for _, ref := range refs {
+		other := schemaDomain(ref.Schema)
+		if other != "" && (strings.Contains(other, domain) || strings.Contains(domain, other)) {
+			ranked = append(ranked, ref)
+		} else {
+			others = append(others, ref)
+		}
+	}
+	return append(ranked, others...)
+}
+
+// schemaDomain strips the layer prefix: base_google_calendar -> google_calendar.
+func schemaDomain(schema string) string {
+	schema = strings.ToLower(strings.TrimSpace(schema))
+	for _, layer := range []string{"base_", "derived_", "marts_"} {
+		if rest, ok := strings.CutPrefix(schema, layer); ok {
+			return rest
+		}
+	}
+	return ""
 }
 
 func (s *Service) relationLookup(ctx context.Context, sql string) []tableRef {
@@ -306,6 +338,19 @@ func (s *Service) tableIndexList(ctx context.Context, ref tableRef) []string {
 		lines = append(lines, def+flag)
 	}
 	return lines
+}
+
+// rankedDisplayNames keeps the order rankByDomain chose (alphabetical inside
+// each group), so the eight shown are the likeliest ones.
+func rankedDisplayNames(refs []tableRef) string {
+	names := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		names = append(names, ref.DisplayName())
+	}
+	if len(names) > 8 {
+		return strings.Join(names[:8], ", ") + ", ..."
+	}
+	return strings.Join(names, ", ")
 }
 
 func displayNames(refs []tableRef) string {
