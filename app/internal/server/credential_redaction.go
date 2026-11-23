@@ -23,6 +23,8 @@ import (
 
 const credentialIdentifierWalk = 128
 
+const credentialDelimiters = " \t\n\r\f\v\"'=:,;()[]{}<>|`"
+
 const credentialLabel = `(?:secret[ _-]?access[ _-]?key|client[ _-]?secret|secret[ _-]?key|private[ _-]?key|` +
 	`api[ _-]?key|apikey|passphrase|password|passwd|secret|token)`
 
@@ -135,7 +137,7 @@ func credentialTextEdits(s string) []cardEdit {
 	}
 	for _, m := range credentialSK.FindAllStringIndex(s, -1) {
 		token := s[m[0]:m[1]]
-		if credentialBoundary(s, m[0], "-") && hasLetterAndDigit(token[3:]) && !credentialPlaceholderValue(token) {
+		if credentialBoundary(s, m[0], "-/.") && hasLetterAndDigit(token[3:]) && !credentialPlaceholderValue(token) {
 			kind := "openai_key"
 			if strings.HasPrefix(token, "sk-ant-") {
 				kind = "anthropic_key"
@@ -158,8 +160,11 @@ func credentialTextEdits(s string) []cardEdit {
 				upper = upper || c >= 'A' && c <= 'Z'
 				lower = lower || c >= 'a' && c <= 'z'
 			}
-			// A run cut out of URL-encoding (%2B...%2F) is part of a longer value.
-			if len(run) == 40 && !strings.Contains(run, "=") && (m[0] == 0 || s[m[0]-1] != '%') && (m[1] == len(s) || s[m[1]] != '%') && upper && lower && hasLetterAndDigit(run) && !credentialPlaceholderValue(run) {
+			// The run must stand alone: one cut out of a URL path or encoding
+			// (.com/..., -2B..., %2F...) is part of a longer value.
+			if len(run) == 40 && !strings.Contains(run, "=") &&
+				(m[0] == 0 || strings.IndexByte(credentialDelimiters, s[m[0]-1]) >= 0) &&
+				(m[1] == len(s) || strings.IndexByte(credentialDelimiters, s[m[1]]) >= 0) && upper && lower && hasLetterAndDigit(run) && !credentialPlaceholderValue(run) {
 				candidates = append(candidates, credentialCandidate{m[0], m[1], "aws_secret_key"})
 			}
 		}

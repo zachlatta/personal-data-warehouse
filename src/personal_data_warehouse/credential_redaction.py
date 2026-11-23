@@ -49,6 +49,7 @@ _PLACEHOLDER_PASSWORDS = frozenset(('password', 'pass', 'passwd', 'pwd', 'secret
 _WORD = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_')
 _IDENTIFIER = _WORD | frozenset('.-')
 _IDENTIFIER_WALK = 128
+_DELIMITERS = frozenset(' \t\n\r\f\v"\'=:,;()[]{}<>|`')
 _MARKER_KIND = re.compile(r'\[REDACTED:([a-z_]+):[0-9a-f]{6}\]')
 
 
@@ -115,14 +116,17 @@ def _text_edits(value):
         if _boundary(value, m.start()) and _has_letter_and_digit(m[0]) and not _placeholder(m[0]):
             candidates.append((m.start(), m.end(), 'github_token'))
     for m in _SK.finditer(value):
-        if _boundary(value, m.start(), '-') and _has_letter_and_digit(m[0][3:]) and not _placeholder(m[0]):
+        if _boundary(value, m.start(), '-/.') and _has_letter_and_digit(m[0][3:]) and not _placeholder(m[0]):
             candidates.append((m.start(), m.end(), 'anthropic_key' if m[0].startswith('sk-ant-') else 'openai_key'))
     if any(_boundary(value, m.start()) and (m.end() == len(value) or value[m.end()] not in _WORD)
            for m in _AWS_ID.finditer(value)):
         for m in _AWS_RUN.finditer(value):
             run = m[0]
-            # A run cut out of URL-encoding (%2B...%2F) is part of a longer value.
-            if (len(run) == 40 and '=' not in run and value[m.start() - 1:m.start()] != '%' and value[m.end():m.end() + 1] != '%' and any(c.isascii() and c.isupper() for c in run) and
+            # The run must stand alone: one cut out of a URL path or encoding
+            # (.com/..., -2B..., %2F...) is part of a longer value.
+            if (len(run) == 40 and '=' not in run and
+                    (m.start() == 0 or value[m.start() - 1] in _DELIMITERS) and
+                    (m.end() == len(value) or value[m.end()] in _DELIMITERS) and any(c.isascii() and c.isupper() for c in run) and
                     any(c.isascii() and c.islower() for c in run) and any('0' <= c <= '9' for c in run) and
                     not _placeholder(run)):
                 candidates.append((m.start(), m.end(), 'aws_secret_key'))
