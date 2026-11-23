@@ -112,16 +112,18 @@ def test_gmail_filter_and_label_mutations_from_proposal_to_resync():
         resynced: list[set[str]] = []
         summary = upstream_mutation_defs.process_upstream_mutation_batch(
             warehouse=warehouse,
-            gmail_executor=GmailMutationExecutor(settings=None, service_factory=lambda _: gmail),  # type: ignore[arg-type]
-            contact_executor=None,  # type: ignore[arg-type]
-            calendar_executor=None,  # type: ignore[arg-type]
-            slack_executor=None,  # type: ignore[arg-type]
-            screen_timelapse_executor=None,  # type: ignore[arg-type]
-            resideo_executor=None,  # type: ignore[arg-type]
-            drive_executor=None,  # type: ignore[arg-type]
+            executors=upstream_mutation_defs.CloudMutationExecutors(
+                gmail=GmailMutationExecutor(settings=None, service_factory=lambda _: gmail),
+                google_people=None,  # type: ignore[arg-type]
+                calendar=None,  # type: ignore[arg-type]
+                slack=None,  # type: ignore[arg-type]
+                screen_timelapse=None,  # type: ignore[arg-type]
+                resideo=None,  # type: ignore[arg-type]
+                google_drive=None,  # type: ignore[arg-type]
+                on_gmail_settings_changed=lambda accounts: (resynced.append(accounts), sync.run()),
+            ),
             limit=50,
             claimed_by="e2e",
-            on_gmail_settings_changed=lambda accounts: (resynced.append(accounts), sync.run()),
         )
         rows = warehouse._query_dicts("SELECT request_index, status, error, result_json FROM @upstream_mutations ORDER BY request_index")
         assert summary.succeeded == 5, rows

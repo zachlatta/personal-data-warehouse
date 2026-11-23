@@ -25,6 +25,7 @@ from psycopg2.extensions import make_dsn
 import pytest
 
 from personal_data_warehouse.defs.upstream_mutations import (
+    CloudMutationExecutors,
     RECLAIMABLE_IDEMPOTENT_OPERATIONS,
     process_upstream_mutation_batch,
 )
@@ -195,17 +196,19 @@ def _work(wh, drive: FakeDrive, *, lock_acquired: bool = True):
     )
     return process_upstream_mutation_batch(
         warehouse=wh,
-        gmail_executor=None,  # type: ignore[arg-type]
-        contact_executor=None,  # type: ignore[arg-type]
-        calendar_executor=None,  # type: ignore[arg-type]
-        slack_executor=None,  # type: ignore[arg-type]
-        screen_timelapse_executor=executor,
-        resideo_executor=None,  # type: ignore[arg-type]
-        drive_executor=None,  # type: ignore[arg-type]
+        executors=CloudMutationExecutors(
+            gmail=None,  # type: ignore[arg-type]
+            google_people=None,  # type: ignore[arg-type]
+            calendar=None,  # type: ignore[arg-type]
+            slack=None,  # type: ignore[arg-type]
+            screen_timelapse=executor,
+            resideo=None,  # type: ignore[arg-type]
+            google_drive=None,  # type: ignore[arg-type]
+            on_gmail_settings_changed=lambda accounts: None,
+        ),
         limit=10,
         claimed_by="purge-test",
         ensure_tables=False,
-        on_gmail_settings_changed=None,
     )
 
 

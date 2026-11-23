@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime, timedelta
 import json
 import os
@@ -28,7 +28,6 @@ from personal_data_warehouse.resideo_mutations import (
 )
 from personal_data_warehouse.calendar_mutations import (
     CALENDAR_PROVIDER,
-    CalendarMutationResult,
     CalendarMutationExecutor,
 )
 from personal_data_warehouse.config import load_settings
@@ -36,10 +35,7 @@ from personal_data_warehouse.google_drive_mutations import (
     GOOGLE_DRIVE_PROVIDER,
     GoogleDriveMutationExecutor,
 )
-from personal_data_warehouse.contact_mutations import (
-    GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
-    GoogleContactMutationExecutor,
-)
+from personal_data_warehouse.contact_mutations import GoogleContactMutationExecutor
 from personal_data_warehouse.gmail_mutations import (
     GMAIL_ARCHIVE_OPERATION,
     GMAIL_MODIFY_THREAD_LABELS_OPERATION,
@@ -182,25 +178,68 @@ def process_upstream_mutations(context) -> dict[str, object]:
                 return asdict(UpstreamMutationWorkerSummary(skipped_due_to_lock=True))
             summary = process_upstream_mutation_batch(
                 warehouse=warehouse,
-                gmail_executor=GmailMutationExecutor(settings=settings),
-                contact_executor=GoogleContactMutationExecutor(settings=settings),
-                calendar_executor=CalendarMutationExecutor(settings=settings),
-                slack_executor=SlackMutationExecutor(warehouse=warehouse),
-                screen_timelapse_executor=screen_timelapse_purge_executor(settings=settings, warehouse=warehouse),
-                resideo_executor=resideo_mutation_executor(settings=settings, warehouse=warehouse),
-                drive_executor=GoogleDriveMutationExecutor(settings=settings),
+                executors=build_cloud_mutation_executors(settings=settings, warehouse=warehouse, logger=context.log),
                 limit=batch_size,
                 claimed_by=claimed_by,
                 reclaim_after=reclaim_after,
-                on_gmail_settings_changed=lambda accounts: resync_gmail_settings(
-                    settings=settings, warehouse=warehouse, accounts=accounts, logger=context.log
-                ),
             )
     finally:
         warehouse.close()
 
     context.log.info("Processed upstream mutations: %s", summary)
     return asdict(summary)
+
+
+def _provider(name: str):
+    return field(metadata={"provider": name})
+
+
+@dataclass(frozen=True)
+class CloudMutationExecutors:
+    """Every provider the cloud workers execute, one required field each.
+
+    The resident worker and the Dagster fallback both build this through
+    build_cloud_mutation_executors, and a worker claims only the providers
+    named here. A provider added here therefore reaches both workers at once,
+    and a provider missing here is never claimed by a worker that would have
+    to defer it (de20a4b, 24b156c, 3fdaf1a, 35c0ad9 each fixed one caller
+    that had been left without an executor or hook).
+    """
+
+    gmail: GmailMutationExecutor = _provider("gmail")
+    google_people: GoogleContactMutationExecutor = _provider("google_people")
+    calendar: CalendarMutationExecutor = _provider(CALENDAR_PROVIDER)
+    slack: SlackMutationExecutor = _provider(SLACK_PROVIDER)
+    screen_timelapse: ScreenTimelapsePurgeExecutor = _provider(SCREEN_TIMELAPSE_PROVIDER)
+    resideo: ResideoMutationExecutor = _provider(RESIDEO_PROVIDER)
+    google_drive: GoogleDriveMutationExecutor = _provider(GOOGLE_DRIVE_PROVIDER)
+    on_gmail_settings_changed: Callable[[set[str]], None] = field()
+
+    def by_provider(self) -> dict[str, object]:
+        return {f.metadata["provider"]: getattr(self, f.name) for f in fields(self) if "provider" in f.metadata}
+
+
+CLOUD_MUTATION_PROVIDERS: tuple[str, ...] = tuple(
+    f.metadata["provider"] for f in fields(CloudMutationExecutors) if "provider" in f.metadata
+)
+# pdw.mutation_policy rows are applied by the Go app inside the approving
+# transaction (app/internal/mutations/policy_change.go) and never wait approved.
+APPLIED_AT_APPROVAL_MUTATION_PROVIDERS: tuple[str, ...] = ("pdw",)
+
+
+def build_cloud_mutation_executors(*, settings, warehouse, logger) -> CloudMutationExecutors:
+    return CloudMutationExecutors(
+        gmail=GmailMutationExecutor(settings=settings),
+        google_people=GoogleContactMutationExecutor(settings=settings),
+        calendar=CalendarMutationExecutor(settings=settings),
+        slack=SlackMutationExecutor(warehouse=warehouse),
+        screen_timelapse=screen_timelapse_purge_executor(settings=settings, warehouse=warehouse),
+        resideo=resideo_mutation_executor(settings=settings, warehouse=warehouse),
+        google_drive=GoogleDriveMutationExecutor(settings=settings),
+        on_gmail_settings_changed=lambda accounts: resync_gmail_settings(
+            settings=settings, warehouse=warehouse, accounts=accounts, logger=logger
+        ),
+    )
 
 
 def screen_timelapse_purge_executor(*, settings, warehouse) -> ScreenTimelapsePurgeExecutor:
@@ -279,7 +318,7 @@ def upstream_mutation_sensor(context):
         _ensure_upstream_mutation_tables_once(warehouse)
         count = warehouse.approved_upstream_mutation_count(
             ensure_tables=False,
-            exclude_providers=LOCAL_ONLY_MUTATION_PROVIDERS,
+            providers=CLOUD_MUTATION_PROVIDERS,
         )
         if count <= 0:
             reclaimable_count = warehouse.stale_reclaimable_upstream_mutation_count(
@@ -371,18 +410,11 @@ def upstream_mutation_observation_sensor(context):
 def process_upstream_mutation_batch(
     *,
     warehouse,
-    gmail_executor: GmailMutationExecutor,
-    contact_executor: GoogleContactMutationExecutor,
-    calendar_executor: CalendarMutationExecutor,
-    slack_executor: SlackMutationExecutor,
-    screen_timelapse_executor: ScreenTimelapsePurgeExecutor,
-    resideo_executor: ResideoMutationExecutor,
+    executors: CloudMutationExecutors,
     limit: int,
     claimed_by: str,
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
     ensure_tables: bool = True,
-    on_gmail_settings_changed: Callable[[set[str]], None] | None,
-    drive_executor: GoogleDriveMutationExecutor,
 ) -> UpstreamMutationWorkerSummary:
     if ensure_tables:
         warehouse.ensure_upstream_mutation_tables()
@@ -395,9 +427,10 @@ def process_upstream_mutation_batch(
     claimed = warehouse.claim_approved_upstream_mutations(
         limit=limit,
         claimed_by=claimed_by,
-        exclude_providers=LOCAL_ONLY_MUTATION_PROVIDERS,
+        providers=CLOUD_MUTATION_PROVIDERS,
         ensure_tables=False,
     )
+    executor_for = executors.by_provider()
 
     succeeded = 0
     failed_retryable = 0
@@ -414,7 +447,7 @@ def process_upstream_mutation_batch(
         status = _record_mutation_result(
             warehouse=warehouse,
             mutation=mutation,
-            result=gmail_executor.execute(mutation),
+            result=executors.gmail.execute(mutation),
             claimed_by=claimed_by,
         )
         processed_mutation_ids.add(str(mutation["id"]))
@@ -427,13 +460,13 @@ def process_upstream_mutation_batch(
             blocked_missing_credentials += 1
         else:
             failed_terminal += 1
-    if changed_gmail_settings_accounts and on_gmail_settings_changed is not None:
-        on_gmail_settings_changed(changed_gmail_settings_accounts)
+    if changed_gmail_settings_accounts:
+        executors.on_gmail_settings_changed(changed_gmail_settings_accounts)
 
     for group in _gmail_thread_label_mutation_groups(claimed):
         processed, counts = _process_gmail_thread_label_mutation_group(
             warehouse=warehouse,
-            gmail_executor=gmail_executor,
+            gmail_executor=executors.gmail,
             mutations=group,
             claimed_by=claimed_by,
         )
@@ -456,29 +489,7 @@ def process_upstream_mutation_batch(
         if skip_reason:
             warehouse.skip_upstream_mutation_for_precondition(str(mutation["id"]), reason=skip_reason, actor_id=claimed_by)
             continue
-        provider = mutation.get("provider")
-        if provider == "google_people" and mutation.get("operation") == GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION:
-            result = contact_executor.execute(mutation)
-        elif provider == CALENDAR_PROVIDER:
-            result = calendar_executor.execute(mutation)
-        elif provider == "gmail":
-            result = gmail_executor.execute(mutation)
-        elif provider == SLACK_PROVIDER:
-            result = slack_executor.execute(mutation)
-        elif provider == SCREEN_TIMELAPSE_PROVIDER:
-            result = screen_timelapse_executor.execute(mutation)
-        elif provider == RESIDEO_PROVIDER:
-            result = resideo_executor.execute(mutation)
-        elif provider == GOOGLE_DRIVE_PROVIDER:
-            result = drive_executor.execute(mutation)
-        else:
-            # Unknown providers should not be burned to failed_terminal by a stale worker
-            # version. Leave them claimable for a worker that understands them.
-            result = CalendarMutationResult(
-                status="failed_retryable",
-                result_json={"reason": "unknown provider for this worker version"},
-                error=f"unsupported provider {provider!r}; deferring for a newer worker",
-            )
+        result = executor_for[str(mutation["provider"])].execute(mutation)
         status = _record_mutation_result(
             warehouse=warehouse,
             mutation=mutation,

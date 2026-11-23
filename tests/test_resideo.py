@@ -20,6 +20,7 @@ import pytest
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.defs.upstream_mutations import (
+    CloudMutationExecutors,
     LOCAL_ONLY_MUTATION_PROVIDERS,
     RECLAIMABLE_IDEMPOTENT_OPERATIONS,
     process_upstream_mutation_batch,
@@ -638,19 +639,21 @@ def test_a_proposal_is_reviewed_approved_and_applied_by_the_worker() -> None:
         client = FakeClient([shadow(), shadow(heat=68.0, status="TemporaryHold")])
         summary = process_upstream_mutation_batch(
             warehouse=wh,
-            gmail_executor=None,  # type: ignore[arg-type]
-            contact_executor=None,  # type: ignore[arg-type]
-            calendar_executor=None,  # type: ignore[arg-type]
-            slack_executor=None,  # type: ignore[arg-type]
-            screen_timelapse_executor=None,  # type: ignore[arg-type]
-            resideo_executor=ResideoMutationExecutor(
-                warehouse=wh, account="home", client_factory=lambda: client, sleep=lambda seconds: None
+            executors=CloudMutationExecutors(
+                gmail=None,  # type: ignore[arg-type]
+                google_people=None,  # type: ignore[arg-type]
+                calendar=None,  # type: ignore[arg-type]
+                slack=None,  # type: ignore[arg-type]
+                screen_timelapse=None,  # type: ignore[arg-type]
+                resideo=ResideoMutationExecutor(
+                    warehouse=wh, account="home", client_factory=lambda: client, sleep=lambda seconds: None
+                ),
+                google_drive=None,  # type: ignore[arg-type]
+                on_gmail_settings_changed=lambda accounts: None,
             ),
             limit=10,
-            drive_executor=None,  # type: ignore[arg-type]
             claimed_by="resideo-test",
             ensure_tables=False,
-            on_gmail_settings_changed=None,
         )
         assert summary.succeeded == 1
         assert client.writes == [("heat", 68.0, "TemporaryHold")]

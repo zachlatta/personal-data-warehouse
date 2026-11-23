@@ -12,6 +12,7 @@ from personal_data_warehouse.google_drive_source_sync import (
 from tests.test_google_drive_source_sync import _settings
 
 from personal_data_warehouse.defs.upstream_mutations import (
+    CloudMutationExecutors,
     process_upstream_mutation_batch,
     observe_drive_mutation_batch,
 )
@@ -104,16 +105,18 @@ def test_drive_proposal_review_approval_and_worker():
         }
         summary = process_upstream_mutation_batch(
             warehouse=warehouse,
-            gmail_executor=None,
-            contact_executor=None,
-            calendar_executor=None,
-            slack_executor=None,
-            screen_timelapse_executor=None,
-            resideo_executor=None,
-            drive_executor=GoogleDriveMutationExecutor(settings=None, service_factory=lambda account: drive),
+            executors=CloudMutationExecutors(
+                gmail=None,  # type: ignore[arg-type]
+                google_people=None,  # type: ignore[arg-type]
+                calendar=None,  # type: ignore[arg-type]
+                slack=None,  # type: ignore[arg-type]
+                screen_timelapse=None,  # type: ignore[arg-type]
+                resideo=None,  # type: ignore[arg-type]
+                google_drive=GoogleDriveMutationExecutor(settings=None, service_factory=lambda account: drive),
+                on_gmail_settings_changed=lambda accounts: None,
+            ),
             limit=10,
             claimed_by="test:drive",
-            on_gmail_settings_changed=None,
         )
         assert summary.claimed == summary.succeeded == 1
         drive.files.return_value.create.assert_called_once()
@@ -123,16 +126,18 @@ def test_drive_proposal_review_approval_and_worker():
         # A second worker pass never repeats the successful create.
         again = process_upstream_mutation_batch(
             warehouse=warehouse,
-            gmail_executor=None,
-            contact_executor=None,
-            calendar_executor=None,
-            slack_executor=None,
-            screen_timelapse_executor=None,
-            resideo_executor=None,
-            drive_executor=GoogleDriveMutationExecutor(settings=None, service_factory=lambda account: drive),
+            executors=CloudMutationExecutors(
+                gmail=None,  # type: ignore[arg-type]
+                google_people=None,  # type: ignore[arg-type]
+                calendar=None,  # type: ignore[arg-type]
+                slack=None,  # type: ignore[arg-type]
+                screen_timelapse=None,  # type: ignore[arg-type]
+                resideo=None,  # type: ignore[arg-type]
+                google_drive=GoogleDriveMutationExecutor(settings=None, service_factory=lambda account: drive),
+                on_gmail_settings_changed=lambda accounts: None,
+            ),
             limit=10,
             claimed_by="test:drive",
-            on_gmail_settings_changed=None,
         )
         assert again.claimed == 0
         folders.append(
