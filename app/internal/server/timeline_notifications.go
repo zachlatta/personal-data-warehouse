@@ -362,9 +362,7 @@ func notificationMediaLookup(db *sql.DB, baseURL string, signer *pdwauth.Service
 		if !strings.HasPrefix(baseURL, "https://") || signer == nil || fileID == "" {
 			return ""
 		}
-		exp := now().Add(notificationAvatarTTL)
-		sig := signer.SignObjectDownload(fileID, "", exp)
-		return fmt.Sprintf("%s/objects/%s?exp=%d&sig=%s", strings.TrimRight(baseURL, "/"), url.PathEscape(fileID), exp.Unix(), url.QueryEscape(sig))
+		return signedObjectDownloadURL(signer, baseURL, fileID, "", now().Add(notificationAvatarTTL))
 	}
 	return func(ctx context.Context, row map[string]any) (notificationMedia, error) {
 		var out notificationMedia

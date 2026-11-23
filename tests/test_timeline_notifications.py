@@ -7,11 +7,20 @@ from pathlib import Path
 
 import pytest
 
-from personal_data_warehouse.postgres import PostgresWarehouse
+from personal_data_warehouse.postgres import POSTGRES_INDEXES, PostgresWarehouse
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 
 pytestmark = pytest.mark.local_integration
+
+
+def test_the_slack_notification_image_lookup_is_served_by_an_index() -> None:
+    """The fan-out attaches a Slack message's image by (account, team_id,
+    conversation_id, message_ts) under a one-second bound; the primary key
+    leads with file_id, so without this index every Slack alert walks the
+    whole team's file index."""
+    sql = " ".join(spec.sql for spec in POSTGRES_INDEXES if spec.table == "slack_files")
+    assert "(account, team_id, conversation_id, message_ts)" in sql
 
 
 @pytest.fixture

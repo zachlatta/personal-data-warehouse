@@ -2800,6 +2800,15 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_files",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_created_at_idx ON @slack_files (created_at DESC)",
     ),
+    # The notification fan-out attaches a Slack message's image by message
+    # under a one-second bound (resolveImageAttachmentForRow); the primary key
+    # leads with file_id, so it cannot serve that lookup.
+    IndexSpec(
+        "slack_files_message_idx",
+        "slack_files",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_message_idx "
+        "ON @slack_files (account, team_id, conversation_id, message_ts)",
+    ),
     # The Slack-file timeline event time falls back from the epoch sentinel to
     # message_ts and then synced_at.  A created_at-only index therefore cannot
     # serve the exact ORDER BY: production performed a five-worker seq scan and
