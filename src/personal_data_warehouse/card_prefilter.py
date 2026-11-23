@@ -1,4 +1,4 @@
-"""Cheap, deliberately permissive candidate discovery; never a Luhn decision."""
+"""Cheap, deliberately permissive candidate discovery; never a Luhn or credential decision."""
 from concurrent.futures import ProcessPoolExecutor
 import json
 import multiprocessing
@@ -7,6 +7,7 @@ import re
 import threading
 
 from personal_data_warehouse.card_redaction import CARD_POLICY, sensitive_count, redact_row
+from personal_data_warehouse.credential_redaction import SQL_PREFILTER, might_contain_credential
 
 UNICODE_UNIT = r'u[0-9a-fA-F]{4}'
 UNIT_DIGITS = '0000'
@@ -31,18 +32,24 @@ def sql_prefilter(expression, *, scope='all'):
     False positives are always confirmed in Python.
     The expression is supplied by code, never by CLI input.
     """
-    if scope == 'tokens':
-        # JSON can encode any ASCII token byte (or its escape backslash).
-        # Literal substring tests are cheap even on large transcript values;
-        # decoded Python confirmation makes the final decision.
-        return (f"(strpos(COALESCE(({expression})::text, ''), 'pdw_') > 0 OR "
-                f"strpos(COALESCE(({expression})::text, ''), 'u00') > 0)")
+    if scope == 'credentials':
+        # Credential literals survive backslash removal; Unicode escapes leave
+        # 'u00'. Python confirmation makes the final decision.
+        return (f"(translate(COALESCE(({expression})::text, ''), chr(92), '') ~* "
+                f"'{_sql_literal(SQL_PREFILTER)}')")
+    # Credential literals survive the unit rewrite (no rule needs a 'u'+hex
+    # run), and rewritten units already match the four-digit sentinel.
     return (f"(regexp_replace(translate(COALESCE(({expression})::text, ''), chr(92), ''), "
-            f"'{UNICODE_UNIT}', '{UNIT_DIGITS}', 'g') ~ '({DIGIT_WINDOW}|pdw_|{UNIT_DIGITS})')")
+            f"'{UNICODE_UNIT}', '{UNIT_DIGITS}', 'g') ~* '({DIGIT_WINDOW}|{UNIT_DIGITS}|{_sql_literal(SQL_PREFILTER)})')")
 
 
-def might_contain_card(value):
-    return 'pdw_' in value or 'u00' in value or bool(_WINDOW.search(_UNIT.sub(UNIT_DIGITS,value.replace('\\',''))))
+def _sql_literal(pattern):
+    return pattern.replace("'", "''")
+
+
+def might_contain_sensitive(value):
+    return (might_contain_credential(value) or 'u00' in value or
+            bool(_WINDOW.search(_UNIT.sub(UNIT_DIGITS,value.replace('\\','')))))
 
 
 def available_cpus():

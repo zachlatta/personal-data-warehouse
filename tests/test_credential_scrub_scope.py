@@ -1,23 +1,24 @@
-"""Token-only maintenance preserves payment data across every repair surface."""
+"""Credential-only maintenance preserves payment data across every repair surface."""
 import argparse
 import gzip
 import json
 
 import pytest
 
+from personal_data_warehouse.credential_redaction import credential_count, marker
 from personal_data_warehouse.card_scrub_selector import ScrubSelector, add_selector_arguments, validate_specification
 from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
 from tests.test_conversation_card_storage import event, warehouse
 from tests.test_card_scrub_discovery import MemoryArchive
 
 TOKEN = 'pdw_' + 'a' * 16 + '_' + 'B' * 40
-MASKED = 'pdw_' + 'a' * 16 + '_[REDACTED]'
+MASKED = 'pdw_' + 'a' * 16 + '_' + marker('pdw_token', 'B' * 40)
 CARD = 'card: 4111111111111111 CVV: 987'
 
 
 @pytest.mark.parametrize('depth', range(5))
-def test_tokens_preserve_every_other_byte(depth):
-    selector = ScrubSelector('tokens')
+def test_credentials_preserve_every_other_byte(depth):
+    selector = ScrubSelector('credentials')
     value = '{ "card":4111111111111111,"cvv":987,"n":1e400,"text":"' + TOKEN + '" }'
     expected = value.replace(TOKEN, MASKED)
     for _ in range(depth):
@@ -28,35 +29,35 @@ def test_tokens_preserve_every_other_byte(depth):
     assert selector.redact(CARD) == CARD
 
 
-def test_token_scope_cli_and_plan_identity():
+def test_credential_scope_cli_and_plan_identity():
     parser = argparse.ArgumentParser()
     add_selector_arguments(parser)
-    assert parser.parse_args(['--scope', 'tokens']).scope == 'tokens'
-    validate_specification(ScrubSelector('tokens').specification)
+    assert parser.parse_args(['--scope', 'credentials']).scope == 'credentials'
+    validate_specification(ScrubSelector('credentials').specification)
     with pytest.raises(ValueError, match='seed'):
-        ScrubSelector('tokens', seed_rows=('unused',))
+        ScrubSelector('credentials', seed_rows=('unused',))
 
 
-def test_token_prefilter_includes_nested_unicode(warehouse):
+def test_credential_prefilter_includes_nested_unicode(warehouse):
     from personal_data_warehouse.card_prefilter import sql_prefilter
-    selector = ScrubSelector('tokens')
+    selector = ScrubSelector('credentials')
     encoded = '"' + ''.join(r'\u%04x' % ord(c) for c in TOKEN) + '"'
     values = [TOKEN, CARD, 'ordinary identifier', encoded]
     for _ in range(4):
         values.append(json.dumps({'nested': values[-1]}))
     for value in values:
-        selected = warehouse._query('SELECT ' + sql_prefilter('%s', scope='tokens'), (value, value))[0][0]
+        selected = warehouse._query('SELECT ' + sql_prefilter('%s', scope='credentials'), (value,))[0][0]
         assert not selector.count(value) or selected
     assert all(selector.count(value) == 1 for value in values[3:])
-    assert not warehouse._query('SELECT ' + sql_prefilter('%s', scope='tokens'), (CARD, CARD))[0][0]
+    assert not warehouse._query('SELECT ' + sql_prefilter('%s', scope='credentials'), (CARD,))[0][0]
 
 
 @pytest.mark.parametrize('dirty', ['source', 'timeline', 'chunk'])
-def test_tokens_rebuild_all_database_copies(warehouse, dirty, tmp_path):
+def test_credentials_rebuild_all_database_copies(warehouse, dirty, tmp_path):
     from personal_data_warehouse.scrub_conversation_cards import discover, scrub, write_plan, read_plan
     from personal_data_warehouse.search_index import SearchChunkBuilder
     from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
-    selector = ScrubSelector('tokens')
+    selector = ScrubSelector('credentials')
     text = CARD + ' ' + (TOKEN if dirty == 'source' else MASKED)
     row = dict(event(), text=text, raw_json=json.dumps({'text': text}), tool_input_json=text, tool_result_json=text)
     warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
@@ -97,11 +98,11 @@ def test_tokens_rebuild_all_database_copies(warehouse, dirty, tmp_path):
         engine.close()
 
 
-def test_token_archives_and_host_jsonl(tmp_path, monkeypatch):
+def test_credential_archives_and_host_jsonl(tmp_path, monkeypatch):
     from personal_data_warehouse.scrub_conversation_objects import discover_objects, scrub_objects
     from personal_data_warehouse.scrub_conversation_jsonl import scrub_jsonl
     monkeypatch.chdir(tmp_path)
-    selector = ScrubSelector('tokens')
+    selector = ScrubSelector('credentials')
     values = [CARD, CARD + ' ' + TOKEN, json.dumps({'nested': TOKEN})]
     store = MemoryArchive(values)
     plan = discover_objects(store, selector=selector)
@@ -118,12 +119,12 @@ def test_token_archives_and_host_jsonl(tmp_path, monkeypatch):
     assert scrub_jsonl(tmp_path, 'session', selector=selector)['matches'] == 0
 
 
-def test_token_db_verify_cli_fails_until_clean(warehouse, monkeypatch):
+def test_credential_db_verify_cli_fails_until_clean(warehouse, monkeypatch):
     import sys
     import personal_data_warehouse.scrub_conversation_cards as module
     monkeypatch.setattr(module, 'PostgresWarehouse', lambda *a, **k: warehouse)
     monkeypatch.setattr(warehouse, 'close', lambda: warehouse._connection.set_session(readonly=False, autocommit=True))
-    monkeypatch.setattr(sys, 'argv', ['scrub', '--scope', 'tokens', '--verify', '--workers', '1'])
+    monkeypatch.setattr(sys, 'argv', ['scrub', '--scope', 'credentials', '--verify', '--workers', '1'])
     row = dict(event(), text=TOKEN, raw_json='{}')
     warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
     with pytest.raises(SystemExit, match='secrets remain'):
@@ -132,7 +133,7 @@ def test_token_db_verify_cli_fails_until_clean(warehouse, monkeypatch):
     module.main()
 
 
-def test_token_object_verify_cli_fails_until_clean(monkeypatch):
+def test_credential_object_verify_cli_fails_until_clean(monkeypatch):
     import sys
     import personal_data_warehouse.config as config
     import personal_data_warehouse.defs.agent_sessions_drive_ingest as ingest
@@ -146,9 +147,89 @@ def test_token_object_verify_cli_fails_until_clean(monkeypatch):
         for row in rows: row.filename='20000102T000000Z-synthetic.jsonl.gz'
         return rows
     monkeypatch.setattr(store,'list_objects',listings)
-    monkeypatch.setattr(sys, 'argv', ['scrub', '--scope', 'tokens', '--verify', '--workers', '1',
+    monkeypatch.setattr(sys, 'argv', ['scrub', '--scope', 'credentials', '--verify', '--workers', '1',
         '--exported-from','2000-01-02T00:00:00Z','--exported-before','2000-01-03T00:00:00Z'])
     with pytest.raises(SystemExit, match='secrets remain'):
         main()
     store.objects.clear()
     main()
+
+
+def test_prefilters_select_every_generated_credential(warehouse):
+    from personal_data_warehouse.card_prefilter import might_contain_sensitive, sql_prefilter
+    from tests.credential_redaction_properties import corpus
+    from tests.credential_redaction_properties import expand
+    key = expand('<<openai>>')
+    escaped = ['{"t":"\\u003c' + key + '"}', '{"t":"\\n' + key + '"}', '{"t":"\\u0009' + key + '"}']
+    values = [value for _, value, _ in corpus() if credential_count(value)] + escaped
+    assert all(credential_count(value) == 1 for value in escaped)
+    for scope in ('credentials', 'all'):
+        sql = 'SELECT bool_and(' + sql_prefilter('v', scope=scope) + ') FROM unnest(%s::text[]) v'
+        assert warehouse._query(sql, (values,))[0][0], scope
+    assert all(might_contain_sensitive(value) for value in values)
+
+
+def test_insert_path_stores_every_credential_shape_as_markers(warehouse):
+    from tests.credential_redaction_properties import FIXTURE, expand
+    cases = [c for c in FIXTURE['cases'] if 'expected' in c]
+    rows = []
+    for i, case in enumerate(cases):
+        value = expand(case['input'])
+        rows.append(dict(event(), event_uuid=f'credential-{i}', seq=i + 1, text=value, tool_result_json=value,
+                         tool_input_json=json.dumps({'command': value}), raw_json=json.dumps({'message': {'content': value}})))
+    warehouse.insert_agent_session_events(rows)
+    stored = {r['event_uuid']: r for r in warehouse._query_dicts('SELECT * FROM @claude_code_events')}
+    dump = json.dumps(stored, default=str)
+    for name, parts in FIXTURE['secrets'].items():
+        if name not in ('awsid', 'pemhead', 'pemfoot'):
+            assert ''.join(parts) not in dump, name
+    for i, case in enumerate(cases):
+        row, want = stored[f'credential-{i}'], expand(case['expected'])
+        assert row['text'] == want and row['tool_result_json'] == want, case['name']
+        assert json.loads(row['tool_input_json'])['command'] == want
+        raw = row['raw_json'] if isinstance(row['raw_json'], dict) else json.loads(row['raw_json'])
+        assert raw['message']['content'] == want
+
+
+def test_credential_report_counts_by_kind_and_role_then_zero_after_scrub(warehouse, tmp_path):
+    from personal_data_warehouse.credential_scrub_report import scan
+    from personal_data_warehouse.scrub_conversation_cards import discover, scrub
+    from tests.credential_redaction_properties import FIXTURE, expand
+    slack, pgpw = expand('<<slack>>'), expand('PGPASSWORD=<<pgpw>>')
+    rows = [dict(event(), event_uuid='u1', seq=1, role='user', text='use ' + slack, raw_json='{}'),
+            dict(event(), event_uuid='t1', seq=2, role='tool', text='', tool_result_json=pgpw + ' and ' + slack, raw_json='{}'),
+            dict(event(), event_uuid='c1', seq=3, role='user', text='desk-0123456789abcdefghijklmnop', raw_json='{}')]
+    warehouse._insert_rows('claude_code_events', rows, AGENT_SESSION_EVENT_COLUMNS)
+    report, samples = scan(warehouse._database_url, warehouse._schema, tables=('claude_code_events',), workers=1, examples=5)
+    assert report['by_kind'] == {'slack_token': 2, 'password': 1}
+    assert report['by_role'] == {'user': 1, 'tool': 2}
+    assert report['rows_scanned'] == {'claude_code_events': 3}
+    assert report['matches'] == 3
+    assert report['source_rows_matched'] == {'claude_code_events': 2}
+    assert report['sessions'] == dict(affected=1, canonical_rows=3, largest_rows=3, over_10000_rows=0)
+    assert report['distinct_secrets_by_kind'] == {'password': 1, 'slack_token': 1}
+    assert {kind: len(items) for kind, items in samples.items()} == {'password': 1, 'slack_token': 1}
+    assert samples['slack_token'][0]['marker'] == expand('<<mask:slack_token:slack>>')
+    dump = json.dumps(samples)
+    assert slack not in dump and expand('<<pgpw>>') not in dump and '[REDACTED:slack_token:' in dump
+    selector = ScrubSelector('credentials')
+    plan = discover(warehouse, selector=selector)
+    scrub(warehouse, apply=True, plan=plan, selector=selector)
+    after, _ = scan(warehouse._database_url, warehouse._schema, tables=('claude_code_events', 'timeline_events', 'search_chunks'), workers=1)
+    assert after['matches'] == 0
+    assert warehouse._query("SELECT text FROM @claude_code_events WHERE event_uuid='c1'")[0][0] == 'desk-0123456789abcdefghijklmnop'
+
+
+def test_hand_check_sample_is_stratified_and_one_example_per_secret():
+    from personal_data_warehouse.credential_scrub_report import _draw, _stratified
+    drawn = {}
+    for table, count in (('codex_events', 50), ('chatgpt_events', 3)):
+        for i in range(count):
+            for _ in range(3):  # the same secret seen in three columns
+                _draw(drawn.setdefault(('secret', table), {}), f'[REDACTED:secret:{table[:2]}{i:04x}]', 4, dict(table=table))
+    _draw(drawn[('secret', 'chatgpt_events')], '[REDACTED:secret:co0001]', 4, dict(table='chatgpt_events'))
+    sample = _stratified(drawn, 6)['secret']
+    markers = [item['marker'] for item in sample]
+    assert len(markers) == len(set(markers)) == 6
+    assert [item['table'] for item in sample[:6]].count('chatgpt_events') == 3
+    assert all(len(pool) <= 16 for pool in drawn.values())

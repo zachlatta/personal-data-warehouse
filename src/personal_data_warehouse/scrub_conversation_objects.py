@@ -19,12 +19,12 @@ import threading
 
 from personal_data_warehouse.card_redaction import is_card, redact
 from personal_data_warehouse.card_scrub_selector import ScrubSelector, add_selector_arguments, selector_from_args
-from personal_data_warehouse.card_prefilter import ConfirmationPool, available_cpus, might_contain_card
+from personal_data_warehouse.card_prefilter import ConfirmationPool, available_cpus, might_contain_sensitive
 
 
 def _line_matches(raw,pool):
     lines=raw.splitlines(keepends=True)
-    indexes=[i for i,line in enumerate(lines) if might_contain_card(line)]
+    indexes=[i for i,line in enumerate(lines) if might_contain_sensitive(line)]
     matches={}
     for start in range(0,len(indexes),max(500,pool.workers*64)):
         batch=indexes[start:start+max(500,pool.workers*64)]
@@ -187,7 +187,7 @@ def main():
         validate_scan_scope(supplied)
         if baseline and supplied!=scan_scope: parser.error('scan scope differs from saved plan')
         scan_scope=supplied
-    if args.scope=='tokens' and scan_scope is None: parser.error('token archive work requires an explicit bounded export interval')
+    if args.scope=='credentials' and scan_scope is None: parser.error('credential archive work requires an explicit bounded export interval')
     if not 1<=args.download_workers<=32: parser.error('--download-workers must be 1..32')
     if args.workers<1:parser.error('--workers must be positive')
     if args.apply and args.verify:parser.error('--apply and --verify are mutually exclusive')
@@ -203,8 +203,8 @@ def main():
         after=discover_objects(store,workers=args.workers,selector=selector,scan_scope=scan_scope,
                                store_factory=factory,download_workers=args.download_workers)['counts']
         print(json.dumps({'after':after}))
-        if args.scope == 'tokens' and after['matches']:
-            raise SystemExit('token verification failed: secrets remain')
+        if args.scope == 'credentials' and after['matches']:
+            raise SystemExit('credential verification failed: secrets remain')
     else:
         plan=discover_objects(store,workers=args.workers,selector=selector,scan_scope=scan_scope,
                               store_factory=factory,download_workers=args.download_workers)

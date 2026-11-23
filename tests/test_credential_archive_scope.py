@@ -5,7 +5,7 @@ import pytest
 
 from personal_data_warehouse import scrub_conversation_objects as m
 from personal_data_warehouse.card_scrub_selector import ScrubSelector
-from tests.test_token_scrub_scope import TOKEN
+from tests.test_credential_scrub_scope import TOKEN
 
 
 def test_scoped_plan_and_verify_never_download_outside_export_interval():
@@ -21,7 +21,7 @@ def test_scoped_plan_and_verify_never_download_outside_export_interval():
     store=Store()
     scope=dict(exported_from='2000-01-02T00:00:00Z',exported_before='2000-01-08T00:00:00Z',
                max_objects=2,max_bytes=10000)
-    selector=ScrubSelector('tokens')
+    selector=ScrubSelector('credentials')
     plan=m.discover_objects(store,selector=selector,scan_scope=scope)
     assert plan['scan_scope']==scope
     m._validate_object_plan(plan)
@@ -53,7 +53,7 @@ def test_scoped_apply_verify_checks_replacement_id(tmp_path, monkeypatch):
         for row in rows: row.filename='20000102T000000Z-synthetic.jsonl.gz'
         return rows
     monkeypatch.setattr(store,'list_objects',listings)
-    selector=ScrubSelector('tokens')
+    selector=ScrubSelector('credentials')
     scope=dict(exported_from='2000-01-02T00:00:00Z',exported_before='2000-01-03T00:00:00Z',
                max_objects=2,max_bytes=10000)
     plan=m.discover_objects(store,selector=selector,scan_scope=scope)
@@ -88,7 +88,7 @@ def test_scoped_scan_reports_counts_only_progress(capsys):
         def get_object(self, ref): return gzip.compress(TOKEN.encode())
     scope=dict(exported_from='2000-01-02T00:00:00Z',exported_before='2000-01-03T00:00:00Z',
                max_objects=5,max_bytes=10**6)
-    m.discover_objects(Store(),selector=ScrubSelector('tokens'),scan_scope=scope,progress_every=2)
+    m.discover_objects(Store(),selector=ScrubSelector('credentials'),scan_scope=scope,progress_every=2)
     lines=capsys.readouterr().err.splitlines()
     assert [line.split()[:2] for line in lines]==[['archive','scan']]*3
     assert lines[-1].startswith('archive scan 5/5 objects')

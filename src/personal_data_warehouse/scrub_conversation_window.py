@@ -1,4 +1,4 @@
-"""Host-side token scrub controller. Run on the production Docker host as root.
+"""Host-side credential scrub controller. Run on the production Docker host as root.
 
 Only plan/verify read production data; the archive-* phases repair the Drive
 archive live and never stop a writer. Apply stops the app and entire Dagster
@@ -15,7 +15,7 @@ import signal
 import subprocess
 import tempfile
 
-RUNTIME_NAME='pdw-conversation-token-scrub'
+RUNTIME_NAME='pdw-conversation-credential-scrub'
 MAINTENANCE_ROOT=Path('/var/lib/pdw-maintenance')
 
 
@@ -68,7 +68,7 @@ def runtime(directory, state, module, *args):
     docker(['run','--rm','--name',RUNTIME_NAME,'--network',state['network'],'--env-file',str(directory/'runtime.env'),
             '--volume',f'{directory}:/scrub','--entrypoint','/app/.venv/bin/python',state['image'],
             '-m',f'personal_data_warehouse.scrub_conversation_{module}',
-            '--scope','tokens','--plan',f'/scrub/token-{module}-plan.json',*args],capture=False)
+            '--scope','credentials','--plan',f'/scrub/credential-{module}-plan.json',*args],capture=False)
 
 
 def plan(directory, archive_args=None):
@@ -111,10 +111,14 @@ def restore(directory):
     if failures: raise RuntimeError('writer restoration failed; rerun restore using the saved state')
 
 
-def apply(directory, max_canonical_rows=10000):
+def apply(directory, max_canonical_rows=10000, max_source_rows=500, max_plan_rows=20000, max_groups=None,
+          large_session_window_seconds=None):
     # A group that overruns its 60-second transaction rolls back; rerunning
     # apply with a cap just above the largest session isolates it.
-    if not 0<max_canonical_rows<=10000: raise ValueError('--max-canonical-rows must be 1..10000')
+    if not 0<max_canonical_rows<=30000: raise ValueError('--max-canonical-rows must be 1..30000')
+    if max_groups is not None and max_groups<1: raise ValueError('--max-groups must be positive')
+    if large_session_window_seconds is not None and not 0<large_session_window_seconds<=300:
+        raise ValueError('--large-session-window-seconds must be 1..300')
     state=json.loads((directory/'state.json').read_text())
     assert_current(state)
     save(directory/'before-stop.json',snapshot(state),replace=True)
@@ -123,7 +127,10 @@ def apply(directory, max_canonical_rows=10000):
     try:
         docker(['stop','--time','30',*[w['Id'] for w in state['writers']]])
         runtime(directory,state,'cards','--apply','--session-batches','--planned-only',
-                '--writers-paused','--max-canonical-rows',str(max_canonical_rows),'--window-seconds','60')
+                '--writers-paused','--max-canonical-rows',str(max_canonical_rows),'--window-seconds','60',
+                '--max-source-rows',str(max_source_rows),'--max-plan-rows',str(max_plan_rows),
+                *(['--max-groups',str(max_groups)] if max_groups else []),
+                *(['--large-session-window-seconds',str(large_session_window_seconds)] if large_session_window_seconds else []))
     finally:
         restore(directory)
 
@@ -153,7 +160,7 @@ def cleanup(directory):
         raise ValueError('cleanup requires a direct directory under the maintenance root')
     if not directory.exists(): return
     allowed={'runtime.env','state.json','before-plan.json','before-stop.json',
-             'token-cards-plan.json','token-objects-plan.json','archive-scope.json'}
+             'credential-cards-plan.json','credential-objects-plan.json','archive-scope.json'}
     entries=list(directory.iterdir())
     # save(replace=True) and the cards plan writer leave '<name>.<random>'
     # temporaries behind if killed between create and rename.
@@ -187,6 +194,10 @@ def main():
                                         'archive-plan','archive-apply','archive-verify'))
     parser.add_argument('--state-dir',type=Path,required=True)
     parser.add_argument('--max-canonical-rows',type=int,default=10000,help='apply only: canonical rows per session group')
+    parser.add_argument('--max-source-rows',type=int,default=500,help='apply only: matching source rows the whole plan may hold')
+    parser.add_argument('--max-plan-rows',type=int,default=20000,help='apply only: source and derived rows the whole plan may hold')
+    parser.add_argument('--max-groups',type=int,help='apply only: session groups per writer outage; rerun apply to resume')
+    parser.add_argument('--large-session-window-seconds',type=int,help='apply only: deadline (<= 300) for a lone session over 10,000 rows')
     parser.add_argument('--exported-from')
     parser.add_argument('--exported-before')
     parser.add_argument('--max-objects',type=int,default=70000)
@@ -200,7 +211,8 @@ def main():
         plan(directory,['--exported-from',args.exported_from,'--exported-before',args.exported_before,
                         '--max-objects',str(args.max_objects),'--max-bytes',str(args.max_bytes)])
     elif args.phase.startswith('archive-'): archive(directory,args.phase.removeprefix('archive-'))
-    elif args.phase=='apply': apply(directory,args.max_canonical_rows)
+    elif args.phase=='apply': apply(directory,args.max_canonical_rows,args.max_source_rows,args.max_plan_rows,args.max_groups,
+                                         args.large_session_window_seconds)
     else: globals()[args.phase](directory)
 
 

@@ -1,7 +1,8 @@
 package server
 
-// Conversation batches are scrubbed after signature verification and before
-// object storage. Python applies the same boundary again at database insertion.
+// Conversation batches are scrubbed of payment cards and credentials
+// (credential_redaction.go) after signature verification and before object
+// storage. Python applies the same boundary again at database insertion.
 import (
 	"bytes"
 	"compress/gzip"
@@ -258,8 +259,7 @@ func validCard(s string) bool {
 }
 
 func redactCardText(s string, context bool) string {
-	s = applyCardEdits(s, cardRedactionEdits(s, context))
-	return applyCardEdits(s, accessTokenEdits(s))
+	return applyCardEdits(s, withCredentials(s, cardRedactionEdits(s, context)))
 }
 
 func redactConversationBatch(body []byte, maxBytes int64) ([]byte, error) {
@@ -281,15 +281,17 @@ func redactConversationBatch(body []byte, maxBytes int64) ([]byte, error) {
 		if !json.Valid(line) {
 			return nil, fmt.Errorf("invalid conversation JSON")
 		}
-		if cardCount(string(line)) == 0 && !bytes.Contains(line, []byte("pdw_")) && !bytes.Contains(line, []byte(`\u`)) {
+		original := string(line)
+		var cards []cardEdit
+		if cardCount(original) > 0 {
+			cards = cardJSONEdits(original)
+		}
+		edits := withCredentials(original, cards)
+		if len(edits) == 0 {
 			continue
 		}
-		cleaned := string(line)
-		if cardCount(cleaned) > 0 {
-			cleaned = applyCardEdits(cleaned, cardJSONEdits(cleaned))
-		}
-		cleaned = applyCardEdits(cleaned, accessTokenEdits(cleaned))
-		if cleaned == string(line) {
+		cleaned := applyCardEdits(original, edits)
+		if cleaned == original {
 			continue
 		}
 		lines[i] = []byte(cleaned)

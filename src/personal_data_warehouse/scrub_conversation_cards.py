@@ -29,6 +29,8 @@ from personal_data_warehouse.card_prefilter import ConfirmationPool, available_c
 
 
 TABLES = (*_AI_CONVERSATION_EVENT_TABLES, 'timeline_events', 'search_chunks')
+# A session this large runs in its own group (see apply_batches).
+LARGE_SESSION_ROWS = 10000
 DERIVED = ('timeline_events', 'search_chunks')
 row_matches = count_row
 
@@ -446,9 +448,10 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
         raise ValueError("plan selector differs from current selector")
     if plan['scope'] != _scope(warehouse): raise ValueError('discovery plan belongs to another warehouse')
     if not apply: return plan['counts']
-    if planned_only and (not selector or selector.scope != 'tokens'):
-        raise ValueError('planned-only repair requires the token selector')
-    if not 0<window_seconds<=60: raise ValueError('maintenance budget must be at most 60 seconds')
+    if planned_only and (not selector or selector.scope != 'credentials'):
+        raise ValueError('planned-only repair requires the credential selector')
+    # 60 seconds per group; apply_batches may give one large session up to 300.
+    if not 0<window_seconds<=300: raise ValueError('maintenance budget must be at most 300 seconds')
     if 'discovery' in plan: raise ValueError('partition discovery incomplete')
     if exact_source_rows is not None and not 0<exact_source_rows<=max_source_rows:
         raise ValueError('invalid exact source-row gate')
@@ -494,14 +497,14 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
         # Canonical new keys are checked before upsert by rebuild_sessions.
         # Recheck saved keys without running whole-corpus detection in-window.
         phase('verification')
-        rows=[row for _,row in _planned_rows(warehouse,plan['candidates'])]
+        rows=[row for _,row in _planned_rows(warehouse,plan['candidates'],prefilter_scope=selector.scope if selector else 'all')]
         with ConfirmationPool(workers,selector) as pool:
             if any(pool.counts(rows)): raise RuntimeError('planned row verification failed; no changes committed')
     return plan['counts']
 
 
 def _session_candidates(warehouse, plan, pool):
-    """Indexed source/session confirmation for explicit planned-only token repair.
+    """Indexed source/session confirmation for explicit planned-only credential repair.
 
     This does not certify unrelated sessions. Full post-restore verification
     remains mandatory. Unknown selected rows IN a planned session fail closed.
@@ -510,22 +513,28 @@ def _session_candidates(warehouse, plan, pool):
     selected=[]
     for source,session in sorted({tuple(c['session']) for c in plan['candidates'] if c['session']}):
         table=_AI_EVENT_TABLE_BY_SOURCE[source]
-        rows=warehouse._query_dicts(f'SELECT * FROM @{table} WHERE source=%s AND session_id=%s', (source,session))
+        # Only rows passing the scan's superset prefilter can hold a selected
+        # reading; the in-window recheck of a large session reads just those.
+        prefilter=sql_prefilter('to_jsonb(candidate)::text',scope=pool.selector.scope if pool.selector else 'all')
+        rows=warehouse._query_dicts(f'SELECT * FROM @{table} candidate WHERE source=%s AND session_id=%s AND {prefilter}', (source,session))
         for row,n in zip(rows,pool.counts(rows),strict=True):
             if n: selected.append(dict(table=table,key=[row[k] for k in POSTGRES_TABLES[table].primary_key]))
     return selected
 
 
-def _planned_rows(warehouse, candidates, *, lock=False):
+def _planned_rows(warehouse, candidates, *, lock=False, prefilter_scope=None):
+    """Saved identities in 500-key batches; ``prefilter_scope`` reads only rows
+    that pass the scan's superset prefilter (the rest cannot hold a reading)."""
     rows=[]
+    prefilter=(' AND '+sql_prefilter('to_jsonb(candidate)::text',scope=prefilter_scope)) if prefilter_scope else ''
     for table in sorted({c['table'] for c in candidates}):
         keys=POSTGRES_TABLES[table].primary_key
         identities=[c['key'] for c in candidates if c['table']==table]
         for offset in range(0,len(identities),500):
             batch=identities[offset:offset+500]
             rows.extend((table,r) for r in warehouse._query_dicts(
-                f'SELECT * FROM @{table} WHERE ('+','.join(keys)+') IN ('+
-                ','.join('('+','.join('%s' for _ in keys)+')' for _ in batch)+')'+(' FOR UPDATE' if lock else ''),
+                f'SELECT * FROM @{table} candidate WHERE ('+','.join(keys)+') IN ('+
+                ','.join('('+','.join('%s' for _ in keys)+')' for _ in batch)+')'+prefilter+(' FOR UPDATE' if lock else ''),
                 tuple(v for identity in batch for v in identity)))
     return rows
 
@@ -632,8 +641,13 @@ def apply_session(warehouse, plan, session, *, selector, window, exact_source_ro
 def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_partial=False,
                   max_canonical_rows=2500, window_seconds=45, gap_seconds=15,
                   max_source_rows=500, max_plan_rows=20000, max_delta_rows=1000,
-                  progress=None, planned_only=False):
+                  progress=None, planned_only=False, max_groups=None, large_session_window_seconds=None):
     """One owner; live planning, then an atomic transaction per session group.
+
+    ``max_groups`` bounds one run (one writer outage); the checkpoint records
+    each completed group, so the next run resumes with the rest. A session over
+    LARGE_SESSION_ROWS canonical rows runs alone, under
+    ``large_session_window_seconds`` (at most 300) when given.
 
     ``window(index)`` must pause writers on entry and restore them in finally,
     including on partial entry failure. Completion is persisted AFTER restore.
@@ -641,13 +655,19 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     Partial discovery retains its original horizon and pending partitions;
     no partial run constitutes final verification. Selector stays in memory.
     """
-    if not 0<max_canonical_rows<=(10000 if planned_only else 5000) or not 0<window_seconds<=60 or gap_seconds<0:
+    # A planned-only group may hold one large session (30,000 rows); the
+    # 60-second transaction deadline still rolls back a group that overruns.
+    if (not 0<max_canonical_rows<=(30000 if planned_only else 5000) or not 0<window_seconds<=60 or gap_seconds<0
+            or max_groups is not None and max_groups<1
+            or large_session_window_seconds is not None and not 0<large_session_window_seconds<=300):
         raise ValueError('invalid batch budget')
     plan=read_plan(Path(path))
     if 'discovery' in plan and not allow_partial: raise ValueError('partition discovery incomplete')
     if plan['scope']!=_scope(warehouse) or plan.get('selector',ScrubSelector().specification)!=(selector or ScrubSelector()).specification:
         raise ValueError('plan scope or selector differs')
-    if sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])>min(500,max_source_rows) or len(plan['candidates'])>min(20000,max_plan_rows):
+    # Plan-wide gates are the explicit flags (defaults 500 / 20,000); each group
+    # stays bounded by the canonical-row cap and its transaction deadline.
+    if sum(c['table'] not in DERIVED and c['matches']>0 for c in plan['candidates'])>max_source_rows or len(plan['candidates'])>max_plan_rows:
         raise ValueError('candidate gate exceeded')
     if any(not c['session'] for c in plan['candidates']):
         raise ValueError('cannot group unidentified session')
@@ -664,6 +684,8 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     groups=[]; group=[]; total=0
     for s,n in counts.items():
         if n>max_canonical_rows: continue
+        if n>LARGE_SESSION_ROWS:
+            groups.append(([s],n)); continue
         if group and total+n>max_canonical_rows:
             groups.append((group,total)); group=[]; total=0
         group.append(s); total+=n
@@ -671,19 +693,21 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     _checkpoint(path,plan)
     if progress: progress(dict(groups=len(groups),oversized_sessions=len(state['oversized']),canonical_rows=sum(counts.values())))
     for index,(sessions,total) in enumerate(groups):
+        if max_groups is not None and index>=max_groups: break
         time.sleep(gap_seconds)  # workers LIVE, including after a resumed run
         candidates=[c for c in plan['candidates'] if tuple(c['session']) in sessions]
         if not planned_only: candidates=_attach_related(warehouse,candidates,warehouse._connection)
-        if len(candidates)>min(20000,max_plan_rows):
+        if len(candidates)>max_plan_rows:
             raise ValueError('group candidate gate exceeded; no maintenance started')
         subset={k:v for k,v in plan.items() if k not in ('discovery','batches')}
         subset.update(candidates=candidates,counts=_details(candidates))
         known=dict(plan,candidates=plan['candidates']+candidates)
         started=time.monotonic()
         with window(index):
+            alone=len(sessions)==1 and total>LARGE_SESSION_ROWS and large_session_window_seconds
             scrub(warehouse,apply=True,plan=subset,selector=selector,workers=workers,
                   max_source_rows=max_source_rows,max_plan_rows=max_plan_rows,
-                  max_delta_rows=max_delta_rows,window_seconds=window_seconds,
+                  max_delta_rows=max_delta_rows,window_seconds=large_session_window_seconds if alone else window_seconds,
                   max_canonical_rows=max_canonical_rows,_known_plan=known,planned_only=planned_only)
         elapsed=time.monotonic()-started
         state['completed'].append(dict(sessions=[list(s) for s in sessions],canonical_rows=total,seconds=elapsed))
@@ -903,20 +927,23 @@ def main():
     parser.add_argument('--max-delta-rows',type=int,default=10000)
     parser.add_argument('--max-plan-rows',type=int,default=20000)
     parser.add_argument('--window-seconds',type=int,default=60)
+    parser.add_argument('--large-session-window-seconds',type=int,help='session batches: deadline (<= 300) for a lone session over 10,000 rows')
     parser.add_argument('--session-batches',action='store_true',help='apply complete sessions in separate bounded transactions')
-    parser.add_argument('--planned-only',action='store_true',help='tokens only: indexed planned-session repair; unrelated sessions require full post-restore verify')
+    parser.add_argument('--planned-only',action='store_true',help='credentials only: indexed planned-session repair; unrelated sessions require full post-restore verify')
     parser.add_argument('--writers-paused',action='store_true',help='acknowledge external writer shutdown and guaranteed restoration')
     parser.add_argument('--max-canonical-rows',type=int,default=10000)
+    parser.add_argument('--max-groups',type=int,help='session batches: stop after N groups; a rerun resumes')
     parser.add_argument('--report-html', type=Path, help='counts-only table for the private email body')
     add_selector_arguments(parser)
     args = parser.parse_args()
     if args.workers < 1: parser.error('--workers must be positive')
+    if not 0 < args.window_seconds <= 60: parser.error('--window-seconds must be 1..60')
     if args.apply and args.verify: parser.error('--apply and --verify are mutually exclusive')
     if args.only_session and (args.planned_only or args.session_batches):
-        parser.error('--only-session is a seed repair; it cannot combine with token session batches')
+        parser.error('--only-session is a seed repair; it cannot combine with credential session batches')
     if args.planned_only or args.session_batches:
-        if not (args.apply and args.planned_only and args.session_batches and args.writers_paused and args.scope=='tokens'):
-            parser.error('session batches require --apply --scope tokens --planned-only --writers-paused')
+        if not (args.apply and args.planned_only and args.session_batches and args.writers_paused and args.scope=='credentials'):
+            parser.error('session batches require --apply --scope credentials --planned-only --writers-paused')
     if not args.verify and args.plan is None: parser.error('--plan is required for discovery and apply')
     warehouse = PostgresWarehouse(os.environ['POSTGRES_DATABASE_URL'],initialize=False)
     warehouse._connection.set_session(readonly=not args.apply,autocommit=True)
@@ -941,8 +968,12 @@ def main():
                 plan=apply_batches(warehouse,args.plan,window=lambda _:nullcontext(),selector=selector,
                     workers=args.workers,planned_only=True,max_canonical_rows=args.max_canonical_rows,
                     window_seconds=args.window_seconds,gap_seconds=0,max_source_rows=args.max_source_rows,
-                    max_plan_rows=args.max_plan_rows,max_delta_rows=args.max_delta_rows)
+                    max_plan_rows=args.max_plan_rows,max_delta_rows=args.max_delta_rows,max_groups=args.max_groups,
+                    large_session_window_seconds=args.large_session_window_seconds)
                 if plan['batches']['oversized']: raise RuntimeError('oversized sessions remain; repair incomplete')
+                done={tuple(s) for g in plan['batches']['completed'] for s in g['sessions']}
+                left={tuple(c['session']) for c in plan['candidates']}-done
+                if left: raise SystemExit(f'{len(left)} planned sessions remain; rerun apply to continue')
             elif args.only_session:
                 from contextlib import nullcontext
                 apply_session(warehouse,plan,args.only_session,selector=selector,
@@ -974,8 +1005,8 @@ def main():
         print(json.dumps({'counts_by_month_source': table, 'details_before': before, 'details_after': after, 'verification_pending':args.apply, 'left_alone': plan.get('left_alone') if not args.verify else None}))
         if args.report_html:
             args.report_html.write_text(report_html(table))
-        if args.verify and args.scope == 'tokens' and any(r['measure']=='matches' and r['count'] for r in after):
-            raise SystemExit('token verification failed: secrets remain')
+        if args.verify and args.scope == 'credentials' and any(r['measure']=='matches' and r['count'] for r in after):
+            raise SystemExit('credential verification failed: secrets remain')
     finally:
         warehouse.close()
 

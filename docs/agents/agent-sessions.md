@@ -478,7 +478,7 @@ is reachable only through the agent's own read-only `muse.db` tool, not from a s
 its phone data (contacts, calendar, health, media library) was empty for this account on
 2026-09-28. Its connectors read other systems PDW already syncs.
 
-## Payment data in conversations
+## Payment data and credentials in conversations
 
 The conversation batch HTTP endpoint redacts payment card data before object
 storage. The shared database writer applies the same policy for every AI event
@@ -519,16 +519,53 @@ Committed constructed examples declare a reproducible `synthetic_provenance`
 recipe checked by `tests/test_card_fixture_provenance.py`. Use published sandbox
 numbers or generate additional examples at test time; never copy live credentials.
 
-The same storage boundaries mask PDW access-token secrets as
-`pdw_<public-id>_[REDACTED]`, preserving the public id. This applies to nested
-JSON strings as well as ordinary transcript text. `--scope tokens` selects only
-PDW access-token secrets and masks only those secrets, preserving card numbers,
-security codes and all other bytes. It uses the storage boundary's token pattern
-and decoded JSON traversal. It accepts no card seeds. The default `--scope all`
-also detects tokens; `--scope labelled` remains a card-only selector. Revocation is a
-separate decision. Rebuilds do not erase historical backups or WAL.
+The same storage boundaries mask credentials (`credential_redaction.go`, mirrored
+in `credential_redaction.py`). Each secret becomes `[REDACTED:<kind>:<hash6>]`, the
+first six hex of its SHA-256, so one leaked value stays matchable across rows
+without being stored. Kinds, in priority order (an overlapping lower-priority match
+is dropped, and a credential owns its digits, so no card mask lands inside one):
 
-For a token-only landing, use the checked-in host controller below from the
+| kind | what is masked |
+| --- | --- |
+| `private_key` | the body of a PEM `-----BEGIN … PRIVATE KEY-----` block (headers kept), or of a truncated one; needs 64+ base64 characters |
+| `url_password` | the password of a `postgres(ql)`, `mysql`, `mariadb`, `redis(s)`, `amqp(s)`, `mongodb(+srv)` or `http(s)` URL's `user:password@`; not a placeholder, not equal to the user, 6+ characters, and not for an RFC 2606 example host (`example.com`, `*.example`) |
+| `pdw_token` | the secret after `pdw_<public-id>_` (the public id is kept) |
+| `slack_token` | a whole `xox[abcdepr]-…` token (also `xoxe.xoxp-…`) of 40+ characters with letters and digits (shorter ones are test or documentation fakes) |
+| `github_token` | `gh[pousr]_` plus 36+ characters, or `github_pat_` plus 22+, not glued to a preceding word character or `-` |
+| `openai_key`, `anthropic_key` | `sk-` (`sk-ant-`) plus 20+ characters, not preceded by a word character, `-`, `/` or `.` nor followed by `@` (so `task-`, `desk-`, `sk-learn`, URL slugs and OpenSSH `sk-ssh-…@openssh.com` names stay) |
+| `aws_secret_key` | a standalone 40-character mixed-case alphanumeric run (delimited by whitespace, quotes, `=:,;`, `\|` or brackets, so not a slice of a URL path or encoding) in a value that also holds an `AKIA`/`ASIA` access key id (the id is kept) |
+| `bearer_token` | the token after `Bearer ` |
+| `password`, `secret` | the value after a label ending in `password`, `passwd`, `passphrase`, `secret`, `secret key`, `secret access key`, `client secret`, `private key`, `api key` or `token` and `:` or `=` (or a JSON field with such a key); paging, counter, tracking and public-client labels (`next_page_token`/`nextPageToken`, `max_tokens`, `email_token`, `clientToken`) and file paths (`/etc/passwd:`) are excluded |
+
+Every token and labelled value must hold a letter and a digit, be 8+ characters, and
+not look like a placeholder (`$VAR`, `<token>`, `{…}`, `***`, `...`, `your…`,
+`example`, an `ALL_CAPS_ENV_NAME`, a function call). Precision wins over recall: a
+short or dictionary-word password, or one after a bare `--password ` flag, is not
+masked. The shared corpus `tests/fixtures/credential_redaction_cases.json` pins one
+fixture per shape plus the look-alikes that must stay (secrets are assembled from parts
+at test time, so the public file holds no token-shaped string); Go and Python build the
+same wrapped corpus (plain, JSON, nested JSON, Unicode-escaped) and must produce the
+same masked text. **Masking is not revocation: rotate a leaked secret.**
+
+`--scope credentials` selects only credential secrets and masks only those,
+preserving card numbers, security codes and all other bytes. It uses the storage
+boundary's masker and decoded JSON traversal. It accepts no card seeds. The default
+`--scope all` also detects credentials; `--scope labelled` remains a card-only
+selector. Rebuilds do not erase historical backups or WAL.
+
+Count before and after with the read-only report, which applies the same masker to
+every AI conversation source table (`--derived` adds the agent rows of
+`timeline_events` and `search_chunks`) and prints matches by table, role, column and
+kind, never a value. It exits 1 while any match remains:
+
+```sh
+uv run python -m personal_data_warehouse.credential_scrub_report --derived
+```
+
+`--since`/`--until` bound it by `occurred_at`; `--examples <new file>` writes masked,
+truncated contexts with each secret's length and character classes for a hand check.
+
+For a credential-only landing, use the checked-in host controller below from the
 landed checkout on mew-dev. It runs a maintenance container on mew-coolify with
 the production Dagster image **by immutable image ID**, the same Docker network,
 no writer volumes (so no Docker socket) and a private environment file. It bypasses the image
@@ -537,7 +574,7 @@ No credentials go in command arguments or stdout. Choose a fresh state directory
 `plan` refuses an existing one. Do not deploy while these phases are in progress.
 
 ```sh
-SCRUB_STATE=/var/lib/pdw-maintenance/token-cleanup-001
+SCRUB_STATE=/var/lib/pdw-maintenance/credential-cleanup-001
 SCRUB_CONTROLLER=src/personal_data_warehouse/scrub_conversation_window.py
 ssh mew-coolify "sudo -n python3 - plan --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
 ```
@@ -595,7 +632,23 @@ Apply records a new `before-stop.json` before the first stop. It executes
 with `--session-batches --planned-only --writers-paused --max-canonical-rows 10000`.
 If a group overruns its transaction, it rolls back and the writers restart;
 rerun `apply --max-canonical-rows <largest session's rows>` so that session runs
-alone (completed groups are skipped).
+alone (completed groups are skipped). The whole plan may hold at most 500 matching
+source rows and 20,000 source plus derived rows unless `apply --max-source-rows N
+--max-plan-rows M` raises them; set both from the reviewed plan counts, never
+blind. Each group stays bounded by `--max-canonical-rows` (up to 30,000, so one
+large session can run alone) and its 60-second transaction, but writers stay
+stopped for the whole run. For a large backfill pass `apply --max-groups N`: the
+run stops after N groups, restores the writers and exits nonzero with the number
+of planned sessions left; rerun `apply` to resume from the checkpoint. Size N and
+the number of outages from the credential report's `sessions` block (affected
+sessions, their canonical rows, the largest session and those over 10,000 rows).
+A session over 10,000 rows always runs in its own group; `apply
+--large-session-window-seconds S` (at most 300) gives that group a longer
+transaction deadline, and every other group keeps 60 seconds. Writers are stopped
+throughout, so the longer deadline only lengthens that outage. The in-window
+session recheck and the post-apply verification read only rows that pass the
+scan's prefilter, and the credential selector runs full confirmation only where a
+rule's anchor appears.
 Each DB transaction retains the 60-second rollback deadline and row gates.
 Restoration is registered **before** stopping anything: even a partial stop or
 failed apply starts the app, then Dagster, in `finally` (`plan` accepts only running writers).
@@ -623,36 +676,38 @@ the full read-only DB scan, requiring zero matches and exit zero:
 ssh mew-coolify "sudo -n python3 - verify --state-dir $SCRUB_STATE" < "$SCRUB_CONTROLLER"
 ```
 
-Token verification exits nonzero if a secret remains. Database repair uses the
+Credential verification exits nonzero if a secret remains. Database repair uses the
 same canonical session regeneration, partial-title/snippet replacement and
-chunk/embedding invalidation as the card repair. The token SQL prefilter uses
-literal `pdw_` or `u00` substring probes (Unicode escapes can encode ASCII token
-bytes), then confirms decoded tokens in Python. Full discovery keeps the existing
+chunk/embedding invalidation as the card repair: the rebuilt timeline rows get a new
+`seq`, and their old chunks and embeddings are deleted so the builders regenerate
+them from masked text. The credential SQL prefilter (`credential_redaction.SQL_PREFILTER`)
+is a case-insensitive superset of every rule's anchor after removing backslashes,
+including the `\u00XX` units an anchor character can be escaped as. Python confirms
+every prefiltered row. Full discovery keeps the existing
 disjoint heap-block scans under one snapshot and bounded primary-key fetches;
 resumable discovery keeps the existing source/month partitions. Explicit
-`--planned-only` token repair replaces the in-window corpus-wide `age(xmin)`
+`--planned-only` credential repair replaces the in-window corpus-wide `age(xmin)`
 scan with indexed source/session confirmation and 500-key primary-key batches.
 New selected source keys **within a planned session** abort for rediscovery.
 Timeline reads use `(adapter,event_id)` and canonical chunks use their indexed
 `anchor`; late-built chunks for rebuilt events are removed too. Chunk/embedding
 deletes and saved-key confirmation are batched. Complete-session groups accept
-up to 10,000 canonical rows, so a session larger than the legacy 5,000-row cap
-can be repaired without splitting its canonical regeneration. Oversized groups
+up to 30,000 canonical rows (`--max-canonical-rows`, default 10,000), so a session
+larger than the legacy 5,000-row cap can be repaired without splitting its
+canonical regeneration. Oversized groups
 still fail the CLI as incomplete. This explicit mode repairs the plan, **not
 unrelated sessions**: it makes no global in-window absence claim. The mandatory
-full post-restore DB scan and 30-day count below establish DB completion; remaining
-tokens require a new reviewed plan. Normal apply retains its full delta gate.
+full post-restore DB scan and the credential report above establish DB completion;
+remaining credentials require a new reviewed plan. Normal apply retains its full delta gate.
 Before archive or host work, read
 `pdw columns marts_ai_conversations.events`, then run:
 
 ```sh
-pdw sql -q 'Verify recent conversation token secrets are gone' "SELECT count(*) FROM marts_ai_conversations.events WHERE occurred_at >= now() - interval '30 days' AND raw_json ~ 'pdw_[a-z0-9]{12,24}_[A-Za-z0-9_-]{30,}'"
+uv run python -m personal_data_warehouse.credential_scrub_report --derived
 ```
 
-If that API query exceeds its statement budget, partition the same predicate
-by source and disjoint UTC days covering the entire 30-day window, and sum the
-counts. A timeout is not zero; all partitions must complete. The full maintenance
-verification above also checks other text/JSON columns and historical copies.
+It must report `"matches": 0`. A failed or interrupted run is not zero; rerun it.
+The full maintenance verification above also checks historical copies.
 
 Next scrub the archive **live**, in a separate state directory. No container
 stops occur in `archive-plan`, `archive-apply` or `archive-verify`. Existing batch
@@ -681,7 +736,7 @@ then deletes its original. It is safe alongside ingestion because replacements
 contain only sanitized bytes. A deployment change requires a fresh archive plan.
 
 ```sh
-ARCHIVE_STATE=/var/lib/pdw-maintenance/token-archive-001
+ARCHIVE_STATE=/var/lib/pdw-maintenance/credential-archive-001
 ssh mew-coolify "sudo -n python3 - archive-plan --state-dir $ARCHIVE_STATE --exported-from ${ARCHIVE_FROM:?} --exported-before ${ARCHIVE_BEFORE:?} --max-objects ${ARCHIVE_MAX_OBJECTS:?} --max-bytes ${ARCHIVE_MAX_BYTES:?}" < "$SCRUB_CONTROLLER"
 # Review the counts and coverage before replacement.
 ssh mew-coolify "sudo -n python3 - archive-apply --state-dir $ARCHIVE_STATE" < "$SCRUB_CONTROLLER"
@@ -696,11 +751,11 @@ roots above. Inspect filenames only, never print matching transcript lines. From
 the landed checkout on that host, repeat for every affected session/root:
 
 ```sh
-uv run python -m personal_data_warehouse.scrub_conversation_jsonl --scope tokens --root "$TRANSCRIPT_ROOT" --session "$SESSION_ID" --apply
-uv run python -m personal_data_warehouse.scrub_conversation_jsonl --scope tokens --root "$TRANSCRIPT_ROOT" --session "$SESSION_ID"
+uv run python -m personal_data_warehouse.scrub_conversation_jsonl --scope credentials --root "$TRANSCRIPT_ROOT" --session "$SESSION_ID" --apply
+uv run python -m personal_data_warehouse.scrub_conversation_jsonl --scope credentials --root "$TRANSCRIPT_ROOT" --session "$SESSION_ID"
 ```
 
-Require zero matches and an actual matching file for each session. Token JSONL
+Require zero matches and an actual matching file for each session. Credential JSONL
 commands exit nonzero if a secret remains; apply rereads before returning success.
 Finally remove controller state, including abandoned archive-first plans. Use the
 cleanup command, never a shell recursive delete. It accepts only a direct child
@@ -734,8 +789,8 @@ invalidation, verification and commit. Persist this list in the private stage
 record, including on failure. Chunk generation remains asynchronous; verify
 after restoration and after the normal builder catches up.
 
-The token-only window controller above shuts down whole containers and launches
-token-only runtime commands. It cannot own a retained in-memory card selector.
+The credential-only window controller above shuts down whole containers and launches
+credential-only runtime commands. It cannot own a retained in-memory card selector.
 For a card keeper deployment handover, bind a replacement against the original
 checkpoint's salted seed revision before sanitizing that seed, require its
 ready state and identical selector specification, then retire the old owner.
