@@ -42,7 +42,14 @@ _LABELLED = re.compile(r'(?i)(' + _LABEL + r')[ \t]*\\*["\']?[ \t]*[:=][ \t]*\\*
 _LABEL_KEY = re.compile(r'(?i)[A-Za-z0-9_. -]*?' + _LABEL)
 _NOT_SECRET_LABEL = re.compile(r'(?i)(?:^|[_. -])(?:page|next|prev|previous|continuation|sync|cursor|csrf|xsrf|'
                                r'idempotency|pagination|max|min|num|total|input|output|cache|count|reasoning|'
-                               r'completion|prompt)[ _-]?token$')
+                               r'completion|prompt|email|visit|client|set)[ _-]?token$')
+# camelCase identifiers (nextPageToken) are split before the check above.
+_CAMEL = re.compile(r'([a-z0-9])([A-Z])')
+# RFC 2606 example hosts: a URL pointing at one is an example, not a login.
+_URL_HOST = re.compile(r'[^:/?#@ \t\n\r\f\v\'"<>\[\]\\]*')
+_EXAMPLE_HOSTS = ('example', 'example.com', 'example.net', 'example.org')
+# Real Slack tokens are 40+ characters; shorter ones are test or doc fakes.
+_SLACK_MIN = 40
 _ENV_CHARS = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')
 _PLACEHOLDER_WORDS = ('...', '***', 'xxxx', 'redacted', 'example', 'placeholder', 'changeme', 'your', 'dummy')
 _PLACEHOLDER_PASSWORDS = frozenset(('password', 'pass', 'passwd', 'pwd', 'secret', 'changeme', 'admin', 'root', 'guest'))
@@ -92,6 +99,15 @@ def _secret_value(value):
             not ('_' in value and all(c in _ENV_CHARS for c in value)))
 
 
+def _not_secret_label(label):
+    return bool(_NOT_SECRET_LABEL.search(_CAMEL.sub(r'\1_\2', label)))
+
+
+def _example_host(host):
+    host = host.lower()
+    return host in _EXAMPLE_HOSTS or host.endswith(tuple('.' + h for h in _EXAMPLE_HOSTS))
+
+
 def _boundary(value, start, extra=''):
     return start == 0 or value[start - 1] not in _WORD and value[start - 1] not in extra
 
@@ -106,15 +122,17 @@ def _text_edits(value):
             candidates.append((head.end(), end, 'private_key'))
     for m in _URL.finditer(value):
         user, password = m[1], m[2]
-        if len(password) >= 6 and password != user and not _placeholder(password) and password.lower() not in _PLACEHOLDER_PASSWORDS:
+        if (len(password) >= 6 and password != user and not _placeholder(password) and
+                password.lower() not in _PLACEHOLDER_PASSWORDS and not _example_host(_URL_HOST.match(value, m.end())[0])):
             candidates.append((m.start(2), m.end(2), 'url_password'))
     for m in _PDW.finditer(value):
         candidates.append((m.start(2), m.end(2), 'pdw_token'))
     for m in _SLACK.finditer(value):
-        if _boundary(value, m.start()) and _has_letter_and_digit(m[0][5:]) and not _placeholder(m[0]):
+        if (len(m[0]) >= _SLACK_MIN and _boundary(value, m.start()) and _has_letter_and_digit(m[0][5:]) and
+                not _placeholder(m[0])):
             candidates.append((m.start(), m.end(), 'slack_token'))
     for m in _GITHUB.finditer(value):
-        if _boundary(value, m.start()) and _has_letter_and_digit(m[0]) and not _placeholder(m[0]):
+        if _boundary(value, m.start(), '-') and _has_letter_and_digit(m[0]) and not _placeholder(m[0]):
             candidates.append((m.start(), m.end(), 'github_token'))
     for m in _SK.finditer(value):
         # OpenSSH security-key algorithms (sk-ssh-ed25519@openssh.com) are names.
@@ -141,7 +159,8 @@ def _text_edits(value):
         while start > max(0, m.start(1) - _IDENTIFIER_WALK) and value[start - 1] in _IDENTIFIER:
             start -= 1
         label, secret = value[start:m.end(1)], m[2]
-        if (_NOT_SECRET_LABEL.search(label) or not _secret_value(secret) or
+        # A label ending a path component (/etc/passwd:) names a file.
+        if (_not_secret_label(label) or not _secret_value(secret) or start > 0 and value[start - 1] == '/' or
                 m.end() < len(value) and value[m.end()] == '('):
             continue
         candidates.append((m.start(2), m.end(2), 'password' if 'pass' in label.lower() else 'secret'))
@@ -166,7 +185,7 @@ def credential_edits(value: str):
         inner = credential_edits(decoded)
         if not inner and index >= 2 and tokens[index - 1][0] == ':' and tokens[index - 2][0].startswith('"'):
             key = json.loads(tokens[index - 2][0])
-            if (len(key) <= _IDENTIFIER_WALK and _LABEL_KEY.fullmatch(key) and not _NOT_SECRET_LABEL.search(key) and
+            if (len(key) <= _IDENTIFIER_WALK and _LABEL_KEY.fullmatch(key) and not _not_secret_label(key) and
                     not any(c in _WS for c in decoded) and _secret_value(decoded)):
                 inner = [(0, len(decoded), marker('password' if 'pass' in key.lower() else 'secret', decoded))]
         if inner:

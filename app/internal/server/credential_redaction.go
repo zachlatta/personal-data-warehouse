@@ -46,8 +46,12 @@ var (
 	// back, as Python does (a lazy prefix is quadratic in Python's engine).
 	credentialLabelled = regexp.MustCompile(`(?i)(` + credentialLabel + `)[ \t]*\\*["']?[ \t]*[:=][ \t]*\\*["']?[ \t]*` +
 		"([^ \\t\\n\\r\\f\\v\"'\\\\`,;&|<>(){}\\[\\]]+)")
-	credentialLabelKey    = regexp.MustCompile(`(?i)^(?:[A-Za-z0-9_. -]*?` + credentialLabel + `)$`)
-	credentialNotSecret   = regexp.MustCompile(`(?i)(?:^|[_. -])(?:page|next|prev|previous|continuation|sync|cursor|csrf|xsrf|idempotency|pagination|max|min|num|total|input|output|cache|count|reasoning|completion|prompt)[ _-]?token$`)
+	credentialLabelKey  = regexp.MustCompile(`(?i)^(?:[A-Za-z0-9_. -]*?` + credentialLabel + `)$`)
+	credentialNotSecret = regexp.MustCompile(`(?i)(?:^|[_. -])(?:page|next|prev|previous|continuation|sync|cursor|csrf|xsrf|idempotency|pagination|max|min|num|total|input|output|cache|count|reasoning|completion|prompt|email|visit|client|set)[ _-]?token$`)
+	// camelCase identifiers (nextPageToken) are split before the check above.
+	credentialCamel = regexp.MustCompile(`([a-z0-9])([A-Z])`)
+	// RFC 2606 example hosts: a URL pointing at one is an example, not a login.
+	credentialURLHost     = regexp.MustCompile(`^[^:/?#@ \t\n\r\f\v'"<>\[\]\\]*`)
 	credentialEnvName     = regexp.MustCompile(`^[A-Z0-9_]*_[A-Z0-9_]*$`)
 	credentialPlaceholder = []string{"...", "***", "xxxx", "redacted", "example", "placeholder", "changeme", "your", "dummy"}
 	credentialWeakURLPass = map[string]bool{"password": true, "pass": true, "passwd": true, "pwd": true, "secret": true, "changeme": true, "admin": true, "root": true, "guest": true}
@@ -95,6 +99,23 @@ func credentialSecretValue(s string) bool {
 	return utf8.RuneCountInString(s) >= 8 && hasLetterAndDigit(s) && !credentialPlaceholderValue(s) && !credentialEnvName.MatchString(s)
 }
 
+// Real Slack tokens are 40+ characters; shorter ones are test or doc fakes.
+const credentialSlackMin = 40
+
+func credentialNotSecretLabel(label string) bool {
+	return credentialNotSecret.MatchString(credentialCamel.ReplaceAllString(label, "${1}_${2}"))
+}
+
+func credentialExampleHost(host string) bool {
+	host = strings.ToLower(host)
+	for _, h := range []string{"example", "example.com", "example.net", "example.org"} {
+		if host == h || strings.HasSuffix(host, "."+h) {
+			return true
+		}
+	}
+	return false
+}
+
 func credentialBoundary(s string, start int, extra string) bool {
 	return start == 0 || !cardWordByte(s[start-1]) && !strings.ContainsRune(extra, rune(s[start-1]))
 }
@@ -117,7 +138,8 @@ func credentialTextEdits(s string) []cardEdit {
 	}
 	for _, m := range credentialURL.FindAllStringSubmatchIndex(s, -1) {
 		user, password := s[m[2]:m[3]], s[m[4]:m[5]]
-		if utf8.RuneCountInString(password) >= 6 && password != user && !credentialPlaceholderValue(password) && !credentialWeakURLPass[strings.ToLower(password)] {
+		if utf8.RuneCountInString(password) >= 6 && password != user && !credentialPlaceholderValue(password) &&
+			!credentialWeakURLPass[strings.ToLower(password)] && !credentialExampleHost(credentialURLHost.FindString(s[m[1]:])) {
 			candidates = append(candidates, credentialCandidate{m[4], m[5], "url_password"})
 		}
 	}
@@ -126,13 +148,13 @@ func credentialTextEdits(s string) []cardEdit {
 	}
 	for _, m := range credentialSlack.FindAllStringIndex(s, -1) {
 		token := s[m[0]:m[1]]
-		if credentialBoundary(s, m[0], "") && hasLetterAndDigit(token[5:]) && !credentialPlaceholderValue(token) {
+		if len(token) >= credentialSlackMin && credentialBoundary(s, m[0], "") && hasLetterAndDigit(token[5:]) && !credentialPlaceholderValue(token) {
 			candidates = append(candidates, credentialCandidate{m[0], m[1], "slack_token"})
 		}
 	}
 	for _, m := range credentialGitHub.FindAllStringIndex(s, -1) {
 		token := s[m[0]:m[1]]
-		if credentialBoundary(s, m[0], "") && hasLetterAndDigit(token) && !credentialPlaceholderValue(token) {
+		if credentialBoundary(s, m[0], "-") && hasLetterAndDigit(token) && !credentialPlaceholderValue(token) {
 			candidates = append(candidates, credentialCandidate{m[0], m[1], "github_token"})
 		}
 	}
@@ -182,7 +204,8 @@ func credentialTextEdits(s string) []cardEdit {
 			start--
 		}
 		label, secret := s[start:m[3]], s[m[4]:m[5]]
-		if credentialNotSecret.MatchString(label) || !credentialSecretValue(secret) || m[1] < len(s) && s[m[1]] == '(' {
+		// A label ending a path component (/etc/passwd:) names a file.
+		if credentialNotSecretLabel(label) || !credentialSecretValue(secret) || start > 0 && s[start-1] == '/' || m[1] < len(s) && s[m[1]] == '(' {
 			continue
 		}
 		kind := "secret"
@@ -226,7 +249,7 @@ func credentialEdits(s string) []cardEdit {
 		if len(inner) == 0 && i >= 2 && s[tokens[i-1][0]:tokens[i-1][1]] == ":" && strings.HasPrefix(s[tokens[i-2][0]:tokens[i-2][1]], `"`) {
 			var key string
 			_ = json.Unmarshal([]byte(s[tokens[i-2][0]:tokens[i-2][1]]), &key)
-			if len(key) <= credentialIdentifierWalk && credentialLabelKey.MatchString(key) && !credentialNotSecret.MatchString(key) &&
+			if len(key) <= credentialIdentifierWalk && credentialLabelKey.MatchString(key) && !credentialNotSecretLabel(key) &&
 				!strings.ContainsAny(decoded, " \t\n\r\f\v") && credentialSecretValue(decoded) {
 				kind := "secret"
 				if strings.Contains(strings.ToLower(key), "pass") {
