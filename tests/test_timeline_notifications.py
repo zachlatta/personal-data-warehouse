@@ -476,6 +476,44 @@ def test_notification_health_matches_a_plain_alert_on_its_title_too(warehouse):
     assert _android_health(wh) == ONE_LOST
 
 
+def test_notification_health_matches_per_source_channels_and_delivery_id(warehouse):
+    wh = warehouse
+    _start_notifications(wh)
+    _seed_upload(wh, "upload")
+    _seed_android_delivery(
+        wh,
+        "d-mail",
+        ALERT_ACCEPTED,
+        {"title": "Sam", "body": "Snippet text"},
+    )
+    _seed_phone_event(
+        wh,
+        "p-mail",
+        RIGHT_AFTER_ACCEPTED,
+        channel_id="mail",
+        notification_tag="pdw-alert",
+        title="Sam",
+        text="Quarterly update",
+        raw_json={"extras": {"pdw.delivery_id": "d-mail"}},
+    )
+    _seed_android_delivery(
+        wh,
+        "d-slack",
+        ALERT_ACCEPTED,
+        {"body": "Hello", "android_style": {"event_id": "slack|9", "conversation_id": "c9"}},
+    )
+    _seed_phone_event(
+        wh,
+        "p-slack",
+        RIGHT_AFTER_ACCEPTED,
+        channel_id="slack",
+        notification_tag="pdw-chat",
+        text="Different",
+        raw_json={"extras": {"pdw.delivery_id": "d-slack"}},
+    )
+    assert _android_health(wh) == ("ok", "", 2, 2, 0)
+
+
 @pytest.mark.parametrize(
     "lagging_upload",
     [

@@ -263,8 +263,7 @@ service below downloads the image and a test push has no button.
 
 **On Android every alert is a data-only push the app draws itself.** Since 2026-10-28, a timeline alert from `android_messages`, `apple_messages`, `whatsapp` or `slack`
 carries `Alert.Android` (`AndroidStyle`: sender, conversation id and title, group, an
-`avatar_url` from a non-placeholder contact photo or the Slack profile, the event id), and
-`Transport.Send` (`app/internal/notifications/sender.go`) picks the wire shape per device from
+authenticated signed `avatar_url` + stable `avatar_cache_key`, optional signed inline `image_url` + `image_mime_type` for photo attachments, per-source channel/color/group, real event `occurred_at_ms`, and the event id), and non-chat timeline/mutation alerts (`gmail`, `calendar`, `google_drive`, `scans`, `mutation_policy`) carry `Alert.AndroidAlert` (`AndroidAlertStyle`: per-source channel, accent color, Android category, grouping, email `subject` for bold-subject `BigTextStyle`, circular sender `avatar_url`/`avatar_name`/`avatar_cache_key`, and real `occurred_at_ms`). Static app icons (`a.Icon`) stay on iOS/Web and are never blown up into `BigPictureStyle` on Android. `Transport.Send` (`app/internal/notifications/sender.go`) picks the wire shape per device from
 the delivery endpoint, which the fan-out fills from `push_devices.platform` and
 `push_devices.capabilities`: an Android device that registered `android_native_alerts` gets
 a data-only Expo message (no title, so FCM hands it to the app instead of drawing it in the
@@ -272,16 +271,20 @@ a data-only Expo message (no title, so FCM hands it to the app instead of drawin
 channel. Since 2026-11-06 a non-chat alert goes the same way from both Expo senders
 (`expoMessage`, and `Notification.message` behind the `notify` tool, `POST /api/push/send`, the
 mutation hook and the test push): `Message.AndroidDataOnly` moves its title, subtitle, body,
-image, collapse id and silence under `data.android_alert`, and `push.DrawsAlertsNatively` is the
+image, collapse id, non-default channel and silence under `data.android_alert`, and `push.DrawsAlertsNatively` is the
 one gate. `android_native_alerts` replaced `android_messaging_style`, whose builds draw chats only
 and show nothing for a data-only non-chat push; the old stored value normalizes away, so such a
 build gets ordinary alerts for everything until it registers again. Android alerts have no action
 buttons: a tap opens the route (an Approve with no running JS would wait silently for the next
 launch), and `collapse_id` now really replaces an alert there, which Expo's Android path never did.
 `capabilities` is declared in both ensure paths (`store.go`, `postgres.py`) with an
-`ADD COLUMN IF NOT EXISTS`, and every registration replaces it. The avatar lookup runs in the
-worker's `Render` under a one-second bound (`withAvatar`); a slow or failed lookup means an
-initial, never a late or lost alert. The phone side is `mobile/plugins/with-messaging-notifications.js`;
+`ADD COLUMN IF NOT EXISTS`, and every registration replaces it. Avatars are resolved across Slack
+users (direct and by indexed email) and `marts_contacts` (by phone, email, or display name) under a
+one-second bound (`withMedia`) and served through the HMAC-authenticated, LRU-cached proxy at
+`GET /api/notifications/avatar` (`app/internal/server/notification_avatar.go`) so no raw upstream
+personal URLs leak into push payloads; image attachments from Android Messages, Apple Messages,
+WhatsApp and Slack are signed via `/objects/` and attached inline to `MessagingStyle` via
+`FileProvider`. The phone side is `mobile/plugins/with-messaging-notifications.js`;
 see `mobile/README.md`.
 
 - **PDW does not repeat what another app on the phone already showed (2026-11-11).** An

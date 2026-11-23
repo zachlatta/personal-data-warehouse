@@ -209,6 +209,7 @@ STATEMENTS = (
         ),
         recent_phone_events AS MATERIALIZED (
             SELECT e.event_at, e.channel_id, e.notification_tag, e.title, e.text, e.messages,
+                   COALESCE(e.raw_json->'extras'->>'pdw.delivery_id', '') AS delivery_id,
                    string_to_array(COALESCE(e.raw_json->'extras'->>'pdw.event_ids', ''), E'\n') AS event_ids
             FROM @android_notification_events e
             WHERE e.event_at >= now() - interval '24 hours 10 seconds'
@@ -220,12 +221,13 @@ STATEMENTS = (
                    CASE
                        WHEN d.payload ? 'android_style' THEN EXISTS (
                            SELECT 1 FROM recent_phone_events e
-                           WHERE (e.channel_id = 'messages' OR e.notification_tag = 'pdw-chat-plain')
+                           WHERE (e.channel_id IN ('messages', 'slack', 'whatsapp') OR e.notification_tag = 'pdw-chat-plain')
                              AND e.event_at >= d.accepted_at - interval '10 seconds'
                              AND e.event_at < d.accepted_at + interval '12 hours'
                              AND (
-                                 (COALESCE(d.payload->'android_style'->>'event_id', '') <> ''
-                                  AND (d.payload->'android_style'->>'event_id') = ANY(e.event_ids))
+                                 (e.delivery_id <> '' AND e.delivery_id = d.id)
+                                 OR (COALESCE(d.payload->'android_style'->>'event_id', '') <> ''
+                                     AND (d.payload->'android_style'->>'event_id') = ANY(e.event_ids))
                                  OR e.text = COALESCE(d.payload->>'body', '')
                                  OR EXISTS (
                                      SELECT 1 FROM jsonb_array_elements(
@@ -237,11 +239,14 @@ STATEMENTS = (
                        )
                        ELSE EXISTS (
                            SELECT 1 FROM recent_phone_events e
-                           WHERE e.channel_id = 'default'
+                           WHERE e.channel_id IN ('default', 'mail', 'calendar', 'mutations')
                              AND e.event_at >= d.accepted_at - interval '10 seconds'
                              AND e.event_at < d.accepted_at + interval '12 hours'
-                             AND e.title = COALESCE(d.payload->>'title', '')
-                             AND e.text = COALESCE(d.payload->>'body', '')
+                             AND (
+                                 (e.delivery_id <> '' AND e.delivery_id = d.id)
+                                 OR (e.title = COALESCE(d.payload->>'title', '')
+                                     AND e.text = COALESCE(d.payload->>'body', ''))
+                             )
                        )
                    END AS matched
             FROM @notification_deliveries d

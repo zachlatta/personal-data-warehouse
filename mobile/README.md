@@ -173,35 +173,31 @@ break from a Mac that only ever runs the iOS simulator:
   `AndroidChannelID` in `app/internal/push`); without it an alert lands
   silently in Firebase's "Miscellaneous" fallback channel.
 
-- **Every alert is drawn natively, chat alerts as conversations.** A message, WhatsApp
-  or Slack alert looks like Google Messages' own: the sender as a person
-  (contact photo, or a coloured initial), one notification per chat that
-  stacks its messages, a conversation shortcut so it sits in the shade's
-  Conversations section, on the `messages` channel ("Messages"). Expo cannot
-  express that, and an Expo push with a title is an FCM *notification*
-  message that Android draws itself while the app is in the background,
-  without running app code. So `plugins/with-messaging-notifications.js`
-  replaces expo-notifications' FCM service with `PdwMessagingService`, and the
-  server sends a chat alert to it as a **data-only** push carrying
-  `android_style` (`AndroidStyle` in `app/internal/notifications/worker.go`).
-  Every other alert is data-only too, carrying `android_alert`
-  (`Message.AndroidDataOnly` in `app/internal/push/expo.go`), and is drawn with
-  its title, text and picture on the `default` channel ("Alerts"), under the tag
-  `pdw-alert`, because Android caps an app at 50 active notifications and only
-  the app's own code can make room before each one. Its `collapse_id` picks the
-  notification, so a later push replaces it; without one the push's own
-  identifier keeps it separate. These alerts have no action buttons: a tap opens
-  `data.route`. Data-only goes only to a device that registered
-  `capabilities: ["android_native_alerts"]` (`app.json`
-  `extra.pushCapabilities`, sent by `src/lib/push.ts`): an older build would
-  receive the same push and show nothing. Registration replaces the list, so a
-  phone rolled back to an older build stops getting data-only alerts the next
-  time it launches, and shows nothing until then. Any other push goes to Expo
-  unchanged; an alert that cannot be drawn is posted plain (same words, same
-  tap), and a tap goes through Expo's response intent, so
-  `handleNotificationResponse` is the same for both. Check a phone with
-  `base_android_notifications.events`: chats on channel `messages`, category
-  `msg`, `is_conversation = 1`; other alerts on channel `default`, tag `pdw-alert`.
+- **Every alert is drawn natively, styled per source.** Chat alerts (Messages, WhatsApp,
+  Slack) look like Google Messages' own: `NotificationCompat.MessagingStyle` with the
+  sender as a `Person` (authenticated contact photo cached in memory and on disk, or a
+  coloured 1–2 letter monogram), inline photo attachments via `FileProvider`, one
+  notification per chat that stacks its messages, real event timestamps, a long-lived
+  conversation shortcut so it sits in the shade's Conversations section, per-source
+  channels (`messages`, `slack`, `whatsapp`) and accent colours, and per-source group
+  summaries. Non-chat alerts (`gmail`, `calendar`, `google_drive`, `scans`, `mutations`,
+  `notify`) arrive under `android_alert` and render with circular contact faces (or
+  monograms), bold subject + snippet `BigTextStyle` for email, `BigPictureStyle` only for
+  real content images (never blown-up app logos), per-source channels (`mail`, `calendar`,
+  `mutations`, `default`), Android categories (`email`, `event`), accent colours, real
+  event timestamps, and `InboxStyle` group summaries when 2+ alerts from one source are
+  active. Expo cannot express that, and an Expo push with a title is an FCM *notification*
+  message that Android draws itself while the app is in the background, without running
+  app code. So `plugins/with-messaging-notifications.js` replaces expo-notifications' FCM
+  service with `PdwMessagingService`, and the server sends every alert as a **data-only**
+  push to devices that registered `capabilities: ["android_native_alerts"]` (`app.json`
+  `extra.pushCapabilities`, sent by `src/lib/push.ts`). Eviction under Android's 50-alert
+  cap runs before every post. These alerts have no action buttons: a tap opens
+  `data.route` through Expo's response intent (`handleNotificationResponse`). Check a
+  phone with `base_android_notifications.events`: chats on `messages`/`slack`/`whatsapp`
+  (`category = 'msg'`, `is_conversation = 1`); mail on `mail` (`category = 'email'`);
+  calendar on `calendar` (`category = 'event'`); approvals on `mutations`; other alerts
+  on `default`.
   Every alert's status-bar small icon is `assets/images/notification-icon.png`,
   which the expo-notifications plugin (`app.json`) installs as
   `@drawable/notification_icon` for Expo, FCM and `PdwMessagingService` alike.
