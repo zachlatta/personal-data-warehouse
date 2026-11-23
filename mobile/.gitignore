@@ -3,8 +3,10 @@ node_modules/
 dist/
 web-build/
 expo-env.d.ts
-ios/
-android/
+# Prebuild output only: a local Expo module keeps its native code in
+# modules/<name>/android, which is source.
+/ios/
+/android/
 *.orig.*
 *.jks
 *.p8

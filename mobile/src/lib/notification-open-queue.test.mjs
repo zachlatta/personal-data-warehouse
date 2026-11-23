@@ -9,6 +9,18 @@ test('Android Messages source links survive notification validation', () => {
  }
 });
 
+test('chat links keep their Android target, and a group link with no URL survives on it alone', () => {
+ const oneToOne = { url: 'imessage://+15555550123', app_url: 'imessage://+15555550123', label: 'BlueBubbles', android: { app: 'bluebubbles', chat_guid: 'any;-;+15555550123' } };
+ assert.deepEqual(notificationOpenLink(oneToOne), oneToOne);
+ const group = { url: '', label: 'BlueBubbles', android: { app: 'bluebubbles', chat_guid: 'any;+;chat123' } };
+ assert.deepEqual(notificationOpenLink(group), group);
+ const rcsGroup = { url: '', label: 'Messages', android: { app: 'google_messages' } };
+ assert.deepEqual(notificationOpenLink(rcsGroup), { url: '', label: 'Messages', android: { app: 'google_messages', recipients: '' } });
+ // An unknown app is dropped; with no URL left the link is refused.
+ assert.equal(notificationOpenLink({ url: '', label: 'Bad', android: { app: 'com.evil', chat_guid: 'x' } }), null);
+ assert.deepEqual(notificationOpenLink({ url: 'sms:+15555550123', label: 'Messages', android: { app: 'com.evil' } }), { url: 'sms:+15555550123', label: 'Messages' });
+});
+
 test('offline opens survive a new queue instance and retries are idempotent', async () => {
  const values = new Map(); const kv = { get: async k => values.get(k) ?? null, set: async (k,v) => { values.set(k,v); }, remove: async k => { values.delete(k); } };
  const open = { delivery_id: 'one', open_proof: 'proof', baseUrl: 'https://example.test' };

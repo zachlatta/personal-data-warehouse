@@ -218,22 +218,42 @@ back it, all behind the static bearer the CLI uses:
 
 **Every timeline row carries its deep link, and the detail carries the conversation.**
 `GET /api/timeline`, `/api/timeline/item` and `/api/timeline/item/context` attach
-`open: {url, label, app_url?}` to each row (`app/internal/server/timeline_links.go`),
+`open: {url, label, app_url?, android?}` to each row (`app/internal/server/timeline_links.go`),
 computed from `adapter` + `source_pk` + `metadata` alone so the list pays no extra query:
 a Slack permalink (`<domain>.slack.com/archives/<conv>/p<ts>`, with `thread_ts`/`cid` for
 a reply, domain from `base_slack.teams`), Gmail as Superhuman's `/<account>/thread/<thread_id>`,
 Calendar's base64 `eid`, Drive `open?id=`, Google Contacts, ChatGPT/claude.ai conversations,
-`wa.me` for a 1:1 WhatsApp chat, `imessage:`/`sms:` for a 1:1 iMessage chat, and the
-Notes `showNote?identifier=` scheme. `app_url` is the native scheme a phone tries first
-and falls back from — the phone app never calls `canOpenURL`, which on iOS would need
-every scheme declared in the native Info.plist. A source with no honest URL (health, photos, voice memos,
-a group chat, a CLI agent transcript) gets **no** link rather than a guessed one.
-Android Messages one-to-one chats use `sms:<handle>` for phone numbers or email
-handles, including RCS chats. Timeline source buttons and push taps share this link.
-Opaque Android group keys still open in PDW: they cannot address a conversation
-through `sms:`, and the mobile client has no package-launch capability. Opening
-Google Messages' inbox for those groups would require a mobile client update;
-an `intent:` URL alone is not supported by the current notification allowlist.
+`wa.me` for a 1:1 WhatsApp chat, `imessage://<handle>` for a 1:1 iMessage chat, `sms:<handle>`
+for a 1:1 text, and the Notes `showNote?identifier=` scheme. `app_url` is the native scheme a
+phone tries first and falls back from — the phone app never calls `canOpenURL`, which on iOS
+would need every scheme declared in the native Info.plist. A source with no honest URL (health,
+photos, voice memos, a WhatsApp group, a CLI agent transcript) gets **no** link rather than a
+guessed one. Timeline source buttons and push taps share this link.
+
+**Chats open in the phone's messaging app, group chats too.** iMessage lives in BlueBubbles on
+the Pixel and texts (SMS, MMS, RCS) in Google Messages, and a URL cannot say which: `sms:`
+resolves to Google Messages even for an iMessage handle, and a group chat has no URL at all.
+So a chat's link also carries `android` (`app/internal/deeplink/android.go`), which the Android
+app opens before any URL through its own native module (`mobile/modules/pdw-chat-launcher`,
+order in `mobile/src/lib/android-chat.ts`):
+
+- `{"app": "bluebubbles", "chat_guid": "<chat.db guid>"}` for every iMessage chat, 1:1 and group.
+  `base_apple_messages.chats.chat_id` is chat.db's `guid` (`any;-;+1…`, `iMessage;+;chat…`), which
+  is BlueBubbles' chat guid. The module sends the intent BlueBubbles' own notifications send:
+  `MainActivity` with extra `chatGuid`, type `OpenChat`. A launcher intent would not do: with
+  BlueBubbles running, Android brings its task forward and drops the extra. React Native's
+  `Linking` cannot attach an extra at all, which is why this is native.
+- `{"app": "google_messages", "recipients": "<a>[,<b>…]"}` for texts: `sms:<members>` sent to
+  Google Messages' package, so another SMS app cannot claim it. An MMS group's `chat_key` is its
+  members; an RCS group's (`rcs-group:<id>`) is opaque and Google Messages exposes no way to open
+  one by id, so `recipients` is empty and the module opens Google Messages' conversation list.
+
+A group chat's link has an empty `url`: iOS and the web show no button for it, and Android opens
+it only through the target. A missing app (or an APK built before the module) makes the module
+report false; the app then tries `app_url`/`url` and, failing those, a tapped alert opens its PDW
+route. Both sides validate the target (two apps, a guid or address shape), because it comes from
+a push. The native module ships only in a new APK; an older APK ignores `android`, opens a 1:1
+chat by URL (an iMessage one in BlueBubbles through `imessage://`) and keeps group chats in PDW.
 `/api/timeline/item` also inlines `context` — `timeline.context(ref, 15, 15)`, the same
 function agents call — with `is_anchor` on the row asked about; both UIs render it as a
 scrollable transcript with earlier/later controls up to the function's 50-a-side cap.

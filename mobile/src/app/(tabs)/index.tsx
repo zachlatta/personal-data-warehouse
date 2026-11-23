@@ -9,7 +9,7 @@ import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { connectFeedLogger, recordUi } from '@/features/feed/engagement';
 import { listTimeline, PRIORITIES, type Priority, type TimelineItem } from '@/lib/api';
-import { openDeepLink } from '@/lib/deep-link';
+import { canOpenDeepLink, openDeepLink } from '@/lib/deep-link';
 import { markEventOpen } from '@/lib/event-paint';
 import { formatWhen, humanSource, truncate } from '@/lib/format';
 import { useConfig } from '@/lib/session';
@@ -94,7 +94,7 @@ export default function TimelineScreen() {
   // Superhuman's rows do not carry. The event screen keeps the full button.
   const openInSource = (item: TimelineItem) => {
     const link = item.open;
-    if (!link?.url) return;
+    if (!canOpenDeepLink(link)) return;
     tick();
     recordUi('timeline_open_source', { metadata: { source: item.source } });
     openDeepLink(link).catch((e) => Alert.alert(`Could not open ${link.label}`, e instanceof Error ? e.message : String(e)));
@@ -151,7 +151,7 @@ export default function TimelineScreen() {
               preview={item.snippet && (item.title || item.context) ? truncate(item.snippet, 200) : undefined}
               labels={[{ text: humanSource(item.source) }]}
               onPressIn={() => prefetchTimelineItem(config, item.adapter, item.event_id)}
-              onLongPress={item.open?.url ? () => openInSource(item) : undefined}
+              onLongPress={canOpenDeepLink(item.open) ? () => openInSource(item) : undefined}
               onPress={() => {
                 markEventOpen(item.adapter, item.event_id);
                 router.push({

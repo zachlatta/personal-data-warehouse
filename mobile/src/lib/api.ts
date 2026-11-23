@@ -1,5 +1,6 @@
 import type { AppConfig } from './config';
 
+import type { AndroidChat } from './android-chat.ts';
 import { requestJson } from './request.ts';
 export { ApiError } from './request.ts';
 
@@ -27,7 +28,9 @@ export function effectiveMobileSearchPriorities(selected: Priority[]): Priority[
 
 // "Open in its source": url works anywhere a browser does; app_url is a
 // native scheme a phone should try first (Slack, Messages, Notes, WhatsApp).
-export type TimelineDeepLink = { url: string; label: string; app_url?: string };
+// url is empty when only the Android chat target can open the record (a group
+// chat); see src/lib/android-chat.ts and app/internal/deeplink.
+export type TimelineDeepLink = { url: string; label: string; app_url?: string; android?: AndroidChat };
 
 export type TimelineItem = {
   adapter: string;

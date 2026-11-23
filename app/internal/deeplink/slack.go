@@ -16,11 +16,14 @@ import (
 )
 
 // Link is the JSON an app client needs to open a record: url works anywhere a
-// browser does, app_url is the native scheme a phone should try first.
+// browser does, app_url is the native scheme a phone should try first, and
+// android is a chat the Android app opens directly before either. A link with
+// only an android target (a group chat no URL can address) has an empty url.
 type Link struct {
-	URL    string `json:"url"`
-	Label  string `json:"label"`
-	AppURL string `json:"app_url,omitempty"`
+	URL     string       `json:"url"`
+	Label   string       `json:"label"`
+	AppURL  string       `json:"app_url,omitempty"`
+	Android *AndroidChat `json:"android,omitempty"`
 }
 
 // Slack returns the link to one message. threadTS is that message's thread
