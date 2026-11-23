@@ -247,10 +247,10 @@ def test_new_health_column_is_migrated_onto_existing_tables() -> None:
     catch this by construction.
 
     The migration used to be a hand-written line per column and this test read
-    the source for it.  Since 2026-08-28 the ensure path reconciles every
-    snapshot table against its own spec, so the contract is now "the column is
-    in the spec, and the spec is reconciled" -- proved end to end by
-    test_ensure_restores_any_missing_column_on_every_health_snapshot_table.
+    the source for it.  Now _ensure_table adds every spec column an existing
+    table lacks, so the contract is "the column is in the spec" -- proved end to
+    end by test_ensure_restores_any_missing_column_on_every_health_snapshot_table
+    and test_every_ensure_path_adds_a_column_its_spec_gained_to_a_table_that_already_exists.
     """
 
     from personal_data_warehouse.postgres import (
