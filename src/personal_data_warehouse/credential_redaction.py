@@ -116,7 +116,9 @@ def _text_edits(value):
         if _boundary(value, m.start()) and _has_letter_and_digit(m[0]) and not _placeholder(m[0]):
             candidates.append((m.start(), m.end(), 'github_token'))
     for m in _SK.finditer(value):
-        if _boundary(value, m.start(), '-/.') and _has_letter_and_digit(m[0][3:]) and not _placeholder(m[0]):
+        # OpenSSH security-key algorithms (sk-ssh-ed25519@openssh.com) are names.
+        if (_boundary(value, m.start(), '-/.') and value[m.end():m.end() + 1] != '@' and
+                _has_letter_and_digit(m[0][3:]) and not _placeholder(m[0])):
             candidates.append((m.start(), m.end(), 'anthropic_key' if m[0].startswith('sk-ant-') else 'openai_key'))
     if any(_boundary(value, m.start()) and (m.end() == len(value) or value[m.end()] not in _WORD)
            for m in _AWS_ID.finditer(value)):

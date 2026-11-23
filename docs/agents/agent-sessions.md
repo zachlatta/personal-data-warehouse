@@ -532,7 +532,7 @@ is dropped, and a credential owns its digits, so no card mask lands inside one):
 | `pdw_token` | the secret after `pdw_<public-id>_` (the public id is kept) |
 | `slack_token` | a whole `xox[abcdepr]-…` token (also `xoxe.xoxp-…`) with letters and digits |
 | `github_token` | `gh[pousr]_` plus 36+ characters, or `github_pat_` plus 22+ |
-| `openai_key`, `anthropic_key` | `sk-` (`sk-ant-`) plus 20+ characters, not preceded by a word character, `-`, `/` or `.` (so `task-`, `desk-`, `sk-learn` and URL slugs stay) |
+| `openai_key`, `anthropic_key` | `sk-` (`sk-ant-`) plus 20+ characters, not preceded by a word character, `-`, `/` or `.` nor followed by `@` (so `task-`, `desk-`, `sk-learn`, URL slugs and OpenSSH `sk-ssh-…@openssh.com` names stay) |
 | `aws_secret_key` | a standalone 40-character mixed-case alphanumeric run (delimited by whitespace, quotes, `=:,;`, `\|` or brackets, so not a slice of a URL path or encoding) in a value that also holds an `AKIA`/`ASIA` access key id (the id is kept) |
 | `bearer_token` | the token after `Bearer ` |
 | `password`, `secret` | the value after a label ending in `password`, `passwd`, `passphrase`, `secret`, `secret key`, `secret access key`, `client secret`, `private key`, `api key` or `token` and `:` or `=` (or a JSON field with such a key); paging and counter labels (`next_page_token`, `max_tokens`) are excluded |

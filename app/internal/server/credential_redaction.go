@@ -137,7 +137,8 @@ func credentialTextEdits(s string) []cardEdit {
 	}
 	for _, m := range credentialSK.FindAllStringIndex(s, -1) {
 		token := s[m[0]:m[1]]
-		if credentialBoundary(s, m[0], "-/.") && hasLetterAndDigit(token[3:]) && !credentialPlaceholderValue(token) {
+		// OpenSSH security-key algorithms (sk-ssh-ed25519@openssh.com) are names.
+		if credentialBoundary(s, m[0], "-/.") && (m[1] == len(s) || s[m[1]] != '@') && hasLetterAndDigit(token[3:]) && !credentialPlaceholderValue(token) {
 			kind := "openai_key"
 			if strings.HasPrefix(token, "sk-ant-") {
 				kind = "anthropic_key"
