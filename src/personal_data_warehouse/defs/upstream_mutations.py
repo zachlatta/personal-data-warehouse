@@ -76,11 +76,8 @@ GMAIL_THREAD_LABEL_OPERATIONS = {
 # Operations whose retry semantics make it safe to reclaim a stale `executing` row without
 # risking duplicate user-visible side effects. Gmail's batchModify is idempotent for label
 # add/remove, and explicit label creation re-lists/reuses same-name labels (including a 409
-# race) before modifying messages. Other creates and sends (calendar, email, contacts) are not.
-# A Slack send (SLACK_SEND_MESSAGE_OPERATION) is deliberately absent too: its executor
-# looks for its own client_msg_id before posting, which makes a `failed_retryable` retry
-# safe, but a reclaim races a worker that may still be mid-post, and the pre-check cannot
-# see a message that has not landed yet.
+# race) before modifying messages. tests/formal/mutation_worker_model.py fails if an entry of
+# NON_RECLAIMABLE_SEND_OPERATIONS is added here: a reclaim races a worker still mid-send.
 RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("gmail", GMAIL_ARCHIVE_OPERATION),
     ("gmail", GMAIL_UNARCHIVE_OPERATION),
