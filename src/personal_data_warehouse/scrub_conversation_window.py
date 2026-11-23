@@ -1,4 +1,4 @@
-"""Host-side token scrub controller. Run on the production Docker host as root.
+"""Host-side credential scrub controller. Run on the production Docker host as root.
 
 Only plan/verify read production data; the archive-* phases repair the Drive
 archive live and never stop a writer. Apply stops the app and entire Dagster
@@ -15,7 +15,7 @@ import signal
 import subprocess
 import tempfile
 
-RUNTIME_NAME='pdw-conversation-token-scrub'
+RUNTIME_NAME='pdw-conversation-credential-scrub'
 MAINTENANCE_ROOT=Path('/var/lib/pdw-maintenance')
 
 
@@ -68,7 +68,7 @@ def runtime(directory, state, module, *args):
     docker(['run','--rm','--name',RUNTIME_NAME,'--network',state['network'],'--env-file',str(directory/'runtime.env'),
             '--volume',f'{directory}:/scrub','--entrypoint','/app/.venv/bin/python',state['image'],
             '-m',f'personal_data_warehouse.scrub_conversation_{module}',
-            '--scope','tokens','--plan',f'/scrub/token-{module}-plan.json',*args],capture=False)
+            '--scope','credentials','--plan',f'/scrub/credential-{module}-plan.json',*args],capture=False)
 
 
 def plan(directory, archive_args=None):
@@ -153,7 +153,7 @@ def cleanup(directory):
         raise ValueError('cleanup requires a direct directory under the maintenance root')
     if not directory.exists(): return
     allowed={'runtime.env','state.json','before-plan.json','before-stop.json',
-             'token-cards-plan.json','token-objects-plan.json','archive-scope.json'}
+             'credential-cards-plan.json','credential-objects-plan.json','archive-scope.json'}
     entries=list(directory.iterdir())
     # save(replace=True) and the cards plan writer leave '<name>.<random>'
     # temporaries behind if killed between create and rename.

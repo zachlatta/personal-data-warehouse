@@ -64,9 +64,9 @@ def main():
     selector = selector_from_args(args)
     counts=scrub_jsonl(args.root,args.session,apply=args.apply,selector=selector)
     print(json.dumps(counts))
-    if args.scope=='tokens':
+    if args.scope=='credentials':
         remaining=scrub_jsonl(args.root,args.session,selector=selector)['matches'] if args.apply else counts['matches']
-        if remaining: raise SystemExit('token verification failed: secrets remain')
+        if remaining: raise SystemExit('credential verification failed: secrets remain')
 
 
 if __name__ == '__main__':

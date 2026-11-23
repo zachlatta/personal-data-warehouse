@@ -5,14 +5,14 @@ import json
 import pytest
 
 from tests.test_conversation_card_storage import event, warehouse
-from tests.test_token_scrub_scope import TOKEN, MASKED, CARD
+from tests.test_credential_scrub_scope import TOKEN, MASKED, CARD
 from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
 
 
 def test_large_session_planned_batches_never_scan_delta(warehouse, tmp_path, monkeypatch):
     from personal_data_warehouse import scrub_conversation_cards as m
     from personal_data_warehouse.card_scrub_selector import ScrubSelector
-    selector = ScrubSelector('tokens')
+    selector = ScrubSelector('credentials')
     row = dict(event(), text=CARD + TOKEN, raw_json=json.dumps({'text': TOKEN}))
     warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
     warehouse._command("INSERT INTO @claude_code_events (source,session_id,event_uuid,seq,role,text) "
@@ -45,7 +45,7 @@ def test_indexed_window_rechecks_session_growth_and_new_chunk(warehouse):
     from personal_data_warehouse.card_scrub_selector import ScrubSelector
     from personal_data_warehouse.search_index import SearchChunkBuilder
     from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
-    selector = ScrubSelector('tokens')
+    selector = ScrubSelector('credentials')
     row = dict(event(), text=TOKEN, raw_json='{}')
     warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
     engine = TimelineSyncEngine(source_url=warehouse._database_url, source_schema=warehouse._schema,
@@ -68,17 +68,17 @@ def test_indexed_window_rechecks_session_growth_and_new_chunk(warehouse):
         engine.close()
 
 
-def test_planned_only_is_explicit_and_token_only(warehouse):
+def test_planned_only_is_explicit_and_credential_only(warehouse):
     from personal_data_warehouse import scrub_conversation_cards as m
     plan = m.discover(warehouse)
-    with pytest.raises(ValueError, match='token'):
+    with pytest.raises(ValueError, match='credential'):
         m.scrub(warehouse, apply=True, plan=plan, planned_only=True)
 
 
 def test_batch_cli_requires_shutdown_acknowledgment(monkeypatch):
     import sys
     from personal_data_warehouse import scrub_conversation_cards as m
-    monkeypatch.setattr(sys,'argv',['scrub','--scope','tokens','--apply','--session-batches','--planned-only'])
+    monkeypatch.setattr(sys,'argv',['scrub','--scope','credentials','--apply','--session-batches','--planned-only'])
     with pytest.raises(SystemExit) as error: m.main()
     assert error.value.code == 2
 
@@ -87,7 +87,7 @@ def test_batch_cli_commits_and_global_verify_still_finds_unrelated_session(wareh
     import sys
     from personal_data_warehouse import scrub_conversation_cards as m
     from personal_data_warehouse.card_scrub_selector import ScrubSelector
-    selector=ScrubSelector('tokens')
+    selector=ScrubSelector('credentials')
     row=dict(event(),text=TOKEN,raw_json='{}')
     warehouse._insert_rows('claude_code_events',[row],AGENT_SESSION_EVENT_COLUMNS)
     path=tmp_path/'plan.json'
@@ -95,7 +95,7 @@ def test_batch_cli_commits_and_global_verify_still_finds_unrelated_session(wareh
     warehouse._insert_rows('claude_code_events',[dict(row,session_id='unrelated')],AGENT_SESSION_EVENT_COLUMNS)
     monkeypatch.setattr(m,'PostgresWarehouse',lambda *a,**k:warehouse)
     monkeypatch.setattr(warehouse,'close',lambda:None)
-    monkeypatch.setattr(sys,'argv',['scrub','--scope','tokens','--apply','--session-batches',
+    monkeypatch.setattr(sys,'argv',['scrub','--scope','credentials','--apply','--session-batches',
                                  '--planned-only','--writers-paused','--workers','1','--plan',str(path)])
     m.main()
     assert len(m.read_plan(path)['batches']['completed']) == 1

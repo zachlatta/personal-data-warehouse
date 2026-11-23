@@ -10,6 +10,7 @@ import secrets
 from dataclasses import dataclass, field
 
 from personal_data_warehouse import card_redaction as cr
+from personal_data_warehouse import credential_redaction
 
 FIELD = r'(?:card(?:[ _-]*number)?|pan|cc|number|num)'
 FIELD_KEY = re.compile('(?i)^'+FIELD+'$')
@@ -27,10 +28,10 @@ class ScrubSelector:
     seed_revision: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
-        if self.scope not in ('all', 'labelled', 'seed', 'tokens'):
+        if self.scope not in ('all', 'labelled', 'seed', 'credentials'):
             raise ValueError('unknown scrub scope')
-        if self.scope == 'tokens' and (self.seed_rows or self.seeds or self.seed_revision):
-            raise ValueError('token scope does not accept card seeds')
+        if self.scope == 'credentials' and (self.seed_rows or self.seeds or self.seed_revision):
+            raise ValueError('credential scope does not accept card seeds')
 
     def seed_only(self, expected):
         """Bind a narrower policy to an already resolved checkpoint revision.
@@ -131,7 +132,7 @@ class ScrubSelector:
 
     def count(self, value):
         if self.scope=='all': return cr.sensitive_count(value)
-        if self.scope=='tokens': return len(cr.token_edits(value))
+        if self.scope=='credentials': return credential_redaction.credential_count(value)
         return sum('[card ' in r for _,_,r in self._edits(value))
 
     def count_row(self, row):
@@ -140,7 +141,7 @@ class ScrubSelector:
         return sum(self.count(v if isinstance(v,str) else json.dumps(v)) for v in row.values() if isinstance(v,(str,dict,list)))
 
     def redact(self, value):
-        if self.scope=='tokens': return cr._apply_edits(value,cr.token_edits(value))
+        if self.scope=='credentials': return credential_redaction.redact_credentials(value)
         return cr.redact(value) if self.scope=='all' else cr._apply_edits(value,self._edits(value))
 
     def redact_row(self, row):
@@ -179,7 +180,7 @@ def resolve_selector(warehouse, scope='all', seed_rows=(), *, expected=None):
 
 
 def add_selector_arguments(parser):
-    parser.add_argument('--scope',choices=('all','labelled','seed','tokens'),default='all')
+    parser.add_argument('--scope',choices=('all','labelled','seed','credentials'),default='all')
     parser.add_argument('--seed-row',action='append',default=[],help='logical_table:JSON primary-key object; repeatable, IDs only')
 
 
@@ -200,10 +201,10 @@ def selector_from_args(args, expected=None):
 
 def validate_specification(spec):
     from personal_data_warehouse.postgres import POSTGRES_TABLES, _AI_CONVERSATION_EVENT_TABLES
-    if not isinstance(spec,dict) or set(spec)!={'scope','seed_rows','seed_revision'} or spec['scope'] not in ('all','labelled','seed','tokens') or not isinstance(spec['seed_rows'],list):
+    if not isinstance(spec,dict) or set(spec)!={'scope','seed_rows','seed_revision'} or spec['scope'] not in ('all','labelled','seed','credentials') or not isinstance(spec['seed_rows'],list):
         raise ValueError('invalid selector specification')
-    if spec['scope']=='tokens' and (spec['seed_rows'] or spec['seed_revision']):
-        raise ValueError('token scope does not accept card seeds')
+    if spec['scope']=='credentials' and (spec['seed_rows'] or spec['seed_revision']):
+        raise ValueError('credential scope does not accept card seeds')
     revision=spec['seed_revision']
     if spec['seed_rows'] and (not isinstance(revision,dict) or set(revision)!={'salt','digest'} or any(not isinstance(v,str) or not re.fullmatch('[a-f0-9]{64}',v) for v in revision.values())):
         raise ValueError('invalid seed revision')

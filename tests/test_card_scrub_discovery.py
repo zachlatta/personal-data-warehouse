@@ -11,7 +11,7 @@ from tests.test_conversation_card_storage import event, warehouse
 
 
 def test_sql_prefilter_is_superset_of_shared_and_generated_cases(warehouse):
-    from personal_data_warehouse.card_prefilter import might_contain_card, sql_prefilter
+    from personal_data_warehouse.card_prefilter import might_contain_sensitive, sql_prefilter
     from tests.card_redaction_properties import property_cases
     cases = json.loads((Path(__file__).parent/'fixtures/card_redaction_cases.json').read_text())['cases']
     values = [c['input'] for c in cases] + [value for _,value,_ in property_cases()]
@@ -25,7 +25,7 @@ def test_sql_prefilter_is_superset_of_shared_and_generated_cases(warehouse):
     units=''.join('\\u%04x'%ord(c) for c in ''.join(r'\u%04x'%ord(c) for c in '4111111111111111'))
     values.append('{"text":"'+units+'"}')
     expected = {i for i,value in enumerate(values) if card_count(value)}
-    assert expected <= {i for i,value in enumerate(values) if might_contain_card(value)}
+    assert expected <= {i for i,value in enumerate(values) if might_contain_sensitive(value)}
     warehouse._command('CREATE TEMP TABLE scrub_prefilter_cases (id integer, value text)')
     with warehouse._connection.cursor() as cursor:
         execute_values(cursor,'INSERT INTO scrub_prefilter_cases VALUES %s',list(enumerate(values)),page_size=500)
@@ -301,12 +301,12 @@ def random_prefilter_cases():
 
 
 def test_random_prefix_suffix_superset_in_postgres_and_archive(warehouse):
-    from personal_data_warehouse.card_prefilter import might_contain_card, sql_prefilter
+    from personal_data_warehouse.card_prefilter import might_contain_sensitive, sql_prefilter
     from personal_data_warehouse.scrub_conversation_objects import discover_objects
     values=list(random_prefilter_cases())
     expected={i for i,v in enumerate(values) if card_count(v)}
     assert len(expected)>2000
-    assert expected<={i for i,v in enumerate(values) if might_contain_card(v)}
+    assert expected<={i for i,v in enumerate(values) if might_contain_sensitive(v)}
     warehouse._command('CREATE TEMP TABLE prefix_prefilter_cases (id integer,value text)')
     with warehouse._connection.cursor() as cursor:
         execute_values(cursor,'INSERT INTO prefix_prefilter_cases VALUES %s',list(enumerate(values)),page_size=500)

@@ -446,8 +446,8 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
         raise ValueError("plan selector differs from current selector")
     if plan['scope'] != _scope(warehouse): raise ValueError('discovery plan belongs to another warehouse')
     if not apply: return plan['counts']
-    if planned_only and (not selector or selector.scope != 'tokens'):
-        raise ValueError('planned-only repair requires the token selector')
+    if planned_only and (not selector or selector.scope != 'credentials'):
+        raise ValueError('planned-only repair requires the credential selector')
     if not 0<window_seconds<=60: raise ValueError('maintenance budget must be at most 60 seconds')
     if 'discovery' in plan: raise ValueError('partition discovery incomplete')
     if exact_source_rows is not None and not 0<exact_source_rows<=max_source_rows:
@@ -501,7 +501,7 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
 
 
 def _session_candidates(warehouse, plan, pool):
-    """Indexed source/session confirmation for explicit planned-only token repair.
+    """Indexed source/session confirmation for explicit planned-only credential repair.
 
     This does not certify unrelated sessions. Full post-restore verification
     remains mandatory. Unknown selected rows IN a planned session fail closed.
@@ -904,7 +904,7 @@ def main():
     parser.add_argument('--max-plan-rows',type=int,default=20000)
     parser.add_argument('--window-seconds',type=int,default=60)
     parser.add_argument('--session-batches',action='store_true',help='apply complete sessions in separate bounded transactions')
-    parser.add_argument('--planned-only',action='store_true',help='tokens only: indexed planned-session repair; unrelated sessions require full post-restore verify')
+    parser.add_argument('--planned-only',action='store_true',help='credentials only: indexed planned-session repair; unrelated sessions require full post-restore verify')
     parser.add_argument('--writers-paused',action='store_true',help='acknowledge external writer shutdown and guaranteed restoration')
     parser.add_argument('--max-canonical-rows',type=int,default=10000)
     parser.add_argument('--report-html', type=Path, help='counts-only table for the private email body')
@@ -913,10 +913,10 @@ def main():
     if args.workers < 1: parser.error('--workers must be positive')
     if args.apply and args.verify: parser.error('--apply and --verify are mutually exclusive')
     if args.only_session and (args.planned_only or args.session_batches):
-        parser.error('--only-session is a seed repair; it cannot combine with token session batches')
+        parser.error('--only-session is a seed repair; it cannot combine with credential session batches')
     if args.planned_only or args.session_batches:
-        if not (args.apply and args.planned_only and args.session_batches and args.writers_paused and args.scope=='tokens'):
-            parser.error('session batches require --apply --scope tokens --planned-only --writers-paused')
+        if not (args.apply and args.planned_only and args.session_batches and args.writers_paused and args.scope=='credentials'):
+            parser.error('session batches require --apply --scope credentials --planned-only --writers-paused')
     if not args.verify and args.plan is None: parser.error('--plan is required for discovery and apply')
     warehouse = PostgresWarehouse(os.environ['POSTGRES_DATABASE_URL'],initialize=False)
     warehouse._connection.set_session(readonly=not args.apply,autocommit=True)
@@ -974,8 +974,8 @@ def main():
         print(json.dumps({'counts_by_month_source': table, 'details_before': before, 'details_after': after, 'verification_pending':args.apply, 'left_alone': plan.get('left_alone') if not args.verify else None}))
         if args.report_html:
             args.report_html.write_text(report_html(table))
-        if args.verify and args.scope == 'tokens' and any(r['measure']=='matches' and r['count'] for r in after):
-            raise SystemExit('token verification failed: secrets remain')
+        if args.verify and args.scope == 'credentials' and any(r['measure']=='matches' and r['count'] for r in after):
+            raise SystemExit('credential verification failed: secrets remain')
     finally:
         warehouse.close()
 

@@ -41,7 +41,7 @@ def test_controller_runtime_has_no_secret_arguments(tmp_path, monkeypatch):
     assert '--env-file' in args and str(tmp_path/'runtime.env') in args
     assert '--entrypoint' in args and '/app/.venv/bin/python' in args
     assert 'personal_data_warehouse.scrub_conversation_cards' in args
-    assert '--scope' in args and 'tokens' in args
+    assert '--scope' in args and 'credentials' in args
 
 
 def test_controller_private_state_files(tmp_path):
@@ -109,10 +109,10 @@ def test_verify_removes_the_runtime_environment_only_after_clean_scans(tmp_path,
 def test_jsonl_token_cli_reports_remaining_secret(tmp_path,monkeypatch):
     import sys
     from personal_data_warehouse import scrub_conversation_jsonl as m
-    from tests.test_token_scrub_scope import TOKEN
+    from tests.test_credential_scrub_scope import TOKEN
     path=tmp_path/'session.jsonl'
     path.write_text(json.dumps({'text':TOKEN})+'\n')
-    args=['scrub','--scope','tokens','--root',str(tmp_path),'--session','session']
+    args=['scrub','--scope','credentials','--root',str(tmp_path),'--session','session']
     monkeypatch.setattr(sys,'argv',args)
     with pytest.raises(SystemExit,match='secrets remain'): m.main()
     monkeypatch.setattr(sys,'argv',args+['--apply'])
@@ -190,7 +190,7 @@ def test_cleanup_removes_crash_left_controller_temp_files(tmp_path, monkeypatch)
     directory=tmp_path/'crashed'
     directory.mkdir()
     (directory/'before-stop.json.k2j3h4').write_text('{}')
-    (directory/'token-cards-plan.json.a8b7.pending').write_text('{}')
+    (directory/'credential-cards-plan.json.a8b7.pending').write_text('{}')
     m.cleanup(directory)
     assert not directory.exists()
 

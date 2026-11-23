@@ -1,4 +1,9 @@
-"""Payment data boundary for conversation storage. Never logs candidate values."""
+"""Payment data boundary for conversation storage. Never logs candidate values.
+
+Credentials share this boundary through credential_redaction: ``redact`` and
+``sensitive_count`` cover both, and a credential owns its whole span even when
+it contains card-like digits.
+"""
 from __future__ import annotations
 
 import base64
@@ -76,7 +81,6 @@ _CODE_KEY = re.compile(r'(?i)^' + _LABEL + '$')
 _CODE_SCALAR = re.compile(r'[0-9]{3,4}(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
 _ESCAPE = re.compile(r'\\+u(003[0-9]|0020|002[dD])')
 _DIGITS = re.compile(r'[0-9]+')
-PDW_TOKEN = re.compile(r'(pdw_[a-z0-9]{12,24}_)[A-Za-z0-9_-]{30,}')
 _SEPARATOR = re.compile(r'[ -]{1,3}')
 _ADJACENT_CODE = re.compile(r'(?:[ -]{1,3}|[:=] {0,3})([0-9]{3,4})(?![0-9])')
 _JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|[{}\[\]:,]|true|false|null')
@@ -157,13 +161,7 @@ def _apply_edits(value, edits):
     return ''.join(output)
 
 
-def _token_leaf_edits(value):
-    # Keep the public id; mask only the secret after it.
-    return [(m.start(0) + len(m[1]), m.end(), '[REDACTED]') for m in PDW_TOKEN.finditer(value)]
-
-
 def _text_edits(value):
-    token_edits = _token_leaf_edits(value)
     # Keep offsets through escaped-digit decoding: unmasked escapes must survive.
     chars = []; bounds = [0]; pos = 0
     while pos < len(value):
@@ -195,32 +193,7 @@ def _text_edits(value):
             merged[-1] = (previous_start, max(end, previous_end), previous_replacement)
         else:
             merged.append((start, end, replacement))
-    edits = [(bounds[a], bounds[b], replacement) for a, b, replacement in merged]
-    # A token owns its entire secret, even when it contains card-like digits.
-    edits = [e for e in edits if not any(e[0] < b and e[1] > a for a,b,_ in token_edits)]
-    return sorted(edits + token_edits)
-
-
-def token_edits(value):
-    """Token secrets only, retaining JSON lexemes and all payment data.
-
-    Use the storage boundary's pattern and decoded-string traversal. Mapping
-    spans back through each wrapper also covers Unicode-escaped token bytes.
-    """
-    tokens = _json_tokens(value)
-    if tokens is not None:
-        edits = []
-        for token in tokens:
-            raw = token[0]
-            if not raw.startswith('"'):
-                continue
-            inner = token_edits(json.loads(raw))
-            if inner:
-                bounds = _json_string_bounds(raw)
-                edits.extend((token.start()+bounds[a], token.start()+bounds[b],
-                              json.dumps(replacement)[1:-1]) for a,b,replacement in inner)
-        return edits
-    return _token_leaf_edits(value)
+    return [(bounds[a], bounds[b], replacement) for a, b, replacement in merged]
 
 
 def _json_string_bounds(token):
@@ -269,7 +242,15 @@ def _json_tokens(value):
 
 
 def _redaction_edits(value, context):
-    if not context and not sensitive_count(value):
+    """Credential spans win; card spans overlapping one are dropped."""
+    credentials = credential_redaction.credential_edits(value)
+    cards = [e for e in _card_edits(value, context)
+             if not any(e[0] < b and e[1] > a for a, b, _ in credentials)]
+    return sorted(credentials + cards)
+
+
+def _card_edits(value, context):
+    if not context and not card_count(value):
         return []
     tokens = _json_tokens(value)
     if tokens is not None:
@@ -284,7 +265,7 @@ def _redaction_edits(value, context):
             if index in codes:
                 edits.append((token.start(), token.end(), '"[redacted]"'))
             elif raw.startswith('"'):
-                inner = _redaction_edits(json.loads(raw), True)
+                inner = _card_edits(json.loads(raw), True)
                 if inner:
                     bounds = _json_string_bounds(raw)
                     edits.extend((token.start()+bounds[a], token.start()+bounds[b],
@@ -332,11 +313,7 @@ def redact(value: str, *, card_context: bool = False) -> str:
 
 
 def sensitive_count(value: str) -> int:
-    tokens = _json_tokens(value)
-    if tokens is not None:
-        return sum(sensitive_count(json.loads(raw)) if raw.startswith('"') else sensitive_count(raw)
-                   for token in tokens if (raw := token[0])[0] in '"-0123456789')
-    return card_count(value) + len(PDW_TOKEN.findall(value))
+    return card_count(value) + credential_redaction.credential_count(value)
 
 
 def redact_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -344,3 +321,6 @@ def redact_row(row: dict[str, Any]) -> dict[str, Any]:
     return {key: redact(value, card_context=context) if isinstance(value, str)
             else json.loads(redact(json.dumps(value), card_context=context)) if isinstance(value, (dict, list))
             else value for key, value in row.items()}
+
+
+from personal_data_warehouse import credential_redaction  # noqa: E402  (mutual import)

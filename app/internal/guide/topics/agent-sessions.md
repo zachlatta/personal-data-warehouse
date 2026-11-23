@@ -184,9 +184,15 @@ word "error", which appears constantly in ordinary content.
 ## What search can and cannot find
 
 Payment card numbers and labelled security codes are masked before conversation
-storage, including raw JSON and uploaded transcript batches. Do not put secrets in
-tool calls or outputs: original host transcripts are separate copies, and warehouse
-redaction does not mean a leaked value was never saved.
+storage, including raw JSON and uploaded transcript batches. So are credentials:
+database/service URL passwords, Slack `xox…` tokens, GitHub tokens, OpenAI and
+Anthropic `sk-` keys, AWS secret keys next to an access key id, PEM private keys,
+PDW token secrets, `Bearer` tokens, and values labelled `password`, `secret`,
+`client_secret`, `api_key` or `token`. Each becomes `[REDACTED:<kind>:<hash6>]`, the
+first six hex of its SHA-256, so one leaked value matches across rows of
+`marts_ai_conversations.events` without being stored. Do not put secrets in tool calls or outputs: original host
+transcripts are separate copies, and masking does not mean a leaked value was never
+saved. **Rotation, not masking, is the fix for a leaked secret.**
 
 The search document for a session is its title, first prompt, working directory and the
 user/assistant turns — **tool calls and tool results are not in it**. A path, command or

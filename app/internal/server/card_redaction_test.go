@@ -396,7 +396,7 @@ func TestAdjacentCodeChainFollowedByIssuerValidCard(t *testing.T) {
 
 func TestPDWTokenRedaction(t *testing.T) {
 	token := `pdw_` + strings.Repeat(`a`, 16) + `_` + strings.Repeat(`B`, 40)
-	want := `pdw_` + strings.Repeat(`a`, 16) + `_[REDACTED]`
+	want := `pdw_` + strings.Repeat(`a`, 16) + `_` + credentialMarker("pdw_token", strings.Repeat(`B`, 40))
 	for _, value := range []string{token, `{"text":"` + token + `"}`} {
 		got := redactCardText(value, false)
 		if strings.Contains(got, token) || !strings.Contains(got, want) {

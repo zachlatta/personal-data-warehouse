@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from personal_data_warehouse.credential_redaction import marker
 from personal_data_warehouse.postgres import PostgresWarehouse, _AI_EVENT_TABLE_BY_SOURCE
 from personal_data_warehouse.agent_sessions_drive_ingest import claude_code_event_row
 from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
@@ -32,7 +33,7 @@ def event():
 
 def test_access_token_storage_and_legacy_rebuild(warehouse):
     token = 'pdw_' + 'a' * 16 + '_' + 'B' * 40
-    masked = 'pdw_' + 'a' * 16 + '_[REDACTED]'
+    masked = 'pdw_' + 'a' * 16 + '_' + marker('pdw_token', 'B' * 40)
     row = dict(event(), text=token, raw_json=json.dumps({'text': token}),
                tool_input_json=json.dumps({'token': token}), tool_result_json=token)
     warehouse.insert_agent_session_events([row])
