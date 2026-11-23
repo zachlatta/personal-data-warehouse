@@ -4,7 +4,8 @@ Capture inserts, not seq changes: enrichment and priority re-walks must never pa
 someone again. Installation is inert until the authenticated experiment switch is on.
 """
 
-TABLES = ("notification_state", "notification_events", "notification_deliveries", "web_push_devices")
+TABLES = ("notification_state", "notification_events", "notification_deliveries", "web_push_devices",
+          "notification_mutes")
 
 
 def ensure_notification_tables(warehouse):
@@ -116,6 +117,19 @@ CAPTURE_FUNCTION_SQL = """CREATE OR REPLACE FUNCTION @capture_timeline_notificat
     END $$"""
 
 
+# A per-source mute with an end (docs/notifications.md, "Muting one source"):
+# the Go worker drops a muted source's events until muted_until. The Go app
+# deploys first and creates the same table at startup
+# (app/internal/notifications/mutes.go, notificationMutesDDL); a test pins the two.
+MUTES_TABLE_SQL = """CREATE TABLE IF NOT EXISTS @notification_mutes (
+        source text PRIMARY KEY,
+        muted_until timestamptz NOT NULL,
+        reason text NOT NULL DEFAULT '',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+    )"""
+
+
 STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS @notification_state (
         id text PRIMARY KEY, enabled bigint NOT NULL DEFAULT 0,
@@ -164,6 +178,8 @@ STATEMENTS = (
         error text NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS web_push_devices_updated_idx ON @web_push_devices (updated_at)",
+    MUTES_TABLE_SQL,
+    "CREATE INDEX IF NOT EXISTS notification_mutes_updated_idx ON @notification_mutes (updated_at)",
     CAPTURE_FUNCTION_SQL,
     """CREATE OR REPLACE VIEW @marts_notifications AS
         SELECT id, adapter, event_id, source, priority,

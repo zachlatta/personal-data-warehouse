@@ -23,6 +23,8 @@ PDW_CLI_ADMIN_SUBCOMMANDS: tuple[str, ...] = (
     "chatgpt", "slack", "whoop", "hn", "heartbeat", "mutations",
     # Writes to the Feed tab (docs/feed.md), not a question to the warehouse.
     "feed",
+    # Mutes one source's phone alerts until a set time (docs/notifications.md).
+    "notifications",
 )
 
 #: Flag spellings run() accepts in place of a subcommand (help and version).

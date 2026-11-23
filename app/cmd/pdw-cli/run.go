@@ -53,6 +53,11 @@ COMMANDS
                              [--idle 30d] [--ttl D]" prints a token once; an
                              unused token dies after its idle limit. See
                              "pdw token" for flags.
+  notifications mute|unmute|mutes
+                             Mute one source's phone alerts until a set time
+                             ("mute slack --until 2027-01-04T09:00:00-05:00"
+                             or "--for 7d"); the mute ends by itself. See
+                             "pdw notifications --help".
   config show                Print the resolved configuration with the token redacted.
   list                       List every tool the server exposes.
                                --json   Emit the raw tool list as a JSON array.
@@ -386,6 +391,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return runSchema(client, rest, stdout, stderr)
 	case "token":
 		return runToken(client, rest, stdout, stderr)
+	case "notifications":
+		return runNotifications(client, rest, stdout, stderr)
 	case "feed":
 		return runFeed(client, rest, stdin, stdout, stderr, getenv)
 	default:
@@ -1458,10 +1465,11 @@ func isVersionFlag(args []string) bool {
 // are answered by the global usage. (The local commands -- ingest, chatgpt,
 // slack, ... -- are dispatched before the help check and print their own.)
 var commandHelp = map[string]string{
-	"search":  searchUsage,
-	"context": contextUsage,
-	"token":   tokenUsage,
-	"feed":    feedUsage,
+	"search":        searchUsage,
+	"context":       contextUsage,
+	"token":         tokenUsage,
+	"notifications": notificationsUsage,
+	"feed":          feedUsage,
 }
 
 // hasHelpArg reports whether a help flag appears before a "--" terminator.

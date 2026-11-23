@@ -417,6 +417,7 @@ var Objects = []CatalogObject{
 	{ID: "marts_health_workout_routes", Kind: "view", Layer: "marts", Domain: "health", Schema: "marts_health", Name: "workout_routes", Discoverable: true, QueryAccess: "public", Secret: false, Comment: "GPS routes. Points per workout_id, in point_index order."},
 	{ID: "notification_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "notification_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "notification_events", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "notification_events", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
+	{ID: "notification_mutes", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "notification_mutes", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "notification_deliveries", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "notification_deliveries", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "web_push_devices", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "web_push_devices", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "capture_timeline_notification", Kind: "function", Layer: "internal", Domain: "internal", Schema: "internal", Name: "capture_timeline_notification", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},

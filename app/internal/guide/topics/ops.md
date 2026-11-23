@@ -70,6 +70,12 @@ receive a captured alert, `no_devices` makes health `attention`, including all s
 Delivery `suppressed` errors `device_dormant`/`device_stopped` are intentional skips,
 not health failures. No device rows are deleted. Desktop Slack overlap is separate.
 
+**Muting one source** (a vacation, a noisy week): `pdw notifications mute slack --until
+2027-01-04T09:00:00-05:00` (or `--for 7d`, at most 90 days) stops that timeline source's
+alerts and ends by itself; `pdw notifications mutes` lists mutes, `unmute` ends one early.
+Its events read `status = 'muted'` in `marts_ops.notifications` and are never sent later;
+queued deliveries skip as `suppressed` / `source_muted`. Mutation alerts are never muted.
+
 **Acceptance is not display, and a tap is not a read.** `accepted_at` means push-service
 acceptance; an Expo `provider_accepted` verdict means downstream handoff, not an OS
 screen observation. `opened_at` is when the server first observed a tap upload;

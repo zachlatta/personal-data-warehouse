@@ -4640,6 +4640,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "notification_events": _state("notification outbox keyed to the original timeline event; not a second real-world event"),
     "notification_deliveries": _state("per-device notification transport and open telemetry; keyed to the original event"),
     "web_push_devices": _state("private browser push subscriptions"),
+    "notification_mutes": _state("per-source notification mutes and when each ends"),
     "push_devices": _state("iOS app devices registered for push notifications"),
     # Mutation policies: Zach's auto-approval rules and their audit, not events.
     "mutation_policies": _state("versioned mutation auto-approval policies (Zach's rules)"),
@@ -4702,6 +4703,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
 # ensure_* method.
 RAW_DDL_TABLES: tuple[str, ...] = (
     "notification_state", "notification_events", "notification_deliveries", "web_push_devices",
+    "notification_mutes",
     "timeline_gmail_correspondents",
     "claude_desktop_credentials",
     "claude_desktop_conversation_state",

@@ -2325,6 +2325,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "notification_events": _data("timeline_notifications", "created_at", "event_ts", "notification delivery instrumentation"),
     "notification_deliveries": _state("timeline_notifications", "updated_at", "notification delivery instrumentation"),
     "web_push_devices": _state("timeline_notifications", "updated_at", "notification delivery instrumentation"),
+    "notification_mutes": _state("timeline_notifications", "updated_at", "notification delivery instrumentation"),
     "mcp_connections": _data("mcp_proxy", "updated_at", note="encrypted owner-managed connection configuration; not an event source"),
     "app_access_tokens": _state("mcp_proxy", "updated_at", "hashed issued bearer tokens and cli_authorize codes, written by the app on issue, use and revoke"),
     "external_feed_items": _state("mcp_proxy", "recorded_at", "bounded outgoing projections refreshed on authenticated pulls; source freshness is measured by the source pipelines"),

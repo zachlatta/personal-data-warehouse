@@ -31,6 +31,7 @@ test('failures, no devices, cancellation and pending each read distinctly', () =
   assert.deepEqual(notificationOutcome({ ...base, failed: 2 }), { label: 'failed', tone: 'bad' });
   assert.deepEqual(notificationOutcome({ ...base, status: 'no_devices', devices: 0 }), { label: 'no devices', tone: 'bad' });
   assert.deepEqual(notificationOutcome({ ...base, status: 'cancelled' }), { label: 'cancelled', tone: 'muted' });
+  assert.deepEqual(notificationOutcome({ ...base, status: 'muted', devices: 0 }), { label: 'skipped: source muted', tone: 'muted' });
   assert.deepEqual(notificationOutcome({ ...base, status: 'pending' }), { label: 'sending', tone: 'neutral' });
   assert.deepEqual(notificationOutcome({ ...base }), { label: 'sending', tone: 'neutral' });
 });

@@ -578,3 +578,24 @@ def test_the_phone_witness_hold_ends_before_health_calls_a_pending_delivery_stuc
 def test_no_surface_says_cc_events_page_when_the_trigger_captures_direct_and_scans(surface):
     text = (Path(__file__).resolve().parent.parent / surface).read_text()
     assert not re.search(r"direct\s*(and|or|/|\+)\s*cc", text, re.IGNORECASE)
+
+
+def test_ensure_creates_the_source_mute_table_empty(warehouse):
+    """A per-source mute (docs/notifications.md, "Muting one source") is a row
+    with an end; a fresh warehouse mutes nothing."""
+    assert warehouse._query("SELECT count(*) FROM @notification_mutes") == [(0,)]
+    assert warehouse._query(
+        "SELECT attname::text FROM pg_attribute WHERE attrelid = %s::regclass AND attnum > 0 "
+        "AND NOT attisdropped ORDER BY attnum", (warehouse.sql_relation("notification_mutes"),)) == [
+        ("source",), ("muted_until",), ("reason",), ("created_at",), ("updated_at",)]
+
+
+def test_the_source_mute_table_is_the_one_the_go_app_creates_at_startup():
+    """The Go app deploys before the Python ensure runs, so its notification
+    service creates the mute table too; both must create the same table."""
+    from personal_data_warehouse.notifications import MUTES_TABLE_SQL
+
+    go = (Path(__file__).resolve().parents[1] / "app/internal/notifications/mutes.go").read_text()
+    match = re.search(r"const notificationMutesDDL = `([^`]*)`", go)
+    assert match, "mutes.go no longer declares notificationMutesDDL"
+    assert " ".join(match.group(1).split()) == " ".join(MUTES_TABLE_SQL.split())

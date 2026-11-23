@@ -301,7 +301,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # says is its newest item (C11).
         # +4 ops: mutation auto-approval policies, their grants, every policy
         # decision, and the kill switch (app/internal/mutations/policy_store.go).
-        "ops": 55,  # outgoing feed projection and script-run telemetry
+        # +1 ops: ops.notification_mutes, per-source alert mutes with an end.
+        "ops": 56,  # outgoing feed projection and script-run telemetry
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).

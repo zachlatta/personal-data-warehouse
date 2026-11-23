@@ -138,6 +138,10 @@ func newWithExpansion(databaseURL string, secret []byte, sender Sender, render f
 		db.Close()
 		return nil, err
 	}
+	if err := ensureMutes(ctx, db, expand); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Service{DB: db, Secret: secret, Sender: sender, Render: render, Expand: expand}, nil
 }
 func (s *Service) Close() error { return s.DB.Close() }
@@ -235,6 +239,18 @@ func (s *Service) Tick(ctx context.Context) error {
 				}
 			}
 			if active {
+				// A mute set after fan-out still holds work already queued.
+				if muted, err := s.deliveryMuted(ctx, d); err != nil {
+					return err
+				} else if muted {
+					if err = s.settle(ctx, d, Result{Status: "suppressed", Error: "source_muted"}, false); err != nil {
+						return err
+					}
+					if _, err = s.DB.ExecContext(ctx, s.q(`UPDATE @notification_events SET status='muted' WHERE id=$1 AND status='fanned_out'`), d.NotificationID); err != nil {
+						return err
+					}
+					continue
+				}
 				reason, err := s.suppressionReason(ctx, d)
 				unchecked := errors.Is(err, errWitnessUnchecked)
 				if err != nil && !unchecked {
@@ -290,12 +306,21 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 	var id string
 	var payload []byte
 	var phoneHoldUntil time.Time
-	err = tx.QueryRowContext(ctx, s.q(`SELECT id,payload,greatest(now(),`+phoneWitnessAnchor+`+$1::interval) FROM @notification_events n WHERE status='pending' AND `+timelineGate+` ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`), interval(PhoneWitnessHold)).Scan(&id, &payload, &phoneHoldUntil)
+	var muted bool
+	err = tx.QueryRowContext(ctx, s.q(`SELECT id,payload,greatest(now(),`+phoneWitnessAnchor+`+$1::interval),`+sourceMuted+` FROM @notification_events n WHERE status='pending' AND `+timelineGate+` ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`), interval(PhoneWitnessHold)).Scan(&id, &payload, &phoneHoldUntil, &muted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
+	}
+	if muted {
+		// A muted source's event reaches no device and is not replayed when
+		// the mute ends (mutes.go).
+		if _, err = tx.ExecContext(ctx, s.q(`UPDATE @notification_events SET status='muted' WHERE id=$1`), id); err != nil {
+			return false, err
+		}
+		return true, tx.Commit()
 	}
 	var row map[string]any
 	if err = json.Unmarshal(payload, &row); err != nil {

@@ -16,6 +16,8 @@ export function notificationOutcome(event: NotificationEvent): NotificationOutco
   if (event.failed > 0) return { label: 'failed', tone: 'bad' };
   if (event.status === 'no_devices') return { label: 'no devices', tone: 'bad' };
   if (event.status === 'cancelled') return { label: 'cancelled', tone: 'muted' };
+  // The source was muted (`pdw notifications mute`): recorded, never sent.
+  if (event.status === 'muted') return { label: 'skipped: source muted', tone: 'muted' };
   return { label: 'sending', tone: 'neutral' };
 }
 

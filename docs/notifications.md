@@ -78,6 +78,41 @@ adding `last_active_at` before requests or worker ticks. Python ensure uses the
 same column definition. Reads rely on startup having completed; no status change
 or dormancy transition runs DDL. No mart gains a required column.
 
+## Muting one source
+
+A source mute silences one timeline source's alerts (`slack`, `gmail`, ...: the
+`source` column of `timeline.events` and `marts_ops.notifications`) until a stated
+time, and then ends by itself. It is for a vacation or a noisy week: the mute
+carries its own end, so nothing has to remember to turn alerts back on.
+
+```bash
+pdw notifications mute slack --until 2027-01-04T09:00:00-05:00 --reason vacation
+pdw notifications mute gmail --for 36h      # or a duration, at most 90 days
+pdw notifications mutes                      # every mute, active or ended
+pdw notifications unmute slack               # end one early
+```
+
+The CLI calls the authenticated API: `GET /api/notifications/mutes`,
+`POST /api/notifications/mutes` with `{source, until (RFC 3339), reason}`, and
+`DELETE /api/notifications/mutes/{source}`. Rows live in `ops.notification_mutes`
+(one per source; ending a mute sets `muted_until` to now and keeps the row).
+
+- Only a source that has paged before can be muted, and the error lists the ones
+  that have: a typo would otherwise mute nothing and look like it worked.
+- While a mute holds, the worker fans the source's captured events out to no
+  device and records them with `status = 'muted'`. A delivery queued before the
+  mute (an Android hold, a retry) is skipped as `suppressed` / `source_muted`
+  and its event reads `muted` too. Other sources keep paging.
+- **Muted events are dropped, not delivered when the mute ends.** A week of
+  Slack alerts arriving at once on the Monday back is not news, it is a flood
+  that buries the first real message; the events themselves stay on the
+  timeline and in Slack. Capture still records each one, so the ledger shows
+  what the mute held back.
+- Mutation alerts (`mutation_policy`) are not timeline notifications, and no
+  mute holds them, the same as the global switch.
+- The Go app creates the table at startup as well as the Python ensure path,
+  because it deploys first and the worker reads the table every tick.
+
 ## What a tap can do
 
 Both the phone and timeline use the same source-link builder, not competing URL

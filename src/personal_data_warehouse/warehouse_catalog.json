@@ -4397,6 +4397,17 @@
       "secret": false
     },
     {
+      "id": "notification_mutes",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "notification_mutes",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "notification_deliveries",
       "kind": "table",
       "layer": "private",

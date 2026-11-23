@@ -69,6 +69,9 @@ func (s *Service) Register(mux *http.ServeMux, auth func(http.Handler) http.Hand
 	mux.Handle("POST "+APIPath+"/devices/status", auth(bounded(s.deviceStatus)))
 	mux.Handle("GET "+APIPath, auth(bounded(s.status)))
 	mux.Handle("POST "+APIPath+"/settings", auth(bounded(s.settings)))
+	mux.Handle("GET "+APIPath+"/mutes", auth(bounded(s.listMutes)))
+	mux.Handle("POST "+APIPath+"/mutes", auth(bounded(s.setMute)))
+	mux.Handle("DELETE "+APIPath+"/mutes/{source}", auth(bounded(s.endMute)))
 	mux.Handle("POST "+APIPath+"/web/register", auth(bounded(s.registerWeb)))
 	mux.Handle("POST "+APIPath+"/web/disable", auth(bounded(s.disableWeb)))
 	// This capability authorizes exactly one idempotent timestamp write, no

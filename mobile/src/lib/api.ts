@@ -461,7 +461,7 @@ export type NotificationEvent = {
   actor: string;
   title: string;
   body: string;
-  // pending → fanned_out | no_devices | cancelled
+  // pending → fanned_out | no_devices | cancelled | muted
   status: string;
   preview?: { title?: string; subtitle?: string; body?: string; icon?: string; route?: string };
   devices: number;
