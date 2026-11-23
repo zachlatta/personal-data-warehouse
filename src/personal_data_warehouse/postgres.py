@@ -9856,17 +9856,9 @@ class PostgresWarehouse:
         limit: int,
         claimed_by: str,
         providers: Sequence[str] | None = None,
-        exclude_providers: Sequence[str] | None = None,
         ensure_tables: bool = True,
     ) -> list[dict[str, Any]]:
-        """Claim approved mutations, optionally scoped to a set of providers.
-
-        Scoping is what keeps two workers off one queue. Apple Notes can only be applied
-        on a Mac running Notes.app, so the cloud worker excludes that provider and the
-        Mac worker claims only it. Without the filter the cloud worker would claim an
-        apple_notes row, fail it as unknown-provider, and bump attempt_count on every
-        tick while the Mac never got a chance at it.
-        """
+        """Claim approved mutations, optionally scoped to a set of providers."""
 
         if ensure_tables:
             self.ensure_upstream_mutation_tables()
@@ -9874,7 +9866,7 @@ class PostgresWarehouse:
             return []
         provider_filter, provider_params = _upstream_mutation_provider_filter(
             providers=providers,
-            exclude_providers=exclude_providers,
+            exclude_providers=None,
         )
         now = datetime.now(tz=UTC)
         # One transaction: pick the rows, re-check every policy-approved one
@@ -10325,13 +10317,12 @@ class PostgresWarehouse:
         *,
         ensure_tables: bool = True,
         providers: Sequence[str] | None = None,
-        exclude_providers: Sequence[str] | None = None,
     ) -> int:
         if ensure_tables:
             self.ensure_upstream_mutation_tables()
         provider_filter, provider_params = _upstream_mutation_provider_filter(
             providers=providers,
-            exclude_providers=exclude_providers,
+            exclude_providers=None,
         )
         # Only rows the worker can act on now: due (not_before reached) or
         # past their deadline (the claim fails those). A step approved days
