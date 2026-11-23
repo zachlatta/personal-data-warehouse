@@ -2761,8 +2761,11 @@ def test_ensure_restores_any_missing_column_on_every_health_snapshot_table(wareh
     column is exactly the author who does not know a hand-written
     `ADD COLUMN IF NOT EXISTS` is also required. So the contract is stated over
     the whole group and every column of it: drop one, re-ensure, and it comes
-    back. A new column added to any of these TableSpecs is covered the day it is
-    written, with no migration line to remember.
+    back. Since _ensure_table widens every TableSpec table this is the
+    view-dependent case of
+    test_every_ensure_path_adds_a_column_its_spec_gained_to_a_table_that_already_exists:
+    it drops the columns the marts views read, with CASCADE, and proves the views
+    are rebuilt and read.
     """
     from personal_data_warehouse.postgres import PIPELINE_HEALTH_SNAPSHOT_TABLES, POSTGRES_TABLES
 

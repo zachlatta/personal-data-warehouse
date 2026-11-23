@@ -281,6 +281,7 @@ logger = logging.getLogger(__name__)
 #: How long the event_ts -> occurred_at migration waits for its ACCESS EXCLUSIVE
 #: lock before failing the run (a later run retries).
 EVENT_TS_RENAME_LOCK_TIMEOUT = "5s"
+SPEC_COLUMN_ADD_LOCK_TIMEOUT = "2s"
 
 
 class EventTsRenameLockTimeout(RuntimeError):
@@ -4521,11 +4522,6 @@ class PostgresWarehouse:
                 "gmail_settings_sync_state",
             ]
         )
-        self._ensure_file_attachment_enrichment_columns()
-        for column in ("storage_backend", "storage_key", "storage_file_id", "storage_url", "storage_status"):
-            self._command(
-                f"ALTER TABLE @gmail_attachments ADD COLUMN IF NOT EXISTS {_identifier(column)} text NOT NULL DEFAULT ''"
-            )
         self._ensure_clean_gmail_inbox_view()
         self._ensure_files_mart_views()
         self._ensure_search_views_if_possible()
@@ -4537,7 +4533,6 @@ class PostgresWarehouse:
         results without depending on any one source's ensure_* path.
         """
         self._ensure_table_group(["file_attachment_enrichments", "audio_transcripts"])
-        self._ensure_file_attachment_enrichment_columns()
         self._ensure_search_views_if_possible()
 
     def ensure_audio_transcript_tables(self) -> None:
@@ -4576,8 +4571,6 @@ class PostgresWarehouse:
 
     def ensure_contacts_tables(self) -> None:
         self._ensure_table_group(["contact_cards", "contact_sync_state", "apple_contact_cards"])
-        self._command("ALTER TABLE @contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
-        self._command("ALTER TABLE @apple_contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
         rebuild_apple_messages_view = self._prepare_contacts_view_replacement()
         self._ensure_clean_contacts_view()
         self._ensure_clean_contact_points_view()
@@ -5987,27 +5980,6 @@ class PostgresWarehouse:
                 "agent_run_tool_calls",
             ]
         )
-        # ``CREATE TABLE IF NOT EXISTS`` does not evolve an existing production
-        # table when the extraction contract gains a field. Keep this explicit
-        # migration beside the owning ensure path so both the extraction asset
-        # and the finance ledger can safely deploy v2 before any v2 row exists.
-        self._command(
-            "ALTER TABLE @manual_finance_extractions "
-            "ADD COLUMN IF NOT EXISTS positions_json jsonb NOT NULL DEFAULT '[]'::jsonb"
-        )
-        # v3: whose money the document reports, on what basis, and the
-        # committed/called/unfunded triple a private fund prints. Empty on
-        # every pre-v3 row, which the ledger reads as "unknown" -- it never
-        # reads absence as "this is the owner's position".
-        for column, ddl in (
-            ("reporting_scope", "text NOT NULL DEFAULT ''"),
-            ("account_holder", "text NOT NULL DEFAULT ''"),
-            ("value_basis", "text NOT NULL DEFAULT ''"),
-            ("commitments_json", "jsonb NOT NULL DEFAULT '[]'::jsonb"),
-        ):
-            self._command(
-                f"ALTER TABLE @manual_finance_extractions ADD COLUMN IF NOT EXISTS {column} {ddl}"
-            )
 
     def ensure_apple_voice_memos_tables(self, *, backfill_content_hashes: bool = True) -> None:
         self._ensure_table_group(
@@ -6111,10 +6083,6 @@ class PostgresWarehouse:
                 "whoop_oauth_tokens",
             ]
         )
-        self._command(
-            "ALTER TABLE @whoop_sync_state "
-            "ADD COLUMN IF NOT EXISTS credential_sha256 text NOT NULL DEFAULT ''"
-        )
         # marts_health.* conforms both WHOOP sources, so either source's
         # ensure_* path can be the one that builds it.
         self._ensure_health_marts_views()
@@ -6170,10 +6138,6 @@ class PostgresWarehouse:
             "ALTER TABLE @whoop_private_sessions ALTER COLUMN session_key SET DEFAULT 'default'"
         )
         self._command("ALTER TABLE @whoop_private_sessions ALTER COLUMN status SET DEFAULT 'ok'")
-        self._command(
-            "ALTER TABLE @whoop_private_sync_state "
-            "ADD COLUMN IF NOT EXISTS collection_signature text NOT NULL DEFAULT ''"
-        )
         self._rekey_whoop_private_snapshot_documents()
         # Retired 2026-08-26: continuous heart rate is collected at the same
         # six-second grain this table held, for every hour rather than only
@@ -6821,25 +6785,6 @@ class PostgresWarehouse:
                 "answer_benchmark_runs",
             ]
         )
-        # _ensure_table_group only CREATEs; it does not widen an existing table,
-        # so a warehouse provisioned before any of these columns existed would
-        # keep the old shape and everything that names the column -- the
-        # collectors' inserts and the marts views below -- would fail on every
-        # run. Fresh-database tests cannot catch that by construction, which is
-        # exactly how it reached production three times (ops.pipeline_health
-        # 2026-08-23, ops.pgbackrest_health 2026-08-27, ops.agent_usage
-        # 2026-08-28). Derived from the TableSpec rather than hand-listed, so
-        # the next column added here needs no migration line and cannot be
-        # forgotten.
-        for table in PIPELINE_HEALTH_SNAPSHOT_TABLES:
-            added = self._reconcile_table_columns(table)
-            if added:
-                logger.info("widened %s with %s", table, ", ".join(added))
-        added = self._reconcile_table_columns("search_benchmark_history")
-        if added:
-            logger.info(
-                "widened search_benchmark_history with %s", ", ".join(added)
-            )
         self.ensure_priority_benchmark_tables()
         self._ensure_pipeline_health_mart_views()
         self._ensure_table_group(["android_call_recordings_recordings"])
@@ -6882,8 +6827,6 @@ class PostgresWarehouse:
         """Private labels and aggregate measurements, without timeline schema DDL."""
         tables = ("priority_benchmark_labels", "priority_benchmark_results")
         self._ensure_table_group(tables)
-        for table in tables:
-            self._reconcile_table_columns(table)
         self._ensure_priority_correctness_view()
 
     def _ensure_priority_correctness_view(self) -> None:
@@ -8660,30 +8603,14 @@ class PostgresWarehouse:
         # adapter reads exists, every timeline sync run fails on that adapter.
         self.ensure_resideo_tables()
         self.ensure_comma_tables()
-        self._ensure_table("timeline_events")
-        self._ensure_table("timeline_sync_state")
-        # Before the indexes: their definitions name occurred_at, so a missing
-        # index on a not-yet-renamed table could not be created.
+        # Before _ensure_table, which would otherwise add an empty occurred_at
+        # beside a not-yet-renamed event_ts, and before the indexes that name it.
         from personal_data_warehouse.notifications import CAPTURE_FUNCTION_SQL
 
         self._migrate_event_ts_to_occurred_at(["timeline_events"], companion_sql=(CAPTURE_FUNCTION_SQL,))
+        self._ensure_table("timeline_events")
+        self._ensure_table("timeline_sync_state")
         self._ensure_indexes(["timeline_events", "timeline_sync_state"])
-        # Migration for pre-existing sync-state tables (the table is ~24 rows,
-        # so the unconditional ACCESS EXCLUSIVE lock here is harmless).
-        self._command(
-            "ALTER TABLE @timeline_sync_state "
-            "ADD COLUMN IF NOT EXISTS adapter_signature text NOT NULL DEFAULT ''"
-        )
-        self._command(
-            "ALTER TABLE @timeline_sync_state ADD COLUMN IF NOT EXISTS "
-            "last_reconcile_at timestamptz NOT NULL "
-            "DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
-        )
-        for column in ("source_newest_ingest_at", "source_measured_at"):
-            self._command(
-                f"ALTER TABLE @timeline_sync_state ADD COLUMN IF NOT EXISTS {column} "
-                "timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
-            )
         # These ALTERs run under an ACCESS EXCLUSIVE lock on a 45+ GB table and
         # ensure_timeline_tables runs on every timeline sync (~288/day in
         # prod), so each is gated on the current catalog state instead of
@@ -8742,42 +8669,16 @@ class PostgresWarehouse:
         installable, so the same code runs against pre-pgvector hosts (the
         chunk backlog builds up and embeds later).
         """
-        for table in ("search_chunks", "search_chunk_embeddings", "search_chunk_sync_state"):
-            self._ensure_table(table)
-        # The vector table's trigger functions copy the chunk's time column by
+        # The rename runs before _ensure_table adds missing spec columns. The
+        # vector table's trigger functions copy the chunk's time column by
         # name, so they are replaced in the rename's own transaction.
         self._migrate_event_ts_to_occurred_at(
             ["search_chunks", "search_chunk_vectors"],
             companion_sql=self._search_chunk_vector_function_sql(),
         )
+        for table in ("search_chunks", "search_chunk_embeddings", "search_chunk_sync_state"):
+            self._ensure_table(table)
         self._ensure_indexes(["search_chunks", "search_chunk_embeddings", "search_chunk_sync_state"])
-        # The embedding drain's persisted cursors joined an existing table;
-        # CREATE TABLE IF NOT EXISTS cannot add them to a live deployment.
-        #
-        # Every ALTER here is issued only when its column is missing. `ADD
-        # COLUMN IF NOT EXISTS` still queues for ACCESS EXCLUSIVE when the column
-        # exists, and this runs on every embeddings tick: on 2026-10-03 the
-        # no-op ALTER on chunk_embeddings waited behind a REINDEX CONCURRENTLY
-        # of the HNSW index, every reader queued behind the ALTER, and hybrid
-        # search's semantic leg timed out for ~19 minutes.
-        sync_columns = self._present_columns("search_chunk_sync_state")
-        for column in (
-            "embed_fresh_built_at",
-            "embed_fresh_chunk_id",
-            "embed_cursor_ts",
-            "embed_cursor_id",
-            "embed_backfill_status",
-            "embed_orphan_checked_at",
-            "embed_orphan_status",
-            "embed_vectors_checked_at",
-        ):
-            if column in sync_columns:
-                continue
-            self._command(
-                "ALTER TABLE @search_chunk_sync_state ADD COLUMN IF NOT EXISTS "
-                f"{_identifier(column)} {_postgres_type(column)} NOT NULL DEFAULT "
-                f"{_default_sql(column)}"
-            )
         if self.pgvector_available():
             if not self._pgvector_ensured:
                 self._command("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
@@ -9652,9 +9553,6 @@ class PostgresWarehouse:
                 "slack_sessions",
             ]
         )
-        # A one-row credential table; user_agent arrived after production's
-        # copy was provisioned (the app's publish path adds it too).
-        self._reconcile_table_columns("slack_sessions")
         self._ensure_slack_conversation_stats_backfilled()
         self._ensure_slack_sync_state_gone_reclassified()
         self._ensure_clean_slack_inbox_view()
@@ -11205,69 +11103,34 @@ class PostgresWarehouse:
             )
         }
 
-    def _reconcile_table_columns(self, table: str) -> list[str]:
-        """Add any ``TableSpec`` column an existing table is missing.
-
-        ``CREATE TABLE IF NOT EXISTS`` never revisits an existing table, so a
-        column added to a spec reaches every fresh database -- and every test,
-        and CI -- while a long-lived warehouse keeps the old shape. Whatever
-        names the column then fails on every run, and the suite stays green,
-        because no fresh-database test can reproduce "provisioned before the
-        column existed".
-
-        That has now happened three times on the health snapshots
-        (``ops.pipeline_health`` 2026-08-23, ``ops.pgbackrest_health``
-        2026-08-27, ``ops.agent_usage`` 2026-08-28), each time repaired by
-        hand-writing one more ``ADD COLUMN IF NOT EXISTS`` beside the last.
-        Hand-written lists are the bug: the author who adds the column is
-        exactly the author who does not know it needs a migration line. This
-        derives the same DDL from the spec the creation path already uses, so
-        the two cannot disagree.
-
-        Deliberately NOT applied to every table: it is called for the small
-        snapshot tables whose whole content is rewritten each collection, where
-        an added column is metadata-only and the lock is irrelevant. Returns the
-        columns it added, so a caller can log a real migration.
-        """
-        rel = canonical_relation(table).with_namespace(self._schema)
-        present = {
-            str(row[0])
-            for row in self._query(
-                _COLUMN_NAMES_SQL,
-                (rel.schema, rel.name),
-            )
-        }
-        if not present:
-            # The table does not exist yet; _ensure_table is about to create it
-            # with every column.
-            return []
-        added: list[str] = []
-        for column in POSTGRES_TABLES[table].columns:
-            if column in present:
-                continue
-            self._command(
-                f"ALTER TABLE {self.sql_relation(table)} ADD COLUMN IF NOT EXISTS "
-                f"{_identifier(column)} {_postgres_type(column, table=table)} "
-                f"NOT NULL DEFAULT {_default_sql(column, table=table)}"
-            )
-            added.append(column)
-        return added
-
     def _ensure_table(self, table: str) -> None:
+        """Create the table, or add the ``TableSpec`` columns an older one lacks.
+
+        CREATE TABLE IF NOT EXISTS never revisits an existing table, so a column
+        added to a spec reached every fresh test database while production
+        inserts failed (a46a143, 5aae109, f9de2aa, f37f22b). Every column here
+        has a constant default, so the ADD is a catalog-only change.
+        """
         spec = POSTGRES_TABLES[table]
-        column_sql = [
-            f"{_identifier(column)} {_postgres_type(column, table=table)} NOT NULL DEFAULT {_default_sql(column, table=table)}"
-            for column in spec.columns
-        ]
-        primary_key = ", ".join(_identifier(column) for column in spec.primary_key)
-        self._command(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.sql_relation(table)} (
-                {", ".join(column_sql)},
-                PRIMARY KEY ({primary_key})
+        present = self._present_columns(table)
+        if present:
+            missing = [column for column in spec.columns if column not in present]
+            if missing:
+                self._add_spec_columns(table, missing)
+        else:
+            column_sql = [
+                f"{_identifier(column)} {_postgres_type(column, table=table)} NOT NULL DEFAULT {_default_sql(column, table=table)}"
+                for column in spec.columns
+            ]
+            primary_key = ", ".join(_identifier(column) for column in spec.primary_key)
+            self._command(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.sql_relation(table)} (
+                    {", ".join(column_sql)},
+                    PRIMARY KEY ({primary_key})
+                )
+                """
             )
-            """
-        )
         if spec.storage_parameters:
             # ensure_* runs on every Dagster run, and ALTER TABLE ... SET takes
             # an ACCESS EXCLUSIVE lock even when it changes nothing — ~2.3k
@@ -11278,6 +11141,39 @@ class PostgresWarehouse:
                 settings = ", ".join(f"{key} = {value}" for key, value in spec.storage_parameters)
                 self._command(f"ALTER TABLE {self.sql_relation(table)} SET ({settings})")
         self._apply_catalog_grant(table)
+
+    def _add_spec_columns(self, table: str, columns: Sequence[str]) -> bool:
+        """Add ``columns`` in one transaction, or give up on a lock wait.
+
+        Returns False, leaving the table unchanged for the next ensure run, when
+        the ACCESS EXCLUSIVE lock is not granted within
+        SPEC_COLUMN_ADD_LOCK_TIMEOUT, so readers queued behind the ALTER wait
+        no longer than that (test_ensure_gives_up_adding_a_column_behind_a_held_lock).
+        """
+        relation = self.sql_relation(table)
+        with self._connection.cursor() as cursor:
+            cursor.execute("BEGIN")
+            try:
+                cursor.execute(f"SET LOCAL lock_timeout = '{SPEC_COLUMN_ADD_LOCK_TIMEOUT}'")
+                for column in columns:
+                    cursor.execute(
+                        f"ALTER TABLE {relation} ADD COLUMN IF NOT EXISTS "
+                        f"{_identifier(column)} {_postgres_type(column, table=table)} "
+                        f"NOT NULL DEFAULT {_default_sql(column, table=table)}"
+                    )
+                cursor.execute("COMMIT")
+            except psycopg2.errors.LockNotAvailable:
+                cursor.execute("ROLLBACK")
+                logger.warning(
+                    "adding %s to %s waited more than %s for its lock; the next ensure retries",
+                    ", ".join(columns), table, SPEC_COLUMN_ADD_LOCK_TIMEOUT,
+                )
+                return False
+            except Exception:
+                cursor.execute("ROLLBACK")
+                raise
+        logger.info("widened %s with %s", table, ", ".join(columns))
+        return True
 
     def _primary_key_columns(self, table: str) -> tuple[str, ...]:
         rel = canonical_relation(table).with_namespace(self._schema)
@@ -11899,27 +11795,6 @@ class PostgresWarehouse:
         rows = [{"transcription_model": "", **row} for row in rows]
         self._insert_rows("file_attachment_enrichments", rows, ATTACHMENT_ENRICHMENT_COLUMNS)
 
-    def _ensure_file_attachment_enrichment_columns(self) -> None:
-        """Add the columns an attachment-enrichment table created before them lacks.
-
-        CREATE TABLE IF NOT EXISTS never revisits a table, and an ALTER TABLE
-        takes ACCESS EXCLUSIVE even when IF NOT EXISTS makes it a no-op, so the
-        catalog is read first and the ALTER only runs when a column is missing.
-        """
-        rel = canonical_relation("file_attachment_enrichments").with_namespace(self._schema)
-        existing = {
-            str(row[0])
-            for row in self._query(
-                _COLUMN_NAMES_SQL,
-                (rel.schema, rel.name),
-            )
-        }
-        if "transcription_model" not in existing:
-            self._command(
-                "ALTER TABLE @file_attachment_enrichments "
-                "ADD COLUMN IF NOT EXISTS transcription_model text NOT NULL DEFAULT ''"
-            )
-
     def ensure_google_drive_source_tables(self) -> None:
         self._ensure_table_group(
             [
@@ -12509,9 +12384,6 @@ class PostgresWarehouse:
         ensure path the domain has leaves the whole domain.
         """
         self._ensure_table_group(list(_SCREEN_TIMELAPSE_TABLES))
-        # content_text joined the tree table after it was live (2026-10-24);
-        # the app adds it the same way, whichever side reaches it first.
-        self._reconcile_table_columns("screen_timelapse_accessibility_trees")
         self._ensure_table_group(["screen_timelapse_descriptions"])
         self._ensure_screen_timelapse_active_screens_view()
 
@@ -12637,9 +12509,6 @@ class PostgresWarehouse:
     def ensure_android_notifications_tables(self) -> None:
         """Provision base_android_notifications.events."""
         self._ensure_table_group(list(_ANDROID_NOTIFICATIONS_TABLES))
-        # event_source and the system-log timings joined the table after it
-        # was live (2026-10-24); the table is small, so adding is cheap.
-        self._reconcile_table_columns("android_notification_events")
 
     def insert_android_notification_events(self, rows: Sequence[Mapping[str, Any]]) -> None:
         """Upsert listener events by (account, device, event_id)."""
@@ -12728,9 +12597,6 @@ class PostgresWarehouse:
         """Provision base_android_messages.messages and .attachments, and the
         messages and files marts over them."""
         self._ensure_table_group(list(_ANDROID_MESSAGES_TABLES))
-        # Reactions, edits, replies and receipts joined the messages table
-        # after it was live (2026-10-24); the table is small.
-        self._reconcile_table_columns("android_messages")
         self._ensure_messages_mart_view_if_possible()
         self._ensure_files_mart_views()
 
@@ -12871,8 +12737,6 @@ class PostgresWarehouse:
         self._ensure_table_group(
             ["resideo_thermostats", "resideo_thermostat_readings", "resideo_sync_state", "resideo_oauth_tokens"]
         )
-        # CREATE TABLE IF NOT EXISTS never revisits a table that already exists.
-        self._reconcile_table_columns("resideo_thermostats")
 
     def insert_resideo_thermostats(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("resideo_thermostats", rows, RESIDEO_THERMOSTAT_COLUMNS)

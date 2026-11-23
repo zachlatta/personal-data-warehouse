@@ -1292,3 +1292,77 @@ def test_guide_only_names_columns_that_exist_on_their_relations(
         offenders
     )
 
+
+
+def test_every_ensure_path_adds_a_column_its_spec_gained_to_a_table_that_already_exists(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # CREATE TABLE IF NOT EXISTS leaves a long-lived table as it was, so a column
+    # added to a TableSpec reached every fresh test database and failed every
+    # insert in production: ops.pipeline_health (a46a143), ops.agent_usage
+    # (5aae109), the health snapshots (f9de2aa), resideo_thermostats (f37f22b).
+    # This provisions, drops a column from every table as an older deployment
+    # would lack it, provisions again, and expects every column back.
+    _provision_everything(warehouse)
+    dropped: dict[str, str] = {}
+    for table, spec in POSTGRES_TABLES.items():
+        sql_name = warehouse.sql_relation(table)
+        located = relation(table).with_namespace(warehouse.schema_namespace)
+        schema, name = located.schema, located.name
+        candidates = warehouse._query(
+            """
+            SELECT a.attname
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
+              AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                              WHERE d.refobjid = c.oid AND d.refobjsubid = a.attnum AND d.deptype = 'n')
+              AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND a.attnum = ANY (i.indkey))
+            ORDER BY a.attnum DESC
+            """,
+            (schema, name),
+        )
+        column = next((str(row[0]) for row in candidates if str(row[0]) in spec.columns and str(row[0]) not in spec.primary_key), None)
+        if column is None:
+            continue
+        warehouse._command(f'ALTER TABLE {sql_name} DROP COLUMN "{column}"')
+        dropped[table] = column
+    assert "resideo_thermostats" in dropped and len(dropped) > 100
+
+    _provision_everything(warehouse)
+
+    missing = sorted(
+        f"{table}.{column}" for table, column in dropped.items() if column not in warehouse._present_columns(table)
+    )
+    assert not missing, f"an existing table kept its old shape: {missing}"
+
+
+def test_ensure_gives_up_adding_a_column_behind_a_held_lock(warehouse: PostgresWarehouse) -> None:
+    # 2026-10-03: an ALTER on search_chunk_embeddings queued behind a REINDEX
+    # CONCURRENTLY, every search read queued behind the ALTER, and the semantic
+    # leg timed out for ~19 minutes. Adding a column must give up instead.
+    import time
+
+    import psycopg2
+
+    from personal_data_warehouse.postgres import SPEC_COLUMN_ADD_LOCK_TIMEOUT
+
+    warehouse.ensure_resideo_tables()
+    table = warehouse.sql_relation("resideo_thermostats")
+    warehouse._command(f'ALTER TABLE {table} DROP COLUMN "schedule_enabled"')
+    holder = psycopg2.connect(_postgres_url())
+    try:
+        with holder.cursor() as cursor:
+            cursor.execute(f"LOCK TABLE {table} IN ACCESS SHARE MODE")
+            started = time.monotonic()
+            warehouse.ensure_resideo_tables()
+            waited = time.monotonic() - started
+        assert waited < float(SPEC_COLUMN_ADD_LOCK_TIMEOUT.rstrip("s")) + 3, waited
+        assert "schedule_enabled" not in warehouse._present_columns("resideo_thermostats")
+    finally:
+        holder.rollback()
+        holder.close()
+
+    warehouse.ensure_resideo_tables()
+    assert "schedule_enabled" in warehouse._present_columns("resideo_thermostats")

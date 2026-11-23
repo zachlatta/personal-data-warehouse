@@ -245,12 +245,12 @@ run with the suite fully green. It happened three times (`pipeline_health` 2026-
 `pgbackrest_health` 2026-08-27, `agent_usage` 2026-08-28), each repaired by hand-writing one
 more `ADD COLUMN IF NOT EXISTS` beside the last — which is the bug, because the author who
 adds a column is exactly the author who does not know a migration line is also required.
-`ensure_pipeline_health_tables` now reconciles every table in
-`PIPELINE_HEALTH_SNAPSHOT_TABLES` against its own spec, and
-`test_ensure_restores_any_missing_column_on_every_health_snapshot_table` drops each column
-in turn and asserts it comes back. It is scoped to those tables on purpose: their whole
-content is rewritten by each collection, so an added column is metadata-only with no heap to
-lock. Deriving the DDL from the spec also exposed a disagreement it had been hiding — the
+The opt-in fix (reconcile these tables only) recurred on `resideo_thermostats` 2026-11-06,
+so every `TableSpec` table now gets it: `_ensure_table` adds each spec column an existing
+table lacks (constant defaults, so catalog-only; under a 2 s `lock_timeout`, so a table
+held by a long lock is widened by a later run instead of queueing every reader), and
+`test_every_ensure_path_adds_a_column_its_spec_gained_to_a_table_that_already_exists`
+drops a column from every table, provisions again and expects them all back. Deriving the DDL from the spec also exposed a disagreement it had been hiding — the
 hand-written migration gave the host-saturation gauges the `-1` "unmeasured" default while a
 freshly created table gave them `0`, which the view reads as an **idle host**, the one
 verdict C6 acts on. `UNMEASURED_SENTINEL_COLUMNS_BY_TABLE` is now the single source for both.
