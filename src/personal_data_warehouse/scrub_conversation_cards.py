@@ -632,8 +632,11 @@ def apply_session(warehouse, plan, session, *, selector, window, exact_source_ro
 def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_partial=False,
                   max_canonical_rows=2500, window_seconds=45, gap_seconds=15,
                   max_source_rows=500, max_plan_rows=20000, max_delta_rows=1000,
-                  progress=None, planned_only=False):
+                  progress=None, planned_only=False, max_groups=None):
     """One owner; live planning, then an atomic transaction per session group.
+
+    ``max_groups`` bounds one run (one writer outage); the checkpoint records
+    each completed group, so the next run resumes with the rest.
 
     ``window(index)`` must pause writers on entry and restore them in finally,
     including on partial entry failure. Completion is persisted AFTER restore.
@@ -641,7 +644,10 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     Partial discovery retains its original horizon and pending partitions;
     no partial run constitutes final verification. Selector stays in memory.
     """
-    if not 0<max_canonical_rows<=(10000 if planned_only else 5000) or not 0<window_seconds<=60 or gap_seconds<0:
+    # A planned-only group may hold one large session (30,000 rows); the
+    # 60-second transaction deadline still rolls back a group that overruns.
+    if (not 0<max_canonical_rows<=(30000 if planned_only else 5000) or not 0<window_seconds<=60 or gap_seconds<0
+            or max_groups is not None and max_groups<1):
         raise ValueError('invalid batch budget')
     plan=read_plan(Path(path))
     if 'discovery' in plan and not allow_partial: raise ValueError('partition discovery incomplete')
@@ -673,6 +679,7 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     _checkpoint(path,plan)
     if progress: progress(dict(groups=len(groups),oversized_sessions=len(state['oversized']),canonical_rows=sum(counts.values())))
     for index,(sessions,total) in enumerate(groups):
+        if max_groups is not None and index>=max_groups: break
         time.sleep(gap_seconds)  # workers LIVE, including after a resumed run
         candidates=[c for c in plan['candidates'] if tuple(c['session']) in sessions]
         if not planned_only: candidates=_attach_related(warehouse,candidates,warehouse._connection)
@@ -909,6 +916,7 @@ def main():
     parser.add_argument('--planned-only',action='store_true',help='credentials only: indexed planned-session repair; unrelated sessions require full post-restore verify')
     parser.add_argument('--writers-paused',action='store_true',help='acknowledge external writer shutdown and guaranteed restoration')
     parser.add_argument('--max-canonical-rows',type=int,default=10000)
+    parser.add_argument('--max-groups',type=int,help='session batches: stop after N groups; a rerun resumes')
     parser.add_argument('--report-html', type=Path, help='counts-only table for the private email body')
     add_selector_arguments(parser)
     args = parser.parse_args()
@@ -943,8 +951,11 @@ def main():
                 plan=apply_batches(warehouse,args.plan,window=lambda _:nullcontext(),selector=selector,
                     workers=args.workers,planned_only=True,max_canonical_rows=args.max_canonical_rows,
                     window_seconds=args.window_seconds,gap_seconds=0,max_source_rows=args.max_source_rows,
-                    max_plan_rows=args.max_plan_rows,max_delta_rows=args.max_delta_rows)
+                    max_plan_rows=args.max_plan_rows,max_delta_rows=args.max_delta_rows,max_groups=args.max_groups)
                 if plan['batches']['oversized']: raise RuntimeError('oversized sessions remain; repair incomplete')
+                done={tuple(s) for g in plan['batches']['completed'] for s in g['sessions']}
+                left={tuple(c['session']) for c in plan['candidates']}-done
+                if left: raise SystemExit(f'{len(left)} planned sessions remain; rerun apply to continue')
             elif args.only_session:
                 from contextlib import nullcontext
                 apply_session(warehouse,plan,args.only_session,selector=selector,

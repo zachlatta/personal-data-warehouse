@@ -122,3 +122,26 @@ def test_plan_wide_row_gates_follow_the_explicit_flags(tmp_path, monkeypatch):
     result = module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'),
                                   planned_only=True, max_source_rows=501, max_plan_rows=501)
     assert result['batches']['completed'] == []
+
+
+def test_session_groups_can_be_applied_a_bounded_number_at_a_time(tmp_path, monkeypatch):
+    import personal_data_warehouse.scrub_conversation_cards as module
+    candidates = [dict(table='claude_code_events', key=['claude_code', f's{i}', f'e{i}'], session=['claude_code', f's{i}'],
+                       month='2026-11', source='claude_code', matches=1) for i in range(3)]
+    plan = dict(version=2, scope=['db', None, None, 'public'], watermarks={'timeline_events': 0, 'search_chunks': '', 'snapshot': '1:1:'},
+                candidates=candidates, counts=module._details(candidates), selector=ScrubSelector('credentials').specification, left_alone=0)
+    path = tmp_path / 'plan.json'
+    path.write_text(json.dumps(plan))
+    applied = []
+    monkeypatch.setattr(module, '_scope', lambda warehouse: plan['scope'])
+    monkeypatch.setattr(module, '_planned_rows', lambda warehouse, candidates, **k: [])
+    monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, sessions, limit: {s: 12000 for s in sessions})
+    monkeypatch.setattr(module, 'scrub', lambda warehouse, plan, **k: applied.append([c['session'] for c in plan['candidates']]))
+    kwargs = dict(window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True,
+                  max_canonical_rows=12000, gap_seconds=0)
+    first = module.apply_batches(None, path, max_groups=2, **kwargs)
+    assert len(applied) == 2 and len(first['batches']['completed']) == 2 and first['batches']['oversized'] == []
+    second = module.apply_batches(None, path, max_groups=2, **kwargs)
+    assert len(applied) == 3 and len(second['batches']['completed']) == 3
+    with pytest.raises(ValueError, match='budget'):
+        module.apply_batches(None, path, max_canonical_rows=30001, **{k: v for k, v in kwargs.items() if k != 'max_canonical_rows'})

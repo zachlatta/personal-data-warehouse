@@ -86,10 +86,12 @@ def test_apply_passes_the_group_cap_so_a_retry_can_isolate_a_session(tmp_path, m
     cards=next(c for c in calls if 'personal_data_warehouse.scrub_conversation_cards' in c)
     assert cards[cards.index('--max-canonical-rows')+1] == '7061'
     with pytest.raises(ValueError):
-        m.apply(tmp_path,max_canonical_rows=10001)
+        m.apply(tmp_path,max_canonical_rows=30001)
     calls.clear()
-    m.apply(tmp_path,max_canonical_rows=5000,max_source_rows=12000,max_plan_rows=400000)
+    m.apply(tmp_path,max_canonical_rows=26000,max_source_rows=12000,max_plan_rows=400000,max_groups=20)
     cards=next(c for c in calls if 'personal_data_warehouse.scrub_conversation_cards' in c)
+    assert cards[cards.index('--max-canonical-rows')+1] == '26000'
+    assert cards[cards.index('--max-groups')+1] == '20'
     assert cards[cards.index('--max-source-rows')+1] == '12000'
     assert cards[cards.index('--max-plan-rows')+1] == '400000'
 
