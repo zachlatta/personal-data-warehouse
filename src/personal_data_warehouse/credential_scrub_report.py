@@ -7,9 +7,11 @@ search_chunks) and reports matches by table, column, role and kind. A clean
 warehouse reports zero matches. Rows are prefiltered in SQL with the same
 superset the scrub uses, then confirmed in Python.
 
-Never prints a matched value. ``--examples`` writes up to N masked, truncated
-contexts per kind (with the secret's length and character classes) to a new
-0600 file for a hand check of false positives; keep it out of the repository.
+Never prints a matched value. ``--examples`` writes a hand-check sample to a new
+0600 file; keep it out of the repository. Per kind it holds up to N distinct
+secrets (deduplicated by marker), drawn round-robin across tables, each table's
+draw being the markers whose SHA-256 sorts lowest (a deterministic random
+sample), with a masked, truncated context and the secret's length and classes.
 
     python -m personal_data_warehouse.credential_scrub_report --since 2026-11-16T00:00:00Z
     python -m personal_data_warehouse.credential_scrub_report --derived --examples .factory-scratch/examples.json
@@ -17,6 +19,7 @@ contexts per kind (with the secret's length and character classes) to a new
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -33,7 +36,7 @@ from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse,
 
 DERIVED = ('timeline_events', 'search_chunks')
 _KIND = re.compile(r'\[REDACTED:([a-z_]+):[0-9a-f]{6}\]')
-CONTEXT = 24
+CONTEXT = 40
 
 
 def _shape(secret):
@@ -45,7 +48,7 @@ def _shape(secret):
 
 
 def row_matches(row):
-    """[(column, kind, masked context, secret shape)] for one row; no raw values."""
+    """[(column, kind, masked context, secret shape, marker)] for one row; no raw values."""
     found = []
     for column, value in row.items():
         if isinstance(value, (dict, list)):
@@ -68,8 +71,41 @@ def row_matches(row):
             at = start + offset
             offset += len(replacement) - (end - start)
             context = cleaned[max(0, at - CONTEXT):at + len(replacement) + CONTEXT]
-            found.append((column, _KIND.match(replacement)[1], context, _shape(value[start:end])))
+            found.append((column, _KIND.match(replacement)[1], context, _shape(value[start:end]), replacement))
     return found
+
+
+def _rank(marker):
+    return hashlib.sha256(marker.encode()).hexdigest()
+
+
+def _draw(pool, marker, size, example):
+    """Keep the ``size`` markers with the lowest rank seen in one (kind, table)."""
+    if marker in pool:
+        return
+    pool[marker] = example
+    if len(pool) > 4 * size:
+        for drop in sorted(pool, key=_rank)[size:]:
+            del pool[drop]
+
+
+def _stratified(drawn, size):
+    """Per kind, round-robin across tables in rank order, one example per marker."""
+    result = {}
+    for kind in sorted({k for k, _ in drawn}):
+        queues = [sorted(drawn[k, t].items(), key=lambda item: _rank(item[0]))[:size]
+                  for k, t in sorted(drawn) if k == kind]
+        picked, seen = [], set()
+        while len(picked) < size and any(queues):
+            for queue in queues:
+                while queue and queue[0][0] in seen:
+                    queue.pop(0)
+                if queue and len(picked) < size:
+                    marker, example = queue.pop(0)
+                    seen.add(marker)
+                    picked.append(dict(example, marker=marker))
+        result[kind] = picked
+    return result
 
 
 def _scope_sql(table, since, until):
@@ -95,7 +131,8 @@ def scan(database_url, schema, *, tables, since=None, until=None, workers=1, pag
     rows_with = Counter()
     scanned = Counter()
     prefiltered = Counter()
-    samples = {}
+    drawn = {}
+    distinct = {}
     matched_rows = Counter()
     session_rows = {}
     pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn')) if workers > 1 else None
@@ -128,11 +165,13 @@ def scan(database_url, schema, *, tables, since=None, until=None, workers=1, pag
                         matched_rows[table] += 1
                         session_rows.setdefault(table, {})[row['source'], row['session_id']] = 0
                     role = 'derived' if table in DERIVED else (row.get('role') or 'unknown')
-                    for column, kind, context, shape in found:
+                    for column, kind, context, shape, marker in found:
                         counts[table, role, column, kind] += 1
-                        if examples and len(samples.setdefault(kind, [])) < examples:
-                            samples[kind].append(dict(table=table, role=role, column=column, context=context, secret=shape))
-                    for kind in {kind for _, kind, _, _ in found}:
+                        distinct.setdefault(kind, set()).add(marker)
+                        if examples:
+                            _draw(drawn.setdefault((kind, table), {}), marker, examples,
+                                  dict(table=table, role=role, column=column, context=context, secret=shape))
+                    for kind in {kind for _, kind, _, _, _ in found}:
                         rows_with[table, role, kind] += 1
                 if progress:
                     progress(dict(table=table, done=min(offset + page_size, len(identities)), prefiltered=len(identities)))
@@ -174,7 +213,8 @@ def scan(database_url, schema, *, tables, since=None, until=None, workers=1, pag
                   rows_by_table_role_kind=[dict(table=t, role=r, kind=k, rows=n) for (t, r, k), n in sorted(rows_with.items())],
                   matches_by_table_role_column_kind=[dict(table=t, role=r, column=c, kind=k, matches=n)
                                                      for (t, r, c, k), n in sorted(counts.items())])
-    return report, samples
+    report['distinct_secrets_by_kind'] = {k: len(v) for k, v in sorted(distinct.items())}
+    return report, _stratified(drawn, examples)
 
 
 def main():
@@ -186,7 +226,7 @@ def main():
     parser.add_argument('--derived', action='store_true', help='also count timeline_events and search_chunks agent rows')
     parser.add_argument('--workers', type=int, default=available_cpus())
     parser.add_argument('--examples', help='new 0600 file for masked, truncated contexts')
-    parser.add_argument('--examples-per-kind', type=int, default=25)
+    parser.add_argument('--examples-per-kind', type=int, default=30)
     parser.add_argument('--database-url-env', default='POSTGRES_DATABASE_URL')
     parser.add_argument('--schema', default=os.environ.get('POSTGRES_SCHEMA', 'public'))
     args = parser.parse_args()

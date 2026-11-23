@@ -49,7 +49,8 @@ _PLACEHOLDER_PASSWORDS = frozenset(('password', 'pass', 'passwd', 'pwd', 'secret
 _WORD = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_')
 _IDENTIFIER = _WORD | frozenset('.-')
 _IDENTIFIER_WALK = 128
-_DELIMITERS = frozenset(' \t\n\r\f\v"\'=:,;()[]{}<>|`')
+# A backslash ends a run too: escaped JSON quoted inside non-JSON text.
+_DELIMITERS = frozenset(' \t\n\r\f\v"\'=:,;()[]{}<>|`\\')
 _MARKER_KIND = re.compile(r'\[REDACTED:([a-z_]+):[0-9a-f]{6}\]')
 
 

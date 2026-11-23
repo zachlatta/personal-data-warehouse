@@ -207,6 +207,9 @@ def test_credential_report_counts_by_kind_and_role_then_zero_after_scrub(warehou
     assert report['matches'] == 3
     assert report['source_rows_matched'] == {'claude_code_events': 2}
     assert report['sessions'] == dict(affected=1, canonical_rows=3, largest_rows=3, over_10000_rows=0)
+    assert report['distinct_secrets_by_kind'] == {'password': 1, 'slack_token': 1}
+    assert {kind: len(items) for kind, items in samples.items()} == {'password': 1, 'slack_token': 1}
+    assert samples['slack_token'][0]['marker'] == expand('<<mask:slack_token:slack>>')
     dump = json.dumps(samples)
     assert slack not in dump and expand('<<pgpw>>') not in dump and '[REDACTED:slack_token:' in dump
     selector = ScrubSelector('credentials')
@@ -215,3 +218,18 @@ def test_credential_report_counts_by_kind_and_role_then_zero_after_scrub(warehou
     after, _ = scan(warehouse._database_url, warehouse._schema, tables=('claude_code_events', 'timeline_events', 'search_chunks'), workers=1)
     assert after['matches'] == 0
     assert warehouse._query("SELECT text FROM @claude_code_events WHERE event_uuid='c1'")[0][0] == 'desk-0123456789abcdefghijklmnop'
+
+
+def test_hand_check_sample_is_stratified_and_one_example_per_secret():
+    from personal_data_warehouse.credential_scrub_report import _draw, _stratified
+    drawn = {}
+    for table, count in (('codex_events', 50), ('chatgpt_events', 3)):
+        for i in range(count):
+            for _ in range(3):  # the same secret seen in three columns
+                _draw(drawn.setdefault(('secret', table), {}), f'[REDACTED:secret:{table[:2]}{i:04x}]', 4, dict(table=table))
+    _draw(drawn[('secret', 'chatgpt_events')], '[REDACTED:secret:co0001]', 4, dict(table='chatgpt_events'))
+    sample = _stratified(drawn, 6)['secret']
+    markers = [item['marker'] for item in sample]
+    assert len(markers) == len(set(markers)) == 6
+    assert [item['table'] for item in sample[:6]].count('chatgpt_events') == 3
+    assert all(len(pool) <= 16 for pool in drawn.values())

@@ -23,7 +23,8 @@ import (
 
 const credentialIdentifierWalk = 128
 
-const credentialDelimiters = " \t\n\r\f\v\"'=:,;()[]{}<>|`"
+// A backslash ends a run too: escaped JSON quoted inside non-JSON text.
+const credentialDelimiters = " \t\n\r\f\v\"'=:,;()[]{}<>|`\\"
 
 const credentialLabel = `(?:secret[ _-]?access[ _-]?key|client[ _-]?secret|secret[ _-]?key|private[ _-]?key|` +
 	`api[ _-]?key|apikey|passphrase|password|passwd|secret|token)`
