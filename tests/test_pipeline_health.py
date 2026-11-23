@@ -735,6 +735,50 @@ def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(ware
     assert rows["uploader_heartbeats"]["status"] == "ok"
 
 
+def test_slack_users_reads_late_without_a_finished_users_walk(warehouse):
+    """The Slack row stays green while messages write, so the users walk needs its own.
+
+    From 2026-11-10 every slack_workspace_user_sync_job run was killed at the
+    4 h cap or cancelled, 3,806 users went more than 14 days stale, and
+    `slack` read ok throughout. `slack_users` reads only the row a walk stamps
+    when it reaches the end of users.list.
+    """
+    from personal_data_warehouse.slack_sync import SLACK_USER_LIST_PASS_STATE_TYPE
+
+    entry = pipeline("slack_users")
+    assert entry.state is not None and entry.state.table == "slack_sync_state"
+    assert (entry.state.scope_column, entry.state.scope_value) == ("object_type", SLACK_USER_LIST_PASS_STATE_TYPE)
+
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+
+    def stamp(object_type, at):
+        warehouse._command(
+            """
+            INSERT INTO @slack_sync_state
+                (account, team_id, object_type, object_id, cursor_ts, last_sync_type, status, error, updated_at, sync_version)
+            VALUES ('zrl', 'T1', %s, 'users', '', 'users', 'ok', '', %s, 1)
+            ON CONFLICT (account, team_id, object_type, object_id)
+            DO UPDATE SET updated_at = EXCLUDED.updated_at
+            """,
+            (object_type, at),
+        )
+
+    def run_status():
+        PipelineHealthCollector(warehouse).run()
+        return warehouse._query_dicts(
+            "SELECT run_status FROM @marts_pipeline_health WHERE pipeline = 'slack_users'"
+        )[0]["run_status"]
+
+    # The walk keeps committing its cursor, but no pass has finished in 5 days.
+    stamp("user_list", now)
+    stamp(SLACK_USER_LIST_PASS_STATE_TYPE, now - timedelta(days=5))
+    assert run_status() == "late"
+
+    stamp(SLACK_USER_LIST_PASS_STATE_TYPE, now)
+    assert run_status() == "ok"
+
+
 INGEST_HEARTBEAT_EXEMPT_PIPELINES: dict[str, str] = {
     "manual_finance": (
         "manual on-demand CLI command (pdw ingest manual-finance <files>) with no scheduled daemon"

@@ -4240,3 +4240,100 @@ def test_a_freshness_pass_stops_polling_at_its_time_budget(monkeypatch):
     ).sync_all()
     polled = [params["channel"] for method, params in client.calls if method == "conversations.history"]
     assert len(polled) == 2, polled
+
+
+def _user_sync_runner(settings, warehouse, client, *, budget_seconds, clock):
+    return SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sleep=lambda seconds: None,
+        sync_users=True,
+        sync_members=False,
+        use_existing_conversations=True,
+        conversation_limit=0,
+        sync_thread_replies=False,
+        user_sync_budget=timedelta(seconds=budget_seconds),
+        monotonic=clock,
+    )
+
+
+def test_an_interrupted_user_sync_resumes_from_its_stored_cursor(monkeypatch):
+    # 2026-11-10..23: a 253k-user users.list walk restarted at page 1 every day
+    # and was killed at the 4 h cap near user 200k, so the last ~3.8k users
+    # went more than 14 days stale. Each page commits its cursor and a run
+    # stops inside its budget; the next run continues from the cursor.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    identity = {
+        "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+        "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+    }
+    first = FakeSlackClient(
+        {
+            **identity,
+            "users.list": [
+                {"ok": True, "members": [{"id": "U1"}], "response_metadata": {"next_cursor": "c1"}},
+                {"ok": True, "members": [{"id": "U2"}], "response_metadata": {"next_cursor": "c2"}},
+            ],
+        }
+    )
+    # The walk starts at 0 s, has used 10 s after page 1 and 100 s after page 2.
+    ticks = iter([0, 10, 100])
+    warehouse = FakeWarehouse()
+    _user_sync_runner(settings, warehouse, first, budget_seconds=60, clock=lambda: next(ticks, 1000)).sync_all()
+
+    assert [row["user_id"] for row in warehouse.users] == ["U1", "U2"]
+    cursors = [u for u in warehouse.state_updates if u["object_type"] == "user_list"]
+    assert [u["cursor_ts"] for u in cursors] == ["c1", "c2"]
+    assert all(u["status"] == "ok" for u in cursors)
+    assert not [u for u in warehouse.state_updates if u["object_type"] == "user_list_pass"]
+
+    # The next run starts at the stored cursor, not at page 1.
+    second = FakeSlackClient(
+        {
+            **identity,
+            "users.list": [{"ok": True, "members": [{"id": "U3"}], "response_metadata": {}}],
+        }
+    )
+    stored = {("zrl", "T1", "user_list", "users"): cursors[-1]}
+    resumed = FakeWarehouse(states=stored)
+    _user_sync_runner(settings, resumed, second, budget_seconds=60, clock=lambda: 0).sync_all()
+
+    assert [params.get("cursor") for method, params in second.calls if method == "users.list"] == ["c2"]
+    assert [row["user_id"] for row in resumed.users] == ["U3"]
+    done = [u for u in resumed.state_updates if u["object_type"] == "user_list"]
+    assert done[-1]["cursor_ts"] == "" and done[-1]["status"] == "complete"
+    passes = [u for u in resumed.state_updates if u["object_type"] == "user_list_pass"]
+    assert len(passes) == 1 and passes[0]["status"] == "ok"
+
+    # A finished walk starts the next pass at page 1.
+    third = FakeSlackClient(
+        {**identity, "users.list": [{"ok": True, "members": [{"id": "U1"}], "response_metadata": {}}]}
+    )
+    restarted = FakeWarehouse(states={("zrl", "T1", "user_list", "users"): done[-1]})
+    _user_sync_runner(settings, restarted, third, budget_seconds=60, clock=lambda: 0).sync_all()
+    assert [params.get("cursor") for method, params in third.calls if method == "users.list"] == [""]
+
+
+def test_a_rejected_user_list_cursor_restarts_the_walk(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+            "users.list": [
+                SlackApiCallError("users.list failed: invalid_cursor", code="invalid_cursor"),
+                {"ok": True, "members": [{"id": "U1"}], "response_metadata": {}},
+            ],
+        }
+    )
+    stored = {("zrl", "T1", "user_list", "users"): {"status": "ok", "cursor_ts": "expired"}}
+    warehouse = FakeWarehouse(states=stored)
+    _user_sync_runner(settings, warehouse, client, budget_seconds=60, clock=lambda: 0).sync_all()
+    assert [params.get("cursor") for method, params in client.calls if method == "users.list"] == ["expired", ""]
+    assert [row["user_id"] for row in warehouse.users] == ["U1"]

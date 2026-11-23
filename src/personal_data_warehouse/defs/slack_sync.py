@@ -380,12 +380,20 @@ def run_slack_metadata_sync(
     return summaries
 
 
+def _user_sync_budget() -> timedelta:
+    # One run walks users.list for this long, then stops at a committed cursor
+    # the next run resumes from. Before 2026-11-23 the walk restarted at page 1
+    # and the 253k-user list (~4.9 h) was killed at the 4 h cap every day.
+    return timedelta(seconds=_int_env("SLACK_USER_SYNC_BUDGET_SECONDS", 3 * 60 * 60))
+
+
 def run_slack_user_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
     return SlackSyncRunner(
         settings=settings,
         warehouse=warehouse,
         logger=logger,
         sync_users=True,
+        user_sync_budget=_user_sync_budget(),
         sync_members=False,
         use_existing_conversations=True,
         conversation_limit=0,
@@ -887,6 +895,8 @@ slack_workspace_metadata_sync_job = define_asset_job(
 slack_workspace_user_sync_job = define_asset_job(
     "slack_workspace_user_sync_job",
     selection=[slack_workspace_user_sync],
+    # The 3 h walk budget plus the 30 min lock wait, under the 4 h global cap.
+    tags={"dagster/max_runtime": "13500"},
 )
 
 slack_workspace_thread_sync_job = define_asset_job(
@@ -946,9 +956,10 @@ def slack_workspace_metadata_sync_every_fifteen_minutes(context):
     return skip_if_job_active(context, job_name="slack_workspace_metadata_sync_job")
 
 
-# Daily, not hourly: a full users.list refresh of a large workspace can take a
-# couple of hours and holds the shared Slack lock the whole time, so it cannot fit
-# an hourly cadence without starving message ingestion. Runs in the early-morning
+# Daily, not hourly: each run walks users.list for up to three hours (a full
+# pass of the 253k-user directory is about two runs, resumed from a stored
+# cursor) and holds the shared Slack lock the whole time, so it cannot fit an
+# hourly cadence without starving message ingestion. Runs in the early-morning
 # low-traffic window (08:11 UTC) to minimise the message-sync gap while it holds
 # the lock.
 @schedule(

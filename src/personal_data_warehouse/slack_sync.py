@@ -72,6 +72,17 @@ SLACK_FRESHNESS_COOL_WINDOW = timedelta(days=365)
 # `status`, which has no such rule.
 SLACK_CONVERSATION_LIST_COMPLETE = "complete"
 
+#: ops.slack_sync_state rows of the workspace users.list walk. ``user_list``
+#: holds the cursor after every committed page (status ``ok`` mid-walk,
+#: SLACK_CONVERSATION_LIST_COMPLETE once the list ended), so a run that stops
+#: at its budget or is killed resumes there; ``user_list_pass`` is stamped only
+#: when a walk reaches the end of the list, and is the run heartbeat of the
+#: ``slack_users`` pipeline. Until 2026-11-23 every run restarted at page 1 and
+#: was killed at the 4 h cap near user 200k of 253k, so the tail went stale.
+SLACK_USER_LIST_STATE_TYPE = "user_list"
+SLACK_USER_LIST_PASS_STATE_TYPE = "user_list_pass"
+SLACK_USER_LIST_OBJECT_ID = "users"
+
 # Which coverage stage last ran, keyed by stage name. Coverage rotates over seven
 # heterogeneous stages and a run that loses the shared Slack lock returns green
 # having done nothing, so a wall-clock rotation silently forfeits that stage's
@@ -318,6 +329,7 @@ class SlackSyncRunner:
         history_window: timedelta | None = None,
         sync_users: bool = True,
         user_page_limit: int | None = None,
+        user_sync_budget: timedelta | None = None,
         sync_members: bool = True,
         freshness_priority: bool = False,
         use_existing_conversations: bool = False,
@@ -364,6 +376,9 @@ class SlackSyncRunner:
         self._history_window = history_window
         self._sync_users_enabled = sync_users
         self._user_page_limit = user_page_limit
+        # How long one run may walk users.list before it stops at a committed
+        # cursor for the next run to continue. None walks to the end.
+        self._user_sync_budget = user_sync_budget
         self._sync_members_enabled = sync_members
         self._freshness_priority = freshness_priority
         self._use_existing_conversations = use_existing_conversations
@@ -544,20 +559,13 @@ class SlackSyncRunner:
 
         users_written = 0
         if self._sync_users_enabled:
-            for page_index, users in enumerate(
-                iter_cursor_pages(client, "users.list", "members", limit=self._settings.slack_page_size, call=self._call),
-                start=1,
-            ):
-                rows = [
-                    user_to_row(account=account.account, team_id=team_id, user=user, synced_at=synced_at)
-                    for user in users
-                    if isinstance(user, Mapping)
-                ]
-                self._warehouse.insert_slack_users(rows)
-                users_written += len(rows)
-                self._logger.info("Synced %s Slack users for %s so far", users_written, account.account)
-                if self._user_page_limit is not None and page_index >= self._user_page_limit:
-                    break
+            users_written = self._sync_users(
+                account=account.account,
+                team_id=team_id,
+                client=client,
+                synced_at=synced_at,
+                state_by_key=state_by_key,
+            )
 
         conversation_pages: Iterator[list[object]]
         if self._use_existing_conversations:
@@ -1275,19 +1283,13 @@ class SlackSyncRunner:
 
         users_written = 0
         if self._sync_users_enabled:
-            for page_index, users in enumerate(
-                iter_cursor_pages(client, "users.list", "members", limit=self._settings.slack_page_size, call=self._call),
-                start=1,
-            ):
-                rows = [
-                    user_to_row(account=account.account, team_id=team_id, user=user, synced_at=synced_at)
-                    for user in users
-                    if isinstance(user, Mapping)
-                ]
-                self._warehouse.insert_slack_users(rows)
-                users_written += len(rows)
-                if self._user_page_limit is not None and page_index >= self._user_page_limit:
-                    break
+            users_written = self._sync_users(
+                account=account.account,
+                team_id=team_id,
+                client=client,
+                synced_at=synced_at,
+                state_by_key=state_by_key,
+            )
 
         return SlackSyncSummary(
             account=account.account,
@@ -1362,6 +1364,118 @@ class SlackSyncRunner:
             next_cursor or "<restart>",
         )
         return conversations
+
+    def _sync_users(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        client,
+        synced_at: datetime,
+        state_by_key: Mapping[tuple[str, str, str, str], Any] | None,
+    ) -> int:
+        """Walk users.list from the stored cursor, committing it every page.
+
+        Stops at ``user_sync_budget`` or ``user_page_limit`` with the cursor
+        stored, so the next run continues; a rejected cursor restarts the walk.
+        """
+        key = (account, team_id, SLACK_USER_LIST_STATE_TYPE, SLACK_USER_LIST_OBJECT_ID)
+        state = (state_by_key or {}).get(key)
+        start_cursor = ""
+        if isinstance(state, Mapping) and str(state.get("status") or "") != SLACK_CONVERSATION_LIST_COMPLETE:
+            start_cursor = str(state.get("cursor_ts") or "")
+        if start_cursor:
+            self._logger.info("Resuming the Slack users.list walk for %s from its stored cursor", account)
+        started = self._monotonic()
+        try:
+            return self._walk_users(
+                account=account, team_id=team_id, client=client, synced_at=synced_at,
+                start_cursor=start_cursor, started=started,
+            )
+        except SlackApiCallError as exc:
+            # Slack cursors expire; a rejected one restarts the walk rather
+            # than wedging the users sync forever.
+            if not start_cursor or str(getattr(exc, "code", "")) not in SLACK_INVALID_CURSOR_CODES:
+                raise
+            self._logger.warning(
+                "Slack users.list cursor was rejected (%s); restarting the walk", getattr(exc, "code", "")
+            )
+            return self._walk_users(
+                account=account, team_id=team_id, client=client, synced_at=synced_at,
+                start_cursor="", started=started,
+            )
+
+    def _walk_users(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        client,
+        synced_at: datetime,
+        start_cursor: str,
+        started: float,
+    ) -> int:
+        users_written = 0
+        for page_index, (users, next_cursor) in enumerate(
+            iter_cursor_pages_with_cursor(
+                client,
+                "users.list",
+                "members",
+                limit=self._settings.slack_page_size,
+                call=self._call,
+                start_cursor=start_cursor,
+            ),
+            start=1,
+        ):
+            rows = [
+                user_to_row(account=account, team_id=team_id, user=user, synced_at=synced_at)
+                for user in users
+                if isinstance(user, Mapping)
+            ]
+            self._warehouse.insert_slack_users(rows)
+            users_written += len(rows)
+            now = self._now()
+            self._warehouse.insert_slack_sync_state(
+                account=account,
+                team_id=team_id,
+                object_type=SLACK_USER_LIST_STATE_TYPE,
+                object_id=SLACK_USER_LIST_OBJECT_ID,
+                cursor_ts=next_cursor,
+                last_sync_type="users",
+                status="ok" if next_cursor else SLACK_CONVERSATION_LIST_COMPLETE,
+                error="",
+                updated_at=now,
+                sync_version=sync_version_from_datetime(now),
+            )
+            self._logger.info("Synced %s Slack users for %s so far", users_written, account)
+            if not next_cursor:
+                self._warehouse.insert_slack_sync_state(
+                    account=account,
+                    team_id=team_id,
+                    object_type=SLACK_USER_LIST_PASS_STATE_TYPE,
+                    object_id=SLACK_USER_LIST_OBJECT_ID,
+                    cursor_ts="",
+                    last_sync_type="users",
+                    status="ok",
+                    error="",
+                    updated_at=now,
+                    sync_version=sync_version_from_datetime(now),
+                )
+                self._logger.info("Finished the Slack users.list walk for %s", account)
+                break
+            if self._user_page_limit is not None and page_index >= self._user_page_limit:
+                break
+            if (
+                self._user_sync_budget is not None
+                and self._monotonic() - started >= self._user_sync_budget.total_seconds()
+            ):
+                self._logger.info(
+                    "Slack users.list walk for %s stopped at its %s budget; the next run resumes",
+                    account,
+                    self._user_sync_budget,
+                )
+                break
+        return users_written
 
     def _walk_conversation_list(
         self,

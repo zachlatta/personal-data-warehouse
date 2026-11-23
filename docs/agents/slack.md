@@ -78,6 +78,21 @@ group DM messages" is a guaranteed false positive. It would also have been wrong
 group DMs really were silent from 2026-08-20T18:57 onward, which is exactly what Slack
 itself reports.
 
+### The workspace users walk resumes from a cursor (2026-11-23)
+
+`slack_workspace_user_sync_job` (daily 08:11 UTC) walks `users.list` for the whole
+workspace into `base_slack.users`. The same page-1 trap hit it: from 2026-11-10 every run
+restarted at page 1, reached about user 200,000 of 253,607 (~200 users per 14 s page) and
+was killed at the 4 h run cap or cancelled, so 3,806 users went more than 14 days stale
+while the `slack` pipeline read `ok` on the strength of message writes. Now each page
+commits its cursor to `ops.slack_sync_state` (`object_type = 'user_list'`, status `ok`
+mid-walk, `complete` at the end); a run walks for `SLACK_USER_SYNC_BUDGET_SECONDS` (3 h)
+and stops there, and the next run continues from the cursor, so a full pass takes about
+two runs. An expired cursor restarts the walk. The job's `dagster/max_runtime` is 13,500 s
+(the budget plus the 30-minute lock wait). A walk that reaches the end stamps
+`object_type = 'user_list_pass'`, which is the run heartbeat of the `slack_users`
+pipeline on `/pipelines`: it reads `late` after four days without a finished pass.
+
 ## Slack channels Zach is not in: discovery is not coverage
 
 **Being listed is not being read, and for four months those were the same word

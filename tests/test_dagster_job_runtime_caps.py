@@ -32,6 +32,9 @@ MAX_RUNTIME_TAG = "dagster/max_runtime"
         (search_index_defs.search_chunks_job, 1800),
         (slack_sync.slack_workspace_sync_job, 1800),
         (slack_sync.slack_workspace_coverage_sync_job, 3600),
+        # A 3 h users.list slice plus up to 30 min waiting for the Slack lock;
+        # the walk resumes from its stored cursor, so the cap never loses work.
+        (slack_sync.slack_workspace_user_sync_job, 13500),
         (gmail_sync.gmail_mailbox_sync_job, 3600),
         (gmail_settings_sync.gmail_settings_sync_job, 900),
         (contacts_sync.contacts_sync_job, 3600),
@@ -51,3 +54,25 @@ def test_answer_benchmark_has_an_explicit_six_hour_cap() -> None:
 
     # Dagster uses the job tag in place of the global four-hour fallback.
     assert int(answer_benchmark_job.tags[MAX_RUNTIME_TAG]) == 6 * 60 * 60
+
+
+def test_the_user_sync_walks_inside_its_runtime_cap(monkeypatch) -> None:
+    from datetime import timedelta
+
+    captured = {}
+
+    class Runner:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def sync_all(self):
+            return []
+
+    monkeypatch.setattr(slack_sync, "SlackSyncRunner", Runner)
+    monkeypatch.delenv("SLACK_USER_SYNC_BUDGET_SECONDS", raising=False)
+    slack_sync.run_slack_user_sync(settings=None, warehouse=None, logger=None)
+    budget = captured["user_sync_budget"]
+    lock_wait = slack_sync._user_sync_lock_wait_seconds()
+    cap = int(slack_sync.slack_workspace_user_sync_job.tags[MAX_RUNTIME_TAG])
+    assert budget == timedelta(hours=3)
+    assert budget.total_seconds() + lock_wait < cap

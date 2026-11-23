@@ -1842,6 +1842,33 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="optional experiment; marts_ops.notification_health distinguishes paused from stale",
     ),
     Pipeline(
+        # `slack` reads ok while messages write, which is how the users walk
+        # went 14 days without finishing (2026-11-10..23) unseen. This row reads
+        # only the stamp a walk writes when it reaches the end of users.list.
+        id="slack_users",
+        label="Slack workspace users",
+        kind="internal",
+        cadence="daily 08:11 UTC, a 3 h resumable slice; a full pass about every two runs",
+        transport="Dagster slack_workspace_user_sync → Slack users.list, cursor in ops.slack_sync_state",
+        # Every daily run re-stamps the users it walks; the finished-pass run
+        # interval below is the tighter check, so writes are judged looser.
+        expected_data_interval=3 * DAY,
+        data_basis="a daily job that writes users on every run; 3d puts late at 6d, behind the 4d finished-pass check",
+        # 253k users at ~200 per 14 s is ~4.9 h of walking: two daily slices.
+        # Late (2x) at four days without a finished pass.
+        expected_run_interval=2 * DAY,
+        state=StateSource(
+            table="slack_sync_state",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+            scope_column="object_type",
+            # personal_data_warehouse.slack_sync.SLACK_USER_LIST_PASS_STATE_TYPE
+            scope_value="user_list_pass",
+        ),
+        note="a run that stops at its budget or is killed resumes from the users.list cursor (object_type user_list)",
+    ),
+    Pipeline(
         id="mcp_proxy",
         label="MCP connections",
         kind="internal",
@@ -2077,7 +2104,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     ),
     "slack_teams": _support("slack", "synced_at"),
     "slack_account_identities": _support("slack", "synced_at"),
-    "slack_users": _support("slack", "synced_at"),
+    # Its own pipeline: the users walk is judged by finishing, not by messages.
+    "slack_users": _data("slack_users", "synced_at"),
     "slack_conversations": _support("slack", "synced_at"),
     "slack_conversation_members": _support("slack", "synced_at"),
     "slack_conversation_stats": _support("slack", "updated_at", "latest_message_at"),
