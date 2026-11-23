@@ -205,6 +205,8 @@ def test_credential_report_counts_by_kind_and_role_then_zero_after_scrub(warehou
     assert report['by_role'] == {'user': 1, 'tool': 2}
     assert report['rows_scanned'] == {'claude_code_events': 3}
     assert report['matches'] == 3
+    assert report['source_rows_matched'] == {'claude_code_events': 2}
+    assert report['sessions'] == dict(affected=1, canonical_rows=3, largest_rows=3, over_10000_rows=0)
     dump = json.dumps(samples)
     assert slack not in dump and expand('<<pgpw>>') not in dump and '[REDACTED:slack_token:' in dump
     selector = ScrubSelector('credentials')

@@ -96,6 +96,8 @@ def scan(database_url, schema, *, tables, since=None, until=None, workers=1, pag
     scanned = Counter()
     prefiltered = Counter()
     samples = {}
+    matched_rows = Counter()
+    session_rows = {}
     pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn')) if workers > 1 else None
     try:
         for table in tables:
@@ -122,6 +124,9 @@ def scan(database_url, schema, *, tables, since=None, until=None, workers=1, pag
                 for row, found in zip(rows, results, strict=True):
                     if not found:
                         continue
+                    if table not in DERIVED:
+                        matched_rows[table] += 1
+                        session_rows.setdefault(table, {})[row['source'], row['session_id']] = 0
                     role = 'derived' if table in DERIVED else (row.get('role') or 'unknown')
                     for column, kind, context, shape in found:
                         counts[table, role, column, kind] += 1
@@ -131,6 +136,16 @@ def scan(database_url, schema, *, tables, since=None, until=None, workers=1, pag
                         rows_with[table, role, kind] += 1
                 if progress:
                     progress(dict(table=table, done=min(offset + page_size, len(identities)), prefiltered=len(identities)))
+            # Size the backfill: every row of an affected session is regenerated.
+            sessions = sorted(session_rows.get(table, {}))
+            for offset in range(0, len(sessions), 500):
+                batch = sessions[offset:offset + 500]
+                with connection.cursor() as cursor:
+                    cursor.execute(warehouse._expand_relations(
+                        f'SELECT source, session_id, count(*) FROM @{table} WHERE (source, session_id) IN ('
+                        + ','.join('(%s,%s)' for _ in batch) + ') GROUP BY 1, 2'), tuple(v for key in batch for v in key))
+                    for source, session, n in cursor.fetchall():
+                        session_rows[table][source, session] = n
     finally:
         if pool:
             pool.shutdown(cancel_futures=True)
@@ -140,6 +155,13 @@ def scan(database_url, schema, *, tables, since=None, until=None, workers=1, pag
         scope=dict(since=since, until=until, tables=list(tables)),
         rows_scanned=dict(scanned), rows_prefiltered=dict(prefiltered),
         matches=sum(counts.values()),
+        source_rows_matched=dict(matched_rows),
+        sessions=dict(
+            affected=sum(len(v) for v in session_rows.values()),
+            canonical_rows=sum(sum(v.values()) for v in session_rows.values()),
+            largest_rows=max((n for v in session_rows.values() for n in v.values()), default=0),
+            over_10000_rows=sum(n > 10000 for v in session_rows.values() for n in v.values()),
+        ),
         seconds=round(time.monotonic() - started, 1),
     )
     by_kind, by_role, by_column, by_table = Counter(), Counter(), Counter(), Counter()
