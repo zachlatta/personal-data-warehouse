@@ -104,7 +104,7 @@ func (c *Client) ListTools(ctx context.Context) ([]ToolInfo, error) {
 	c.authorize(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, transportError(req, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -146,7 +146,7 @@ func (c *Client) CallTool(ctx context.Context, name string, input json.RawMessag
 	c.authorize(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, transportError(req, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
@@ -241,7 +241,7 @@ func (c *Client) Request(ctx context.Context, method, path string, body any) ([]
 	c.authorize(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, transportError(req, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
@@ -296,4 +296,23 @@ func RedeemBootstrap(ctx context.Context, httpClient *http.Client, baseURL, code
 		return BootstrapGrant{}, fmt.Errorf("bootstrap grant carried no token")
 	}
 	return grant, nil
+}
+
+// transportError names a refused proxy CONNECT. When an HTTPS proxy answers
+// CONNECT with an error status, Go's whole message is the bare status text
+// (`Post "https://.../api/tools/search": Forbidden`), which twelve sessions
+// from 2026-11-14 read as PDW refusing them; PDW's own refusals arrive as
+// responses and read `http 403: <message>`.
+func transportError(req *http.Request, err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) || urlErr.Err == nil {
+		return err
+	}
+	text := urlErr.Err.Error()
+	for code := 400; code < 600; code++ {
+		if status := http.StatusText(code); status != "" && status == text {
+			return fmt.Errorf("your HTTPS proxy refused the connection to %s; this is not a PDW error (the proxy answered CONNECT with %s: check its allow list, or set NO_PROXY for this host): %w", req.URL.Hostname(), text, err)
+		}
+	}
+	return err
 }
