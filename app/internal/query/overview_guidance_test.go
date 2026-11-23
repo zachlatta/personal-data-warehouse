@@ -249,8 +249,12 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// 2026-11-19: marts_voice_memos.start_screenshots, the phone screen as a
 	// Pixel memo started, added one relation line ("Phone screen at memo
 	// start."): 10696. 10696 is that line and no more.
-	if guidance > 10696 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10696)", guidance)
+	//
+	// 2026-11-23: marts_ops.mcp_connection_health, one row per proxied MCP
+	// connection with its status and redacted cause, added one relation line
+	// ("MCP connections."): 10719. 10719 is that line and no more.
+	if guidance > 10719 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10719)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

@@ -2895,7 +2895,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "One row per connected MCP server (pdw list): failing on authorization_failed (reconnect it in Connections), with when the status changed and the redacted last_error; a 'transient:' error leaves the status alone."
+      "comment": "MCP connections. One row each; failing: reconnect it in Connections, last_error is the cause."
     },
     {
       "id": "marts_ops_plaid_item_health",
