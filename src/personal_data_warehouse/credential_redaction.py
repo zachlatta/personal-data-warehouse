@@ -121,7 +121,8 @@ def _text_edits(value):
            for m in _AWS_ID.finditer(value)):
         for m in _AWS_RUN.finditer(value):
             run = m[0]
-            if (len(run) == 40 and '=' not in run and any(c.isascii() and c.isupper() for c in run) and
+            # A run cut out of URL-encoding (%2B...%2F) is part of a longer value.
+            if (len(run) == 40 and '=' not in run and value[m.start() - 1:m.start()] != '%' and value[m.end():m.end() + 1] != '%' and any(c.isascii() and c.isupper() for c in run) and
                     any(c.isascii() and c.islower() for c in run) and any('0' <= c <= '9' for c in run) and
                     not _placeholder(run)):
                 candidates.append((m.start(), m.end(), 'aws_secret_key'))

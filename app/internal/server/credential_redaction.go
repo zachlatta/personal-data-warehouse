@@ -27,18 +27,18 @@ const credentialLabel = `(?:secret[ _-]?access[ _-]?key|client[ _-]?secret|secre
 	`api[ _-]?key|apikey|passphrase|password|passwd|secret|token)`
 
 var (
-	credentialURL      = regexp.MustCompile(`(?i)(?:postgres(?:ql)?|mysql|mariadb|rediss?|amqps?|mongodb(?:\+srv)?|https?)://([^ \t\n\r\f\v/@:?#'"<>\[\]\\]*):([^ \t\n\r\f\v/@?#'"<>\[\]\\]+)@`)
-	credentialPDW      = regexp.MustCompile(`(pdw_[a-z0-9]{12,24}_)([A-Za-z0-9_-]{30,})`)
-	credentialSlack    = regexp.MustCompile(`xox[abcdepr](?:\.xox[a-z])?-[A-Za-z0-9%-]{10,}`)
-	credentialGitHub   = regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}`)
-	credentialSK       = regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`)
-	credentialAWSID    = regexp.MustCompile(`(?:AKIA|ASIA)[A-Z0-9]{16}`)
-	credentialAWSRun   = regexp.MustCompile(`[A-Za-z0-9/+=]+`)
-	credentialPEMHead  = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----`)
-	credentialPEMFoot  = regexp.MustCompile(`-----END [A-Z0-9 ]*PRIVATE KEY-----`)
-	credentialPEMTail  = regexp.MustCompile(`^[A-Za-z0-9+/=\r\n\\]*`)
-	credentialBase64   = regexp.MustCompile(`[A-Za-z0-9+/]`)
-	credentialBearer   = regexp.MustCompile(`(?i)bearer[ \t]+([A-Za-z0-9._~+/=-]{16,})`)
+	credentialURL     = regexp.MustCompile(`(?i)(?:postgres(?:ql)?|mysql|mariadb|rediss?|amqps?|mongodb(?:\+srv)?|https?)://([^ \t\n\r\f\v/@:?#'"<>\[\]\\]*):([^ \t\n\r\f\v/@?#'"<>\[\]\\]+)@`)
+	credentialPDW     = regexp.MustCompile(`(pdw_[a-z0-9]{12,24}_)([A-Za-z0-9_-]{30,})`)
+	credentialSlack   = regexp.MustCompile(`xox[abcdepr](?:\.xox[a-z])?-[A-Za-z0-9%-]{10,}`)
+	credentialGitHub  = regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}`)
+	credentialSK      = regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`)
+	credentialAWSID   = regexp.MustCompile(`(?:AKIA|ASIA)[A-Z0-9]{16}`)
+	credentialAWSRun  = regexp.MustCompile(`[A-Za-z0-9/+=]+`)
+	credentialPEMHead = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----`)
+	credentialPEMFoot = regexp.MustCompile(`-----END [A-Z0-9 ]*PRIVATE KEY-----`)
+	credentialPEMTail = regexp.MustCompile(`^[A-Za-z0-9+/=\r\n\\]*`)
+	credentialBase64  = regexp.MustCompile(`[A-Za-z0-9+/]`)
+	credentialBearer  = regexp.MustCompile(`(?i)bearer[ \t]+([A-Za-z0-9._~+/=-]{16,})`)
 	// The label is matched alone and its identifier found by a bounded walk
 	// back, as Python does (a lazy prefix is quadratic in Python's engine).
 	credentialLabelled = regexp.MustCompile(`(?i)(` + credentialLabel + `)[ \t]*\\*["']?[ \t]*[:=][ \t]*\\*["']?[ \t]*` +
@@ -158,7 +158,8 @@ func credentialTextEdits(s string) []cardEdit {
 				upper = upper || c >= 'A' && c <= 'Z'
 				lower = lower || c >= 'a' && c <= 'z'
 			}
-			if len(run) == 40 && !strings.Contains(run, "=") && upper && lower && hasLetterAndDigit(run) && !credentialPlaceholderValue(run) {
+			// A run cut out of URL-encoding (%2B...%2F) is part of a longer value.
+			if len(run) == 40 && !strings.Contains(run, "=") && (m[0] == 0 || s[m[0]-1] != '%') && (m[1] == len(s) || s[m[1]] != '%') && upper && lower && hasLetterAndDigit(run) && !credentialPlaceholderValue(run) {
 				candidates = append(candidates, credentialCandidate{m[0], m[1], "aws_secret_key"})
 			}
 		}
