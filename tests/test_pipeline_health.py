@@ -229,6 +229,39 @@ def test_the_pipelines_data_tables_are_cheaply_probeable():
         )
 
 
+def test_a_scoped_state_read_of_a_large_table_has_an_index():
+    """A scoped StateSource is a WHERE the collector runs every ten minutes.
+
+    On a large state table it needs an index leading with the scope column or
+    a partial index on exactly that scope. ops.slack_sync_state is 1.55M rows /
+    216 MB of heap (2026-11-23), and slack_state_scope_idx leads with account,
+    so `object_type = 'user_list_pass'` alone would seq-scan it every run.
+    """
+    for entry in PIPELINES:
+        source = entry.state
+        if source is None or not source.scope_column or source.table not in _LARGE_TABLES:
+            continue
+        partial = f"WHERE {source.scope_column} = '{source.scope_value}'"
+        covered = [
+            index.name
+            for index in POSTGRES_INDEXES
+            if index.table == source.table
+            and (
+                partial in index.sql
+                # A full index leading with the scope column; a partial one on
+                # another scope's value cannot answer this read.
+                or (
+                    " WHERE " not in index.sql
+                    and index.sql[index.sql.find("(", index.sql.find(" ON ")) + 1 :].startswith(source.scope_column)
+                )
+            )
+        ]
+        assert covered, (
+            f"{entry.id} reads {source.table} WHERE {source.scope_column} = "
+            f"{source.scope_value!r} with no index for it; add a partial index"
+        )
+
+
 # Tables measured in production at over PROBE_MAX_UNINDEXED_BYTES. Kept as an
 # explicit list so the guard above stays a pure test; the collector itself reads
 # real sizes from pg_class at runtime.

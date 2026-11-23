@@ -2056,6 +2056,13 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_sync_state",
         "CREATE INDEX IF NOT EXISTS slack_sync_state_coverage_stage_idx ON @slack_sync_state (object_type, object_id) WHERE object_type = 'coverage_stage'",
     ),
+    # The slack_users pipeline's run heartbeat: one row per account the
+    # pipeline-health collector reads every ten minutes.
+    IndexSpec(
+        "slack_sync_state_user_list_pass_idx",
+        "slack_sync_state",
+        "CREATE INDEX IF NOT EXISTS slack_sync_state_user_list_pass_idx ON @slack_sync_state (object_type, object_id) WHERE object_type = 'user_list_pass'",
+    ),
     IndexSpec(
         "slack_messages_huddle_idx",
         "slack_messages",
