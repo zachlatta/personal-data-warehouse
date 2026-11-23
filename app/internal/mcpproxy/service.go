@@ -295,6 +295,11 @@ func (t *proxyTool) Invoke(ctx context.Context, input json.RawMessage) (any, boo
 	if err := json.Unmarshal(input, &object); err != nil || object == nil {
 		return nil, true, &tool.InvalidInputError{Message: "tool arguments must be a JSON object"}
 	}
+	// Answered from the cached schema, without a connection or a call: an
+	// argument the tool's closed schema does not list cannot succeed upstream.
+	if message := unknownArguments(t.Name(), t.definition.InputSchema, object); message != "" {
+		return nil, true, &tool.InvalidInputError{Message: message}
+	}
 	ctx, cancel := context.WithTimeout(ctx, upstreamCallBudget)
 	defer cancel()
 	c, client, err := t.service.prepare(ctx, t.connection, func(c *record) error {

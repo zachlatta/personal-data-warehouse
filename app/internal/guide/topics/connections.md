@@ -30,6 +30,9 @@ and types, and check every unfamiliar definition before launching parallel calls
 Some clients cache definitions; reconnect PDW in that client if newly connected tools
 have not appeared.
 {{end}}
+When a tool's schema closes its object (`additionalProperties: false`), PDW refuses an
+argument it does not list as `invalid_input`, naming the arguments the tool takes, without
+calling the upstream; correct the argument names rather than retrying.
 The upstream input schema, result content, structured result and error flag are retained.
 A tool error is not an empty successful result.
 
