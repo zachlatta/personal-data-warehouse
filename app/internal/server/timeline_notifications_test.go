@@ -39,8 +39,13 @@ func TestAndroidMessagesNotificationLinkFromDecodedMetadata(t *testing.T) {
 	if a.Open == nil || a.Open.URL != "sms:+15555550100" || a.Open.AppURL != "sms:+15555550100" {
 		t.Fatalf("1:1 chat: %+v", a.Open)
 	}
-	if a := renderTimelineNotification(row(map[string]any{"chat_key": "+15555550100", "group": true}), "https://pdw.example", timelineLinkEnv{}); a.Open != nil {
-		t.Fatalf("group chat must fall back to PDW: %+v", a.Open)
+	if a.Open.Android == nil || a.Open.Android.App != "google_messages" || a.Open.Android.Recipients != "+15555550100" {
+		t.Fatalf("1:1 chat android target: %+v", a.Open.Android)
+	}
+	// An RCS group has no URL; the Android target opens Google Messages.
+	g := renderTimelineNotification(row(map[string]any{"chat_key": "rcs-group:G1", "group": true}), "https://pdw.example", timelineLinkEnv{})
+	if g.Open == nil || g.Open.URL != "" || g.Open.AppURL != "" || g.Open.Android == nil || g.Open.Android.App != "google_messages" || g.Open.Android.Recipients != "" {
+		t.Fatalf("group chat: %+v", g.Open)
 	}
 }
 

@@ -66,3 +66,10 @@ const HUES = {
   agent_sessions: "#d0743f", agent_session: "#d0743f",
 };
 export function hue(src) { return HUES[src] || "#8f8b86"; }
+
+// An item's `open` link when a browser can follow it, else null. A group
+// chat's link carries only the phone's Android target and an empty url
+// (app/internal/deeplink), so the web shows no button for it.
+export function browserLink(open) {
+  return open && open.url ? open : null;
+}

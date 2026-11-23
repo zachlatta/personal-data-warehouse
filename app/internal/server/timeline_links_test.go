@@ -3,9 +3,11 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/deeplink"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
@@ -23,43 +25,64 @@ func linkFor(t *testing.T, adapter, sourceTable, pk, metadata string) *timelineD
 }
 
 func TestTimelineDeepLinkAndroidMessages(t *testing.T) {
-	cases := []struct{ name, metadata, want string }{
-		{"phone", `{"chat_key":"+15555550123","group":false}`, "sms:+15555550123"},
-		{"formatted phone", `{"chat_key":"+1 (555) 555-0123","group":false}`, "sms:+15555550123"},
-		{"email", `{"chat_key":"test+chat@example.test","group":false}`, "sms:test+chat@example.test"},
-		{"group", `{"chat_key":"bugle:42","group":true}`, ""},
-		{"group with handle", `{"chat_key":"+15555550123","group":true}`, ""},
-		{"opaque", `{"chat_key":"bugle:42","group":false}`, ""},
-		{"punctuation is not digits", `{"chat_key":"1....","group":false}`, ""},
-		{"query injection", `{"chat_key":"test@example.test?body=unexpected","group":false}`, ""},
-		{"recipient injection", `{"chat_key":"test@example.test,+15555550123","group":false}`, ""},
-		{"missing", `{}`, ""},
+	// A 1:1 text opens its conversation in Google Messages through sms:. A
+	// group has no sms: URL a browser or iPhone could follow, so only the
+	// Android target is set: an MMS group names its members, which Google
+	// Messages resolves to the conversation; an RCS group key is opaque, so
+	// its target opens Google Messages without one.
+	googleMessages := func(recipients string) *deeplink.AndroidChat {
+		return &deeplink.AndroidChat{App: deeplink.AndroidAppGoogleMessages, Recipients: recipients}
+	}
+	cases := []struct {
+		name, metadata, url string
+		android             *deeplink.AndroidChat
+	}{
+		{"phone", `{"chat_key":"+15555550123","group":false}`, "sms:+15555550123", googleMessages("+15555550123")},
+		{"formatted phone", `{"chat_key":"+1 (555) 555-0123","group":false}`, "sms:+15555550123", googleMessages("+15555550123")},
+		{"email", `{"chat_key":"test+chat@example.test","group":false}`, "sms:test+chat@example.test", googleMessages("test+chat@example.test")},
+		{"rcs group", `{"chat_key":"rcs-group:G1","group":true}`, "", googleMessages("")},
+		{"mms group names its members", `{"chat_key":"+15555550123,+15555550124","group":true}`, "", googleMessages("+15555550123,+15555550124")},
+		{"group with one handle", `{"chat_key":"+15555550123","group":true}`, "", googleMessages("+15555550123")},
+		{"group member injection", `{"chat_key":"+15555550123,test@example.test?body=x","group":true}`, "", googleMessages("")},
+		{"opaque", `{"chat_key":"bugle:42","group":false}`, "", nil},
+		{"punctuation is not digits", `{"chat_key":"1....","group":false}`, "", nil},
+		{"query injection", `{"chat_key":"test@example.test?body=unexpected","group":false}`, "", nil},
+		{"recipient injection", `{"chat_key":"test@example.test,+15555550123","group":false}`, "", nil},
+		{"missing", `{}`, "", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			link := linkFor(t, "android_message", "android_messages", `{"device":"test-phone","message_key":"content://mms/123"}`, tc.metadata)
-			if tc.want == "" {
+			if tc.android == nil {
 				if link != nil {
 					t.Fatalf("expected PDW fallback, got %#v", link)
 				}
 				return
 			}
-			if link == nil || link.URL != tc.want || link.AppURL != tc.want || link.Label != "Messages" {
-				t.Fatalf("link = %#v, want %s", link, tc.want)
+			want := &timelineDeepLink{URL: tc.url, AppURL: tc.url, Label: "Messages", Android: tc.android}
+			if !reflect.DeepEqual(link, want) {
+				t.Fatalf("link = %#v (android %#v), want %#v (android %#v)", link, androidOf(link), want, want.Android)
 			}
 			// Alert taps and timeline source buttons must get the same link.
 			row := map[string]any{"source": "android_messages", "source_table": "android_messages", "adapter": "android_message", "metadata": tc.metadata}
 			alert := renderTimelineNotification(row, "https://pdw.example.test", timelineLinkEnv{})
-			if alert.Open == nil || *alert.Open != *link {
+			if !reflect.DeepEqual(alert.Open, link) {
 				t.Fatalf("alert link = %#v, want %#v", alert.Open, link)
 			}
 			item := map[string]any{}
 			attachDeepLink(item, row, timelineLinkEnv{})
-			if open, ok := item["open"].(*timelineDeepLink); !ok || *open != *link {
+			if open, ok := item["open"].(*timelineDeepLink); !ok || !reflect.DeepEqual(open, link) {
 				t.Fatalf("timeline link = %#v, want %#v", item["open"], link)
 			}
 		})
 	}
+}
+
+func androidOf(link *timelineDeepLink) *deeplink.AndroidChat {
+	if link == nil {
+		return nil
+	}
+	return link.Android
 }
 
 func TestTimelineDeepLinkSlackMessagePermalink(t *testing.T) {
@@ -199,19 +222,41 @@ func TestTimelineDeepLinkAppleNotesUsesTheNotesScheme(t *testing.T) {
 }
 
 func TestTimelineDeepLinkAppleMessagesOpensTheChatForOneToOne(t *testing.T) {
-	// A 1:1 chat's identifier is the other party's handle, which Messages
-	// resolves through sms:/imessage:. A group chat's identifier is opaque.
+	// On the Pixel an iMessage chat lives in BlueBubbles, which opens a chat
+	// by its chat.db guid (the chat_id PDW stores) and resolves imessage://.
+	// sms: would land in Google Messages, which has no iMessage chats.
 	link := linkFor(t, "apple_message", "apple_messages",
 		`{"account":"z","message_id":"M"}`,
 		`{"chat_id":"iMessage;-;+15551234567","service":"iMessage"}`)
-	if link == nil || link.URL != "imessage://+15551234567" || link.AppURL != "sms:+15551234567" {
-		t.Fatalf("link = %#v", link)
+	want := &timelineDeepLink{
+		URL:     "imessage://+15551234567",
+		AppURL:  "imessage://+15551234567",
+		Label:   "BlueBubbles",
+		Android: &deeplink.AndroidChat{App: deeplink.AndroidAppBlueBubbles, ChatGUID: "iMessage;-;+15551234567"},
 	}
+	if !reflect.DeepEqual(link, want) {
+		t.Fatalf("link = %#v (android %#v)", link, androidOf(link))
+	}
+}
+
+func TestTimelineDeepLinkAppleMessagesGroupOpensOnlyInBlueBubbles(t *testing.T) {
+	// A group's identifier is an opaque chatNNN token no URL can open, but
+	// BlueBubbles opens the chat from its guid.
 	group := linkFor(t, "apple_message", "apple_messages",
 		`{"account":"z","message_id":"M"}`,
 		`{"chat_id":"any;+;chat138687451987295488"}`)
-	if group != nil {
-		t.Fatalf("group chat should have no deep link, got %#v", group)
+	want := &timelineDeepLink{
+		Label:   "BlueBubbles",
+		Android: &deeplink.AndroidChat{App: deeplink.AndroidAppBlueBubbles, ChatGUID: "any;+;chat138687451987295488"},
+	}
+	if !reflect.DeepEqual(group, want) {
+		t.Fatalf("group link = %#v (android %#v)", group, androidOf(group))
+	}
+	for _, chatID := range []string{"", "any;+;", "chat123", "any;?;chat1", "any;+;chat;1", "any;+;chat1\n"} {
+		meta, _ := json.Marshal(map[string]string{"chat_id": chatID})
+		if link := linkFor(t, "apple_message", "apple_messages", `{"account":"z","message_id":"M"}`, string(meta)); link != nil {
+			t.Fatalf("chat_id %q: link = %#v", chatID, link)
+		}
 	}
 }
 

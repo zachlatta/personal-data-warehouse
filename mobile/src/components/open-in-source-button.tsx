@@ -4,14 +4,14 @@ import { Alert, Pressable, StyleSheet } from 'react-native';
 import { ThemedText } from '@/components/themed-text';
 import type { TimelineDeepLink } from '@/lib/api';
 import { useTheme } from '@/hooks/use-theme';
-import { openDeepLink } from '@/lib/deep-link';
+import { canOpenDeepLink, openDeepLink } from '@/lib/deep-link';
 
 // The "open in Slack / Gmail / Messages…" affordance. `compact` is the
 // list-row form: an arrow only, sized for a thumb.
 export function OpenInSourceButton({ link, compact = false }: { link?: TimelineDeepLink; compact?: boolean }) {
   const [busy, setBusy] = useState(false);
   const theme = useTheme();
-  if (!link?.url) return null;
+  if (!canOpenDeepLink(link)) return null;
   const onPress = async () => {
     if (busy) return;
     setBusy(true);

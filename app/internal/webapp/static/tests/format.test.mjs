@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fmtTime, dayOf, formatWhen, isReal, pretty, truncate, hue } from "../format.js";
+import { fmtTime, dayOf, formatWhen, isReal, pretty, truncate, hue, browserLink } from "../format.js";
 
 test("fmtTime and dayOf render in the local timezone and survive garbage", () => {
   const d = new Date(2026, 7, 27, 9, 5);
@@ -39,4 +39,14 @@ test("truncate keeps short text and marks cut text", () => {
 test("every known source has a distinct hue and unknown ones share the fallback", () => {
   assert.notEqual(hue("gmail"), hue("slack"));
   assert.equal(hue("nope"), hue("also-nope"));
+});
+
+test("browserLink keeps only a link a browser can follow", () => {
+  // A group chat's link has only the phone's Android target and url "":
+  // the web must show no button for it (an empty href reopens this page).
+  assert.equal(browserLink({ url: "", label: "BlueBubbles", android: { app: "bluebubbles", chat_guid: "any;+;chat1" } }), null);
+  assert.equal(browserLink(undefined), null);
+  assert.equal(browserLink(null), null);
+  const link = { url: "https://example.test/x", label: "Slack" };
+  assert.equal(browserLink(link), link);
 });

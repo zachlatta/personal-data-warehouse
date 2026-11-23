@@ -1,3 +1,5 @@
+import { androidChatOf, type AndroidChat } from './android-chat.ts';
+
 // Small independent records keep each Keychain value below its size limit.
 // Only scoped open capabilities are queued: no message text or warehouse token.
 type KV = { get(key: string): Promise<string | null>; set(key: string, value: string): Promise<void>; remove(key: string): Promise<void> };
@@ -47,12 +49,21 @@ export class OpenQueue {
   }
 }
 
-export function notificationOpenLink(value: unknown): { url: string; label: string; app_url?: string } | null {
+// A push's source link, kept only if something in it is safe to open: an
+// allowed URL scheme, or an Android chat target (src/lib/android-chat.ts). A
+// group chat's link has only the target and an empty url.
+export function notificationOpenLink(value: unknown): { url: string; label: string; app_url?: string; android?: AndroidChat } | null {
   if (!value || typeof value !== 'object') return null;
   const v = value as Record<string, unknown>;
   const allowed = (u: unknown): u is string => typeof u === 'string' && /^(https:\/\/|slack:|sms:|imessage:|whatsapp:|applenotes:|mobilenotes:|addressbook:)/i.test(u);
-  if (!allowed(v.url) || typeof v.label !== 'string') return null;
-  return { url: v.url, label: v.label, ...(allowed(v.app_url) ? { app_url: v.app_url } : {}) };
+  const android = androidChatOf(v.android);
+  if (typeof v.label !== 'string' || !(allowed(v.url) || (v.url === '' && android))) return null;
+  return {
+    url: allowed(v.url) ? v.url : '',
+    label: v.label,
+    ...(allowed(v.app_url) ? { app_url: v.app_url } : {}),
+    ...(android ? { android } : {}),
+  };
 }
 
 // Navigation and persistence have separate completion signals. In particular,

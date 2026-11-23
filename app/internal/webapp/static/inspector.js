@@ -3,6 +3,7 @@
 // the timeline ledger and search results.
 import { timeline } from "./api.js";
 import { el, h, clear, section, kvTable, fmtTime, fmtFull, dayOf, isReal, hue } from "./ui.js";
+import { browserLink } from "./format.js";
 
 let onClose = null;
 
@@ -180,7 +181,7 @@ export function openItem(item, options = {}) {
   el("dtitle").textContent = item.title || item.snippet || item.event_id;
   const body = clear(el("dbody"));
 
-  if (item.open && item.open.url) body.appendChild(openButton(item.open));
+  if (browserLink(item.open)) body.appendChild(openButton(item.open));
 
   const head = section("event");
   head.appendChild(kvTable([
@@ -210,13 +211,13 @@ export function openItem(item, options = {}) {
     body.removeChild(loading);
     // The detail row carries the deep link even when the list row
     // predates it (context rows opened from the transcript, search hits).
-    if (detail.item && detail.item.open && !(item.open && item.open.url)) {
+    if (detail.item && browserLink(detail.item.open) && !browserLink(item.open)) {
       item.open = detail.item.open;
       body.insertBefore(openButton(item.open), body.firstChild);
     }
     if (detail.context) {
       // right after the preview (or the event table when there is none)
-      const anchorSect = body.children[item.open && item.open.url ? 3 : 2] || null;
+      const anchorSect = body.children[browserLink(item.open) ? 3 : 2] || null;
       appendContextSection(body, item, detail.context, anchorSect, open);
     }
     if (detail.item_media) {

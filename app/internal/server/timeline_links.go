@@ -38,9 +38,13 @@ var (
 	// Apple Messages 1:1 chat identifiers are a handle (phone or email); a
 	// group chat's identifier is an opaque chatNNN token Messages cannot open
 	// from a URL.
-	appleMessagesHandlePattern  = regexp.MustCompile(`^(\+?[0-9][0-9 ().-]{4,}|[^@\s]+@[^@\s]+)$`)
-	androidMessagesPhonePattern = regexp.MustCompile(`^\+?[0-9][0-9 ().-]{4,}$`)
-	androidMessagesEmailPattern = regexp.MustCompile(`^[a-zA-Z0-9._+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+$`)
+	appleMessagesHandlePattern = regexp.MustCompile(`^(\+?[0-9][0-9 ().-]{4,}|[^@\s]+@[^@\s]+)$`)
+	// A chat.db guid, "<service>;<-|+>;<identifier>", which is also
+	// BlueBubbles' chat guid. It travels as an intent extra, not in a URL,
+	// so only the shape and control characters are checked.
+	appleMessagesChatGUIDPattern = regexp.MustCompile(`^[A-Za-z]{2,16};[-+];[^\x00-\x1f\x7f;]{1,200}$`)
+	androidMessagesPhonePattern  = regexp.MustCompile(`^\+?[0-9][0-9 ().-]{4,}$`)
+	androidMessagesEmailPattern  = regexp.MustCompile(`^[a-zA-Z0-9._+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+$`)
 )
 
 func linkString(m map[string]any, key string) string {
@@ -76,7 +80,7 @@ func decodeLinkJSON(raw any) map[string]any {
 // timelineDeepLinkFor computes the source deep link for a timeline row from
 // the row's own adapter, source_pk and metadata — nothing here needs a second
 // query, so the list endpoint can attach it to every row for free. A source
-// with no openable URL (health, photos, voice memos, a group chat) returns nil
+// with no openable URL (health, photos, voice memos, a WhatsApp group) returns nil
 // and the UI simply shows no button; a guessed link that opens the wrong
 // thing is worse than none.
 func timelineDeepLinkFor(row map[string]any, env timelineLinkEnv) *timelineDeepLink {
@@ -124,38 +128,9 @@ func timelineDeepLinkFor(row map[string]any, env timelineLinkEnv) *timelineDeepL
 			Label:  "WhatsApp",
 		}
 	case sourceTable == "apple_messages":
-		// chat.db chat ids are "<service>;<-|+>;<identifier>": "-" is a 1:1
-		// chat whose identifier is the other party's handle, "+" a group whose
-		// identifier is an opaque chatNNN token no URL can open.
-		parts := strings.SplitN(linkString(meta, "chat_id"), ";", 3)
-		if len(parts) != 3 || parts[1] != "-" || !appleMessagesHandlePattern.MatchString(parts[2]) {
-			return nil
-		}
-		handle := strings.ReplaceAll(parts[2], " ", "")
-		return &timelineDeepLink{
-			URL:    "imessage://" + handle,
-			AppURL: "sms:" + handle,
-			Label:  "Messages",
-		}
+		return appleMessagesDeepLink(linkString(meta, "chat_id"))
 	case sourceTable == "android_messages":
-		// sms: resolves a recipient in the default Android messaging app,
-		// including RCS conversations in Google Messages. Never use message_key:
-		// content://mms/N identifies a message, not an openable conversation.
-		// Opaque group keys have no recipient URL. Launching the app by package
-		// would require mobile support; keep the PDW fallback for those rows.
-		if group, _ := meta["group"].(bool); group {
-			return nil
-		}
-		handle := linkString(meta, "chat_key")
-		if androidMessagesPhonePattern.MatchString(handle) {
-			handle = strings.NewReplacer(" ", "", "(", "", ")", "", ".", "", "-", "").Replace(handle)
-			if digits := len(strings.TrimPrefix(handle, "+")); digits < 5 || digits > 20 {
-				return nil
-			}
-		} else if !androidMessagesEmailPattern.MatchString(handle) {
-			return nil
-		}
-		return &timelineDeepLink{URL: "sms:" + handle, AppURL: "sms:" + handle, Label: "Messages"}
+		return androidMessagesDeepLink(meta)
 	case sourceTable == "apple_note_revisions":
 		noteID := linkString(pk, "note_id")
 		if noteID == "" {
@@ -186,6 +161,80 @@ func timelineDeepLinkFor(row map[string]any, env timelineLinkEnv) *timelineDeepL
 		return &timelineDeepLink{URL: target, Label: "Mutation review"}
 	}
 	return nil
+}
+
+// appleMessagesDeepLink opens an iMessage chat in BlueBubbles, where iMessage
+// lives on Zach's Pixel: the Android app hands BlueBubbles the chat.db guid,
+// which opens 1:1 and group chats alike. A 1:1 chat's identifier is also the
+// other party's handle, so imessage://<handle> (which BlueBubbles resolves) is
+// the URL fallback; sms: is not, because on Android it opens Google Messages,
+// which has no iMessage chats. A group's identifier is an opaque chatNNN token
+// no URL can open, so it has only the Android target.
+func appleMessagesDeepLink(chatID string) *timelineDeepLink {
+	if !appleMessagesChatGUIDPattern.MatchString(chatID) {
+		return nil
+	}
+	link := &timelineDeepLink{
+		Label:   "BlueBubbles",
+		Android: &deeplink.AndroidChat{App: deeplink.AndroidAppBlueBubbles, ChatGUID: chatID},
+	}
+	parts := strings.SplitN(chatID, ";", 3)
+	if parts[1] == "-" && appleMessagesHandlePattern.MatchString(parts[2]) {
+		handle := strings.ReplaceAll(parts[2], " ", "")
+		link.URL = "imessage://" + handle
+		link.AppURL = link.URL
+	}
+	return link
+}
+
+// androidMessagesDeepLink opens a text conversation in Google Messages. sms:
+// resolves a recipient in the default Android messaging app, including RCS
+// conversations. Never use message_key: content://mms/N identifies a message,
+// not an openable conversation. A group has no sms: URL worth giving a browser
+// or an iPhone, so it gets only the Android target: an MMS group's key is its
+// members, which Google Messages resolves to the conversation; an RCS group's
+// key is opaque, so its target opens the conversation list.
+func androidMessagesDeepLink(meta map[string]any) *timelineDeepLink {
+	chatKey := linkString(meta, "chat_key")
+	if group, _ := meta["group"].(bool); group {
+		var members []string
+		for _, member := range strings.Split(chatKey, ",") {
+			address, ok := androidMessagesAddress(member)
+			if !ok {
+				members = nil
+				break
+			}
+			members = append(members, address)
+		}
+		return &timelineDeepLink{
+			Label:   "Messages",
+			Android: &deeplink.AndroidChat{App: deeplink.AndroidAppGoogleMessages, Recipients: strings.Join(members, ",")},
+		}
+	}
+	handle, ok := androidMessagesAddress(chatKey)
+	if !ok {
+		return nil
+	}
+	return &timelineDeepLink{
+		URL:     "sms:" + handle,
+		AppURL:  "sms:" + handle,
+		Label:   "Messages",
+		Android: &deeplink.AndroidChat{App: deeplink.AndroidAppGoogleMessages, Recipients: handle},
+	}
+}
+
+// androidMessagesAddress normalizes one phone number or email address as sms:
+// takes it, or reports that it is not one (an opaque key, or a value that
+// would smuggle a query or a second recipient into the URL).
+func androidMessagesAddress(value string) (string, bool) {
+	if androidMessagesPhonePattern.MatchString(value) {
+		value = strings.NewReplacer(" ", "", "(", "", ")", "", ".", "", "-", "").Replace(value)
+		if digits := len(strings.TrimPrefix(value, "+")); digits < 5 || digits > 20 {
+			return "", false
+		}
+		return value, true
+	}
+	return value, androidMessagesEmailPattern.MatchString(value)
 }
 
 // superhumanDeepLink opens a Gmail message's conversation in Superhuman,
