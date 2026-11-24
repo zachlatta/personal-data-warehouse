@@ -7,7 +7,6 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     AGENT_ENRICHMENT_PROMPT_VERSION,
     ContainerAgentStructuredClient,
     LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
-    apply_contact_alias_corrections,
     apply_segment_preserving_transcript_fallback,
     ensure_recording_level_fields,
     enrichment_row,
@@ -642,7 +641,7 @@ def test_enrichment_prompt_teaches_turn_level_speakers_from_the_agenda() -> None
     prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
     assert "speaker_turns" in prompt
     assert "agenda" in prompt
-    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v11"
+    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v12"
 
 
 def test_segment_preserving_fallback_assembles_local_transcript_sentinel() -> None:
@@ -843,6 +842,16 @@ def test_enrichment_task_input_includes_diarized_segments_and_recording_context(
                 "source_kind": "google_contacts",
                 "account": "account@example.com",
                 "card_id": "people/c1",
+                "is_ambiguous": True,
+                "other_given_name_match_count": 2,
+                "competing_contacts": [
+                    {
+                        "canonical_name": "Ace Rivera",
+                        "primary_email": "ace@example.com",
+                        "organization": "Example Org",
+                        "job_title": "Lead",
+                    }
+                ],
             }
         ],
         event_identity_hints={
@@ -864,6 +873,9 @@ def test_enrichment_task_input_includes_diarized_segments_and_recording_context(
     assert "diarized_segments" in task_input
     assert "contact_alias_hints" in task_input
     assert "Taylor Example" in task_input
+    assert "Ace Rivera" in task_input
+    assert '"is_ambiguous": true' in task_input
+    assert '"other_given_name_match_count": 2' in task_input
     assert "event_identity_hints" in task_input
     assert "Launch Week Team Plan" in task_input
     assert "source of truth for speaker turns" not in task_input
@@ -1116,6 +1128,8 @@ def test_load_contact_alias_hints_reads_human_edited_contact_nicknames() -> None
                     "",
                     "",
                     '[{"value":"Ace"}]',
+                    0,
+                    "[]",
                 )
             ]
 
@@ -1126,6 +1140,7 @@ def test_load_contact_alias_hints_reads_human_edited_contact_nicknames() -> None
     )
 
     assert "jsonb_array_elements(c.nicknames)" in queries[0]
+    assert "competing_given_name_contacts" in queries[0]
     assert hints == [
         {
             "mention": "Ace",
@@ -1140,34 +1155,149 @@ def test_load_contact_alias_hints_reads_human_edited_contact_nicknames() -> None
             "source_kind": "google_contacts",
             "account": "account@example.com",
             "card_id": "people/c1",
+            "is_ambiguous": False,
+            "recent_interaction_count": 0,
+            "other_given_name_match_count": 0,
+            "competing_contacts": [],
         }
     ]
 
 
-def test_apply_contact_alias_corrections_rewrites_final_output_aliases() -> None:
-    corrected = apply_contact_alias_corrections(
-        result={
-            "summary": "Ace will send the draft. Ace Cooper is a different full-name phrase.",
-            "action_items": ["Ask Ace to follow up."],
-            "evidence": ["Contact alias data maps 'Ace' to Taylor Example."],
-            "transcript": "Jordan Example: I talked to Ace about it.",
-            "speaker_map": [{"speaker_label": "B", "speaker_name": "Taylor Example", "evidence": "Ace appears in ASR."}],
-        },
-        contact_alias_hints=[
+def test_load_contact_alias_hints_marks_nickname_colliding_with_given_name_ambiguous() -> None:
+    class Warehouse:
+        def _query(self, sql):
+            if "competing_given_name_contacts" in sql:
+                return [
+                    (
+                        "Alex",
+                        "google_people",
+                        "account@example.com",
+                        "google_contacts",
+                        "people/c2",
+                        "Alexander Vance",
+                        "Alexander",
+                        "Vance",
+                        "alexvance@example.org",
+                        "Example Org",
+                        "Fellow",
+                        '[{"value":"Alex"}]',
+                        2,
+                        '[{"canonical_name":"Alex Chen","primary_email":"alex@other.example","emails":["alex@other.example"],"organization":"Other Org","job_title":""},{"canonical_name":"Alex Rivera","primary_email":"alex@example.org","emails":["alex@example.org"],"organization":"Example Org","job_title":"Tech Lead"}]',
+                    )
+                ]
+            if "@marts_messages_messages" in sql:
+                return [("alex rivera", 42)]
+            if "@gmail_messages" in sql:
+                return [("alex@example.org", 15), ("alexvance@example.org", 2)]
+            if "@calendar_events" in sql:
+                return [('[{"email":"alex@example.org"}]',), ('[{"email":"alexvance@example.org"}]',)]
+            return []
+
+    hints = load_contact_alias_hints(
+        Warehouse(),
+        recording={"title": "Call", "transcript_text": "Thanks for joining, Alex.", "recorded_at": datetime(2026, 3, 10, tzinfo=UTC)},
+        transcript_segments=[],
+    )
+
+    assert len(hints) == 1
+    assert hints[0]["canonical_name"] == "Alexander Vance"
+    assert hints[0]["is_ambiguous"] is True
+    assert hints[0]["recent_interaction_count"] == 3
+    assert hints[0]["other_given_name_match_count"] == 2
+    # Close collaborator Alex Rivera ranks #1 ahead of alphabetically earlier Alex Chen
+    assert [c["canonical_name"] for c in hints[0]["competing_contacts"]] == ["Alex Rivera", "Alex Chen"]
+    assert hints[0]["competing_contacts"][0]["recent_interaction_count"] == 58
+    assert hints[0]["competing_contacts"][1]["recent_interaction_count"] == 0
+
+
+def test_enrichment_runner_does_not_blindly_rewrite_contact_nicknames(monkeypatch) -> None:
+    from personal_data_warehouse import apple_voice_memos_enrichment as module
+
+    assert not hasattr(module, "apply_contact_alias_corrections")
+
+    class AliasClient:
+        model = "test-model"
+
+        def create_agentic_structured(self, **_kwargs):
+            return {
+                "calendar_event_id": "",
+                "calendar_confidence": 0.0,
+                "title": "Planning call with Alex",
+                "start_at": "2026-03-10T15:00:00+00:00",
+                "end_at": "2026-03-10T15:30:00+00:00",
+                "participants": ["Jordan Example", "Alex Rivera"],
+                "speaker_map": [
+                    {"speaker_label": "A", "speaker_name": "Jordan Example", "confidence": 0.99, "evidence": "host"},
+                    {"speaker_label": "B", "speaker_name": "Alex Rivera", "confidence": 0.95, "evidence": "project thread"},
+                ],
+                "speaker_turns": [],
+                "transcript_corrections": [],
+                "transcript": "Jordan Example: Thanks for joining, Alex.\n\nAlex Rivera: The draft is ready.",
+                "summary": "Jordan and Alex Rivera reviewed the draft. Alex shared next steps.",
+                "action_items": ["Follow up with Alex."],
+                "evidence": ["Project thread says Alex owns the draft."],
+            }
+
+    candidate = {
+        "source": "android_call_recordings",
+        "account": "account@example.com",
+        "recording_id": "call-1",
+        "content_sha256": "sha",
+        "recorded_at": datetime(2026, 3, 10, 15, 0, 0, tzinfo=UTC),
+        "title": "Call",
+        "transcript_text": "Thanks for joining, Alex.",
+        "provider_transcript_id": "tx-1",
+    }
+    warehouse = _RunnerWarehouse("tx-1")
+    monkeypatch.setattr(module, "load_enrichment_candidates", lambda *_a, **_k: [dict(candidate)])
+    monkeypatch.setattr(module, "load_calendar_candidates", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        module,
+        "load_transcript_segments",
+        lambda *_a, **_k: [{"segment_index": 0, "speaker_label": "A", "start_ms": 0, "end_ms": 1000, "text": "Thanks for joining, Alex."}],
+    )
+    monkeypatch.setattr(
+        module,
+        "load_contact_alias_hints",
+        lambda *_a, **_k: [
             {
-                "mention": "Ace",
-                "canonical_name": "Taylor Example",
-                "given_name": "Taylor",
-                "aliases": ["Ace"],
+                "mention": "Alex",
+                "canonical_name": "Alexander Vance",
+                "given_name": "Alexander",
+                "family_name": "Vance",
+                "aliases": ["Alex"],
+                "is_ambiguous": True,
+                "other_given_name_match_count": 2,
+                "competing_contacts": [{"canonical_name": "Alex Rivera", "primary_email": "alex@example.org"}],
             }
         ],
     )
+    monkeypatch.setattr(module, "load_event_identity_hints", lambda *_a, **_k: {})
+    monkeypatch.setattr(module, "current_provider_transcript_id", lambda wh, _recording: wh.current_transcript_id)
 
-    assert corrected["summary"] == "Taylor will send the draft. Ace Cooper is a different full-name phrase."
-    assert corrected["action_items"] == ["Ask Taylor to follow up."]
-    assert corrected["evidence"] == ["Contact alias data maps 'Taylor' to Taylor Example."]
-    assert corrected["transcript"] == "Jordan Example: I talked to Taylor about it."
-    assert corrected["speaker_map"][0]["evidence"] == "Taylor appears in ASR."
+    module.VoiceMemosEnrichmentRunner(warehouse=warehouse, client=AliasClient(), logger=_Logger()).sync(limit=1)
+
+    assert len(warehouse.enrichment_rows) == 1
+    row = warehouse.enrichment_rows[0]
+    assert "Alexander" not in row["title"]
+    assert "Alexander" not in row["summary"]
+    assert "Alexander" not in row["transcript"]
+    assert "Alexander" not in row["evidence_json"]
+    assert "Thanks for joining, Alex." in row["transcript"]
+    assert "Alex owns the draft." in row["evidence_json"]
+
+
+def test_enrichment_prompt_treats_contact_nicknames_as_non_authoritative_candidates() -> None:
+    prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
+
+    assert "NOT a source of truth" in prompt
+    assert "competing_contacts" in prompt
+    assert "recent_interaction_count" in prompt
+    assert "explicit prior identity clarification" in prompt
+    assert "unrelated email or a contact nickname alone is never evidence" in prompt
+    assert "keep the name exactly as spoken" in prompt
+    assert "source-of-truth candidate" not in prompt
+    assert "merely exact contact match" not in prompt
 
 
 def test_load_enrichment_candidates_scans_all_recording_history_without_limit() -> None:
@@ -1630,7 +1760,7 @@ def test_enrichment_prompt_teaches_sessions_spans_and_sectioned_summaries() -> N
     assert "one speaker_turns entry per turn" in prompt
     assert "introduced by first name only" in prompt
     assert "recording owner" in prompt
-    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v11"
+    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v12"
 
 
 def test_an_unresolved_label_is_not_named_after_someone_its_evidence_merely_mentions() -> None:

@@ -4545,6 +4545,188 @@ def test_postgres_contact_card_incremental_delete_removes_card_from_clean_contac
     assert clean_rows == [(0,)]
 
 
+def test_postgres_load_contact_alias_hints_flags_ambiguity_and_ranks_by_interaction(
+    warehouse: PostgresWarehouse,
+) -> None:
+    from personal_data_warehouse.apple_voice_memos_enrichment import load_contact_alias_hints
+
+    warehouse.ensure_contacts_tables()
+    warehouse.ensure_tables()
+    warehouse.ensure_calendar_tables()
+    warehouse.ensure_apple_messages_tables()
+    warehouse.ensure_whatsapp_tables()
+
+    recorded_at = datetime(2026, 3, 10, 15, 0, tzinfo=UTC)
+    recent_at = datetime(2026, 3, 7, 15, 0, tzinfo=UTC)
+
+    cards = [
+        # Nickname holder whose nickname ("Alex") collides with 10 same-given-name contacts.
+        _contact_card_row(
+            card_id="people/nick-alex",
+            display_name="Alexander Vance",
+            given_name="Alexander",
+            family_name="Vance",
+            primary_email="alexvance@example.org",
+            emails=[{"value": "alexvance@example.org"}],
+            organization="Example Org",
+            job_title="Fellow",
+            nicknames=[{"value": "Alex"}],
+            sync_version=10,
+        ),
+        # Unambiguous nickname holder ("Ace", zero same-given-name contacts).
+        _contact_card_row(
+            card_id="people/nick-ace",
+            display_name="Jordan Example",
+            given_name="Jordan",
+            family_name="Example",
+            primary_email="jordan@example.org",
+            emails=[{"value": "jordan@example.org"}],
+            nicknames=[{"value": "Ace"}],
+            sync_version=10,
+        ),
+        # Close collaborator placed alphabetically LAST (after 9 other Alex A..I contacts)
+        # so it would be dropped by the cap of 8 without interaction-based ranking.
+        # Split across two cards (personal + work) to verify multi-card email aggregation.
+        _contact_card_row(
+            card_id="people/alex-z-personal",
+            display_name="Alex Zeta",
+            given_name="Alex",
+            family_name="Zeta",
+            primary_email="alex.zeta@personal.example",
+            emails=[{"value": "alex.zeta@personal.example"}],
+            organization="Example Org",
+            job_title="Tech Lead",
+            sync_version=10,
+        ),
+        _contact_card_row(
+            card_id="people/alex-z-work",
+            display_name="Alex Zeta",
+            given_name="Alex",
+            family_name="Zeta",
+            primary_email="alex@example.org",
+            emails=[{"value": "alex@example.org"}],
+            organization="",
+            sync_version=10,
+        ),
+    ]
+    for letter in "ABCDEFGHI":
+        cards.append(
+            _contact_card_row(
+                card_id=f"people/alex-{letter.lower()}",
+                display_name=f"Alex {letter}person",
+                given_name="Alex",
+                family_name=f"{letter}person",
+                primary_email=f"alex.{letter.lower()}@other.example",
+                emails=[{"value": f"alex.{letter.lower()}@other.example"}],
+                organization="Other Org",
+                sync_version=10,
+            )
+        )
+    warehouse.insert_contact_cards(cards)
+
+    # Seed real interactions: Alex Zeta has 3 messages + 2 emails + 1 calendar event = 6;
+    # Alexander Vance has 1 calendar event = 1; all other Alex A..I have 0.
+    warehouse.insert_apple_message_handles(
+        [
+            {
+                "account": "zach@example.test",
+                "handle_id": "handle-zeta",
+                "handle_rowid": 1,
+                "address": "alex@example.org",
+                "country": "US",
+                "service": "iMessage",
+                "uncanonicalized_id": "",
+                "person_centric_id": "",
+                "raw_metadata_json": "{}",
+                "ingested_at": recent_at,
+                "sync_version": 10,
+            }
+        ]
+    )
+    warehouse.insert_apple_messages(
+        [
+            _default_row(
+                APPLE_MESSAGE_COLUMNS,
+                account="zach@example.test",
+                message_id=f"imsg-{i}",
+                message_rowid=i + 1,
+                handle_id="handle-zeta",
+                body_text="Checking in on the project.",
+                message_at=recent_at,
+                ingested_at=recent_at,
+                sync_version=10,
+            )
+            for i in range(3)
+        ]
+    )
+    warehouse.insert_messages(
+        [
+            {
+                **_message_row(message_id=f"gm-{i}", subject="Project update", labels=["INBOX"], sync_version=10),
+                "internal_date": recent_at,
+                "to_addresses": ["alex@example.org"],
+            }
+            for i in range(2)
+        ]
+    )
+    warehouse.insert_calendar_events(
+        [
+            _default_row(
+                CALENDAR_EVENT_COLUMNS,
+                account="zach@example.test",
+                calendar_id="primary",
+                event_id="ev-zeta",
+                summary="Weekly Sync",
+                attendees_json='[{"email":"alex@example.org"}]',
+                start_at=recent_at,
+                end_at=recent_at,
+                synced_at=recent_at,
+                sync_version=10,
+            ),
+            _default_row(
+                CALENDAR_EVENT_COLUMNS,
+                account="zach@example.test",
+                calendar_id="primary",
+                event_id="ev-vance",
+                summary="Cohort Check-in",
+                attendees_json='[{"email":"alexvance@example.org"}]',
+                start_at=recent_at,
+                end_at=recent_at,
+                synced_at=recent_at,
+                sync_version=10,
+            ),
+        ]
+    )
+
+    hints = load_contact_alias_hints(
+        warehouse,
+        recording={
+            "title": "Call",
+            "recorded_at": recorded_at,
+            "transcript_text": "Thanks for joining, Alex. Also tell Ace hello.",
+        },
+        transcript_segments=[],
+    )
+
+    by_mention = {h["mention"]: h for h in hints}
+    assert set(by_mention) == {"Alex", "Ace"}
+
+    alex_hint = by_mention["Alex"]
+    assert alex_hint["canonical_name"] == "Alexander Vance"
+    assert alex_hint["is_ambiguous"] is True
+    assert alex_hint["other_given_name_match_count"] == 10
+    assert alex_hint["recent_interaction_count"] == 1
+    assert len(alex_hint["competing_contacts"]) == 8
+    assert alex_hint["competing_contacts"][0]["canonical_name"] == "Alex Zeta"
+    assert alex_hint["competing_contacts"][0]["recent_interaction_count"] == 6
+
+    ace_hint = by_mention["Ace"]
+    assert ace_hint["canonical_name"] == "Jordan Example"
+    assert ace_hint["is_ambiguous"] is False
+    assert ace_hint["other_given_name_match_count"] == 0
+    assert ace_hint["competing_contacts"] == []
+
+
 def test_ensure_view_replaces_view_whose_columns_cannot_be_dropped(warehouse: PostgresWarehouse) -> None:
     # CREATE OR REPLACE VIEW cannot drop a column, and this database is shared:
     # another checkout running a different revision leaves views whose shape does
