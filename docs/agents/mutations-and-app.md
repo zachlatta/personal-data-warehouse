@@ -74,6 +74,16 @@ back it, all behind the static bearer the CLI uses:
   The forward is filed in the original's thread, as Gmail files its own.
   `tests/test_email_attachments_e2e.py` drives the whole path: real proposal, phone-shaped
   edit and approval through the API, real worker, loopback Gmail.
+- **An email names its people, not just their addresses.** At proposal and at every
+  reviewer edit (`app/internal/mutations/gmail_addresses.go`) the store writes
+  `message.from` as `Name <account>` and each bare To/Cc/Bcc address as `Name <addr>`, so
+  the reviewer approves the headers that go out. A name comes from
+  `marts_contacts.contact_points` when every card for the address agrees, else from the
+  `From` headers of recent `base_gmail.messages` when they all agree (a Google Group's
+  "Person via Group" counts as the group); a conflict leaves the address bare rather than
+  guess, and a name the agent or reviewer typed is kept. The executor
+  (`build_email_raw` in `gmail_mutations.py`) only formats what is stored, RFC 2047 for
+  non-ASCII names, and sends a bare `From` when the payload has none.
 - **A batch is reviewed as the thing it is about, not as its payload.** A request is
   n mutations, and n is routinely in the hundreds — 43 Gmail threads, 277 Slack
   conversations — so a review that renders each mutation's JSON is a review that gets

@@ -208,7 +208,7 @@ func (s *PostgresStore) lookupGmailFromDisplayName(ctx context.Context, email st
 		  AND lower(from_address) = $2
 		ORDER BY internal_date DESC
 		LIMIT $3
-	`, escapeLikeLiteral(email), email, gmailRecipientNameCandidateLimit)
+	`, likeEscape(email), email, gmailRecipientNameCandidateLimit)
 	if err != nil {
 		return ""
 	}
@@ -256,11 +256,6 @@ func normalizeGmailFromDisplayName(name string) string {
 		}
 	}
 	return name
-}
-
-func escapeLikeLiteral(value string) string {
-	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return replacer.Replace(value)
 }
 
 func applyGmailEmailDisplayNames(mutations []storedMutation, names map[string]string) []storedMutation {
