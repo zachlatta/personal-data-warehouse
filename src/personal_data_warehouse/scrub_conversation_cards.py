@@ -32,6 +32,11 @@ from personal_data_warehouse.card_prefilter import ConfirmationPool, available_c
 TABLES = (*_AI_CONVERSATION_EVENT_TABLES, 'timeline_events', 'search_chunks')
 # A session this large runs in its own group (see apply_batches).
 LARGE_SESSION_ROWS = 10000
+# The in-window recheck costs about 0.7 s per prefiltered MB in production, so a
+# group of at most 40 MB stays well inside its 60-second transaction; a heavier
+# session runs alone under the 300-second large-session deadline.
+MAX_GROUP_BYTES = 40_000_000
+LARGE_SESSION_WINDOW_SECONDS = 300
 DERIVED = ('timeline_events', 'search_chunks')
 row_matches = count_row
 
@@ -305,7 +310,7 @@ def catch_up(warehouse, plan, *, selector=None, workers=1, path=None, max_passes
     if 'discovery' in plan: raise ValueError('partition discovery incomplete')
     for _ in range(max_passes):
         watermarks=_watermarks(warehouse,warehouse._connection)
-        with ConfirmationPool(workers,selector) as pool:
+        with ConfirmationPool(workers,selector,tally=False) as pool:
             delta=_selected_delta(warehouse,plan,pool)
         indexed={(c['table'],tuple(c['key'])):c for c in plan['candidates']}
         indexed.update({(c['table'],tuple(c['key'])):c for c in delta})
@@ -383,12 +388,14 @@ def _validate_plan(plan):
     if 'batches' in plan:
         state=plan['batches']
         if set(state)!={'completed','oversized'}: raise ValueError('invalid batch checkpoint')
+        # Built once: every progress save validates the whole checkpoint while
+        # writers are stopped, and a set per batch record cost groups x candidates.
+        known={tuple(c['session']) for c in plan['candidates'] if c['session']}
         for group in state['completed']+state['oversized']:
             if set(group)!={'sessions','canonical_rows','seconds'} or not isinstance(group['sessions'],list):
                 raise ValueError('invalid batch record')
             if type(group['canonical_rows']) is not int or group['canonical_rows']<0 or not isinstance(group['seconds'],(float,int)) or not 0<=group['seconds']<float('inf'):
                 raise ValueError('invalid batch measurements')
-            known={tuple(c['session']) for c in plan['candidates'] if c['session']}
             if any(not isinstance(s,list) or len(s)!=2 or tuple(s) not in known for s in group['sessions']):
                 raise ValueError('invalid batch session')
     if 'discovery' in plan:
@@ -472,7 +479,7 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
                 raise ValueError('canonical row gate exceeded; no changes committed')
         planned={(c['table'],tuple(c['key'])) for c in (_known_plan or plan)['candidates']}
         phase('delta_guard')
-        with ConfirmationPool(workers,selector) as pool:
+        with ConfirmationPool(workers,selector,tally=False) as pool:
             delta=(_session_candidates(warehouse,plan,pool) if planned_only else
                    _selected_delta(warehouse,plan,pool,page_size,max_delta_rows))
             for item in delta:
@@ -499,7 +506,7 @@ def scrub(warehouse, *, apply=False, page_size=500, workers=1, plan=None, select
         # Recheck saved keys without running whole-corpus detection in-window.
         phase('verification')
         rows=[row for _,row in _planned_rows(warehouse,plan['candidates'],prefilter_scope=selector.scope if selector else 'all')]
-        with ConfirmationPool(workers,selector) as pool:
+        with ConfirmationPool(workers,selector,tally=False) as pool:
             if any(pool.counts(rows)): raise RuntimeError('planned row verification failed; no changes committed')
     return plan['counts']
 
@@ -562,6 +569,19 @@ def _canonical_counts(warehouse, sessions, limit):
         for s in sorted(sessions)}
 
 
+def _session_bytes(warehouse, sessions, scope):
+    """Bytes of each session's rows that pass the scan prefilter, read live.
+
+    The in-window recheck confirms exactly these rows, so its time follows
+    these bytes (about 0.7 s per MB in production), not the row count.
+    """
+    from personal_data_warehouse.postgres import _AI_EVENT_TABLE_BY_SOURCE
+    prefilter=sql_prefilter('to_jsonb(candidate)::text',scope=scope)
+    return {s:int(warehouse._query(f'SELECT COALESCE(sum(octet_length(to_jsonb(candidate)::text)),0) '
+        f'FROM @{_AI_EVENT_TABLE_BY_SOURCE[s[0]]} candidate WHERE source=%s AND session_id=%s AND {prefilter}',s)[0][0])
+        for s in sorted(sessions)}
+
+
 def session_subplan(warehouse, plan, session, *, selector):
     """Reconfirm one session from a fully scanned checkpoint while live.
 
@@ -619,7 +639,7 @@ def apply_session(warehouse, plan, session, *, selector, window, exact_source_ro
     # the checkpoint horizon: this fence is valid only for this apply attempt.
     fence = _watermarks(warehouse, warehouse._connection)
     known_ids = {(c['table'], tuple(c['key'])) for c in plan['candidates']}
-    with ConfirmationPool(workers, selector) as pool:
+    with ConfirmationPool(workers,selector,tally=False) as pool:
         for item in _selected_delta(warehouse, plan, pool, limit=max_delta_rows):
             if (item['table'], tuple(item['key'])) not in known_ids:
                 raise RuntimeError('new candidates require discovery; no changes committed')
@@ -642,13 +662,16 @@ def apply_session(warehouse, plan, session, *, selector, window, exact_source_ro
 def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_partial=False,
                   max_canonical_rows=2500, window_seconds=45, gap_seconds=15,
                   max_source_rows=500, max_plan_rows=20000, max_delta_rows=1000,
-                  progress=None, planned_only=False, max_groups=None, large_session_window_seconds=None):
+                  progress=None, planned_only=False, max_groups=None,
+                  large_session_window_seconds=LARGE_SESSION_WINDOW_SECONDS, max_group_bytes=MAX_GROUP_BYTES):
     """One owner; live planning, then an atomic transaction per session group.
 
     ``max_groups`` bounds one run (one writer outage); the checkpoint records
-    each completed group, so the next run resumes with the rest. A session over
-    LARGE_SESSION_ROWS canonical rows runs alone, under
-    ``large_session_window_seconds`` (at most 300) when given.
+    each completed group, so the next run resumes with the rest. A group holds
+    at most ``max_canonical_rows`` rows and ``max_group_bytes`` prefiltered
+    bytes (the in-window recheck's cost). A session over LARGE_SESSION_ROWS
+    rows or over the byte cap runs alone, under ``large_session_window_seconds``
+    (at most 300, the default), so one heavy session can still finish.
 
     ``window(index)`` must pause writers on entry and restore them in finally,
     including on partial entry failure. Completion is persisted AFTER restore.
@@ -660,7 +683,7 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     # 60-second transaction deadline still rolls back a group that overruns.
     if (not 0<max_canonical_rows<=(30000 if planned_only else 5000) or not 0<window_seconds<=60 or gap_seconds<0
             or max_groups is not None and max_groups<1
-            or large_session_window_seconds is not None and not 0<large_session_window_seconds<=300):
+            or not 0<large_session_window_seconds<=300 or not 0<max_group_bytes):
         raise ValueError('invalid batch budget')
     plan=read_plan(Path(path))
     if 'discovery' in plan and not allow_partial: raise ValueError('partition discovery incomplete')
@@ -675,25 +698,27 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     state=plan.setdefault('batches',dict(completed=[],oversized=[]))
     completed={tuple(s) for g in state['completed'] for s in g['sessions']}
     # Never silently trust a completion if an old key has become selected again.
-    with ConfirmationPool(workers,selector) as pool:
+    with ConfirmationPool(workers,selector,tally=False) as pool:
         finished=[c for c in plan['candidates'] if tuple(c['session']) in completed]
         if any(pool.counts([row for _,row in _planned_rows(warehouse,finished)])):
             raise RuntimeError('completed session changed; rediscovery required')
     sessions={tuple(c['session']) for c in plan['candidates']}-completed
     counts=_canonical_counts(warehouse,sessions,max_canonical_rows)
     state['oversized']=[dict(sessions=[list(s)],canonical_rows=n,seconds=0) for s,n in counts.items() if n>max_canonical_rows]
-    groups=[]; group=[]; total=0
+    sizes=_session_bytes(warehouse,{s for s,n in counts.items() if n<=max_canonical_rows},selector.scope if selector else 'all')
+    groups=[]; group=[]; total=0; size=0
     for s,n in counts.items():
         if n>max_canonical_rows: continue
-        if n>LARGE_SESSION_ROWS:
-            groups.append(([s],n)); continue
-        if group and total+n>max_canonical_rows:
-            groups.append((group,total)); group=[]; total=0
-        group.append(s); total+=n
-    if group: groups.append((group,total))
+        if n>LARGE_SESSION_ROWS or sizes[s]>max_group_bytes:
+            groups.append(([s],n,True)); continue
+        if group and (total+n>max_canonical_rows or size+sizes[s]>max_group_bytes):
+            groups.append((group,total,False)); group=[]; total=0; size=0
+        group.append(s); total+=n; size+=sizes[s]
+    if group: groups.append((group,total,False))
     _checkpoint(path,plan)
-    if progress: progress(dict(groups=len(groups),oversized_sessions=len(state['oversized']),canonical_rows=sum(counts.values())))
-    for index,(sessions,total) in enumerate(groups):
+    if progress: progress(dict(groups=len(groups),oversized_sessions=len(state['oversized']),canonical_rows=sum(counts.values()),
+                               prefiltered_bytes=sum(sizes.values())))
+    for index,(sessions,total,alone) in enumerate(groups):
         if max_groups is not None and index>=max_groups: break
         time.sleep(gap_seconds)  # workers LIVE, including after a resumed run
         candidates=[c for c in plan['candidates'] if tuple(c['session']) in sessions]
@@ -705,7 +730,6 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
         known=dict(plan,candidates=plan['candidates']+candidates)
         started=time.monotonic()
         with window(index):
-            alone=len(sessions)==1 and total>LARGE_SESSION_ROWS and large_session_window_seconds
             scrub(warehouse,apply=True,plan=subset,selector=selector,workers=workers,
                   max_source_rows=max_source_rows,max_plan_rows=max_plan_rows,
                   max_delta_rows=max_delta_rows,window_seconds=large_session_window_seconds if alone else window_seconds,
@@ -742,7 +766,7 @@ def _apply_plan(warehouse, plan, page_size, workers, selector=None, *, planned_o
             identity=session_identity(row)
             if identity in sessions:active.add(identity)
     updates={}
-    with ConfirmationPool(workers, selector) as pool:
+    with ConfirmationPool(workers,selector,tally=False) as pool:
         sources=[]
         for ((table,_),row),matches in zip(current.items(),pool.counts(list(current.values())),strict=True):
             if not matches: continue
@@ -815,7 +839,7 @@ def _mask_stale_copies(warehouse, rows, workers, selector, page_size):
     hash's embedding is dropped, as for a regenerated chunk.
     """
     updates={}; old_shas=[]
-    with ConfirmationPool(workers,selector) as pool:
+    with ConfirmationPool(workers,selector,tally=False) as pool:
         for offset in range(0,len(rows),page_size):
             batch=rows[offset:offset+page_size]
             for (table,row),cleaned in zip(batch,pool.redacted([row for _,row in batch]),strict=True):
@@ -845,7 +869,8 @@ def _mask_stale_copies(warehouse, rows, workers, selector, page_size):
 
 def rebuild_sessions(warehouse, sessions, page_size, selector=None):
     from personal_data_warehouse.postgres import _AI_EVENT_TABLE_BY_SOURCE
-    from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
+    from personal_data_warehouse.timeline import (TIMELINE_MASKED_COLUMNS, TIMELINE_NORMALIZED_COLUMNS,
+                                                  TimelineSyncEngine, adapter_by_name, masked_rows)
 
     stamp = warehouse._query('SELECT now()')[0][0]
     if any(source not in _AI_EVENT_TABLE_BY_SOURCE for source,_ in sessions):
@@ -870,6 +895,7 @@ def rebuild_sessions(warehouse, sessions, page_size, selector=None):
     keys = set()
     regenerated_keys = set()
     rebuilt_sessions = set()
+    checked = [TIMELINE_NORMALIZED_COLUMNS.index(c) for c in TIMELINE_MASKED_COLUMNS]
     for name in ('agent_session', 'agent_session_turn'):
         adapter = adapter_by_name(name)
         watermark_ts, watermark_id = stamp, ''
@@ -879,11 +905,13 @@ def rebuild_sessions(warehouse, sessions, page_size, selector=None):
             if not rows:
                 break
             selected = []
-            for row in rows:
+            # The same post-cut masking ingest-time sync applies, checked
+            # before the write: a cut fragment is masked, anything else refuses.
+            for row in (masked_rows(rows) if adapter.mask_credentials else rows):
                 identity = session_identity(dict(source_pk=row[9]))
                 if identity not in sessions:
                     continue
-                if any((selector.count if selector else sensitive_count)(str(row[i])) for i in (6, 7, 10, 11)):
+                if any((selector.count if selector else sensitive_count)(str(row[i])) for i in checked):
                     raise RuntimeError('canonical regeneration still contains selected sensitive data; no changes committed')
                 selected.append(row)
                 keys.add((name, row[0]))
@@ -897,7 +925,7 @@ def rebuild_sessions(warehouse, sessions, page_size, selector=None):
                         regenerated_keys.add((name, pk['event_uuid'], identity))
                 if name == 'agent_session':
                     rebuilt_sessions.add(identity)
-            engine._upsert(adapter, selected)
+            engine._upsert(adapter, selected, masked=True)
             watermark_ts, watermark_id = rows[-1][12], rows[-1][0]
     if rebuilt_sessions != sessions:
         raise RuntimeError('canonical source missing for affected session; no changes committed')
@@ -978,7 +1006,10 @@ def main():
     parser.add_argument('--max-delta-rows',type=int,default=10000)
     parser.add_argument('--max-plan-rows',type=int,default=20000)
     parser.add_argument('--window-seconds',type=int,default=60)
-    parser.add_argument('--large-session-window-seconds',type=int,help='session batches: deadline (<= 300) for a lone session over 10,000 rows')
+    parser.add_argument('--large-session-window-seconds',type=int,default=LARGE_SESSION_WINDOW_SECONDS,
+                        help='session batches: deadline (<= 300) for a lone session over 10,000 rows or over --max-group-mb')
+    parser.add_argument('--max-group-mb',type=int,default=MAX_GROUP_BYTES//1_000_000,
+                        help='session batches: prefiltered megabytes per group; a heavier session runs alone')
     parser.add_argument('--session-batches',action='store_true',help='apply complete sessions in separate bounded transactions')
     parser.add_argument('--planned-only',action='store_true',help='credentials only: indexed planned-session repair; unrelated sessions require full post-restore verify')
     parser.add_argument('--writers-paused',action='store_true',help='acknowledge external writer shutdown and guaranteed restoration')
@@ -1020,7 +1051,7 @@ def main():
                     workers=args.workers,planned_only=True,max_canonical_rows=args.max_canonical_rows,
                     window_seconds=args.window_seconds,gap_seconds=0,max_source_rows=args.max_source_rows,
                     max_plan_rows=args.max_plan_rows,max_delta_rows=args.max_delta_rows,max_groups=args.max_groups,
-                    large_session_window_seconds=args.large_session_window_seconds)
+                    large_session_window_seconds=args.large_session_window_seconds,max_group_bytes=args.max_group_mb*1_000_000)
                 if plan['batches']['oversized']: raise RuntimeError('oversized sessions remain; repair incomplete')
                 done={tuple(s) for g in plan['batches']['completed'] for s in g['sessions']}
                 left={tuple(c['session']) for c in plan['candidates']}-done

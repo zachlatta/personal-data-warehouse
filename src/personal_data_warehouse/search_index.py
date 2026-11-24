@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import functools
 import hashlib
 import logging
 import os
@@ -237,6 +238,13 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+@functools.cache
+def _credential_masked_adapters() -> frozenset[str]:
+    from personal_data_warehouse.timeline import TIMELINE_ADAPTERS
+
+    return frozenset(adapter.name for adapter in TIMELINE_ADAPTERS if adapter.mask_credentials)
+
+
 def split_text(text: str, *, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> list[str]:
     """Split a document into chunks on line boundaries where possible.
 
@@ -338,7 +346,26 @@ class SearchChunkBuilder:
 
     def _plain_chunks(self, row: dict[str, Any]) -> list[_ChunkRow]:
         anchor = f"{row['adapter']}|{row['event_id']}"
-        pieces = split_text(row["search_text"] or "")
+        document = row["search_text"] or ""
+        pieces = split_text(document)
+        if row["adapter"] in _credential_masked_adapters():
+            # A chunk is a window of an agent transcript: mask what each cut
+            # selects and drop a marker it cut through (derived_redaction).
+            from personal_data_warehouse.derived_redaction import mask_cut
+
+            last = len(pieces) - 1
+            pieces = [
+                masked
+                for index, piece in enumerate(pieces)
+                if len(
+                    masked := mask_cut(
+                        piece,
+                        cut_start=index > 0,
+                        cut_end=index < last or len(document) > DOCUMENT_MAX_CHARS,
+                    ).strip()
+                )
+                >= CHUNK_MIN_CHARS
+            ]
         return [
             _ChunkRow(
                 chunk_id=f"{anchor}#{index}",

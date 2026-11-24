@@ -106,6 +106,18 @@ def test_apply_passes_the_group_cap_so_a_retry_can_isolate_a_session(tmp_path, m
     assert cards[cards.index('--large-session-window-seconds')+1] == '240'
     with pytest.raises(ValueError):
         m.apply(tmp_path,large_session_window_seconds=301)
+    # The recheck costs about 0.7 s per prefiltered MB, so groups are also
+    # capped by bytes; the default keeps a group well inside 60 seconds.
+    calls.clear()
+    m.apply(tmp_path)
+    cards=next(c for c in calls if 'personal_data_warehouse.scrub_conversation_cards' in c)
+    assert cards[cards.index('--max-group-mb')+1] == '40'
+    calls.clear()
+    m.apply(tmp_path,max_group_mb=25)
+    cards=next(c for c in calls if 'personal_data_warehouse.scrub_conversation_cards' in c)
+    assert cards[cards.index('--max-group-mb')+1] == '25'
+    with pytest.raises(ValueError):
+        m.apply(tmp_path,max_group_mb=0)
 
 
 def test_verify_removes_the_runtime_environment_only_after_clean_scans(tmp_path, monkeypatch):

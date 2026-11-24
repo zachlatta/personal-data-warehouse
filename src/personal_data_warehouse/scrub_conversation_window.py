@@ -112,13 +112,14 @@ def restore(directory):
 
 
 def apply(directory, max_canonical_rows=5000, max_source_rows=500, max_plan_rows=20000, max_groups=None,
-          large_session_window_seconds=None):
+          large_session_window_seconds=None, max_group_mb=40):
     # A group that overruns its 60-second transaction rolls back; rerunning
     # apply with a cap just above the largest session isolates it.
     if not 0<max_canonical_rows<=30000: raise ValueError('--max-canonical-rows must be 1..30000')
     if max_groups is not None and max_groups<1: raise ValueError('--max-groups must be positive')
     if large_session_window_seconds is not None and not 0<large_session_window_seconds<=300:
         raise ValueError('--large-session-window-seconds must be 1..300')
+    if not 0<max_group_mb: raise ValueError('--max-group-mb must be positive')
     state=json.loads((directory/'state.json').read_text())
     assert_current(state)
     save(directory/'before-stop.json',snapshot(state),replace=True)
@@ -129,6 +130,7 @@ def apply(directory, max_canonical_rows=5000, max_source_rows=500, max_plan_rows
         runtime(directory,state,'cards','--apply','--session-batches','--planned-only',
                 '--writers-paused','--max-canonical-rows',str(max_canonical_rows),'--window-seconds','60',
                 '--max-source-rows',str(max_source_rows),'--max-plan-rows',str(max_plan_rows),
+                '--max-group-mb',str(max_group_mb),
                 *(['--max-groups',str(max_groups)] if max_groups else []),
                 *(['--large-session-window-seconds',str(large_session_window_seconds)] if large_session_window_seconds else []))
     finally:
@@ -197,7 +199,8 @@ def main():
     parser.add_argument('--max-source-rows',type=int,default=500,help='apply only: matching source rows the whole plan may hold')
     parser.add_argument('--max-plan-rows',type=int,default=20000,help='apply only: source and derived rows the whole plan may hold')
     parser.add_argument('--max-groups',type=int,help='apply only: session groups per writer outage; rerun apply to resume')
-    parser.add_argument('--large-session-window-seconds',type=int,help='apply only: deadline (<= 300) for a lone session over 10,000 rows')
+    parser.add_argument('--large-session-window-seconds',type=int,help='apply only: deadline (<= 300, default 300) for a lone session over 10,000 rows or --max-group-mb')
+    parser.add_argument('--max-group-mb',type=int,default=40,help='apply only: prefiltered megabytes per session group (the recheck runs about 0.7 s per MB)')
     parser.add_argument('--exported-from')
     parser.add_argument('--exported-before')
     parser.add_argument('--max-objects',type=int,default=70000)
@@ -212,7 +215,7 @@ def main():
                         '--max-objects',str(args.max_objects),'--max-bytes',str(args.max_bytes)])
     elif args.phase.startswith('archive-'): archive(directory,args.phase.removeprefix('archive-'))
     elif args.phase=='apply': apply(directory,args.max_canonical_rows,args.max_source_rows,args.max_plan_rows,args.max_groups,
-                                         args.large_session_window_seconds)
+                                         args.large_session_window_seconds,args.max_group_mb)
     else: globals()[args.phase](directory)
 
 

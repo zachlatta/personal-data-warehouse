@@ -116,6 +116,7 @@ def test_plan_wide_row_gates_follow_the_explicit_flags(tmp_path, monkeypatch):
     monkeypatch.setattr(module, '_scope', lambda warehouse: plan['scope'])
     monkeypatch.setattr(module, '_planned_rows', lambda warehouse, candidates, **k: [])
     monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, sessions, limit: {})
+    monkeypatch.setattr(module, '_session_bytes', lambda warehouse, sessions, scope: {})
     from contextlib import nullcontext
     with pytest.raises(ValueError, match='candidate gate exceeded'):
         module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True)
@@ -136,6 +137,7 @@ def test_session_groups_can_be_applied_a_bounded_number_at_a_time(tmp_path, monk
     monkeypatch.setattr(module, '_scope', lambda warehouse: plan['scope'])
     monkeypatch.setattr(module, '_planned_rows', lambda warehouse, candidates, **k: [])
     monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, sessions, limit: {s: 12000 for s in sessions})
+    monkeypatch.setattr(module, '_session_bytes', lambda warehouse, sessions, scope: {s: 1000 for s in sessions})
     monkeypatch.setattr(module, 'scrub', lambda warehouse, plan, **k: applied.append([c['session'] for c in plan['candidates']]))
     kwargs = dict(window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True,
                   max_canonical_rows=12000, gap_seconds=0)
@@ -199,6 +201,7 @@ def test_a_large_session_runs_alone_under_its_own_deadline(tmp_path, monkeypatch
     monkeypatch.setattr(module, '_scope', lambda warehouse: plan['scope'])
     monkeypatch.setattr(module, '_planned_rows', lambda warehouse, candidates, **k: [])
     monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, s, limit: {k: sessions[k] for k in s})
+    monkeypatch.setattr(module, '_session_bytes', lambda warehouse, s, scope: {k: 1000 for k in s})
     monkeypatch.setattr(module, 'scrub', lambda warehouse, plan, **k: windows.update(
         {tuple(sorted(c['session'][1] for c in plan['candidates'])): k['window_seconds']}))
     module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True,
@@ -207,3 +210,107 @@ def test_a_large_session_runs_alone_under_its_own_deadline(tmp_path, monkeypatch
     with pytest.raises(ValueError, match='budget'):
         module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'),
                              planned_only=True, large_session_window_seconds=301)
+
+
+def _byte_plan(module, tmp_path, names):
+    candidates = [dict(table='claude_code_events', key=['claude_code', s, 'e'], session=['claude_code', s],
+                       month='2026-11', source='claude_code', matches=1) for s in names]
+    plan = dict(version=2, scope=['db', None, None, 'public'], watermarks={'timeline_events': 0, 'search_chunks': '', 'snapshot': '1:1:'},
+                candidates=candidates, counts=module._details(candidates), selector=ScrubSelector('credentials').specification, left_alone=0)
+    path = tmp_path / 'plan.json'
+    path.write_text(json.dumps(plan))
+    return plan, path
+
+
+def test_groups_are_sized_by_prefiltered_bytes_and_a_heavy_session_gets_the_long_deadline(tmp_path, monkeypatch):
+    """Recheck time follows the bytes the prefilter passes, not the row count.
+
+    A few rows can hold 150 MB of tool output, so a row cap alone cannot keep a
+    group inside its 60-second transaction. A session heavier than the byte cap
+    runs alone under the large-session deadline, which defaults to the 300 s
+    maximum so a heavy session can always finish.
+    """
+    import personal_data_warehouse.scrub_conversation_cards as module
+    mb = 1_000_000
+    rows = {'heavy': 40, 'a': 100, 'b': 100, 'c': 100, 'd': 100}
+    sizes = {'heavy': 150 * mb, 'a': 15 * mb, 'b': 15 * mb, 'c': 15 * mb, 'd': 1 * mb}
+    plan, path = _byte_plan(module, tmp_path, rows)
+    windows = []
+    monkeypatch.setattr(module, '_scope', lambda warehouse: plan['scope'])
+    monkeypatch.setattr(module, '_planned_rows', lambda warehouse, candidates, **k: [])
+    monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, s, limit: {k: rows[k[1]] for k in sorted(s)})
+    scopes = []
+    monkeypatch.setattr(module, '_session_bytes', lambda warehouse, s, scope: scopes.append(scope) or {k: sizes[k[1]] for k in s})
+    monkeypatch.setattr(module, 'scrub', lambda warehouse, plan, **k: windows.append(
+        (tuple(sorted(c['session'][1] for c in plan['candidates'])), k['window_seconds'])))
+    module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True,
+                         max_canonical_rows=5000, window_seconds=60, gap_seconds=0, max_group_bytes=40 * mb)
+    assert scopes == ['credentials']
+    assert sorted(windows) == [(('a', 'b'), 60), (('c', 'd'), 60), (('heavy',), 300)]
+    with pytest.raises(ValueError, match='budget'):
+        module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'),
+                             planned_only=True, max_group_bytes=0)
+
+
+def test_session_bytes_count_only_rows_the_prefilter_passes(warehouse):
+    from personal_data_warehouse import scrub_conversation_cards as m
+    plain = [dict(event(), event_uuid=f'p{i}', seq=i + 1, text='plain words ' * 1000, raw_json='{}') for i in range(3)]
+    dirty = dict(event(), event_uuid='dirty', seq=99, text='use ' + TOKEN, raw_json='{}')
+    warehouse._insert_rows('claude_code_events', plain + [dirty], AGENT_SESSION_EVENT_COLUMNS)
+    [(expected,)] = warehouse._query("SELECT octet_length(to_jsonb(c)::text) FROM @claude_code_events c WHERE event_uuid='dirty'")
+    sizes = m._session_bytes(warehouse, {('claude_code', 'test-session'), ('claude_code', 'absent')}, 'credentials')
+    assert sizes == {('claude_code', 'test-session'): expected, ('claude_code', 'absent'): 0}
+
+
+def test_checkpoint_validation_does_not_rescan_candidates_per_completed_group():
+    """Each progress save validates the whole checkpoint while writers are stopped.
+
+    Rebuilding the set of planned sessions once per completed group made a save
+    cost groups x candidates (about 80 s per save at production size).
+    """
+    import personal_data_warehouse.scrub_conversation_cards as module
+
+    class Counted(list):
+        reads = 0
+
+        def __iter__(self):
+            Counted.reads += 1
+            return super().__iter__()
+
+    def reads(groups):
+        candidates = [dict(table='claude_code_events', key=['claude_code', f's{i}', 'e'], session=['claude_code', f's{i}'],
+                           month='2026-11', source='claude_code', matches=1) for i in range(50)]
+        plan = dict(version=2, scope=['db', None, None, 'public'],
+                    watermarks={'timeline_events': 0, 'search_chunks': '', 'snapshot': '1:1:'},
+                    candidates=candidates, counts=module._details(candidates),
+                    batches=dict(completed=[dict(sessions=[['claude_code', f's{i}']], canonical_rows=1, seconds=1.0)
+                                            for i in range(groups)], oversized=[]))
+        plan['candidates'] = Counted(candidates)
+        Counted.reads = 0
+        module._validate_plan(plan)
+        return Counted.reads
+
+    assert reads(1) == reads(40)
+    with pytest.raises(ValueError, match='invalid batch session'):
+        module._validate_plan(dict(version=2, scope=['db', None, None, 'public'],
+                                   watermarks={'timeline_events': 0, 'search_chunks': '', 'snapshot': '1:1:'},
+                                   candidates=[], counts=[],
+                                   batches=dict(completed=[dict(sessions=[['claude_code', 'unknown']], canonical_rows=1,
+                                                                seconds=1.0)], oversized=[])))
+
+
+def test_the_timed_window_skips_the_left_alone_recount(warehouse, tmp_path, monkeypatch):
+    """The left-alone statistic belongs to discovery; inside the window it doubled the recheck."""
+    from personal_data_warehouse import scrub_conversation_cards as m
+    from personal_data_warehouse import card_prefilter
+    selector = ScrubSelector('credentials')
+    row = dict(event(), text=CARD + ' use ' + TOKEN, raw_json=json.dumps({'text': TOKEN}))
+    warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+    plan = m.discover(warehouse, selector=selector)
+    assert plan['left_alone'] > 0  # the card is left alone by the credential scope
+    path = tmp_path / 'plan.json'
+    m.write_plan(path, plan)
+    monkeypatch.setattr(card_prefilter, 'count_row', lambda row: pytest.fail('full sensitive recount in the timed window'))
+    state = m.apply_batches(warehouse, path, window=lambda _: nullcontext(), selector=selector, planned_only=True, gap_seconds=0)
+    assert len(state['batches']['completed']) == 1
+    assert warehouse._query('SELECT text FROM @claude_code_events WHERE event_uuid=%s', (row['event_uuid'],))[0][0] == CARD + ' use ' + MASKED

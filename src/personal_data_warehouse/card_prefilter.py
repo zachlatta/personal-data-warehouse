@@ -63,16 +63,20 @@ def count_row(row):
 
 class ConfirmationPool:
     """Bounded in-memory IPC; spawned children never inherit DB connections."""
-    def __init__(self, workers, selector=None):
+    def __init__(self, workers, selector=None, *, tally=True):
+        """``tally=False`` skips the left-alone statistic: a second, full
+        sensitive count of every row. Discovery reports it; a timed maintenance
+        window must not pay for it."""
         self.workers = max(1,workers)
         self.selector = selector
+        self.tally = tally
         self.left_alone = 0
         self._pool = None
         self._lock = threading.Lock()
 
     def counts(self, rows, *, statistics=None):
         counts = self._map(self.selector.count_row if self.selector else count_row,rows)
-        if self.selector and self.selector.scope != "all":
+        if self.tally and self.selector and self.selector.scope != "all":
             total = sum(self._map(count_row,rows))
             with self._lock: self.left_alone += total - sum(counts)
             if statistics is not None: statistics['left_alone'] += total - sum(counts)

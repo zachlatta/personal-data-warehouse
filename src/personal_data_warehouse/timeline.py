@@ -139,6 +139,31 @@ TIMELINE_NORMALIZED_COLUMNS = (
     "priority",
 )
 
+# The text columns an agent-transcript adapter masks after its SQL cut them,
+# with the character cap that cut each (None: never cut). The scrub's rebuild
+# checks exactly these columns.
+TIMELINE_MASKED_COLUMNS = {
+    "title": TIMELINE_TITLE_CHARS,
+    "snippet": TIMELINE_SNIPPET_CHARS,
+    "metadata": None,
+    "search_text": None,
+}
+
+
+def masked_rows(rows: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+    """Credential-mask TIMELINE_MASKED_COLUMNS of normalized rows (derived_redaction)."""
+    from personal_data_warehouse.derived_redaction import mask_cut
+
+    positions = [(TIMELINE_NORMALIZED_COLUMNS.index(name), cap) for name, cap in TIMELINE_MASKED_COLUMNS.items()]
+    result = []
+    for row in rows:
+        values = list(row)
+        for index, cap in positions:
+            if isinstance(values[index], str):
+                values[index] = mask_cut(values[index], cut_end=cap is not None and len(values[index]) >= cap)
+        result.append(tuple(values))
+    return result
+
 
 @dataclass(frozen=True)
 class TimelineAdapter:
@@ -248,6 +273,13 @@ class TimelineAdapter:
     # Also not part of `adapter_signature`: it is a copy of text already
     # inside backfill_sql, not a new input to any row's content.
     event_id_expression: str = ""
+    # Mask credentials in title, snippet, metadata and search_text AFTER the
+    # SQL has cut them (see derived_redaction). Set for adapters over agent
+    # transcripts, whose source rows are masked whole at ingest but whose cut
+    # copies can hold a fragment the full text never did. Not part of
+    # `adapter_signature`: masking is applied in Python to every row the
+    # engine writes, so it needs no re-walk of rows already stored.
+    mask_credentials: bool = False
 
 
 def _real_ts(*exprs: str) -> str:
@@ -3658,6 +3690,7 @@ def _agent_session_adapter() -> TimelineAdapter:
         # Enrichment does several indexed probes per session after pagination.
         # Keep historical pages small enough for the fast lane to stay responsive.
         batch_size=1000,
+        mask_credentials=True,
     )
 
 
@@ -3817,6 +3850,7 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
         ),
         priority_expression=_AGENT_TURN_PRIORITY,
         batch_size=5000,
+        mask_credentials=True,
     )
 
 
@@ -5059,9 +5093,12 @@ class TimelineSyncEngine:
             cursor.execute(self._source_sql(sql), params)
             return cursor.fetchall()
 
-    def _upsert(self, adapter: TimelineAdapter, rows: list[tuple[Any, ...]]) -> None:
+    def _upsert(self, adapter: TimelineAdapter, rows: list[tuple[Any, ...]], *, masked: bool = False) -> None:
+        """``masked=True``: the caller already applied ``masked_rows`` (the scrub checks them first)."""
         if not rows:
             return
+        if adapter.mask_credentials and not masked:
+            rows = masked_rows(rows)
         invalid = [
             (str(row[0]) if row else "<missing event_id>", row[13] if len(row) > 13 else None)
             for row in rows
