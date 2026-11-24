@@ -769,13 +769,15 @@ func TestCreateRequestSkipsQuotedSignatureInNewestSentMessageAndFallsBack(t *tes
 // seedCleanContactPointsFixture exposes a test-scoped view at
 // @clean_contact_points (which is a view in the real warehouse catalog, never
 // a table) backed by a per-test table, and drops both in t.Cleanup so the
-// shared test database is never left with a table masking the mart view.
+// shared test database is never left with a table masking the mart view. The
+// view is created plainly, never replaced, so a database that already has one
+// fails the test here and keeps it: only the view this call created is dropped.
 func seedCleanContactPointsFixture(t *testing.T, store *PostgresStore, suffix int64) string {
 	t.Helper()
 	ctx := context.Background()
 	schema := warehouse.QuoteIdent(warehouse.SchemaOf("clean_contact_points"))
 	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+schema); err != nil {
-		t.Skipf("cannot create contacts schema in this database: %v", err)
+		t.Fatalf("cannot create contacts schema in this database: %v", err)
 	}
 	backingTable := schema + "." + warehouse.QuoteIdent(fmt.Sprintf("test_contact_points_%d", suffix))
 	if _, err := store.db.ExecContext(ctx, fmt.Sprintf(`
@@ -786,19 +788,21 @@ func seedCleanContactPointsFixture(t *testing.T, store *PostgresStore, suffix in
 			source_updated_at timestamptz
 		)
 	`, backingTable)); err != nil {
-		t.Skipf("cannot create backing contact_points table in this database: %v", err)
+		t.Fatalf("cannot create backing contact_points table in this database: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = execContext(context.Background(), store.db, `DROP VIEW IF EXISTS @clean_contact_points`)
 		_, _ = store.db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+backingTable)
 	})
 	if _, err := execContext(ctx, store.db, fmt.Sprintf(`
-		CREATE OR REPLACE VIEW @clean_contact_points AS
+		CREATE VIEW @clean_contact_points AS
 		SELECT point_type, normalized_value, display_name, source_updated_at
 		FROM %s
 	`, backingTable)); err != nil {
-		t.Skipf("cannot create clean_contact_points view in this database: %v", err)
+		t.Fatalf("cannot create clean_contact_points view in this database: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = execContext(context.Background(), store.db, `DROP VIEW IF EXISTS @clean_contact_points`)
+	})
 	return backingTable
 }
 
@@ -808,7 +812,7 @@ func TestCreateRequestAndUpdateEmailResolveDisplayNames(t *testing.T) {
 	suffix := time.Now().UnixNano()
 	contactPointsTable := seedCleanContactPointsFixture(t, store, suffix)
 	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("gmail_messages"))); err != nil {
-		t.Skipf("cannot create gmail schema in this database: %v", err)
+		t.Fatalf("cannot create gmail schema in this database: %v", err)
 	}
 	if _, err := execContext(ctx, store.db, `
 		CREATE TABLE IF NOT EXISTS @gmail_messages (
@@ -818,7 +822,7 @@ func TestCreateRequestAndUpdateEmailResolveDisplayNames(t *testing.T) {
 			PRIMARY KEY (account, message_id)
 		)
 	`); err != nil {
-		t.Skipf("cannot create gmail_messages in this database: %v", err)
+		t.Fatalf("cannot create gmail_messages in this database: %v", err)
 	}
 	_, _ = execContext(ctx, store.db, `ALTER TABLE @gmail_messages ADD COLUMN IF NOT EXISTS payload_json text`)
 
@@ -917,7 +921,7 @@ func TestCreateRequestHandlesGroupSharedSendersAndConflictingContacts(t *testing
 	suffix := time.Now().UnixNano()
 	contactPointsTable := seedCleanContactPointsFixture(t, store, suffix)
 	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("gmail_messages"))); err != nil {
-		t.Skipf("cannot create gmail schema in this database: %v", err)
+		t.Fatalf("cannot create gmail schema in this database: %v", err)
 	}
 	if _, err := execContext(ctx, store.db, `
 		CREATE TABLE IF NOT EXISTS @gmail_messages (
@@ -927,7 +931,7 @@ func TestCreateRequestHandlesGroupSharedSendersAndConflictingContacts(t *testing
 			PRIMARY KEY (account, message_id)
 		)
 	`); err != nil {
-		t.Skipf("cannot create gmail_messages in this database: %v", err)
+		t.Fatalf("cannot create gmail_messages in this database: %v", err)
 	}
 	_, _ = execContext(ctx, store.db, `ALTER TABLE @gmail_messages ADD COLUMN IF NOT EXISTS payload_json text`)
 
