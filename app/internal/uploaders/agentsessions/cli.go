@@ -183,7 +183,8 @@ const DefaultMaxWatchInterval = 30 * time.Second
 // pass 1 of every five-minute window.
 const DefaultIdleAfter = 10 * time.Minute
 
-// defaultMtimeSettleWindow guards against coarse-mtime / same-tick rewrites.
+// defaultMtimeSettleWindow guards the OpenClaw store against a write in the
+// same mtime tick as the read (transcript files use persisted mtime/inode).
 const defaultMtimeSettleWindow = 2 * time.Second
 
 // runWatch is `--watch`: Sync until the window closes, staying at interval
@@ -226,8 +227,10 @@ func runWatch(runner *Runner, window, interval, maxInterval, idleAfter time.Dura
 			lastActivity = summary.LatestModTime
 		}
 		active := summary.LinesSelected > 0 || summary.LinesSkipped > 0 || summary.LimitReached || summary.FilesWithNewLines > 0
-		if active {
-			lastActivity = now
+		if active || runner.hasOpenClawStore() {
+			if active {
+				lastActivity = now
+			}
 			currentInterval = interval
 		} else if lastActivity.IsZero() || now.Sub(lastActivity) >= idleAfter {
 			// Already idle past idleAfter (including pass 1 after a 5-minute

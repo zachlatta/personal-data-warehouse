@@ -78,8 +78,8 @@ app's ingest endpoint (see below), which writes them into the `agent-sessions/in
 folder. The `--limit` flag bounds a run (useful for a first backfill). In Dagster, the
 `agent_sessions_drive_inbox_sensor` + `agent_sessions_drive_ingest` asset consume the batches.
 
-**A turn lands in seconds on an active host, and the first line after ten quiet minutes waits
-at most 30 s more.** Measured 2026-11-08 over seven days from
+**A turn lands in seconds on an active host, and on transcript-file hosts the first line
+after ten quiet minutes waits at most 30 s more.** Measured 2026-11-08 over seven days from
 `timeline.events.first_seen_at - occurred_at`, Claude Code, Codex, OpenClaw and Argon turns
 landed p50 3-4 min, p99 6-7 min, and almost none of it was work: the five-minute uploader
 tick, a 60 s inbox sensor and a Dagster run start (~5 s), then a fast lane that took 15.2 s
@@ -88,8 +88,11 @@ for two rows because the `agent_session` roll-up's plan is costed at 1.6M and Po
 
 - the device runs `--watch`: a pass every two seconds while any transcript or the OpenClaw
   store was modified within `--idle-after` (10 m, so a 40-120 s thinking gap adds nothing).
-  After that the pause grows to `--max-interval` (30 s) and returns to two seconds on the
-  first new line. Idleness is read from on-disk mtimes (far-future ones ignored), so an idle
+  After that, on transcript-file hosts, the pause grows to `--max-interval` (30 s) and
+  returns to two seconds on the first new line. Hosts with an OpenClaw SQLite store on disk
+  do not back off and stay at `--interval` (2 s), because delaying the first turn after a
+  quiet spell lets it land inside OpenClaw's whole-store rewrite behind a large batch.
+  Idleness is read from on-disk mtimes (far-future ones ignored), so an idle
   host backs off from the first pass of every window. Before this, porygon ran 137 passes a
   window and 10% of a core with nothing to upload (2026-11-24). A window ends after five
   minutes (`AGENT_SESSIONS_WATCH_WINDOW`) so the wrapper posts the heartbeat; a failed pass

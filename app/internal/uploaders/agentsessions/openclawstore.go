@@ -46,6 +46,19 @@ func (r *Runner) openClawStoreSessions(rows []common.Row) []openClawStoreSession
 	return sessions
 }
 
+// hasOpenClawStore reports whether this host has an OpenClaw SQLite store on
+// disk. Hosts with one stay at the base --watch interval rather than backing
+// off when idle, so a new turn after a quiet spell lands before OpenClaw
+// rewrites the whole store.
+func (r *Runner) hasOpenClawStore() bool {
+	path := strings.TrimSpace(r.Dirs.OpenClawStore)
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // readOpenClawStore ships transcript_events rows past each session's cursor.
 // It reports how many sessions the store holds.
 func (r *Runner) readOpenClawStore(batch *pendingBatch, remaining *int, summary *Summary) error {
