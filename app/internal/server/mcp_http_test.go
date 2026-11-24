@@ -164,6 +164,67 @@ func TestMCPServesToolsListForUnknownSessionID(t *testing.T) {
 	}
 }
 
+func TestMCPInitializeContentType(t *testing.T) {
+	srv := newMCPTestServer(t)
+	token := oauthAccessToken(t, srv)
+	const body = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`
+
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		origin      string
+		bearer      string
+		want        int
+	}{
+		{name: "JSON", contentType: "application/json", bearer: token, want: http.StatusOK},
+		{name: "JSON with charset", contentType: "application/json; charset=UTF-8", bearer: token, want: http.StatusOK},
+		{name: "missing content type", bearer: token, want: http.StatusUnsupportedMediaType},
+		{name: "plain text", contentType: "text/plain", bearer: token, want: http.StatusUnsupportedMediaType},
+		{name: "malformed parameters", contentType: "application/json; charset", bearer: token, want: http.StatusUnsupportedMediaType},
+		{name: "missing bearer", contentType: "application/json; charset=UTF-8", want: http.StatusUnauthorized},
+		{name: "cross-origin", contentType: "application/json; charset=UTF-8", origin: "https://other.example", bearer: token, want: http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, srv.URL+"/mcp", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			if tc.contentType != "" {
+				req.Header.Set("Content-Type", tc.contentType)
+			}
+			if tc.bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.bearer)
+			}
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			raw, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != tc.want {
+				t.Fatalf("initialize status = %d, want %d: %s", resp.StatusCode, tc.want, raw)
+			}
+			if tc.want == http.StatusOK {
+				var rpc struct {
+					Result struct {
+						ProtocolVersion string `json:"protocolVersion"`
+					} `json:"result"`
+				}
+				if err := json.Unmarshal(raw, &rpc); err != nil || rpc.Result.ProtocolVersion != "2025-11-25" {
+					t.Fatalf("invalid initialize response: %s (decode error: %v)", raw, err)
+				}
+			}
+		})
+	}
+}
+
 func TestMCPConnectionsAdminAPIRejectsDownstreamOAuthTokens(t *testing.T) {
 	srv := newMCPTestServer(t)
 	token := oauthAccessToken(t, srv)
