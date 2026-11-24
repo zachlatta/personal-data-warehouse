@@ -117,22 +117,14 @@ func newestDeviceEvents(files []SessionFile) map[string]newestEvent {
 	latestMod := map[string]time.Time{}
 	mods := make([]time.Time, len(files))
 	for i, file := range files {
-		if file.hasSig {
-			mods[i] = time.Unix(0, file.sig.modTime)
-		} else {
-			info, err := os.Stat(file.Path)
-			if err != nil {
-				continue
-			}
-			mods[i] = info.ModTime()
-		}
+		mods[i] = time.Unix(0, file.sig.modTime)
 		if mods[i].After(latestMod[file.Tool]) {
 			latestMod[file.Tool] = mods[i]
 		}
 	}
 	newest := map[string]newestEvent{}
 	for i, file := range files {
-		if mods[i].IsZero() || latestMod[file.Tool].Sub(mods[i]) > observeRecentSpan {
+		if latestMod[file.Tool].Sub(mods[i]) > observeRecentSpan {
 			continue
 		}
 		for _, line := range tailLines(file.Path) {

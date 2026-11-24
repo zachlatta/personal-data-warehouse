@@ -81,11 +81,11 @@ func TestStateRoundTripsAndResetsOnAccountChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := state.RecordProgress("/a.jsonl", 42, 3, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+	if err := state.RecordProgress("/a.jsonl", 42, 3, fileSignature{modTime: 5, inode: 6}, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
-	progress, _ := state.ProgressFor("/a.jsonl")
-	if progress.UploadedOffset != 42 || progress.UploadedLines != 3 {
+	want := FileProgress{UploadedOffset: 42, UploadedLines: 3, LastMtimeNs: 5, LastInode: 6}
+	if progress, _ := state.LoadAll(); progress["/a.jsonl"] != want {
 		t.Fatalf("progress = %+v", progress)
 	}
 	state.Close()
@@ -94,8 +94,7 @@ func TestStateRoundTripsAndResetsOnAccountChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer state.Close()
-	progress, _ = state.ProgressFor("/a.jsonl")
-	if progress.UploadedOffset != 0 {
+	if progress, _ := state.LoadAll(); len(progress) != 0 {
 		t.Fatalf("an account change must wipe the state, got %+v", progress)
 	}
 }
@@ -244,8 +243,8 @@ func TestRunnerCoalescesFilesAndCommitsEachAtBatchBoundaries(t *testing.T) {
 	if summary.BatchesUploaded != 2 || len(uploads.batches[0]) != 3 || len(uploads.batches[1]) != 2 {
 		t.Fatalf("summary = %+v batches=%d", summary, len(uploads.batches))
 	}
-	a, _ := state.ProgressFor(filepath.Join(root, "a.jsonl"))
-	b, _ := state.ProgressFor(filepath.Join(root, "b.jsonl"))
+	progress, _ := state.LoadAll()
+	a, b := progress[filepath.Join(root, "a.jsonl")], progress[filepath.Join(root, "b.jsonl")]
 	if a.UploadedLines != 2 || b.UploadedLines != 3 {
 		t.Fatalf("progress a=%+v b=%+v", a, b)
 	}

@@ -67,10 +67,12 @@ func TestDiscoverArgonFindsFullTranscriptsAndReadsSessionMeta(t *testing.T) {
 		t.Fatalf("Discover = %v, want the three transcript_full.jsonl transcripts only", files)
 	}
 	byID := map[string]SessionFile{}
+	var meta argonMetaCache
 	for _, f := range files {
 		if f.Tool != ArgonTool {
 			t.Fatalf("tool = %q, want %q", f.Tool, ArgonTool)
 		}
+		f.Session = meta.sessionMeta(f.Path, f.SessionID)
 		byID[f.SessionID] = f
 	}
 	if got := byID["sess-main"].Session["cwd"]; got != "/work/repo" {

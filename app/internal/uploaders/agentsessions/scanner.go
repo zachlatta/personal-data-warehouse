@@ -46,11 +46,11 @@ type SessionFile struct {
 	SessionID string
 	Path      string
 	// Session is per-transcript metadata no single line carries, shipped on
-	// every line's record (Muse, Muse Code, Argon).
+	// every line's record. Muse and Muse Code discovery set it; Argon's is
+	// looked up only for a transcript with new lines (argonMetaCache).
 	Session map[string]any
 
-	sig    fileSignature
-	hasSig bool
+	sig fileSignature
 }
 
 // Dirs names each tool's transcript root; an empty root disables that tool.
@@ -112,17 +112,13 @@ func lookup(getenv common.Getenv, name string) (string, bool) {
 // Discover lists every transcript under the configured roots, in a stable
 // order so batching is deterministic across runs.
 func Discover(dirs Dirs) []SessionFile {
-	return discoverFiles(dirs, true)
-}
-
-func discoverFiles(dirs Dirs, loadArgonMeta bool) []SessionFile {
 	var files []SessionFile
 	files = append(files, discoverClaudeCode(dirs.ClaudeProjects)...)
 	files = append(files, discoverCodex(dirs.CodexSessions)...)
 	files = append(files, discoverOpenClaw(dirs.OpenClawSessions)...)
 	files = append(files, discoverPi(dirs.PiSessions)...)
 	files = append(files, discoverMuseCode(dirs.MuseCodeSessions)...)
-	files = append(files, discoverArgon(dirs.ArgonSessions, loadArgonMeta)...)
+	files = append(files, discoverArgon(dirs.ArgonSessions)...)
 	files = append(files, discoverMuse(dirs.MuseAgents)...)
 	sort.Slice(files, func(i, j int) bool {
 		if files[i].Tool != files[j].Tool {
@@ -159,10 +155,7 @@ func walkJSONLSkipping(root string, skipDir func(name string) bool, visit func(p
 		if !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}
-		// Match lstat semantics: skip symlinks and other non-regular entries.
-		if d.Type() != 0 && !d.Type().IsRegular() {
-			return nil
-		}
+		// Symlinks and other non-regular entries are not transcripts.
 		fi, err := d.Info()
 		if err != nil || !fi.Mode().IsRegular() {
 			return nil
@@ -178,7 +171,6 @@ func sessionFileWithInfo(tool, sessionID, path string, info fs.FileInfo) Session
 		SessionID: sessionID,
 		Path:      path,
 		sig:       signatureFromInfo(info),
-		hasSig:    true,
 	}
 }
 

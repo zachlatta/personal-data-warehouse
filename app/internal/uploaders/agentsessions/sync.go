@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
@@ -61,9 +62,9 @@ type Runner struct {
 	// it fully shipped is passed over without a state lookup or a read, and
 	// idle passes log nothing.
 	SkipUnchanged bool
-	// MtimeSettleWindow guards against coarse-mtime / same-tick rewrites: a
-	// file modified more recently than Now()-MtimeSettleWindow is not marked
-	// unchanged until its mtime settles.
+	// MtimeSettleWindow guards the OpenClaw store against a write in the same
+	// mtime tick as the read: a source modified more recently than
+	// Now()-MtimeSettleWindow is not marked unchanged until its mtime settles.
 	MtimeSettleWindow time.Duration
 	// Observe posts each tool's newest event (contract C11); nil disables it.
 	Observe ingestclient.ObservationPoster
@@ -76,10 +77,11 @@ type Runner struct {
 	pass    map[string]fileSignature
 	// progress caches file_state in memory after a single bulk LoadAll so a
 	// restarted watcher does not issue thousands of per-file SQLite SELECTs.
-	progress       map[string]FileProgress
-	progressLoaded bool
-	backfillSigs   map[string]fileSignature
-	argonMeta      argonMetaCache
+	progress map[string]FileProgress
+	// backfill holds this pass's signatures for caught-up file_state rows that
+	// predate signature tracking.
+	backfill  map[string]fileSignature
+	argonMeta argonMetaCache
 }
 
 // fileSignature is what a watcher compares between passes. An append moves
@@ -104,6 +106,14 @@ func signatureFromInfo(info fs.FileInfo) fileSignature {
 	}
 }
 
+func fileInode(info fs.FileInfo) uint64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Ino
+	}
+	return 0
+}
+
+// signatureOf combines a database and its sidecars into one signature.
 func signatureOf(paths ...string) (fileSignature, bool) {
 	var sig fileSignature
 	found := false
@@ -173,7 +183,6 @@ type pendingProgress struct {
 	offset int64
 	lineNo int64
 	sig    fileSignature
-	hasSig bool
 }
 
 type pendingBatch struct {
@@ -188,12 +197,12 @@ func newPendingBatch(size int) *pendingBatch {
 	return &pendingBatch{batchSize: size, pending: map[string]pendingProgress{}}
 }
 
-func (b *pendingBatch) add(record map[string]any, path string, offset, lineNo int64, sig fileSignature, hasSig bool) {
+func (b *pendingBatch) add(record map[string]any, path string, offset, lineNo int64, sig fileSignature) {
 	b.records = append(b.records, record)
 	if _, seen := b.pending[path]; !seen {
 		b.order = append(b.order, path)
 	}
-	b.pending[path] = pendingProgress{offset: offset, lineNo: lineNo, sig: sig, hasSig: hasSig}
+	b.pending[path] = pendingProgress{offset: offset, lineNo: lineNo, sig: sig}
 }
 
 func (b *pendingBatch) full() bool { return len(b.records) >= b.batchSize }
@@ -225,17 +234,16 @@ func (r *Runner) Sync() (Summary, error) {
 	if r.SkipUnchanged && r.shipped == nil {
 		r.shipped = map[string]fileSignature{}
 	}
-	if r.Mode == "incremental" && r.State != nil && !r.progressLoaded {
+	if r.Mode == "incremental" && r.State != nil && r.progress == nil {
 		loaded, err := r.State.LoadAll()
 		if err != nil {
 			return Summary{}, err
 		}
 		r.progress = loaded
-		r.progressLoaded = true
 	}
 	r.pass = map[string]fileSignature{}
-	r.backfillSigs = map[string]fileSignature{}
-	files := discoverFiles(r.Dirs, false)
+	r.backfill = map[string]fileSignature{}
+	files := Discover(r.Dirs)
 	r.observeNewest(files)
 	if !r.SkipUnchanged {
 		r.Logger.Infof("Discovered %d agent session transcript file(s)", len(files))
@@ -281,13 +289,12 @@ func (r *Runner) Sync() (Summary, error) {
 	if err := r.flush(batch); err != nil {
 		return summary, err
 	}
-	if r.State != nil && len(r.backfillSigs) > 0 {
-		if err := r.State.BackfillSignatures(r.backfillSigs); err != nil {
+	if len(r.backfill) > 0 {
+		if err := r.State.BackfillSignatures(r.backfill); err != nil {
 			return summary, err
 		}
-		for path, sig := range r.backfillSigs {
+		for path, sig := range r.backfill {
 			p := r.progress[path]
-			p.LastSize = sig.size
 			p.LastMtimeNs = sig.modTime
 			p.LastInode = sig.inode
 			r.progress[path] = p
@@ -317,48 +324,21 @@ type fileResult struct {
 
 func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, summary *Summary) (fileResult, bool, error) {
 	sig := file.sig
-	if !file.hasSig {
-		var found bool
-		sig, found = signatureOf(file.Path)
-		if !found {
-			return fileResult{}, false, nil
-		}
-	}
 	r.recordLatestModTime(summary, sig)
 	if r.unchanged(file.Path, sig) {
 		summary.FilesUnchanged++
 		return fileResult{}, false, nil
 	}
-	// Fast path across process restarts: if persisted state recorded this
-	// exact signature (size, mtime, inode) and it has settled, skip without
-	// opening or reading the file.
-	if r.Mode == "incremental" && r.SkipUnchanged && r.progressLoaded && r.isSettled(sig) {
-		if p, ok := r.progress[file.Path]; ok && p.LastSize >= 0 &&
-			p.LastSize == sig.size && p.LastMtimeNs == sig.modTime && p.LastInode == sig.inode {
-			r.caughtUp(file.Path, sig)
-			summary.FilesUnchanged++
-			return fileResult{}, false, nil
-		}
-	}
 	size := sig.size
-	startOffset, startLine, err := r.startPosition(file.Path, sig, true)
-	if err != nil {
-		return fileResult{}, false, err
-	}
+	startOffset, startLine := r.startPosition(file.Path, sig)
 	if size <= startOffset {
-		// Already caught up. Backfill signature only for pre-upgrade rows
-		// (LastMtimeNs == 0 && LastInode == 0) or settled rows whose signature
-		// still matches what was committed — never backfill over a mismatch.
-		if r.Mode == "incremental" && r.progressLoaded && r.isSettled(sig) {
-			if p, ok := r.progress[file.Path]; ok && p.LastSize < 0 &&
-				((p.LastMtimeNs == 0 && p.LastInode == 0) || (p.LastMtimeNs == sig.modTime && p.LastInode == sig.inode)) {
-				r.backfillSigs[file.Path] = sig
-			}
+		if p, ok := r.progress[file.Path]; ok && p.LastMtimeNs == 0 {
+			r.backfill[file.Path] = sig
 		}
 		r.caughtUp(file.Path, sig)
 		return fileResult{}, true, nil
 	}
-	if file.Tool == ArgonTool && file.Session == nil {
+	if file.Tool == ArgonTool {
 		file.Session = r.argonMeta.sessionMeta(file.Path, file.SessionID)
 	}
 	handle, err := os.Open(file.Path)
@@ -393,7 +373,7 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 			result.skipped++
 			continue
 		}
-		batch.add(r.envelope(file, seq, parsed), file.Path, offset, lineNo, sig, true)
+		batch.add(r.envelope(file, seq, parsed), file.Path, offset, lineNo, sig)
 		result.selected++
 		if batch.full() {
 			if err := r.flush(batch); err != nil {
@@ -409,7 +389,7 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 	if result.selected == 0 && offset != startOffset {
 		// Consumed only skipped/blank lines; advance so we do not reprocess
 		// them next run. (Files with selected lines commit via flush.)
-		if err := r.commit(file.Path, offset, lineNo, sig, !result.deferred && !shortRead); err != nil {
+		if err := r.commit(file.Path, offset, lineNo, sig); err != nil {
 			return result, true, err
 		}
 	}
@@ -462,7 +442,7 @@ func (r *Runner) flush(batch *pendingBatch) error {
 	// lines whose records are in this just-uploaded batch.
 	for _, path := range batch.order {
 		progress := batch.pending[path]
-		if err := r.commit(path, progress.offset, progress.lineNo, progress.sig, progress.hasSig); err != nil {
+		if err := r.commit(path, progress.offset, progress.lineNo, progress.sig); err != nil {
 			return err
 		}
 	}
@@ -471,79 +451,42 @@ func (r *Runner) flush(batch *pendingBatch) error {
 	return nil
 }
 
-func (r *Runner) startPosition(path string, sig fileSignature, hasSig bool) (int64, int64, error) {
+// startPosition is where to resume a source. sig is the zero signature for an
+// OpenClaw store session, whose cursor is a seq rather than a byte offset.
+func (r *Runner) startPosition(path string, sig fileSignature) (offset, line int64) {
 	if r.Mode != "incremental" || r.State == nil {
-		return 0, 0, nil
+		return 0, 0
 	}
-	var (
-		progress FileProgress
-		err      error
-	)
-	if r.progressLoaded {
-		var ok bool
-		progress, ok = r.progress[path]
-		if !ok {
-			progress = FileProgress{Path: path, LastSize: -1}
-		}
-	} else {
-		progress, err = r.State.ProgressFor(path)
-		if err != nil {
-			return 0, 0, err
-		}
-	}
-	if !hasSig {
-		return progress.UploadedOffset, progress.UploadedLines, nil
-	}
+	progress := r.progress[path]
 	if progress.UploadedOffset > sig.size {
 		// File was truncated/rotated; re-read from the beginning.
-		return 0, 0, nil
+		return 0, 0
 	}
 	if progress.LastInode != 0 && sig.inode != 0 && progress.LastInode != sig.inode {
 		// File was atomically replaced (rename/recreate); re-read from the beginning.
-		return 0, 0, nil
+		return 0, 0
 	}
 	if progress.UploadedOffset == sig.size && sig.size > 0 && progress.LastMtimeNs != 0 && progress.LastMtimeNs != sig.modTime {
-		// Same-size in-place rewrite (including one within the settle window
-		// when LastSize is still -1); re-read from the beginning.
-		return 0, 0, nil
+		// Same-size in-place rewrite; re-read from the beginning.
+		return 0, 0
 	}
-	return progress.UploadedOffset, progress.UploadedLines, nil
+	return progress.UploadedOffset, progress.UploadedLines
 }
 
-func (r *Runner) commit(path string, offset, lineNo int64, sig fileSignature, hasSig bool) error {
+// commit records what was shipped and the signature taken before it was read.
+func (r *Runner) commit(path string, offset, lineNo int64, sig fileSignature) error {
 	if r.State == nil {
 		return nil
 	}
-	var (
-		lastSize    int64 = -1
-		lastMtimeNs int64
-		lastInode   uint64
-	)
-	// Only persist the file signature when we reached the end of the file (or
-	// it is settled); a deferred mid-file commit must not claim the whole file
-	// was processed at sig.
-	if hasSig && offset >= sig.size && r.isSettled(sig) {
-		lastSize = sig.size
-		lastMtimeNs = sig.modTime
-		lastInode = sig.inode
-	} else if hasSig {
-		// Still record inode and mtime so rename/rewrite is detected even on
-		// partially-shipped or freshly-written files, while LastSize=-1 keeps
-		// the restart fast-skip disabled until fully settled.
-		lastMtimeNs = sig.modTime
-		lastInode = sig.inode
-	}
-	if err := r.State.RecordProgressWithSignature(path, offset, lineNo, lastSize, lastMtimeNs, lastInode, r.Now()); err != nil {
+	if err := r.State.RecordProgress(path, offset, lineNo, sig, r.Now()); err != nil {
 		return err
 	}
-	if r.progressLoaded {
+	if r.progress != nil {
 		r.progress[path] = FileProgress{
-			Path:           path,
 			UploadedOffset: offset,
 			UploadedLines:  lineNo,
-			LastSize:       lastSize,
-			LastMtimeNs:    lastMtimeNs,
-			LastInode:      lastInode,
+			LastMtimeNs:    sig.modTime,
+			LastInode:      sig.inode,
 		}
 	}
 	return nil

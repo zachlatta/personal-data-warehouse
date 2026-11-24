@@ -278,7 +278,9 @@ func TestRunnerReuploadsSameSizeInPlaceRewrite(t *testing.T) {
 	}
 }
 
-func TestRunnerMtimeSettleWindowPreventsRacySkip(t *testing.T) {
+// Inside the settle window a source is re-checked rather than remembered, so a
+// store write in the same mtime tick as the read is not missed.
+func TestRunnerDoesNotRememberAnUnsettledSource(t *testing.T) {
 	root := t.TempDir()
 	transcript := filepath.Join(root, "recent.jsonl")
 	now := time.Date(2026, 5, 21, 12, 0, 10, 0, time.UTC)
@@ -313,7 +315,7 @@ func TestRunnerMtimeSettleWindowPreventsRacySkip(t *testing.T) {
 	}
 }
 
-func TestRunnerSkipsUnchangedFilesAcrossRestartsUsingPersistedState(t *testing.T) {
+func TestRunnerDoesNotReuploadAfterARestart(t *testing.T) {
 	root := t.TempDir()
 	transcript := filepath.Join(root, "persist.jsonl")
 	oldTime := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
@@ -336,8 +338,8 @@ func TestRunnerSkipsUnchangedFilesAcrossRestartsUsingPersistedState(t *testing.T
 	r2 := newRunner(t, root, uploads, state2)
 	r2.SkipUnchanged = true
 	s2, err := r2.Sync()
-	if err != nil || s2.FilesUnchanged != 1 || s2.LinesSelected != 0 {
-		t.Fatalf("fresh Runner after restart must skip unchanged file on pass 1: %+v, %v", s2, err)
+	if err != nil || s2.LinesSelected != 0 || len(uploads.batches) != 1 {
+		t.Fatalf("a fresh Runner must not re-upload an unchanged file: %+v, %v", s2, err)
 	}
 
 	// Now append while running; must still be picked up.
@@ -350,7 +352,7 @@ func TestRunnerSkipsUnchangedFilesAcrossRestartsUsingPersistedState(t *testing.T
 	}
 }
 
-func TestRunWatchBacksOffWhenIdleAndResetsOnActivity(t *testing.T) {
+func TestRunWatchBacksOffFromPassOneWhenAlreadyIdle(t *testing.T) {
 	env, root := cliEnv(t)
 	app := testfixtures.NewFakeApp(t)
 	cfg := ingestclient.Config{BaseURL: app.URL(), Token: "secret"}
@@ -378,20 +380,12 @@ func TestRunWatchBacksOffWhenIdleAndResetsOnActivity(t *testing.T) {
 	if elapsed < 500*time.Millisecond {
 		t.Fatalf("idle watch must not exit early, ran %s", elapsed)
 	}
-	var passes int
-	for _, field := range strings.Fields(out) {
-		if strings.HasPrefix(field, "passes=") {
-			for _, ch := range strings.TrimPrefix(field, "passes=") {
-				passes = passes*10 + int(ch-'0')
-			}
-		}
-	}
-	if passes == 0 || passes > 5 {
+	if passes := parseWatchPasses(t, out); passes == 0 || passes > 5 {
 		t.Fatalf("idle watch must back off from pass 1: got passes=%d in %s (out=%q)", passes, elapsed, out)
 	}
 }
 
-// M4: verify backoff resets to base interval on activity; fails if reset is removed.
+// A line landing while the watcher is backed off puts it back at the base interval.
 func TestRunWatchResetsToBaseIntervalAfterBackoffOnActivity(t *testing.T) {
 	env, root := cliEnv(t)
 	app := testfixtures.NewFakeApp(t)
@@ -451,12 +445,14 @@ func TestRunWatchResetsToBaseIntervalAfterBackoffOnActivity(t *testing.T) {
 	}
 }
 
-// M2: empty directories back off from pass 1, and far-future mtimes are
-// ignored when computing LatestModTime so they cannot defeat backoff.
-func TestRunWatchStaysFastWhenActiveAndHandlesFutureMtimesAndZeroFiles(t *testing.T) {
+// Empty directories back off from pass 1, and far-future mtimes are ignored
+// when computing LatestModTime so they cannot defeat backoff.
+func TestRunWatchBacksOffWithNoFilesAndIgnoresFutureMtimes(t *testing.T) {
 	// 1) Zero files: backs off immediately from pass 1.
 	env, root := cliEnv(t)
-	os.Remove(filepath.Join(root, "claude", "project-a", "11111111-2222-3333-4444-555555555555.jsonl"))
+	if err := os.Remove(filepath.Join(root, "claude", "project-a", "11111111-2222-3333-4444-555555555555.jsonl")); err != nil {
+		t.Fatal(err)
+	}
 	app := testfixtures.NewFakeApp(t)
 	cfg := ingestclient.Config{BaseURL: app.URL(), Token: "secret"}
 	args := append([]string{"--watch", "450ms", "--interval", "20ms", "--max-interval", "200ms"}, stateArgs(root)...)
@@ -464,7 +460,7 @@ func TestRunWatchStaysFastWhenActiveAndHandlesFutureMtimesAndZeroFiles(t *testin
 	if code != 0 {
 		t.Fatalf("zero-file watch failed: code=%d stderr=%q", code, errOut)
 	}
-	if !strings.Contains(out, "passes=2 ") && !strings.Contains(out, "passes=3 ") && !strings.Contains(out, "passes=4 ") {
+	if passes := parseWatchPasses(t, out); passes < 2 || passes > 4 {
 		t.Fatalf("zero-file host must back off from pass 1: %q", out)
 	}
 
@@ -472,7 +468,9 @@ func TestRunWatchStaysFastWhenActiveAndHandlesFutureMtimesAndZeroFiles(t *testin
 	futurePath := filepath.Join(root, "claude", "project-a", "future.jsonl")
 	os.WriteFile(futurePath, []byte("{\"n\":1}\n"), 0o644)
 	farFuture := time.Now().Add(24 * time.Hour)
-	os.Chtimes(futurePath, farFuture, farFuture)
+	if err := os.Chtimes(futurePath, farFuture, farFuture); err != nil {
+		t.Fatal(err)
+	}
 	runner := newRunner(t, filepath.Join(root, "claude"), &fakeUploads{}, nil)
 	s, err := runner.Sync()
 	if err != nil {
@@ -501,7 +499,7 @@ func parseWatchPasses(t *testing.T, out string) int {
 	return 0
 }
 
-// M2(a): a transcript modified seconds ago (< idle-after) and already uploaded
+// A transcript modified seconds ago (< idle-after) and already uploaded
 // must keep runWatch at the base interval across multiple idle passes.
 func TestRunWatchStaysAtBaseIntervalForRecentlyModifiedTranscript(t *testing.T) {
 	env, root := cliEnv(t)
@@ -531,7 +529,7 @@ func TestRunWatchStaysAtBaseIntervalForRecentlyModifiedTranscript(t *testing.T) 
 	}
 }
 
-// M2(b): a recently modified OpenClaw store (< idle-after) with no transcripts
+// A recently modified OpenClaw store (< idle-after) with no transcripts
 // and already uploaded must keep runWatch at the base interval.
 func TestRunWatchStaysAtBaseIntervalForRecentlyModifiedOpenClawStore(t *testing.T) {
 	root := t.TempDir()
@@ -541,8 +539,11 @@ func TestRunWatchStaysAtBaseIntervalForRecentlyModifiedOpenClawStore(t *testing.
 	}
 	addEvent(t, db, "sess-1", 0, `{"type":"message","n":0}`)
 	recent := time.Now().Add(-10 * time.Second)
-	os.Chtimes(dirs.OpenClawStore, recent, recent)
-	os.Chtimes(dirs.OpenClawStore+"-wal", recent, recent)
+	for _, path := range []string{dirs.OpenClawStore, dirs.OpenClawStore + "-wal"} {
+		if err := os.Chtimes(path, recent, recent); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	env := map[string]string{
 		"AGENT_SESSIONS_ACCOUNT":                "zach@example.com",
@@ -576,7 +577,7 @@ func TestRunWatchStaysAtBaseIntervalForRecentlyModifiedOpenClawStore(t *testing.
 	}
 }
 
-// M1: OpenClaw store with a live WAL file must be skipped under the 2s settle window
+// An OpenClaw store with a live WAL file must be skipped under the 2s settle window
 // (signatureOf combines db + wal mtimes; isSettled must check real max mtime, not hash).
 func TestRunnerSkipsOpenClawStoreWithWALUnderSettleWindow(t *testing.T) {
 	db, dirs := newOpenClawStore(t, t.TempDir())
@@ -591,8 +592,11 @@ func TestRunnerSkipsOpenClawStoreWithWALUnderSettleWindow(t *testing.T) {
 	}
 	// Backdate both DB and WAL past the 2s settle window so pass 1 settles immediately.
 	settled := time.Now().Add(-10 * time.Second)
-	os.Chtimes(dirs.OpenClawStore, settled, settled)
-	os.Chtimes(walPath, settled, settled)
+	for _, path := range []string{dirs.OpenClawStore, walPath} {
+		if err := os.Chtimes(path, settled, settled); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	state, _ := OpenState(filepath.Join(t.TempDir(), "s.sqlite"), "z@x")
 	defer state.Close()
@@ -617,7 +621,7 @@ func TestRunnerSkipsOpenClawStoreWithWALUnderSettleWindow(t *testing.T) {
 	}
 }
 
-// M3: same-size rewrite inside the 2s settle window must still upload its new line,
+// A same-size rewrite inside the 2s settle window must still upload its new line,
 // both within the same Runner and across a restart + after settling.
 func TestRunnerReuploadsSameSizeRewriteInsideSettleWindow(t *testing.T) {
 	root := t.TempDir()
@@ -641,7 +645,7 @@ func TestRunnerReuploadsSameSizeRewriteInsideSettleWindow(t *testing.T) {
 		t.Fatalf("pass 1 = %+v, %v", s, err)
 	}
 
-	// Same-size in-place rewrite while STILL inside the 2s settle window (LastSize is -1).
+	// Same-size in-place rewrite while STILL inside the 2s settle window.
 	f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -682,7 +686,7 @@ func TestRunnerReuploadsSameSizeRewriteInsideSettleWindow(t *testing.T) {
 	}
 }
 
-// F4: argonMetaCache must not cache a failed SQLite read.
+// argonMetaCache must not cache a failed SQLite read.
 func TestArgonMetaCacheDoesNotCacheFailedSQLiteRead(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "conversation_summaries.db")
@@ -699,7 +703,7 @@ func TestArgonMetaCacheDoesNotCacheFailedSQLiteRead(t *testing.T) {
 	}
 }
 
-// F5: symlinked .jsonl files must be skipped (matching lstat semantics).
+// Symlinked .jsonl files must be skipped (matching lstat semantics).
 func TestDiscoverSkipsSymlinkedJSONL(t *testing.T) {
 	root := t.TempDir()
 	realFile := filepath.Join(t.TempDir(), "real.jsonl")
@@ -708,7 +712,12 @@ func TestDiscoverSkipsSymlinkedJSONL(t *testing.T) {
 	if err := os.Symlink(realFile, link); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
-	if files := Discover(Dirs{ClaudeProjects: root}); len(files) != 0 {
+	logs := filepath.Join(root, "brain", "sess-1", ".system_generated", "logs")
+	os.MkdirAll(logs, 0o755)
+	if err := os.Symlink(realFile, filepath.Join(logs, argonTranscriptName)); err != nil {
+		t.Fatal(err)
+	}
+	if files := Discover(Dirs{ClaudeProjects: root, ArgonSessions: filepath.Join(root, "brain")}); len(files) != 0 {
 		t.Fatalf("symlinked .jsonl must be skipped, got %v", files)
 	}
 }
@@ -751,7 +760,7 @@ func TestRunnerUpgradesLegacyStateAndBackfillsSignatures(t *testing.T) {
 	os.WriteFile(transcript, content, 0o644)
 	os.Chtimes(transcript, oldTime, oldTime)
 
-	// Build a pre-upgrade state DB without last_size/last_mtime_ns/last_inode.
+	// Build a pre-upgrade state DB without last_mtime_ns/last_inode.
 	statePath := filepath.Join(t.TempDir(), "legacy.sqlite")
 	rawDB, err := common.OpenSQLite(statePath)
 	if err != nil {
@@ -786,14 +795,18 @@ func TestRunnerUpgradesLegacyStateAndBackfillsSignatures(t *testing.T) {
 	}
 	state1.Close()
 
-	// Second run after restart must immediately skip using the backfilled signature.
+	// After a restart the backfilled signature detects a same-size rewrite, so
+	// hosts that upgrade are covered without waiting for each file to grow.
 	state2, _ := OpenState(statePath, "z@x")
 	defer state2.Close()
 	r2 := newRunner(t, root, uploads, state2)
 	r2.SkipUnchanged = true
-	s2, err := r2.Sync()
-	if err != nil || s2.FilesUnchanged != 1 || s2.LinesSelected != 0 {
-		t.Fatalf("restart after backfill must skip immediately: %+v, %v", s2, err)
+	if s2, err := r2.Sync(); err != nil || s2.LinesSelected != 0 {
+		t.Fatalf("a backfilled file must not be re-uploaded: %+v, %v", s2, err)
+	}
+	os.WriteFile(transcript, []byte("{\"a\":2}\n"), 0o644)
+	if s3, err := r2.Sync(); err != nil || s3.LinesSelected != 1 {
+		t.Fatalf("a same-size rewrite of a backfilled file must upload: %+v, %v", s3, err)
 	}
 }
 

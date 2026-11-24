@@ -20,9 +20,9 @@ import (
 //
 // Individual JSONL lines carry no cwd, session title, or parent session id.
 // Those live in ~/.gemini/antigravity-cli/conversation_summaries.db and
-// annotations/<session-id>.pbtxt; standalone Discover loads them eagerly while
-// Runner loads them lazily only for changed transcripts (cached by DB+WAL
-// signature) and ships non-empty values on SessionFile.Session.
+// annotations/<session-id>.pbtxt. The Runner reads them only for a transcript
+// with new lines (the database cached by its and its WAL's signature) and ships
+// non-empty values on SessionFile.Session.
 const argonTranscriptName = "transcript_full.jsonl"
 
 var argonAnnotationTitleRe = regexp.MustCompile(`(?m)^\s*title:\s*"((?:\\.|[^"\\])*)"`)
@@ -35,7 +35,6 @@ type argonSummary struct {
 
 type argonSummaryCacheEntry struct {
 	sig       fileSignature
-	hasSig    bool
 	summaries map[string]argonSummary
 }
 
@@ -46,25 +45,22 @@ type argonMetaCache struct {
 func (c *argonMetaCache) summariesFor(agyRoot string) map[string]argonSummary {
 	dbPath := filepath.Join(agyRoot, "conversation_summaries.db")
 	sig, found := signatureOf(dbPath, dbPath+"-wal")
+	if !found {
+		return nil
+	}
+	if cached, ok := c.byDB[dbPath]; ok && cached.sig == sig {
+		return cached.summaries
+	}
+	summaries, err := loadArgonSummaries(dbPath)
+	if err != nil {
+		// A failed read (agy holds the database) is retried on the next changed
+		// transcript, not remembered until the database moves.
+		return nil
+	}
 	if c.byDB == nil {
 		c.byDB = map[string]argonSummaryCacheEntry{}
 	}
-	if cached, ok := c.byDB[dbPath]; ok && cached.hasSig == found && (!found || cached.sig == sig) {
-		return cached.summaries
-	}
-	var summaries map[string]argonSummary
-	if found {
-		var ok bool
-		summaries, ok = loadArgonSummaries(dbPath)
-		if !ok {
-			// Do not cache a transient SQLite open/query failure; retry on the
-			// next changed transcript instead of dropping metadata until the DB moves.
-			return summaries
-		}
-	} else {
-		summaries = map[string]argonSummary{}
-	}
-	c.byDB[dbPath] = argonSummaryCacheEntry{sig: sig, hasSig: found, summaries: summaries}
+	c.byDB[dbPath] = argonSummaryCacheEntry{sig: sig, summaries: summaries}
 	return summaries
 }
 
@@ -91,7 +87,7 @@ func (c *argonMetaCache) sessionMeta(path, sessionID string) map[string]any {
 	return meta
 }
 
-func discoverArgon(root string, loadMeta bool) []SessionFile {
+func discoverArgon(root string) []SessionFile {
 	if strings.TrimSpace(root) == "" {
 		return nil
 	}
@@ -101,22 +97,17 @@ func discoverArgon(root string, loadMeta bool) []SessionFile {
 		return nil
 	}
 	var files []SessionFile
-	var cache argonMetaCache
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		sessionID := entry.Name()
 		path := filepath.Join(root, sessionID, ".system_generated", "logs", argonTranscriptName)
-		info, err := os.Stat(path)
+		info, err := os.Lstat(path)
 		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		file := sessionFileWithInfo(ArgonTool, sessionID, path, info)
-		if loadMeta {
-			file.Session = cache.sessionMeta(path, sessionID)
-		}
-		files = append(files, file)
+		files = append(files, sessionFileWithInfo(ArgonTool, sessionID, path, info))
 	}
 	return files
 }
@@ -129,14 +120,11 @@ func argonRootDir(sessionDir string) string {
 	return parent
 }
 
-func loadArgonSummaries(dbPath string) (map[string]argonSummary, bool) {
+func loadArgonSummaries(dbPath string) (map[string]argonSummary, error) {
 	out := map[string]argonSummary{}
-	if _, err := os.Stat(dbPath); err != nil {
-		return out, os.IsNotExist(err)
-	}
 	db, err := common.OpenSQLiteReadOnly(dbPath)
 	if err != nil {
-		return out, false
+		return nil, err
 	}
 	defer db.Close()
 	rows, err := common.Query(db, `SELECT conversation_id, COALESCE(title, '') AS title,
@@ -144,7 +132,7 @@ func loadArgonSummaries(dbPath string) (map[string]argonSummary, bool) {
 		COALESCE(parent_conversation_id, '') AS parent_conversation_id
 		FROM conversation_summaries`)
 	if err != nil {
-		return out, false
+		return nil, err
 	}
 	for _, row := range rows {
 		id := strings.TrimSpace(row.String("conversation_id"))
@@ -157,7 +145,7 @@ func loadArgonSummaries(dbPath string) (map[string]argonSummary, bool) {
 			parentSessionID: strings.TrimSpace(row.String("parent_conversation_id")),
 		}
 	}
-	return out, true
+	return out, nil
 }
 
 func firstWorkspacePath(rawJSON string) string {

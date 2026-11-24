@@ -78,33 +78,31 @@ app's ingest endpoint (see below), which writes them into the `agent-sessions/in
 folder. The `--limit` flag bounds a run (useful for a first backfill). In Dagster, the
 `agent_sessions_drive_inbox_sensor` + `agent_sessions_drive_ingest` asset consume the batches.
 
-**Active turns land in seconds; the first line after >10 minutes of host silence waits at most 30 s.** Measured 2026-11-08 over seven days from
+**A turn lands in seconds on an active host, and the first line after ten quiet minutes waits
+at most 30 s more.** Measured 2026-11-08 over seven days from
 `timeline.events.first_seen_at - occurred_at`, Claude Code, Codex, OpenClaw and Argon turns
 landed p50 3-4 min, p99 6-7 min, and almost none of it was work: the five-minute uploader
 tick, a 60 s inbox sensor and a Dagster run start (~5 s), then a fast lane that took 15.2 s
 for two rows because the `agent_session` roll-up's plan is costed at 1.6M and Postgres spent
 5.4 s per query compiling JIT code for a 2 ms query. Now:
 
-- the device runs `--watch`: a pass every two seconds while any transcript or store was
-  modified within `--idle-after` (default 10 m, so model-thinking gaps of 40–120 s stay at
-  2 s with no added latency). Once no transcript or store has been modified for 10 m
-  (judged from on-disk mtimes so an already-idle host like porygon backs off from pass 1 of
-  every five-minute window, and ignoring far-future mtimes), the pause backs off up to
-  `--max-interval` (default 30 s; ~10 passes per 5 min) and resets to 2 s immediately on
-  new activity — so the first line written after >10 m of total host silence waits at most
-  30 s (avg ~15 s), well within the 1-hour upstream SLA (`source_sla.py`) and the <1 min
-  landing target. A transcript whose size, mtime and inode did not move (persisted in
-  `file_state` across five-minute restarts, loaded in one bulk query at startup, with a 2 s
-  mtime settle guard against coarse-mtime rewrites) costs one `stat` during discovery, not a
-  second `stat`, a per-file SQLite lookup or a read. Touching a transcript (`touch`) or
-  changing its inode (e.g., copying or restoring transcripts onto a host) re-ships that
-  file from byte 0 so same-size rewrites and atomic replacements are never missed; warehouse
-  ingest deduplicates by primary key. Argon lists `<brain>` one level deep and loads
-  `conversation_summaries.db` / `.pbtxt` metadata lazily only for changed transcripts
-  (without caching transient SQLite read failures), and Claude/Muse Code prune non-transcript
-  subdirectories (`tool-results`, `.msp-view-v1`, `.spool`, `tool-outputs`, `approval-review`).
-  A window ends after five minutes (`AGENT_SESSIONS_WATCH_WINDOW`) so the wrapper posts the
-  heartbeat as before; a failed pass ends it early and non-zero;
+- the device runs `--watch`: a pass every two seconds while any transcript or the OpenClaw
+  store was modified within `--idle-after` (10 m, so a 40-120 s thinking gap adds nothing).
+  After that the pause grows to `--max-interval` (30 s) and returns to two seconds on the
+  first new line. Idleness is read from on-disk mtimes (far-future ones ignored), so an idle
+  host backs off from the first pass of every window. Before this, porygon ran 137 passes a
+  window and 10% of a core with nothing to upload (2026-11-24). A window ends after five
+  minutes (`AGENT_SESSIONS_WATCH_WINDOW`) so the wrapper posts the heartbeat; a failed pass
+  ends it early and non-zero;
+- a transcript whose size, mtime and inode did not move costs the one `stat` discovery makes,
+  and the OpenClaw store one of its database and WAL (a store modified in the last two seconds
+  is read again, in case a write shared the read's mtime tick). Discovery skips the
+  subdirectories that hold no transcripts and lists Argon's `brain` one level deep.
+  `file_state` keeps each transcript's offset, mtime and inode, and a restarted watcher loads
+  it in one query;
+- **a moved mtime at the same size, or a new inode, re-ships the transcript from byte 0**, so a
+  same-size rewrite or an atomic replacement is not missed. A `touch` or a restore from backup
+  therefore re-ships what it touched; ingest dedupes by primary key;
 - the app NOTIFYs `pdw_agent_sessions_landing` when it stores a batch, and the resident
   `agent_sessions_landing_worker` in the Dagster container runs the asset's own
   `ingest_agent_sessions_inbox` (one advisory lock, so the worker and a sensor run never
@@ -401,7 +399,8 @@ truncates text and double-encodes tool arguments, and `chunks/` holds per-step f
 so the uploader reads only `transcript_full.jsonl`. Per-session metadata (`cwd` from
 `workspace_uris`, `title`, and `parent_conversation_id` for subagents) lives outside the
 lines in `~/.gemini/antigravity-cli/conversation_summaries.db` and
-`annotations/<session-id>.pbtxt`, which discovery reads and ships on `session`.
+`annotations/<session-id>.pbtxt`, which the uploader reads for a transcript with new lines
+and ships on `session`.
 
 Each line is `{step_index, source, type, status, created_at, ...}`; `event_uuid` is
 `<session_id>#<step_index>`. `argon_event_row` maps the step types as follows (shapes
