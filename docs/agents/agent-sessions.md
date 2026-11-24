@@ -629,12 +629,31 @@ remain the final guard against an unaccounted writer.
 
 Apply records a new `before-stop.json` before the first stop. It executes
 `docker stop --time 30 <dagster-id> <app-id>`, runs only DB apply
-with `--session-batches --planned-only --writers-paused --max-canonical-rows 5000`
-(production regenerates about 4 ms per canonical row, so a 5,000-row group takes about
-20 s; 10,000-row groups overran the 60-second transaction).
+with `--session-batches --planned-only --writers-paused --max-canonical-rows 5000
+--max-group-mb 40`. A group's time follows two sizes: canonical rows (production
+regenerates about 4 ms per row, so a 5,000-row group takes about 20 s; 10,000-row
+groups overran the 60-second transaction) and **prefiltered bytes**, the rows that
+pass the scan prefilter and are rechecked in the window (about 0.7 s per MB in
+production while the window also ran the left-alone recount; about 0.25 s per MB on
+one worker without it, measured on the test warehouse). A few
+rows of tool output can hold 100+ MB, so a row cap alone cannot bound a group: each
+group also holds at most `--max-group-mb` prefiltered megabytes. `plan` measures each
+session's prefiltered bytes while the writers are live and stores them in the plan
+(`session_bytes`); apply measures only a session the plan lacks. A session over
+10,000 rows **or** over the byte cap runs alone under the large-session deadline
+(300 s by default). Everything apply does runs with the writers stopped, so it
+keeps the work before the first group small: each completed group records a
+database snapshot taken after its commit and before the writers restart, and a
+later run rechecks only the source rows of completed sessions written since then
+(a secret re-ingested into a completed session still stops the run), instead of
+every finished row. The timed window does not compute the left-alone statistic
+(discovery reports it), does not confirm a derived copy of a session it is about
+to rebuild (the rebuild replaces or masks it either way), and reads the rebuild in
+pages of the adapter's batch size (each page re-reads the group's temporary view);
+each progress save validates the checkpoint in time linear in its size.
 If a group overruns its transaction, it rolls back and the writers restart;
-rerun `apply --max-canonical-rows <largest session's rows>` so that session runs
-alone (completed groups are skipped). The whole plan may hold at most 500 matching
+rerun `apply` with a smaller `--max-group-mb` or `--max-canonical-rows` (completed
+groups are skipped). The whole plan may hold at most 500 matching
 source rows and 20,000 source plus derived rows unless `apply --max-source-rows N
 --max-plan-rows M` raises them; set both from the reviewed plan counts, never
 blind. Each group stays bounded by `--max-canonical-rows` (up to 30,000, so one
@@ -644,9 +663,9 @@ run stops after N groups, restores the writers and exits nonzero with the number
 of planned sessions left; rerun `apply` to resume from the checkpoint. Size N and
 the number of outages from the credential report's `sessions` block (affected
 sessions, their canonical rows, the largest session and those over 10,000 rows).
-A session over 10,000 rows always runs in its own group; `apply
---large-session-window-seconds S` (at most 300) gives that group a longer
-transaction deadline, and every other group keeps 60 seconds. Writers are stopped
+A lone session's group gets `apply --large-session-window-seconds S` (at most 300,
+the default) as its transaction deadline, and every other group keeps 60 seconds.
+The deadline is a ceiling: a group that finishes sooner releases the writers sooner. Writers are stopped
 throughout, so the longer deadline only lengthens that outage. The in-window
 session recheck and the post-apply verification read only rows that pass the
 scan's prefilter, and the credential selector runs full confirmation only where a
@@ -692,7 +711,27 @@ re-chunks it from the masked text), and a masked chunk gets its new `text_sha256
 with nothing selected is left byte-identical. Only a key the rebuild wrote for
 **another** session still refuses the group (`canonical event missing for derived
 copy`), and a session with no canonical source at all still refuses (`canonical
-source missing`). The credential SQL prefilter (`credential_redaction.SQL_PREFILTER`)
+source missing`).
+
+**A cut copy is masked after the cut.** A timeline title (300 characters) or snippet
+(500) is a prefix of a turn, and a search chunk is a window of it. The source is
+masked whole at ingest, but a cut can turn a value that is not a secret in full
+(say, a labelled value that ends in a placeholder word) into a secret-shaped
+fragment. The two agent-session adapters set `mask_credentials`, so the one
+`TimelineSyncEngine` write path (ingest-time sync and the scrub's rebuild alike)
+masks title, snippet, metadata and search text with
+`derived_redaction.mask_cut` after the SQL cut them; a title or snippet cut through
+an existing `[REDACTED:kind:abcdef]` marker drops the partial marker. The chunk
+builder masks each agent-transcript chunk with `mask_window`, which knows the whole
+document and moves a window edge that falls inside a marker to that marker's edge. The scrub checks the
+masked rows before writing them and the credential report reads the stored rows,
+so the two agree; a masked title can exceed 300 characters by one marker. The flag
+is not part of `adapter_signature`, so it causes no re-walk: stored copies change
+only when the scrub rebuilds their session or the sync rewrites the row. Masking is
+credentials-only, like the scope. The Go app cuts transcript text only for display
+(`left(text, 700)` in the timeline detail view) and stores nothing derived.
+
+The credential SQL prefilter (`credential_redaction.SQL_PREFILTER`)
 is a case-insensitive superset of every rule's anchor after removing backslashes,
 including the `\u00XX` units an anchor character can be escaped as. Python confirms
 every prefiltered row. Full discovery keeps the existing

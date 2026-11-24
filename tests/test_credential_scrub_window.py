@@ -138,6 +138,8 @@ def test_session_groups_can_be_applied_a_bounded_number_at_a_time(tmp_path, monk
     monkeypatch.setattr(module, '_planned_rows', lambda warehouse, candidates, **k: [])
     monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, sessions, limit: {s: 12000 for s in sessions})
     monkeypatch.setattr(module, '_session_bytes', lambda warehouse, sessions, scope: {s: 1000 for s in sessions})
+    monkeypatch.setattr(module, '_post_commit_snapshot', lambda warehouse: '1:1:')
+    monkeypatch.setattr(module, '_written_since', lambda warehouse, sessions, snapshot: [])
     monkeypatch.setattr(module, 'scrub', lambda warehouse, plan, **k: applied.append([c['session'] for c in plan['candidates']]))
     kwargs = dict(window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True,
                   max_canonical_rows=12000, gap_seconds=0)
@@ -202,6 +204,8 @@ def test_a_large_session_runs_alone_under_its_own_deadline(tmp_path, monkeypatch
     monkeypatch.setattr(module, '_planned_rows', lambda warehouse, candidates, **k: [])
     monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, s, limit: {k: sessions[k] for k in s})
     monkeypatch.setattr(module, '_session_bytes', lambda warehouse, s, scope: {k: 1000 for k in s})
+    monkeypatch.setattr(module, '_post_commit_snapshot', lambda warehouse: '1:1:')
+    monkeypatch.setattr(module, '_written_since', lambda warehouse, sessions, snapshot: [])
     monkeypatch.setattr(module, 'scrub', lambda warehouse, plan, **k: windows.update(
         {tuple(sorted(c['session'][1] for c in plan['candidates'])): k['window_seconds']}))
     module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True,
@@ -241,6 +245,8 @@ def test_groups_are_sized_by_prefiltered_bytes_and_a_heavy_session_gets_the_long
     monkeypatch.setattr(module, '_canonical_counts', lambda warehouse, s, limit: {k: rows[k[1]] for k in sorted(s)})
     scopes = []
     monkeypatch.setattr(module, '_session_bytes', lambda warehouse, s, scope: scopes.append(scope) or {k: sizes[k[1]] for k in s})
+    monkeypatch.setattr(module, '_post_commit_snapshot', lambda warehouse: '1:1:')
+    monkeypatch.setattr(module, '_written_since', lambda warehouse, sessions, snapshot: [])
     monkeypatch.setattr(module, 'scrub', lambda warehouse, plan, **k: windows.append(
         (tuple(sorted(c['session'][1] for c in plan['candidates'])), k['window_seconds'])))
     module.apply_batches(None, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'), planned_only=True,
@@ -283,7 +289,7 @@ def test_checkpoint_validation_does_not_rescan_candidates_per_completed_group():
         plan = dict(version=2, scope=['db', None, None, 'public'],
                     watermarks={'timeline_events': 0, 'search_chunks': '', 'snapshot': '1:1:'},
                     candidates=candidates, counts=module._details(candidates),
-                    batches=dict(completed=[dict(sessions=[['claude_code', f's{i}']], canonical_rows=1, seconds=1.0)
+                    batches=dict(completed=[dict(sessions=[['claude_code', f's{i}']], canonical_rows=1, seconds=1.0, snapshot='1:1:')
                                             for i in range(groups)], oversized=[]))
         plan['candidates'] = Counted(candidates)
         Counted.reads = 0
@@ -296,7 +302,117 @@ def test_checkpoint_validation_does_not_rescan_candidates_per_completed_group():
                                    watermarks={'timeline_events': 0, 'search_chunks': '', 'snapshot': '1:1:'},
                                    candidates=[], counts=[],
                                    batches=dict(completed=[dict(sessions=[['claude_code', 'unknown']], canonical_rows=1,
-                                                                seconds=1.0)], oversized=[])))
+                                                                seconds=1.0, snapshot='1:1:')], oversized=[])))
+
+
+def test_a_completed_session_is_rechecked_only_for_rows_written_after_its_commit(warehouse, tmp_path, monkeypatch):
+    """Every apply run starts with writers stopped and rechecks completed sessions.
+
+    Reconfirming every finished row grew with progress (the whole backfill by the
+    last run). Each completed group records a snapshot taken after its commit,
+    so a later run reads only source rows written since; a secret re-ingested
+    into a completed session still stops the run.
+    """
+    from personal_data_warehouse import scrub_conversation_cards as m
+    selector = ScrubSelector('credentials')
+    rows = [dict(event(), session_id=s, event_uuid=f'{s}-dirty', text='use ' + TOKEN, raw_json='{}') for s in ('s-a', 's-b')]
+    warehouse._insert_rows('claude_code_events', rows, AGENT_SESSION_EVENT_COLUMNS)
+    path = tmp_path / 'plan.json'
+    m.write_plan(path, m.discover(warehouse, selector=selector))
+    kwargs = dict(window=lambda _: nullcontext(), selector=selector, planned_only=True, gap_seconds=0, max_groups=1,
+                  max_canonical_rows=1)
+    first = m.apply_batches(warehouse, path, **kwargs)
+    assert [g['sessions'] for g in first['batches']['completed']] == [[['claude_code', 's-a']]]
+    assert first['batches']['completed'][0]['snapshot']
+    counted = []
+    original = ScrubSelector.count_row
+    monkeypatch.setattr(ScrubSelector, 'count_row', lambda self, row: counted.append(row.get('session_id')) or original(self, row))
+    m.apply_batches(warehouse, path, **kwargs)
+    assert 's-a' not in counted and 's-b' in counted
+    warehouse._insert_rows('claude_code_events', [dict(rows[0], event_uuid='s-a-again', seq=7)], AGENT_SESSION_EVENT_COLUMNS)
+    with pytest.raises(RuntimeError, match='completed session changed'):
+        m.apply_batches(warehouse, path, **kwargs)
+
+
+def test_rows_written_since_include_a_transaction_in_progress_at_the_snapshot(warehouse):
+    import psycopg2
+    from personal_data_warehouse import scrub_conversation_cards as m
+    warehouse._insert_rows('claude_code_events', [dict(event(), event_uuid='before', raw_json='{}')], AGENT_SESSION_EVENT_COLUMNS)
+    other = psycopg2.connect(warehouse._database_url)
+    try:
+        with other.cursor() as cursor:
+            cursor.execute(warehouse._expand_relations(
+                "INSERT INTO @claude_code_events (source,session_id,event_uuid,seq,role,text) "
+                "VALUES ('claude_code','test-session','in-progress',5,'user','late')"))
+        snapshot = m._post_commit_snapshot(warehouse)
+        other.commit()
+    finally:
+        other.close()
+    warehouse._insert_rows('claude_code_events', [dict(event(), event_uuid='after', seq=9, raw_json='{}')], AGENT_SESSION_EVENT_COLUMNS)
+    rows = m._written_since(warehouse, {('claude_code', 'test-session')}, snapshot)
+    assert sorted(r['event_uuid'] for r in rows) == ['after', 'in-progress']
+
+
+def test_discovery_records_session_bytes_so_the_outage_does_not_measure_them(warehouse, tmp_path, monkeypatch):
+    from personal_data_warehouse import scrub_conversation_cards as m
+    row = dict(event(), text='use ' + TOKEN, raw_json='{}')
+    warehouse._insert_rows('claude_code_events', [row], AGENT_SESSION_EVENT_COLUMNS)
+    path = tmp_path / 'plan.json'
+    monkeypatch.setattr(m, 'PostgresWarehouse', lambda *a, **k: warehouse)
+    monkeypatch.setattr(warehouse, 'close', lambda: None)
+    monkeypatch.setattr('sys.argv', ['scrub', '--scope', 'credentials', '--plan', str(path), '--workers', '1'])
+    m.main()
+    warehouse._connection.set_session(readonly=False)  # discovery opened it read-only
+    plan = m.read_plan(path)
+    expected = m._session_bytes(warehouse, {('claude_code', 'test-session')}, 'credentials')
+    assert plan['session_bytes'] == [['claude_code', 'test-session', expected[('claude_code', 'test-session')]]]
+    monkeypatch.setattr(m, '_session_bytes', lambda *a, **k: pytest.fail('session bytes measured while writers are stopped'))
+    state = m.apply_batches(warehouse, path, window=lambda _: nullcontext(), selector=ScrubSelector('credentials'),
+                            planned_only=True, gap_seconds=0)
+    assert len(state['batches']['completed']) == 1
+
+
+def test_the_rebuild_pages_by_the_adapter_batch_not_the_scrub_page(warehouse, monkeypatch):
+    """Each rebuild page re-reads and sorts the whole group's temporary view, so
+    500-row pages made regeneration superlinear in a session's size."""
+    from personal_data_warehouse import scrub_conversation_cards as m
+    from personal_data_warehouse.timeline import TimelineSyncEngine
+    rows = [dict(event(), event_uuid=f't{i}', seq=i + 1, text=f'turn {i}', raw_json='{}') for i in range(1200)]
+    warehouse._insert_rows('claude_code_events', rows, AGENT_SESSION_EVENT_COLUMNS)
+    fetched = []
+    original = TimelineSyncEngine._fetch
+    monkeypatch.setattr(TimelineSyncEngine, '_fetch', lambda self, sql, params: fetched.append(params['limit']) or original(self, sql, params))
+    keys, _ = m.rebuild_sessions(warehouse, {('claude_code', 'test-session')}, 500, ScrubSelector('credentials'))
+    assert len([k for k in keys if k[0] == 'agent_session_turn']) == 1200
+    assert len(fetched) == 4  # one page and one empty page per adapter
+
+
+def test_sanitize_does_not_confirm_derived_copies_the_rebuild_replaces(warehouse, monkeypatch):
+    """A derived row of a session already being rebuilt is regenerated or masked
+    in place whatever its count, so confirming it in sanitize was wasted time."""
+    from personal_data_warehouse import scrub_conversation_cards as m
+    selector = ScrubSelector('credentials')
+    rows = [dict(event(), event_uuid=f't{i}', seq=i + 1, text=f'turn {i} ' + TOKEN, raw_json='{}') for i in range(3)]
+    warehouse._insert_rows('claude_code_events', rows, AGENT_SESSION_EVENT_COLUMNS)
+    from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
+    engine = TimelineSyncEngine(source_url=warehouse._database_url, source_schema=warehouse._schema, dest_schema=warehouse._schema,
+                                adapters=[adapter_by_name(n) for n in ('agent_session', 'agent_session_turn')])
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    # The copies an older sync wrote, before ingest masked the source.
+    warehouse._command("UPDATE @timeline_events SET search_text = search_text || ' ' || %s", (TOKEN,))
+    plan = m.discover(warehouse, selector=selector)
+    timings = []
+    in_sanitize = []
+    original = ScrubSelector.count_row
+    monkeypatch.setattr(ScrubSelector, 'count_row', lambda self, row: in_sanitize.append(
+        'adapter' in row and bool(timings) and timings[-1]['phase'] == 'recount') or original(self, row))
+    m.scrub(warehouse, apply=True, plan=plan, selector=selector, planned_only=True, timings=timings)
+    assert 'sanitize' in [t['phase'] for t in timings]
+    assert not any(in_sanitize)
+    assert not m.discover(warehouse, selector=selector)['candidates']
 
 
 def test_the_timed_window_skips_the_left_alone_recount(warehouse, tmp_path, monkeypatch):

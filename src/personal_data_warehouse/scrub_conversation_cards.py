@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import html
+import re
 import signal
 import threading
 import tempfile
@@ -39,6 +40,7 @@ MAX_GROUP_BYTES = 40_000_000
 LARGE_SESSION_WINDOW_SECONDS = 300
 DERIVED = ('timeline_events', 'search_chunks')
 row_matches = count_row
+_SNAPSHOT = re.compile(r'[0-9]+:[0-9]+:[0-9,]*')
 
 
 @contextmanager
@@ -383,17 +385,26 @@ def _validate_plan(plan):
         from personal_data_warehouse.card_scrub_selector import validate_specification
         validate_specification(plan["selector"])
         if type(plan.get("left_alone")) is not int or plan["left_alone"] < 0: raise ValueError("invalid left-alone count")
-    if set(plan) - {"selector","left_alone","discovery","batches"} != {'version','scope','watermarks','candidates','counts'} or plan['version'] != 2:
+    if set(plan) - {"selector","left_alone","discovery","batches","session_bytes"} != {'version','scope','watermarks','candidates','counts'} or plan['version'] != 2:
         raise ValueError('invalid discovery plan')
+    # Built once: every progress save validates the whole checkpoint while
+    # writers are stopped, and a set per batch record cost groups x candidates.
+    known={tuple(c['session']) for c in plan['candidates'] if c['session']}
+    if 'session_bytes' in plan:
+        if any(not isinstance(e,list) or len(e)!=3 or tuple(e[:2]) not in known or type(e[2]) is not int or e[2]<0
+               for e in plan['session_bytes']):
+            raise ValueError('invalid session sizes')
     if 'batches' in plan:
         state=plan['batches']
         if set(state)!={'completed','oversized'}: raise ValueError('invalid batch checkpoint')
-        # Built once: every progress save validates the whole checkpoint while
-        # writers are stopped, and a set per batch record cost groups x candidates.
-        known={tuple(c['session']) for c in plan['candidates'] if c['session']}
-        for group in state['completed']+state['oversized']:
-            if set(group)!={'sessions','canonical_rows','seconds'} or not isinstance(group['sessions'],list):
+        # A completed group also records the snapshot taken after its commit.
+        records=[(g,{'sessions','canonical_rows','seconds','snapshot'}) for g in state['completed']]
+        records+=[(g,{'sessions','canonical_rows','seconds'}) for g in state['oversized']]
+        for group,fields in records:
+            if set(group)!=fields or not isinstance(group['sessions'],list):
                 raise ValueError('invalid batch record')
+            if 'snapshot' in group and not (isinstance(group['snapshot'],str) and _SNAPSHOT.fullmatch(group['snapshot'])):
+                raise ValueError('invalid batch snapshot')
             if type(group['canonical_rows']) is not int or group['canonical_rows']<0 or not isinstance(group['seconds'],(float,int)) or not 0<=group['seconds']<float('inf'):
                 raise ValueError('invalid batch measurements')
             if any(not isinstance(s,list) or len(s)!=2 or tuple(s) not in known for s in group['sessions']):
@@ -582,6 +593,32 @@ def _session_bytes(warehouse, sessions, scope):
         for s in sorted(sessions)}
 
 
+def _post_commit_snapshot(warehouse):
+    return _read_on(warehouse,warehouse._connection,'SELECT pg_current_snapshot()::text AS value')[0]['value']
+
+
+def _written_since(warehouse, sessions, snapshot):
+    """Source rows of ``sessions`` written by a transaction ``snapshot`` does not see:
+    an xid at or past its xmax, or one still in progress when it was taken."""
+    from personal_data_warehouse.postgres import _AI_EVENT_TABLE_BY_SOURCE
+    _check_horizon(warehouse,snapshot)
+    rows=[]
+    for table in sorted({_AI_EVENT_TABLE_BY_SOURCE[source] for source,_ in sessions}):
+        ordered=sorted(s for s in sessions if _AI_EVENT_TABLE_BY_SOURCE[s[0]]==table)
+        rows.extend(warehouse._query_dicts(
+            f'SELECT * FROM @{table} candidate WHERE (source,session_id) IN ('+','.join('(%s,%s)' for _ in ordered)+') '
+            'AND (age(candidate.xmin) <= age(pg_snapshot_xmax(%s::pg_snapshot)::xid) OR '
+            'candidate.xmin = ANY(ARRAY(SELECT x::xid FROM pg_snapshot_xip(%s::pg_snapshot) x)))',
+            tuple(v for pair in ordered for v in pair)+(snapshot,snapshot)))
+    return rows
+
+
+def session_bytes_entries(warehouse, plan, scope):
+    """``plan['session_bytes']``, measured while writers are live (see apply_batches)."""
+    sizes=_session_bytes(warehouse,{tuple(c['session']) for c in plan['candidates'] if c['session']},scope)
+    return [[*s,n] for s,n in sorted(sizes.items())]
+
+
 def session_subplan(warehouse, plan, session, *, selector):
     """Reconfirm one session from a fully scanned checkpoint while live.
 
@@ -614,7 +651,7 @@ def session_subplan(warehouse, plan, session, *, selector):
         candidates.append(dict(c, matches=n))
     if not candidates: raise ValueError('session absent from checkpoint')
     candidates = _attach_related(warehouse, candidates, warehouse._connection)
-    subset = {k:v for k,v in plan.items() if k not in ('discovery','batches')}
+    subset = {k:v for k,v in plan.items() if k not in ('discovery','batches','session_bytes')}
     subset.update(candidates=candidates, counts=_details(candidates), selector=selector.specification)
     return subset
 
@@ -698,14 +735,19 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     state=plan.setdefault('batches',dict(completed=[],oversized=[]))
     completed={tuple(s) for g in state['completed'] for s in g['sessions']}
     # Never silently trust a completion if an old key has become selected again.
+    # Writers are stopped here, so read only source rows written after each
+    # group's commit; rereading every finished row grew with progress.
     with ConfirmationPool(workers,selector,tally=False) as pool:
-        finished=[c for c in plan['candidates'] if tuple(c['session']) in completed]
-        if any(pool.counts([row for _,row in _planned_rows(warehouse,finished)])):
-            raise RuntimeError('completed session changed; rediscovery required')
+        for g in state['completed']:
+            if any(pool.counts(_written_since(warehouse,{tuple(s) for s in g['sessions']},g['snapshot']))):
+                raise RuntimeError('completed session changed; rediscovery required')
     sessions={tuple(c['session']) for c in plan['candidates']}-completed
     counts=_canonical_counts(warehouse,sessions,max_canonical_rows)
     state['oversized']=[dict(sessions=[list(s)],canonical_rows=n,seconds=0) for s,n in counts.items() if n>max_canonical_rows]
-    sizes=_session_bytes(warehouse,{s for s,n in counts.items() if n<=max_canonical_rows},selector.scope if selector else 'all')
+    # Sizes recorded at plan time (writers live); measure only a session the plan lacks.
+    sizes={(e[0],e[1]):e[2] for e in plan.get('session_bytes',[])}
+    missing={s for s,n in counts.items() if n<=max_canonical_rows and s not in sizes}
+    if missing: sizes.update(_session_bytes(warehouse,missing,selector.scope if selector else 'all'))
     groups=[]; group=[]; total=0; size=0
     for s,n in counts.items():
         if n>max_canonical_rows: continue
@@ -717,7 +759,7 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
     if group: groups.append((group,total,False))
     _checkpoint(path,plan)
     if progress: progress(dict(groups=len(groups),oversized_sessions=len(state['oversized']),canonical_rows=sum(counts.values()),
-                               prefiltered_bytes=sum(sizes.values())))
+                               prefiltered_bytes=sum(sizes[s] for s,n in counts.items() if n<=max_canonical_rows)))
     for index,(sessions,total,alone) in enumerate(groups):
         if max_groups is not None and index>=max_groups: break
         time.sleep(gap_seconds)  # workers LIVE, including after a resumed run
@@ -725,7 +767,7 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
         if not planned_only: candidates=_attach_related(warehouse,candidates,warehouse._connection)
         if len(candidates)>max_plan_rows:
             raise ValueError('group candidate gate exceeded; no maintenance started')
-        subset={k:v for k,v in plan.items() if k not in ('discovery','batches')}
+        subset={k:v for k,v in plan.items() if k not in ('discovery','batches','session_bytes')}
         subset.update(candidates=candidates,counts=_details(candidates))
         known=dict(plan,candidates=plan['candidates']+candidates)
         started=time.monotonic()
@@ -734,8 +776,11 @@ def apply_batches(warehouse, path, *, window, selector=None, workers=1, allow_pa
                   max_source_rows=max_source_rows,max_plan_rows=max_plan_rows,
                   max_delta_rows=max_delta_rows,window_seconds=large_session_window_seconds if alone else window_seconds,
                   max_canonical_rows=max_canonical_rows,_known_plan=known,planned_only=planned_only)
+            # Before writers restart: any later write gets a newer xid.
+            snapshot=_post_commit_snapshot(warehouse)
         elapsed=time.monotonic()-started
-        state['completed'].append(dict(sessions=[list(s) for s in sessions],canonical_rows=total,seconds=elapsed))
+        state['completed'].append(dict(sessions=[list(s) for s in sessions],canonical_rows=total,seconds=elapsed,
+                                       snapshot=snapshot))
         _checkpoint(path,plan)
         if progress: progress(dict(completed_groups=len(state['completed']),canonical_rows=total,window_seconds=elapsed))
     return plan
@@ -768,7 +813,11 @@ def _apply_plan(warehouse, plan, page_size, workers, selector=None, *, planned_o
     updates={}
     with ConfirmationPool(workers,selector,tally=False) as pool:
         sources=[]
-        for ((table,_),row),matches in zip(current.items(),pool.counts(list(current.values())),strict=True):
+        # A derived row of an already-active session is regenerated or masked in
+        # place whatever its count; confirming it here only cost window time.
+        unsettled=[(key,row) for key,row in current.items()
+                   if key[0] not in DERIVED or session_identity(row) not in active]
+        for ((table,_),row),matches in zip(unsettled,pool.counts([row for _,row in unsettled]),strict=True):
             if not matches: continue
             identity = session_identity(row) if table in DERIVED else (row['source'],row['session_id'])
             if not identity: raise RuntimeError('cannot identify canonical session for a derived match; no changes committed')
@@ -900,8 +949,9 @@ def rebuild_sessions(warehouse, sessions, page_size, selector=None):
         adapter = adapter_by_name(name)
         watermark_ts, watermark_id = stamp, ''
         while True:
+            # Pages of the adapter batch size: each page re-reads and sorts the whole temporary view.
             sql=adapter.incremental_sql.replace('@ai_conversation_events','pg_temp.card_scrub_events')
-            rows = engine._fetch(sql, dict(watermark_ts=watermark_ts, watermark_id=watermark_id, limit=page_size))
+            rows = engine._fetch(sql, dict(watermark_ts=watermark_ts, watermark_id=watermark_id, limit=max(page_size, adapter.batch_size)))
             if not rows:
                 break
             selected = []
@@ -1079,8 +1129,11 @@ def main():
                 plan=discover_resumable(warehouse,args.plan,workers=args.workers,selector=selector,
                     progress=lambda counts:print(json.dumps(counts),flush=True))
                 plan=catch_up(warehouse,plan,workers=args.workers,selector=selector,path=args.plan)
+                plan['session_bytes']=session_bytes_entries(warehouse,plan,selector.scope)
+                _checkpoint(args.plan,plan)
             else:
                 plan = discover(warehouse,workers=args.workers,selector=selector)
+                plan['session_bytes']=session_bytes_entries(warehouse,plan,selector.scope)
                 write_plan(args.plan,plan)
             before = plan['counts']
         table = month_source_report(before, after)

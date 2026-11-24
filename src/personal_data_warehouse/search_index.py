@@ -253,10 +253,16 @@ def split_text(text: str, *, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CH
     rebuild).
     """
     text = text[:DOCUMENT_MAX_CHARS]
+    pieces = (text[start:end].strip() for start, end in split_spans(text, max_chars=max_chars, overlap=overlap))
+    return [piece for piece in pieces if len(piece) >= CHUNK_MIN_CHARS]
+
+
+def split_spans(text: str, *, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> list[tuple[int, int]]:
+    """``split_text``'s windows as (start, end) offsets, before stripping."""
+    text = text[:DOCUMENT_MAX_CHARS]
     if len(text) <= max_chars:
-        stripped = text.strip()
-        return [stripped] if len(stripped) >= CHUNK_MIN_CHARS else []
-    chunks: list[str] = []
+        return [(0, len(text))]
+    spans: list[tuple[int, int]] = []
     start = 0
     while start < len(text):
         end = min(start + max_chars, len(text))
@@ -265,13 +271,11 @@ def split_text(text: str, *, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CH
             newline = text.rfind("\n", start + max_chars // 2, end)
             if newline > start:
                 end = newline
-        piece = text[start:end].strip()
-        if len(piece) >= CHUNK_MIN_CHARS:
-            chunks.append(piece)
+        spans.append((start, end))
         if end >= len(text):
             break
         start = max(end - overlap, start + 1)
-    return chunks
+    return spans
 
 
 def window_start(occurred_at: datetime) -> datetime:
@@ -347,25 +351,18 @@ class SearchChunkBuilder:
     def _plain_chunks(self, row: dict[str, Any]) -> list[_ChunkRow]:
         anchor = f"{row['adapter']}|{row['event_id']}"
         document = row["search_text"] or ""
-        pieces = split_text(document)
         if row["adapter"] in _credential_masked_adapters():
-            # A chunk is a window of an agent transcript: mask what each cut
-            # selects and drop a marker it cut through (derived_redaction).
-            from personal_data_warehouse.derived_redaction import mask_cut
+            # A chunk is a window of an agent transcript: keep a marker the
+            # window cuts out of it and mask what the cut selects (derived_redaction).
+            from personal_data_warehouse.derived_redaction import mask_window
 
-            last = len(pieces) - 1
             pieces = [
-                masked
-                for index, piece in enumerate(pieces)
-                if len(
-                    masked := mask_cut(
-                        piece,
-                        cut_start=index > 0,
-                        cut_end=index < last or len(document) > DOCUMENT_MAX_CHARS,
-                    ).strip()
-                )
-                >= CHUNK_MIN_CHARS
+                piece
+                for start, end in split_spans(document)
+                if len(piece := mask_window(document, start, end).strip()) >= CHUNK_MIN_CHARS
             ]
+        else:
+            pieces = split_text(document)
         return [
             _ChunkRow(
                 chunk_id=f"{anchor}#{index}",

@@ -59,18 +59,25 @@ def test_the_fixture_is_a_placeholder_in_full_and_a_secret_once_cut():
 
 
 def test_mask_cut_masks_the_fragment_and_drops_a_cut_marker():
-    from personal_data_warehouse.derived_redaction import mask_cut
+    from personal_data_warehouse.derived_redaction import mask_cut, mask_window
     assert mask_cut(CUT, cut_end=True) == LEAD + LABEL + marker('secret', VALUE[:30])
     assert mask_cut(CUT) == mask_cut(CUT, cut_end=True)  # masking does not depend on knowing it was cut
     assert mask_cut(CUT_TEXT) == CUT_TEXT  # nothing selected: byte-identical
     text = 'see ' + MARKER + ' done'
-    for cut in range(len('see ') + 1, len('see ') + len(MARKER)):
+    after = len('see ') + len(MARKER)
+    for cut in range(len('see ') + 1, after):
         assert mask_cut(text[:cut], cut_end=True) == 'see '
-        assert mask_cut(text[cut:], cut_start=True) == text[len('see ') + len(MARKER):]
+        assert mask_window(text, 0, cut) == 'see '
+        assert mask_window(text, cut, len(text)) == ' done'
     # An intact marker at either edge stays, and an uncut value is never trimmed.
     assert mask_cut('see ' + MARKER, cut_end=True) == 'see ' + MARKER
-    assert mask_cut(MARKER + ' done', cut_start=True) == MARKER + ' done'
+    assert mask_window(text, 0, after) == 'see ' + MARKER
+    assert mask_window(text, len('see '), len(text)) == MARKER + ' done'
     assert mask_cut('ends with [RED') == 'ends with [RED'
+    # A window knows its document: text that merely looks like a marker's tail stays.
+    assert mask_window('x = [1, a2] and more', 8, 20) == 'a2] and more'
+    # A window cut into a secret-shaped fragment is masked like a title.
+    assert mask_window(CUT_TEXT, 0, len(CUT)) == LEAD + LABEL + marker('secret', VALUE[:30])
 
 
 def test_sync_masks_a_title_cut_into_a_secret_shaped_fragment(warehouse):
