@@ -718,7 +718,7 @@ masked whole at ingest, but a cut can turn a value that is not a secret in full
 fragment. The two agent-session adapters set `mask_credentials`, so the one
 `TimelineSyncEngine` write path (ingest-time sync and the scrub's rebuild alike)
 masks title, snippet, metadata and search text with
-`derived_redaction.mask_cut` after the SQL cut them; a title or snippet cut through
+the derived-redaction module's `mask_cut` after the SQL cut them; a title or snippet cut through
 an existing `[REDACTED:kind:abcdef]` marker drops the partial marker. The chunk
 builder masks each agent-transcript chunk with `mask_window`, which knows the whole
 document and moves a window edge that falls inside a marker to that marker's edge. The scrub checks the
