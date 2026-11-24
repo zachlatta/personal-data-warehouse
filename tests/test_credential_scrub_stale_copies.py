@@ -109,3 +109,28 @@ def test_stale_derived_copies_are_masked_in_place_and_the_count_reaches_zero(war
     everything = [warehouse._query_dicts(f'SELECT * FROM @{t}') for t in ('timeline_events', 'search_chunks', 'claude_code_events')]
     assert TOKEN not in json.dumps(everything, default=str)
 
+
+def test_a_key_the_rebuild_writes_for_another_session_still_refuses(warehouse):
+    """A copy whose key the rebuild wrote for another session is not stale.
+
+    Masking it in place would keep a row the rebuild has just overwritten, so the
+    group refuses and the transaction leaves every row as it was.
+    """
+    from personal_data_warehouse import scrub_conversation_cards as m
+    selector = ScrubSelector('credentials')
+    text = 'see ' + TOKEN
+    other = dict(event(), session_id='other-session', event_uuid='other-event',
+                 text=text, raw_json=json.dumps({'text': text}), tool_input_json='{}', tool_result_json='')
+    warehouse._insert_rows('claude_code_events', [other], AGENT_SESSION_EVENT_COLUMNS)
+    [(seq,)] = warehouse._query("SELECT seq FROM @ai_conversation_events WHERE session_id='other-session'")
+    # The turn key the rebuild writes for other-session, held by a copy that names test-session.
+    warehouse._command(
+        """INSERT INTO @timeline_events (adapter,event_id,source,context,source_pk,search_text)
+           VALUES ('agent_session_turn',%s,'claude_code','claude_code|test-session',%s,%s)""",
+        (f'claude_code|other-session|{seq}', json.dumps(dict(source='claude_code', session_id='test-session', seq=1)), text))
+    warehouse._insert_rows('claude_code_events', [dict(event(), text='safe content', raw_json='{}')], AGENT_SESSION_EVENT_COLUMNS)
+    before = [warehouse._query_dicts(f'SELECT * FROM @{t} ORDER BY 1,2') for t in ('timeline_events', 'claude_code_events')]
+    with pytest.raises(RuntimeError, match='canonical event missing for derived copy'):
+        m.scrub(warehouse, apply=True, selector=selector)
+    assert [warehouse._query_dicts(f'SELECT * FROM @{t} ORDER BY 1,2') for t in ('timeline_events', 'claude_code_events')] == before
+
