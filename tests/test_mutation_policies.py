@@ -62,17 +62,34 @@ GO_POSTGRES_PACKAGES = ("./internal/mutations", "./internal/mutationworkers/..."
 
 @pytest.mark.local_integration
 def test_every_go_postgres_test_in_the_mutation_packages_runs() -> None:
-    result = subprocess.run(
-        ["go", "test", *GO_POSTGRES_PACKAGES, "-count=1", "-p", "1", "-v"],
-        cwd=ROOT / "app",
-        env={**os.environ, "PDW_TEST_POSTGRES_URL": os.environ["POSTGRES_DATABASE_URL"]},
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert result.returncode == 0, result.stdout[-20000:] + result.stderr
-    assert "PDW_TEST_POSTGRES_URL is not set" not in result.stdout, "a Postgres-backed Go test skipped"
-    assert result.stdout.count("--- PASS") >= 10, result.stdout[-5000:]
+    import psycopg2
+    from psycopg2 import sql
+    from psycopg2.extensions import make_dsn
+
+    from tests.conftest import make_test_schema
+
+    admin = psycopg2.connect(os.environ["POSTGRES_DATABASE_URL"])
+    admin.autocommit = True
+    database = make_test_schema("go_mutations")
+    with admin.cursor() as cursor:
+        cursor.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+    try:
+        url = make_dsn(os.environ["POSTGRES_DATABASE_URL"], dbname=database)
+        result = subprocess.run(
+            ["go", "test", *GO_POSTGRES_PACKAGES, "-count=1", "-p", "1", "-v"],
+            cwd=ROOT / "app",
+            env={**os.environ, "PDW_TEST_POSTGRES_URL": url},
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert result.returncode == 0, result.stdout[-20000:] + result.stderr
+        assert "PDW_TEST_POSTGRES_URL is not set" not in result.stdout, "a Postgres-backed Go test skipped"
+        assert result.stdout.count("--- PASS") >= 10, result.stdout[-5000:]
+    finally:
+        with admin.cursor() as cursor:
+            cursor.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
+        admin.close()
 
 
 @pytest.mark.local_integration

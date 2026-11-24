@@ -766,22 +766,47 @@ func TestCreateRequestSkipsQuotedSignatureInNewestSentMessageAndFallsBack(t *tes
 	}
 }
 
-func TestCreateRequestAndUpdateEmailResolveDisplayNames(t *testing.T) {
-	store := testStore(t)
+// seedCleanContactPointsFixture exposes a test-scoped view at
+// @clean_contact_points (which is a view in the real warehouse catalog, never
+// a table) backed by a per-test table, and drops both in t.Cleanup so the
+// shared test database is never left with a table masking the mart view.
+func seedCleanContactPointsFixture(t *testing.T, store *PostgresStore, suffix int64) string {
+	t.Helper()
 	ctx := context.Background()
-	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("clean_contact_points"))); err != nil {
+	schema := warehouse.QuoteIdent(warehouse.SchemaOf("clean_contact_points"))
+	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+schema); err != nil {
 		t.Skipf("cannot create contacts schema in this database: %v", err)
 	}
-	if _, err := execContext(ctx, store.db, `
-		CREATE TABLE IF NOT EXISTS @clean_contact_points (
+	backingTable := schema + "." + warehouse.QuoteIdent(fmt.Sprintf("test_contact_points_%d", suffix))
+	if _, err := store.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (
 			point_type text,
 			normalized_value text,
 			display_name text,
 			source_updated_at timestamptz
 		)
-	`); err != nil {
-		t.Skipf("cannot create clean_contact_points in this database: %v", err)
+	`, backingTable)); err != nil {
+		t.Skipf("cannot create backing contact_points table in this database: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = execContext(context.Background(), store.db, `DROP VIEW IF EXISTS @clean_contact_points`)
+		_, _ = store.db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+backingTable)
+	})
+	if _, err := execContext(ctx, store.db, fmt.Sprintf(`
+		CREATE OR REPLACE VIEW @clean_contact_points AS
+		SELECT point_type, normalized_value, display_name, source_updated_at
+		FROM %s
+	`, backingTable)); err != nil {
+		t.Skipf("cannot create clean_contact_points view in this database: %v", err)
+	}
+	return backingTable
+}
+
+func TestCreateRequestAndUpdateEmailResolveDisplayNames(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	suffix := time.Now().UnixNano()
+	contactPointsTable := seedCleanContactPointsFixture(t, store, suffix)
 	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("gmail_messages"))); err != nil {
 		t.Skipf("cannot create gmail schema in this database: %v", err)
 	}
@@ -797,22 +822,24 @@ func TestCreateRequestAndUpdateEmailResolveDisplayNames(t *testing.T) {
 	}
 	_, _ = execContext(ctx, store.db, `ALTER TABLE @gmail_messages ADD COLUMN IF NOT EXISTS payload_json text`)
 
-	suffix := time.Now().UnixNano()
 	sender := fmt.Sprintf("sender-%d@example.test", suffix)
 	contactOnly := fmt.Sprintf("contact-%d@example.test", suffix)
 	bothSources := fmt.Sprintf("both-%d@example.test", suffix)
 	gmailOnly := fmt.Sprintf("gmail-%d@example.test", suffix)
 	addedLater := fmt.Sprintf("later-%d@example.test", suffix)
 	unknown := fmt.Sprintf("unknown-%d@example.test", suffix)
+	t.Cleanup(func() {
+		_, _ = execContext(context.Background(), store.db, `DELETE FROM @gmail_messages WHERE account = $1`, sender)
+	})
 
-	if _, err := execContext(ctx, store.db, `
-		INSERT INTO @clean_contact_points (point_type, normalized_value, display_name, source_updated_at)
+	if _, err := store.db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %s (point_type, normalized_value, display_name, source_updated_at)
 		VALUES
 			('email', $1, 'Ada Example', '2026-10-01 00:00:00+00'),
 			('email', $2, 'Contact Person', '2026-10-02 00:00:00+00'),
 			('email', $3, 'Preferred Contact', '2026-10-03 00:00:00+00'),
 			('email', $4, 'Later, Person', '2026-10-04 00:00:00+00')
-	`, sender, contactOnly, bothSources, addedLater); err != nil {
+	`, contactPointsTable), sender, contactOnly, bothSources, addedLater); err != nil {
 		t.Fatalf("seed clean_contact_points: %v", err)
 	}
 	if _, err := execContext(ctx, store.db, `
@@ -887,19 +914,8 @@ func TestCreateRequestAndUpdateEmailResolveDisplayNames(t *testing.T) {
 func TestCreateRequestHandlesGroupSharedSendersAndConflictingContacts(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
-	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("clean_contact_points"))); err != nil {
-		t.Skipf("cannot create contacts schema in this database: %v", err)
-	}
-	if _, err := execContext(ctx, store.db, `
-		CREATE TABLE IF NOT EXISTS @clean_contact_points (
-			point_type text,
-			normalized_value text,
-			display_name text,
-			source_updated_at timestamptz
-		)
-	`); err != nil {
-		t.Skipf("cannot create clean_contact_points in this database: %v", err)
-	}
+	suffix := time.Now().UnixNano()
+	contactPointsTable := seedCleanContactPointsFixture(t, store, suffix)
 	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("gmail_messages"))); err != nil {
 		t.Skipf("cannot create gmail schema in this database: %v", err)
 	}
@@ -915,22 +931,24 @@ func TestCreateRequestHandlesGroupSharedSendersAndConflictingContacts(t *testing
 	}
 	_, _ = execContext(ctx, store.db, `ALTER TABLE @gmail_messages ADD COLUMN IF NOT EXISTS payload_json text`)
 
-	suffix := time.Now().UnixNano()
 	sender := fmt.Sprintf("sender-edge-%d@example.test", suffix)
 	groupAddr := fmt.Sprintf("support-group-%d@example.test", suffix)
 	sharedAddr := fmt.Sprintf("notifications-%d@example.test", suffix)
 	conflictFallback := fmt.Sprintf("conflict-fb-%d@example.test", suffix)
 	conflictBare := fmt.Sprintf("conflict-bare-%d@example.test", suffix)
+	t.Cleanup(func() {
+		_, _ = execContext(context.Background(), store.db, `DELETE FROM @gmail_messages WHERE account = $1`, sender)
+	})
 
-	if _, err := execContext(ctx, store.db, `
-		INSERT INTO @clean_contact_points (point_type, normalized_value, display_name, source_updated_at)
+	if _, err := store.db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %s (point_type, normalized_value, display_name, source_updated_at)
 		VALUES
 			('email', $1, 'Ada Example', '2026-10-01 00:00:00+00'),
 			('email', $2, 'Old Card Name', '2026-10-05 00:00:02+00'),
 			('email', $2, 'New Card Name', '2026-10-05 00:00:01+00'),
 			('email', $3, 'Stale Person', '2026-10-05 00:00:02+00'),
 			('email', $3, 'Other Person', '2026-10-05 00:00:01+00')
-	`, sender, conflictFallback, conflictBare); err != nil {
+	`, contactPointsTable), sender, conflictFallback, conflictBare); err != nil {
 		t.Fatalf("seed clean_contact_points: %v", err)
 	}
 	if _, err := execContext(ctx, store.db, `
