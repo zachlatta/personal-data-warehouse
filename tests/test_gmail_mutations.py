@@ -635,6 +635,77 @@ def test_build_email_raw_preserves_gmail_style_html_body() -> None:
     assert html_part.get_content().strip() == body_html
 
 
+def test_build_email_raw_formats_display_names_with_rfc5322_and_rfc2047() -> None:
+    raw = gmail_mutations.build_email_raw(
+        account="sender@example.test",
+        message={
+            "from": "Ada Example <sender@example.test>",
+            "to": [
+                '"Doe, Jane" <jane@example.test>',
+                '"Smith, \\"Bob\\"" <bob@example.test>',
+                "Renée Müller <renee@example.test>",
+                "bare@example.test",
+            ],
+            "cc": ["Grace Hopper <grace@example.test>"],
+            "bcc": ['"Secret, Person" <secret@example.test>'],
+            "subject": "Display names",
+            "body_text": "Hello everyone.",
+        },
+    )
+
+    raw_bytes = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+    # Wire bytes of headers must be pure ASCII (RFC 2047 encoded for non-ASCII).
+    header_block = raw_bytes.split(b"\r\n\r\n", 1)[0]
+    header_block.decode("ascii")
+    assert b"=?utf-8?" in header_block.lower()
+
+    parsed = _decode_raw_message(raw)
+    assert [(a.display_name, a.addr_spec) for a in parsed["From"].addresses] == [
+        ("Ada Example", "sender@example.test"),
+    ]
+    assert [(a.display_name, a.addr_spec) for a in parsed["To"].addresses] == [
+        ("Doe, Jane", "jane@example.test"),
+        ('Smith, "Bob"', "bob@example.test"),
+        ("Renée Müller", "renee@example.test"),
+        ("", "bare@example.test"),
+    ]
+    assert [(a.display_name, a.addr_spec) for a in parsed["Cc"].addresses] == [
+        ("Grace Hopper", "grace@example.test"),
+    ]
+    assert [(a.display_name, a.addr_spec) for a in parsed["Bcc"].addresses] == [
+        ("Secret, Person", "secret@example.test"),
+    ]
+
+
+def test_build_email_raw_from_falls_back_to_account_and_never_spoofs_address() -> None:
+    raw_default = gmail_mutations.build_email_raw(
+        account="sender@example.test",
+        message={
+            "to": ["one@example.test"],
+            "subject": "Default from",
+            "body_text": "Hi",
+        },
+    )
+    parsed_default = _decode_raw_message(raw_default)
+    assert [(a.display_name, a.addr_spec) for a in parsed_default["From"].addresses] == [
+        ("", "sender@example.test"),
+    ]
+
+    raw_mismatch = gmail_mutations.build_email_raw(
+        account="sender@example.test",
+        message={
+            "from": "Spoofed Name <other@example.test>",
+            "to": ["one@example.test"],
+            "subject": "Mismatch from",
+            "body_text": "Hi",
+        },
+    )
+    parsed_mismatch = _decode_raw_message(raw_mismatch)
+    assert [(a.display_name, a.addr_spec) for a in parsed_mismatch["From"].addresses] == [
+        ("", "sender@example.test"),
+    ]
+
+
 def test_gmail_mutation_failure_status_marks_missing_scope_as_blocked() -> None:
     error = RuntimeError("OAuth token for zach@example.test cannot be refreshed")
 

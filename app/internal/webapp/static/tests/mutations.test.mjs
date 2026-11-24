@@ -273,6 +273,10 @@ test("assembleEmailBody orders editor, signature, quote and joins text with blan
   assert.equal(out.body_text, "Hello\n\n--\nZ\n\nold\n");
   assert.equal(assembleEmailBody({ editorHTML: "<div>x</div>", editorText: "x" }).body_html, "<div>x</div>");
   assert.deepEqual(splitEmailAddressList("a@example.test, b@example.test\n\nc@example.test"), ["a@example.test", "b@example.test", "c@example.test"]);
+  assert.deepEqual(
+    splitEmailAddressList('"Doe, Jane" <jane@example.test>, Ada Example <ada@example.test>\n"Smith, \\"Bob\\"" <bob@example.test>'),
+    ['"Doe, Jane" <jane@example.test>', "Ada Example <ada@example.test>", '"Smith, \\"Bob\\"" <bob@example.test>'],
+  );
 });
 
 // --- calendar -----------------------------------------------------------------

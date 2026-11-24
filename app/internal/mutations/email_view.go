@@ -25,7 +25,7 @@ func gmailEmailView(mutation Mutation) map[string]any {
 	variants := gmailEmailVariants(mutation, email)
 	out := make([]map[string]any, 0, len(variants))
 	for _, variant := range variants {
-		item := gmailEmailMessageView(variant.Message)
+		item := gmailEmailMessageView(variant.Message, mutation.Account)
 		item["id"] = variant.ID
 		item["title"] = variant.Title
 		item["selected"] = variant.Selected
@@ -38,7 +38,7 @@ func gmailEmailView(mutation Mutation) map[string]any {
 	}
 	view := map[string]any{
 		"delivery_mode": deliveryMode,
-		"message":       gmailEmailMessageView(email),
+		"message":       gmailEmailMessageView(email, mutation.Account),
 		"variants":      out,
 		"reply_threads": threadViews,
 		"has_variants":  len(variants) > 1,
@@ -57,7 +57,7 @@ func gmailEmailView(mutation Mutation) map[string]any {
 // whole thing as it will be sent. Each part is also carried as plain text
 // (editor_text, signature_text, quoted_text) for a client whose editor is a
 // plain text field — the iOS app — so no client strips HTML on its own.
-func gmailEmailMessageView(email map[string]any) map[string]any {
+func gmailEmailMessageView(email map[string]any, fallbackAccount ...string) map[string]any {
 	bodyHTML := strings.TrimSpace(stringFromAny(email["body_html"]))
 	bodyText := stringFromAny(email["body_text"])
 	if bodyHTML == "" {
@@ -66,7 +66,12 @@ func gmailEmailMessageView(email map[string]any) map[string]any {
 	fullBodyHTML := bodyHTML
 	bodyHTML, quotedHTML := splitGmailQuotedHTML(bodyHTML)
 	editorHTML, signatureHTML := splitEmailBodyAndSignatureHTML(bodyHTML)
+	from := strings.TrimSpace(stringFromAny(email["from"]))
+	if from == "" && len(fallbackAccount) > 0 {
+		from = strings.TrimSpace(fallbackAccount[0])
+	}
 	return map[string]any{
+		"from":               from,
 		"attachments":        email["attachments"],
 		"to":                 stringSliceFromAny(email["to"]),
 		"cc":                 stringSliceFromAny(email["cc"]),
@@ -295,9 +300,48 @@ func addressListFromAny(value any) []string {
 	return normalizeStringSlice(stringSliceFromAny(value))
 }
 
+// splitEmailAddressList splits a comma- or newline-separated recipient string
+// without breaking on commas inside RFC 5322 quoted display names such as
+// `"Doe, Jane" <jane@example.test>`.
 func splitEmailAddressList(value string) []string {
-	fields := strings.FieldsFunc(value, func(r rune) bool {
-		return r == ',' || r == '\n' || r == '\r'
-	})
+	var fields []string
+	var current strings.Builder
+	inQuotes := false
+	escaped := false
+	flush := func() {
+		if entry := strings.TrimSpace(current.String()); entry != "" {
+			fields = append(fields, entry)
+		}
+		current.Reset()
+		inQuotes = false
+		escaped = false
+	}
+	for _, r := range value {
+		if r == '\n' || r == '\r' {
+			flush()
+			continue
+		}
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' && inQuotes {
+			current.WriteRune(r)
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			inQuotes = !inQuotes
+			current.WriteRune(r)
+			continue
+		}
+		if r == ',' && !inQuotes {
+			flush()
+			continue
+		}
+		current.WriteRune(r)
+	}
+	flush()
 	return normalizeStringSlice(fields)
 }

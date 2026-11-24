@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -762,5 +763,123 @@ func TestCreateRequestSkipsQuotedSignatureInNewestSentMessageAndFallsBack(t *tes
 	bodyText := stringFromAny(message["body_text"])
 	if bodyText != "Checking in.\n\n--\nZach Latta\nHack Club\n" {
 		t.Fatalf("body_text = %q", bodyText)
+	}
+}
+
+func TestCreateRequestAndUpdateEmailResolveDisplayNames(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("clean_contact_points"))); err != nil {
+		t.Skipf("cannot create contacts schema in this database: %v", err)
+	}
+	if _, err := execContext(ctx, store.db, `
+		CREATE TABLE IF NOT EXISTS @clean_contact_points (
+			point_type text,
+			normalized_value text,
+			display_name text,
+			source_updated_at timestamptz
+		)
+	`); err != nil {
+		t.Skipf("cannot create clean_contact_points in this database: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("gmail_messages"))); err != nil {
+		t.Skipf("cannot create gmail schema in this database: %v", err)
+	}
+	if _, err := execContext(ctx, store.db, `
+		CREATE TABLE IF NOT EXISTS @gmail_messages (
+			account text, message_id text, thread_id text, internal_date timestamptz,
+			label_ids text[], is_deleted bigint, body_html text, body_text text,
+			from_address text, payload_json text, rfc822_message_id text, references_header text, in_reply_to_header text,
+			PRIMARY KEY (account, message_id)
+		)
+	`); err != nil {
+		t.Skipf("cannot create gmail_messages in this database: %v", err)
+	}
+	_, _ = execContext(ctx, store.db, `ALTER TABLE @gmail_messages ADD COLUMN IF NOT EXISTS payload_json text`)
+
+	suffix := time.Now().UnixNano()
+	sender := fmt.Sprintf("sender-%d@example.test", suffix)
+	contactOnly := fmt.Sprintf("contact-%d@example.test", suffix)
+	bothSources := fmt.Sprintf("both-%d@example.test", suffix)
+	gmailOnly := fmt.Sprintf("gmail-%d@example.test", suffix)
+	addedLater := fmt.Sprintf("later-%d@example.test", suffix)
+	unknown := fmt.Sprintf("unknown-%d@example.test", suffix)
+
+	if _, err := execContext(ctx, store.db, `
+		INSERT INTO @clean_contact_points (point_type, normalized_value, display_name, source_updated_at)
+		VALUES
+			('email', $1, 'Ada Example', '2026-10-01 00:00:00+00'),
+			('email', $2, 'Contact Person', '2026-10-02 00:00:00+00'),
+			('email', $3, 'Preferred Contact', '2026-10-03 00:00:00+00'),
+			('email', $4, 'Later, Person', '2026-10-04 00:00:00+00')
+	`, sender, contactOnly, bothSources, addedLater); err != nil {
+		t.Fatalf("seed clean_contact_points: %v", err)
+	}
+	if _, err := execContext(ctx, store.db, `
+		INSERT INTO @gmail_messages (account, message_id, thread_id, internal_date, label_ids, is_deleted, from_address, payload_json)
+		VALUES
+			($1, $2, 't-1', '2026-10-05 00:00:00+00', ARRAY['INBOX'], 0, $3, $4),
+			($1, $5, 't-2', '2026-10-06 00:00:00+00', ARRAY['INBOX'], 0, $6, $7)
+	`,
+		sender,
+		fmt.Sprintf("msg-both-%d", suffix), bothSources, fmt.Sprintf(`{"headers":[{"name":"From","value":"Stale Bot <%s>"}]}`, bothSources),
+		fmt.Sprintf("msg-gmail-%d", suffix), gmailOnly, fmt.Sprintf(`{"headers":[{"name":"From","value":"Gmail Person <%s>"}]}`, gmailOnly),
+	); err != nil {
+		t.Fatalf("seed gmail_messages: %v", err)
+	}
+
+	created, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title:       "Send with resolved names",
+		Reason:      "integration test",
+		RequestedBy: "test",
+		Mutations: []MutationInput{{
+			Type:         GmailSendEmailOperation,
+			Account:      sender,
+			DeliveryMode: "send",
+			Message: map[string]any{
+				"to":        []string{contactOnly, "Explicit Name <" + gmailOnly + ">"},
+				"cc":        []string{bothSources, gmailOnly, unknown},
+				"subject":   "Hello",
+				"body_text": "Checking in.",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	msg := mapFromAny(created.Mutations[0].Payload["message"])
+	if got := stringFromAny(msg["from"]); got != "Ada Example <"+sender+">" {
+		t.Fatalf("from = %q", got)
+	}
+	wantTo := []string{"Contact Person <" + contactOnly + ">", "Explicit Name <" + gmailOnly + ">"}
+	if !reflect.DeepEqual(stringSliceFromAny(msg["to"]), wantTo) {
+		t.Fatalf("to = %#v, want %#v", msg["to"], wantTo)
+	}
+	wantCC := []string{"Preferred Contact <" + bothSources + ">", "Gmail Person <" + gmailOnly + ">", unknown}
+	if !reflect.DeepEqual(stringSliceFromAny(msg["cc"]), wantCC) {
+		t.Fatalf("cc = %#v, want %#v", msg["cc"], wantCC)
+	}
+
+	updated, err := store.UpdateGmailEmailMutation(ctx, created.ID, created.Mutations[0].ID, UpdateGmailEmailMutationInput{
+		DeliveryMode: "send",
+		Message: map[string]any{
+			"to":        []string{"Edited Name <" + contactOnly + ">"},
+			"cc":        []string{addedLater},
+			"subject":   "Hello",
+			"body_text": "Checking in.",
+		},
+	}, "app:test")
+	if err != nil {
+		t.Fatalf("UpdateGmailEmailMutation: %v", err)
+	}
+	updatedMsg := mapFromAny(updated.Payload["message"])
+	if got := stringFromAny(updatedMsg["from"]); got != "Ada Example <"+sender+">" {
+		t.Fatalf("updated from = %q", got)
+	}
+	if got := stringSliceFromAny(updatedMsg["to"]); !reflect.DeepEqual(got, []string{"Edited Name <" + contactOnly + ">"}) {
+		t.Fatalf("updated to = %#v", got)
+	}
+	if got := stringSliceFromAny(updatedMsg["cc"]); !reflect.DeepEqual(got, []string{`"Later, Person" <` + addedLater + ">"}) {
+		t.Fatalf("updated cc = %#v", got)
 	}
 }

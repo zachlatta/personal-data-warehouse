@@ -251,6 +251,10 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
   }
 
   const fields = h("div", "cfields");
+  const fromRow = h("div", "cfield");
+  fromRow.appendChild(h("span", "lab", "From"));
+  fromRow.appendChild(h("span", "m", V.str(variant.from) || mutation.account));
+  fields.appendChild(fromRow);
   const inputs = {};
   for (const [key, label, value] of [
     ["to", "To", V.stringSlice(variant.to).join(", ")],
@@ -455,7 +459,8 @@ function renderGmailEmail(request, mutation, actions) {
     if (threads.length) article.appendChild(renderReplyContext(threads, null));
     const ro = h("div", "email-ro");
     ro.appendChild(dl([
-      ["Delivery", deliveryMode], ["To", V.stringSlice(message.to).join(", ")], ["Cc", V.stringSlice(message.cc).join(", ")],
+      ["Delivery", deliveryMode], ["From", V.str(message.from) || mutation.account],
+      ["To", V.stringSlice(message.to).join(", ")], ["Cc", V.stringSlice(message.cc).join(", ")],
       ["Bcc", V.stringSlice(message.bcc).join(", ")], ["Subject", V.str(message.subject)],
     ]));
     ro.appendChild(attachmentList(V.emailAttachments(message)));

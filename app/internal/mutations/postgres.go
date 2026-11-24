@@ -174,6 +174,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 		return Request{}, err
 	}
 	normalized = s.enrichGmailEmailReplyHeaders(ctx, normalized)
+	normalized = s.enrichGmailEmailAddresses(ctx, normalized)
 	normalized = s.enrichGmailEmailSignatures(ctx, normalized)
 	normalized = s.enrichGmailEmailReplyQuotes(ctx, normalized)
 	if normalized, err = s.enrichGmailEmailForwards(ctx, normalized); err != nil {
@@ -730,6 +731,7 @@ func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID 
 		payload = enriched[0].Payload
 		preview = enriched[0].Preview
 	}
+	enriched = s.enrichGmailEmailAddresses(ctx, enriched)
 	enriched = s.enrichGmailEmailSignatures(ctx, enriched)
 	enriched = s.enrichGmailEmailReplyQuotes(ctx, enriched)
 	if enriched, err = s.enrichGmailEmailForwards(ctx, enriched); err != nil {
@@ -2260,6 +2262,9 @@ func normalizeMessageForStorage(message map[string]any) map[string]any {
 		"subject":   strings.TrimSpace(stringFromAny(message["subject"])),
 		"body_text": stringFromAny(message["body_text"]),
 		"body_html": stringFromAny(message["body_html"]),
+	}
+	if from := strings.TrimSpace(stringFromAny(message["from"])); from != "" {
+		out["from"] = from
 	}
 	if attachments, ok := message["attachments"]; ok {
 		out["attachments"] = attachments

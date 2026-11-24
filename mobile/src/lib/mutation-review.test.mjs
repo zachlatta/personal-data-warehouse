@@ -782,8 +782,8 @@ function sendEmailMutation(overrides = {}) {
       has_variants: true,
       message: { to: ['vendor@example.test'], cc: [], bcc: [], subject: 'Re: quote', editor_text: 'Sounds good.', editor_html: '<div>Sounds good.</div>', signature_html: '<div class="gmail_signature"><b>Zach</b></div>', signature_text: 'Zach', quoted_html: '<div class="gmail_quote">On Mon, they wrote:<br>hi</div>', quoted_text: 'On Mon, they wrote:\nhi', reply_to_thread_id: 't-9', in_reply_to: '<m1@example.test>', references: ['<m0@example.test>', '<m1@example.test>'] },
       variants: [
-        { id: 'variant-1', title: 'Direct', selected: false, to: ['vendor@example.test'], cc: [], bcc: [], subject: 'Re: quote', editor_text: 'Sounds good.', editor_html: '<div>Sounds good.</div>', signature_html: '', signature_text: '', quoted_html: '', quoted_text: '', reply_to_thread_id: 't-9', in_reply_to: '', references: [] },
-        { id: 'variant-2', title: 'Softer', selected: true, to: ['vendor@example.test'], cc: ['boss@example.test'], bcc: [], subject: 'Re: quote', editor_text: 'Maybe.', editor_html: '<div>Maybe.</div>', signature_html: '<div class="gmail_signature"><b>Zach</b></div>', signature_text: 'Zach', quoted_html: '<div class="gmail_quote">older</div>', quoted_text: 'older', reply_to_thread_id: 't-9', in_reply_to: '<m1@example.test>', references: ['<m1@example.test>'] },
+        { id: 'variant-1', title: 'Direct', selected: false, from: 'Ada Example <sender@example.test>', to: ['vendor@example.test'], cc: [], bcc: [], subject: 'Re: quote', editor_text: 'Sounds good.', editor_html: '<div>Sounds good.</div>', signature_html: '', signature_text: '', quoted_html: '', quoted_text: '', reply_to_thread_id: 't-9', in_reply_to: '', references: [] },
+        { id: 'variant-2', title: 'Softer', selected: true, from: 'Ada Example <sender@example.test>', to: ['vendor@example.test'], cc: ['boss@example.test'], bcc: [], subject: 'Re: quote', editor_text: 'Maybe.', editor_html: '<div>Maybe.</div>', signature_html: '<div class="gmail_signature"><b>Zach</b></div>', signature_text: 'Zach', quoted_html: '<div class="gmail_quote">older</div>', quoted_text: 'older', reply_to_thread_id: 't-9', in_reply_to: '<m1@example.test>', references: ['<m1@example.test>'] },
       ],
       reply_threads: [
         { thread_id: 't-9', subject: 'quote', messages: [{ message_id: 'm1', from_address: 'vendor@example.test', from_name: 'Vendor', to_addresses: ['zach@example.test'], internal_date: '2026-08-30T15:00:00Z', body_text: 'hi there' }] },
@@ -799,6 +799,11 @@ test('a send_email mutation becomes an editable composer: variants, the selected
   assert.equal(isGmailSendEmailMutation({ provider: 'gmail', operation: 'gmail.archive_threads' }), false);
   const review = gmailEmailReview(mutation);
   assert.equal(review.deliveryMode, 'send');
+  assert.equal(review.variants[0].from, 'Ada Example <sender@example.test>');
+  assert.deepEqual(
+    gmailEmailUpdateInput(review.variants[0], { to: '"Doe, Jane" <jane@example.test>, Ada Example <ada@example.test>', cc: '', bcc: '', subject: 'Re: quote', editorText: 'Hi' }, 'send').message.to,
+    ['"Doe, Jane" <jane@example.test>', 'Ada Example <ada@example.test>'],
+  );
   assert.equal(review.hasVariants, true);
   assert.deepEqual(review.variants.map((variant) => variant.id), ['variant-1', 'variant-2']);
   assert.equal(review.selectedVariantId, 'variant-2');

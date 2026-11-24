@@ -213,7 +213,7 @@ export function GmailEmailComposeCard({
         <View style={styles.cardHeader}>
           <View style={styles.cardHeaderCopy}>
             <ThemedText type="smallBold">{deliveryMode === 'draft' ? 'Save as Gmail draft' : 'Send email'}</ThemedText>
-            <ThemedText type="small" themeColor="textSecondary">{mutation.account}</ThemedText>
+            <ThemedText type="small" themeColor="textSecondary">{variant.from || mutation.account}</ThemedText>
           </View>
           <StatusPill status={mutation.status} />
         </View>
@@ -247,7 +247,7 @@ export function GmailEmailComposeCard({
         </View>
       ) : null}
 
-      {alone ? <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>From {mutation.account}</ThemedText> : null}
+      {alone ? <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>From {variant.from || mutation.account}</ThemedText> : null}
       <View style={[styles.fields, { backgroundColor: alone ? theme.backgroundElement : theme.background }]}>
         <Field
           label="To"

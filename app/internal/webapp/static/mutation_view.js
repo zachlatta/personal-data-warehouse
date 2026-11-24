@@ -589,7 +589,29 @@ export function assembleEmailBody({ editorHTML, editorText, signatureHTML, signa
   return { body_html, body_text };
 }
 
-export function splitEmailAddressList(value) { return normalizeStringSlice(str(value).split(/[,\n\r]/)); }
+export function splitEmailAddressList(value) {
+  const fields = [];
+  let current = "";
+  let inQuotes = false;
+  let escaped = false;
+  const flush = () => {
+    const entry = current.trim();
+    if (entry) fields.push(entry);
+    current = "";
+    inQuotes = false;
+    escaped = false;
+  };
+  for (const ch of str(value)) {
+    if (ch === "\n" || ch === "\r") { flush(); continue; }
+    if (escaped) { current += ch; escaped = false; continue; }
+    if (ch === "\\" && inQuotes) { current += ch; escaped = true; continue; }
+    if (ch === '"') { inQuotes = !inQuotes; current += ch; continue; }
+    if (ch === "," && !inQuotes) { flush(); continue; }
+    current += ch;
+  }
+  flush();
+  return normalizeStringSlice(fields);
+}
 
 // --- contacts ---------------------------------------------------------------
 

@@ -1666,6 +1666,7 @@ export type GmailEmailVariant = {
   id: string;
   title: string;
   selected: boolean;
+  from: string;
   to: string[];
   cc: string[];
   bcc: string[];
@@ -1739,6 +1740,7 @@ function gmailEmailVariant(raw: Record<string, unknown>, fallback: { id: string;
     title: text(raw.title) || fallback.title,
     selected: typeof raw.selected === 'boolean' ? raw.selected : fallback.selected,
     attachments: records(raw.attachments).map((a) => ({ filename: text(a.filename), content_type: text(a.content_type), data_base64: text(a.data_base64) })),
+    from: text(raw.from),
     to: list(raw.to),
     cc: list(raw.cc),
     bcc: list(raw.bcc),
@@ -1893,7 +1895,27 @@ export function assembleEmailBody(parts: { editorText: string; signatureHTML: st
 }
 
 export function splitEmailAddressList(value: string): string[] {
-  return value.split(/[,\n\r]/).map((entry) => entry.trim()).filter(Boolean);
+  const fields: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  let escaped = false;
+  const flush = () => {
+    const entry = current.trim();
+    if (entry) fields.push(entry);
+    current = '';
+    inQuotes = false;
+    escaped = false;
+  };
+  for (const ch of value) {
+    if (ch === '\n' || ch === '\r') { flush(); continue; }
+    if (escaped) { current += ch; escaped = false; continue; }
+    if (ch === '\\' && inQuotes) { current += ch; escaped = true; continue; }
+    if (ch === '"') { inQuotes = !inQuotes; current += ch; continue; }
+    if (ch === ',' && !inQuotes) { flush(); continue; }
+    current += ch;
+  }
+  flush();
+  return fields;
 }
 
 export type GmailEmailEdits = { to: string; cc: string; bcc: string; subject: string; editorText: string };

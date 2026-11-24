@@ -4,8 +4,10 @@ import base64
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from email import policy as email_policy
+from email.headerregistry import Address
 from email.message import EmailMessage
 from email.parser import BytesParser
+from email.utils import getaddresses, parseaddr
 import re
 import ssl
 from typing import Any
@@ -617,9 +619,9 @@ def build_email_raw(
     forwarded_parts: list[EmailMessage] | None = None,
 ) -> str:
     recipients = {
-        "To": _string_list(message.get("to")),
-        "Cc": _string_list(message.get("cc")),
-        "Bcc": _string_list(message.get("bcc")),
+        "To": _recipient_addresses(message.get("to")),
+        "Cc": _recipient_addresses(message.get("cc")),
+        "Bcc": _recipient_addresses(message.get("bcc")),
     }
     if not any(recipients.values()):
         raise ValueError("email must include at least one recipient")
@@ -632,10 +634,10 @@ def build_email_raw(
         raise ValueError("email body must not be blank")
 
     email = EmailMessage()
-    email["From"] = account
+    email["From"] = _format_from_header(account, message.get("from"))
     for header, values in recipients.items():
         if values:
-            email[header] = ", ".join(values)
+            email[header] = _format_address_header(values)
     email["Subject"] = subject
     in_reply_to = str(message.get("in_reply_to") or "").strip()
     if in_reply_to:
@@ -730,6 +732,83 @@ def _string_list(value: Any) -> list[str]:
     else:
         return []
     return [str(item).strip() for item in raw_values if str(item).strip()]
+
+
+def _clean_display_name(value: str) -> str:
+    cleaned = "".join(" " if ord(ch) < 32 or ord(ch) == 127 else ch for ch in value)
+    return " ".join(cleaned.split())
+
+
+def _parse_address_pair(raw: str) -> tuple[str, str]:
+    text = raw.strip()
+    if not text:
+        return "", ""
+    name, addr = parseaddr(text)
+    name = _clean_display_name(name)
+    addr = addr.strip()
+    if text.endswith(">") and "<" in text:
+        bracket_index = text.rfind("<")
+        candidate_addr = text[bracket_index + 1 : -1].strip()
+        if "@" in candidate_addr and (not addr or addr.casefold() != candidate_addr.casefold()):
+            candidate_name = _clean_display_name(text[:bracket_index].strip().strip('"'))
+            name, addr = candidate_name, candidate_addr
+    if name and addr and name.casefold() == addr.casefold():
+        name = ""
+    return name, addr
+
+
+def _make_address(name: str, addr: str, fallback: str) -> Address | str:
+    if "@" in addr:
+        try:
+            return Address(display_name=name, addr_spec=addr)
+        except ValueError:
+            pass
+    return fallback
+
+
+def _format_from_header(account: str, raw_from: Any) -> Address | str:
+    account_addr = str(account or "").strip()
+    display_name = ""
+    if raw_from is not None:
+        parsed_name, parsed_addr = _parse_address_pair(str(raw_from))
+        if parsed_name and (not parsed_addr or parsed_addr.casefold() == account_addr.casefold()):
+            display_name = parsed_name
+    return _make_address(display_name, account_addr, account_addr)
+
+
+def _recipient_addresses(value: Any) -> list[Address | str]:
+    if value is None:
+        return []
+    out: list[Address | str] = []
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        for raw_name, raw_addr in getaddresses([value]):
+            name = _clean_display_name(raw_name)
+            addr = raw_addr.strip()
+            if name and addr and name.casefold() == addr.casefold():
+                name = ""
+            if addr:
+                out.append(_make_address(name, addr, addr))
+        return out
+    if not isinstance(value, list):
+        return []
+    for item in value:
+        text = str(item).strip()
+        if not text:
+            continue
+        name, addr = _parse_address_pair(text)
+        if addr:
+            out.append(_make_address(name, addr, text))
+        else:
+            out.append(text)
+    return out
+
+
+def _format_address_header(values: list[Address | str]) -> tuple[Address, ...] | str:
+    if all(isinstance(v, Address) for v in values):
+        return tuple(v for v in values if isinstance(v, Address))
+    return ", ".join(str(v) for v in values)
 
 
 def _email_attachments(value: Any) -> list[tuple[dict[str, Any], bytes]]:
