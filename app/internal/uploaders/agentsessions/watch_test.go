@@ -354,14 +354,21 @@ func TestRunWatchBacksOffWhenIdleAndResetsOnActivity(t *testing.T) {
 	env, root := cliEnv(t)
 	app := testfixtures.NewFakeApp(t)
 	cfg := ingestclient.Config{BaseURL: app.URL(), Token: "secret"}
-	// First run ships the initial file so the watch window starts completely idle.
+	transcript := filepath.Join(root, "claude", "project-a", "11111111-2222-3333-4444-555555555555.jsonl")
+	// Backdate the transcript past idle-after BEFORE seeding so the committed
+	// signature matches the old mtime and pass 1 starts genuinely idle (like
+	// porygon after a 5-minute restart).
+	oldTime := time.Now().Add(-20 * time.Minute)
+	if err := os.Chtimes(transcript, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
 	if code, _, errOut := runCLI(t, stateArgs(root), env, cfg); code != 0 {
 		t.Fatalf("seed run failed: code=%d stderr=%q", code, errOut)
 	}
 
-	// Idle watch for 600ms with 20ms interval and 200ms max-interval:
-	// without backoff this would run ~30 passes; with backoff it runs <= 10.
-	args := append([]string{"--watch", "600ms", "--interval", "20ms", "--max-interval", "200ms"}, stateArgs(root)...)
+	// Idle watch for 600ms with 20ms interval and 250ms max-interval:
+	// already idle past 10m so it backs off from pass 1 (<= 5 passes in 600ms).
+	args := append([]string{"--watch", "600ms", "--interval", "20ms", "--max-interval", "250ms"}, stateArgs(root)...)
 	started := time.Now()
 	code, out, errOut := runCLI(t, args, env, cfg)
 	elapsed := time.Since(started)
@@ -379,8 +386,237 @@ func TestRunWatchBacksOffWhenIdleAndResetsOnActivity(t *testing.T) {
 			}
 		}
 	}
-	if passes == 0 || passes > 12 {
-		t.Fatalf("idle watch must back off: got passes=%d in %s (out=%q)", passes, elapsed, out)
+	if passes == 0 || passes > 5 {
+		t.Fatalf("idle watch must back off from pass 1: got passes=%d in %s (out=%q)", passes, elapsed, out)
+	}
+}
+
+// M4: verify backoff resets to base interval on activity; fails if reset is removed.
+func TestRunWatchResetsToBaseIntervalAfterBackoffOnActivity(t *testing.T) {
+	env, root := cliEnv(t)
+	app := testfixtures.NewFakeApp(t)
+	cfg := ingestclient.Config{BaseURL: app.URL(), Token: "secret"}
+	transcript := filepath.Join(root, "claude", "project-a", "11111111-2222-3333-4444-555555555555.jsonl")
+	oldTime := time.Now().Add(-20 * time.Minute)
+	if err := os.Chtimes(transcript, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errOut := runCLI(t, stateArgs(root), env, cfg); code != 0 {
+		t.Fatalf("seed run failed: code=%d stderr=%q", code, errOut)
+	}
+
+	// max-interval=450ms, interval=20ms: pass 1 sleeps 450ms (backed off).
+	// Append line 1 while backed off; once it lands, immediately append line 2
+	// and assert line 2 lands within 150ms (only possible if interval reset to 20ms).
+	var secondLatency time.Duration
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		time.Sleep(50 * time.Millisecond)
+		f, _ := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+		f.WriteString("{\"type\":\"user\",\"n\":10}\n")
+		f.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for len(app.Calls()) < 2 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if len(app.Calls()) < 2 {
+			return
+		}
+		// Immediately append another line; watcher must now be at 20ms, not 450ms.
+		tAppend := time.Now()
+		f, _ = os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+		f.WriteString("{\"type\":\"user\",\"n\":11}\n")
+		f.Close()
+		deadline = time.Now().Add(2 * time.Second)
+		for len(app.Calls()) < 3 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if len(app.Calls()) >= 3 {
+			secondLatency = time.Since(tAppend)
+		}
+	}()
+
+	args := append([]string{"--watch", "1200ms", "--interval", "20ms", "--max-interval", "450ms"}, stateArgs(root)...)
+	code, out, errOut := runCLI(t, args, env, cfg)
+	<-doneCh
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q out=%q", code, errOut, out)
+	}
+	if len(app.Calls()) < 3 {
+		t.Fatalf("expected 3 upload calls (seed + 2 appends), got %d", len(app.Calls()))
+	}
+	if secondLatency == 0 || secondLatency > 200*time.Millisecond {
+		t.Fatalf("after activity woke a backed-off watcher, next line took %s (want <200ms at 20ms base interval)", secondLatency)
+	}
+}
+
+// M2: active sessions stay at base interval across thinking gaps shorter than idle-after,
+// while future-dated mtimes and empty directories still back off.
+func TestRunWatchStaysFastWhenActiveAndHandlesFutureMtimesAndZeroFiles(t *testing.T) {
+	// 1) Zero files: backs off immediately from pass 1.
+	env, root := cliEnv(t)
+	os.Remove(filepath.Join(root, "claude", "project-a", "11111111-2222-3333-4444-555555555555.jsonl"))
+	app := testfixtures.NewFakeApp(t)
+	cfg := ingestclient.Config{BaseURL: app.URL(), Token: "secret"}
+	args := append([]string{"--watch", "450ms", "--interval", "20ms", "--max-interval", "200ms"}, stateArgs(root)...)
+	code, out, errOut := runCLI(t, args, env, cfg)
+	if code != 0 {
+		t.Fatalf("zero-file watch failed: code=%d stderr=%q", code, errOut)
+	}
+	if !strings.Contains(out, "passes=2 ") && !strings.Contains(out, "passes=3 ") && !strings.Contains(out, "passes=4 ") {
+		t.Fatalf("zero-file host must back off from pass 1: %q", out)
+	}
+
+	// 2) Future-dated mtime must not pin LatestModTime and defeat backoff.
+	futurePath := filepath.Join(root, "claude", "project-a", "future.jsonl")
+	os.WriteFile(futurePath, []byte("{\"n\":1}\n"), 0o644)
+	farFuture := time.Now().Add(24 * time.Hour)
+	os.Chtimes(futurePath, farFuture, farFuture)
+	runner := newRunner(t, filepath.Join(root, "claude"), &fakeUploads{}, nil)
+	s, err := runner.Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.LatestModTime.IsZero() {
+		t.Fatalf("far-future mtime must be ignored for LatestModTime, got %s", s.LatestModTime)
+	}
+}
+
+// M1: OpenClaw store with a live WAL file must be skipped under the 2s settle window
+// (signatureOf combines db + wal mtimes; isSettled must check real max mtime, not hash).
+func TestRunnerSkipsOpenClawStoreWithWALUnderSettleWindow(t *testing.T) {
+	db, dirs := newOpenClawStore(t, t.TempDir())
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatal(err)
+	}
+	addEvent(t, db, "sess-1", 0, `{"type":"message","n":0}`)
+	addEvent(t, db, "sess-1", 1, `{"type":"message","n":1}`)
+	walPath := dirs.OpenClawStore + "-wal"
+	if _, err := os.Stat(walPath); err != nil {
+		t.Fatalf("expected WAL file %s to exist: %v", walPath, err)
+	}
+	// Backdate both DB and WAL past the 2s settle window so pass 1 settles immediately.
+	settled := time.Now().Add(-10 * time.Second)
+	os.Chtimes(dirs.OpenClawStore, settled, settled)
+	os.Chtimes(walPath, settled, settled)
+
+	state, _ := OpenState(filepath.Join(t.TempDir(), "s.sqlite"), "z@x")
+	defer state.Close()
+	uploads := &fakeUploads{}
+	runner := storeRunner(t, dirs, uploads, state)
+	runner.SkipUnchanged = true
+	runner.MtimeSettleWindow = defaultMtimeSettleWindow
+	runner.Now = func() time.Time { return time.Now().UTC() }
+
+	first, err := runner.Sync()
+	if err != nil || first.LinesSelected != 2 {
+		t.Fatalf("first pass = %+v, %v", first, err)
+	}
+	second, err := runner.Sync()
+	if err != nil || second.LinesSelected != 0 || second.FilesUnchanged != 1 {
+		t.Fatalf("WAL OpenClaw store must be skipped under settle window: %+v, %v", second, err)
+	}
+	addEvent(t, db, "sess-1", 2, `{"type":"message","n":2}`)
+	third, err := runner.Sync()
+	if err != nil || third.LinesSelected != 1 {
+		t.Fatalf("WAL OpenClaw store must be re-read after new event: %+v, %v", third, err)
+	}
+}
+
+// M3: same-size rewrite inside the 2s settle window must still upload its new line,
+// both within the same Runner and across a restart + after settling.
+func TestRunnerReuploadsSameSizeRewriteInsideSettleWindow(t *testing.T) {
+	root := t.TempDir()
+	transcript := filepath.Join(root, "racy-rewrite.jsonl")
+	baseNow := time.Date(2026, 5, 21, 12, 0, 10, 0, time.UTC)
+	t1 := baseNow.Add(-500 * time.Millisecond)
+	t2 := baseNow.Add(-100 * time.Millisecond)
+	os.WriteFile(transcript, []byte("{\"a\":1}\n"), 0o644)
+	os.Chtimes(transcript, t1, t1)
+
+	statePath := filepath.Join(t.TempDir(), "s.sqlite")
+	state1, _ := OpenState(statePath, "z@x")
+	uploads := &fakeUploads{}
+	now := baseNow
+	r1 := newRunner(t, root, uploads, state1)
+	r1.SkipUnchanged = true
+	r1.MtimeSettleWindow = 2 * time.Second
+	r1.Now = func() time.Time { return now }
+
+	if s, err := r1.Sync(); err != nil || s.LinesSelected != 1 {
+		t.Fatalf("pass 1 = %+v, %v", s, err)
+	}
+
+	// Same-size in-place rewrite while STILL inside the 2s settle window (LastSize is -1).
+	f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString("{\"a\":2}\n")
+	f.Close()
+	os.Chtimes(transcript, t2, t2)
+
+	// 1) Same runner must upload {"a":2}.
+	s2, err := r1.Sync()
+	if err != nil || s2.LinesSelected != 1 || len(uploads.batches) != 2 {
+		t.Fatalf("same-size rewrite inside settle window must upload: %+v, %v, batches=%d", s2, err, len(uploads.batches))
+	}
+	if got := uploads.batches[1][0]["record"].(map[string]any)["line"].(map[string]any)["a"].(float64); got != 2 {
+		t.Fatalf("got a=%v, want 2", got)
+	}
+
+	// 2) Rewrite again to {"a":3} inside settle window, then simulate restart AFTER settling.
+	t3 := baseNow.Add(-50 * time.Millisecond)
+	f, _ = os.OpenFile(transcript, os.O_WRONLY|os.O_TRUNC, 0o644)
+	f.WriteString("{\"a\":3}\n")
+	f.Close()
+	os.Chtimes(transcript, t3, t3)
+	state1.Close()
+
+	state2, _ := OpenState(statePath, "z@x")
+	defer state2.Close()
+	r2 := newRunner(t, root, uploads, state2)
+	r2.SkipUnchanged = true
+	r2.MtimeSettleWindow = 2 * time.Second
+	r2.Now = func() time.Time { return baseNow.Add(10 * time.Second) }
+	s3, err := r2.Sync()
+	if err != nil || s3.LinesSelected != 1 || len(uploads.batches) != 3 {
+		t.Fatalf("same-size rewrite across restart must upload (never masked by backfill): %+v, %v, batches=%d", s3, err, len(uploads.batches))
+	}
+	if got := uploads.batches[2][0]["record"].(map[string]any)["line"].(map[string]any)["a"].(float64); got != 3 {
+		t.Fatalf("got a=%v, want 3", got)
+	}
+}
+
+// F4: argonMetaCache must not cache a failed SQLite read.
+func TestArgonMetaCacheDoesNotCacheFailedSQLiteRead(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "conversation_summaries.db")
+	// Write a corrupt/unreadable SQLite file so the first read fails.
+	if err := os.WriteFile(dbPath, []byte("not a sqlite db"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var cache argonMetaCache
+	if got := cache.summariesFor(root); len(got) != 0 {
+		t.Fatalf("corrupt db returned %v", got)
+	}
+	if _, cached := cache.byDB[dbPath]; cached {
+		t.Fatal("failed SQLite read must not be cached")
+	}
+}
+
+// F5: symlinked .jsonl files must be skipped (matching lstat semantics).
+func TestDiscoverSkipsSymlinkedJSONL(t *testing.T) {
+	root := t.TempDir()
+	realFile := filepath.Join(t.TempDir(), "real.jsonl")
+	os.WriteFile(realFile, []byte("{\"n\":1}\n"), 0o644)
+	link := filepath.Join(root, "linked.jsonl")
+	if err := os.Symlink(realFile, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if files := Discover(Dirs{ClaudeProjects: root}); len(files) != 0 {
+		t.Fatalf("symlinked .jsonl must be skipped, got %v", files)
 	}
 }
 

@@ -159,12 +159,11 @@ func walkJSONLSkipping(root string, skipDir func(name string) bool, visit func(p
 		if !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}
-		var fi fs.FileInfo
-		if d.Type().IsRegular() {
-			fi, err = d.Info()
-		} else {
-			fi, err = os.Stat(path)
+		// Match lstat semantics: skip symlinks and other non-regular entries.
+		if d.Type() != 0 && !d.Type().IsRegular() {
+			return nil
 		}
+		fi, err := d.Info()
 		if err != nil || !fi.Mode().IsRegular() {
 			return nil
 		}

@@ -34,6 +34,10 @@ type Summary struct {
 	// FilesUnchanged counts transcripts (and the OpenClaw store) a
 	// SkipUnchanged pass passed over because nothing about them moved.
 	FilesUnchanged int
+	// LatestModTime is the newest non-future real modification time seen
+	// across all discovered transcripts and the OpenClaw store this pass.
+	// Zero when no files exist or all mtimes are in the future.
+	LatestModTime time.Time
 }
 
 // BatchUploader posts one gzipped batch; the ingest client satisfies it.
@@ -81,17 +85,22 @@ type Runner struct {
 // fileSignature is what a watcher compares between passes. An append moves
 // the size; an in-place rewrite moves modTime; an atomic rename replacement
 // moves inode; a SQLite write moves the database's or its WAL's mtime.
+// latestModTime is always a real UnixNano timestamp (the max across all paths
+// in signatureOf) so settle checks never inspect a hashed/overflowed modTime.
 type fileSignature struct {
-	size    int64
-	modTime int64
-	inode   uint64
+	size          int64
+	modTime       int64
+	inode         uint64
+	latestModTime int64
 }
 
 func signatureFromInfo(info fs.FileInfo) fileSignature {
+	mt := info.ModTime().UnixNano()
 	return fileSignature{
-		size:    info.Size(),
-		modTime: info.ModTime().UnixNano(),
-		inode:   fileInode(info),
+		size:          info.Size(),
+		modTime:       mt,
+		inode:         fileInode(info),
+		latestModTime: mt,
 	}
 }
 
@@ -106,13 +115,33 @@ func signatureOf(paths ...string) (fileSignature, bool) {
 			}
 			continue
 		}
-		found = true
 		s := signatureFromInfo(info)
+		if !found || s.latestModTime > sig.latestModTime {
+			sig.latestModTime = s.latestModTime
+		}
+		found = true
 		sig.size = sig.size*31 + s.size
 		sig.modTime = sig.modTime*31 + s.modTime
 		sig.inode = sig.inode*31 + s.inode
 	}
 	return sig, found
+}
+
+// futureMtimeTolerance allows minor clock skew when computing LatestModTime
+// for idle-backoff decisions while ignoring bogus far-future mtimes.
+const futureMtimeTolerance = 5 * time.Second
+
+func (r *Runner) recordLatestModTime(summary *Summary, sig fileSignature) {
+	if sig.latestModTime <= 0 {
+		return
+	}
+	mt := time.Unix(0, sig.latestModTime).UTC()
+	if mt.After(r.Now().Add(futureMtimeTolerance)) {
+		return
+	}
+	if mt.After(summary.LatestModTime) {
+		summary.LatestModTime = mt
+	}
 }
 
 // unchanged reports whether key still has the signature it was shipped at.
@@ -128,7 +157,7 @@ func (r *Runner) isSettled(sig fileSignature) bool {
 	if r.MtimeSettleWindow <= 0 {
 		return true
 	}
-	mod := time.Unix(0, sig.modTime)
+	mod := time.Unix(0, sig.latestModTime)
 	return r.Now().Sub(mod) >= r.MtimeSettleWindow
 }
 
@@ -295,6 +324,7 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 			return fileResult{}, false, nil
 		}
 	}
+	r.recordLatestModTime(summary, sig)
 	if r.unchanged(file.Path, sig) {
 		summary.FilesUnchanged++
 		return fileResult{}, false, nil
@@ -316,10 +346,12 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 		return fileResult{}, false, err
 	}
 	if size <= startOffset {
-		// Already caught up. Backfill signature for pre-upgrade state rows so
-		// future restarts skip immediately and detect same-size rewrites/renames.
-		if r.Mode == "incremental" && r.progressLoaded {
-			if p, ok := r.progress[file.Path]; ok && p.LastSize < 0 && r.isSettled(sig) {
+		// Already caught up. Backfill signature only for pre-upgrade rows
+		// (LastMtimeNs == 0 && LastInode == 0) or settled rows whose signature
+		// still matches what was committed — never backfill over a mismatch.
+		if r.Mode == "incremental" && r.progressLoaded && r.isSettled(sig) {
+			if p, ok := r.progress[file.Path]; ok && p.LastSize < 0 &&
+				((p.LastMtimeNs == 0 && p.LastInode == 0) || (p.LastMtimeNs == sig.modTime && p.LastInode == sig.inode)) {
 				r.backfillSigs[file.Path] = sig
 			}
 		}
@@ -470,8 +502,9 @@ func (r *Runner) startPosition(path string, sig fileSignature, hasSig bool) (int
 		// File was atomically replaced (rename/recreate); re-read from the beginning.
 		return 0, 0, nil
 	}
-	if progress.UploadedOffset == sig.size && sig.size > 0 && progress.LastSize >= 0 && progress.LastMtimeNs != 0 && progress.LastMtimeNs != sig.modTime {
-		// Same-size in-place rewrite; re-read from the beginning.
+	if progress.UploadedOffset == sig.size && sig.size > 0 && progress.LastMtimeNs != 0 && progress.LastMtimeNs != sig.modTime {
+		// Same-size in-place rewrite (including one within the settle window
+		// when LastSize is still -1); re-read from the beginning.
 		return 0, 0, nil
 	}
 	return progress.UploadedOffset, progress.UploadedLines, nil

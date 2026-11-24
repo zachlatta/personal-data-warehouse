@@ -18,8 +18,9 @@ line by line, through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist`
 - Wrapper script: `bin/agent-sessions-upload-launchd`
 - Run cadence: resident (`KeepAlive`, `RunAtLoad`, 10 s `ThrottleInterval`): each run is a
-  five-minute `--watch` window (2 s base interval when active, backing off exponentially up
-  to `--max-interval` 60 s when idle), then the heartbeat, then the next window
+  five-minute `--watch` window (2 s while any transcript or store was modified within
+  `--idle-after` 10 m, backing off up to `--max-interval` 30 s when idle), then the
+  heartbeat, then the next window
 - Command: `pdw ingest agent-sessions --mode incremental --watch 300s` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
 - Main run log: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.heartbeat`
@@ -77,21 +78,30 @@ app's ingest endpoint (see below), which writes them into the `agent-sessions/in
 folder. The `--limit` flag bounds a run (useful for a first backfill). In Dagster, the
 `agent_sessions_drive_inbox_sensor` + `agent_sessions_drive_ingest` asset consume the batches.
 
-**A turn lands in seconds, not minutes.** Measured 2026-11-08 over seven days from
+**Active turns land in seconds; the first line after >10 minutes of host silence waits at most 30 s.** Measured 2026-11-08 over seven days from
 `timeline.events.first_seen_at - occurred_at`, Claude Code, Codex, OpenClaw and Argon turns
 landed p50 3-4 min, p99 6-7 min, and almost none of it was work: the five-minute uploader
 tick, a 60 s inbox sensor and a Dagster run start (~5 s), then a fast lane that took 15.2 s
 for two rows because the `agent_session` roll-up's plan is costed at 1.6M and Postgres spent
 5.4 s per query compiling JIT code for a 2 ms query. Now:
 
-- the device runs `--watch`: a pass every two seconds while transcripts are active, backing
-  off exponentially after three idle passes up to `--max-interval` (default 60 s) and
-  resetting to two seconds as soon as a pass sees new lines. A transcript whose size, mtime
-  and inode did not move (persisted in `file_state` across five-minute restarts, loaded in
-  one bulk query at startup, with a 2 s mtime settle guard against coarse-mtime rewrites)
-  costs one `stat` during discovery, not a second `stat`, a per-file SQLite lookup or a read;
-  Argon lists `<brain>` one level deep and loads `conversation_summaries.db` / `.pbtxt`
-  metadata lazily only for changed transcripts, and Claude/Muse Code prune non-transcript
+- the device runs `--watch`: a pass every two seconds while any transcript or store was
+  modified within `--idle-after` (default 10 m, so model-thinking gaps of 40–120 s stay at
+  2 s with no added latency). Once no transcript or store has been modified for 10 m
+  (judged from on-disk mtimes so an already-idle host like porygon backs off from pass 1 of
+  every five-minute window, and ignoring far-future mtimes), the pause backs off up to
+  `--max-interval` (default 30 s; ~10 passes per 5 min) and resets to 2 s immediately on
+  new activity — so the first line written after >10 m of total host silence waits at most
+  30 s (avg ~15 s), well within the 1-hour upstream SLA (`source_sla.py`) and the <1 min
+  landing target. A transcript whose size, mtime and inode did not move (persisted in
+  `file_state` across five-minute restarts, loaded in one bulk query at startup, with a 2 s
+  mtime settle guard against coarse-mtime rewrites) costs one `stat` during discovery, not a
+  second `stat`, a per-file SQLite lookup or a read. Touching a transcript (`touch`) or
+  changing its inode (e.g., copying or restoring transcripts onto a host) re-ships that
+  file from byte 0 so same-size rewrites and atomic replacements are never missed; warehouse
+  ingest deduplicates by primary key. Argon lists `<brain>` one level deep and loads
+  `conversation_summaries.db` / `.pbtxt` metadata lazily only for changed transcripts
+  (without caching transient SQLite read failures), and Claude/Muse Code prune non-transcript
   subdirectories (`tool-results`, `.msp-view-v1`, `.spool`, `tool-outputs`, `approval-review`).
   A window ends after five minutes (`AGENT_SESSIONS_WATCH_WINDOW`) so the wrapper posts the
   heartbeat as before; a failed pass ends it early and non-zero;

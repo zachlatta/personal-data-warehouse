@@ -4,10 +4,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Resident: the wrapper runs `pdw ingest agent-sessions --watch 300s` (a pass
-# every two seconds), posts the window's heartbeat, and exits; Restart=always
-# starts the next window. No timer: on 2026-11-06 a restarted user manager left
-# the old five-minute timer "active (elapsed)" and nothing ran for 13 hours.
+# Resident: the wrapper runs `pdw ingest agent-sessions --watch 300s` (2 s
+# while active, backing off up to 30 s once idle for 10 min), posts the
+# window's heartbeat, and exits; Restart=always starts the next window. No
+# timer: on 2026-11-06 a restarted user manager left the old five-minute timer
+# "active (elapsed)" and nothing ran for 13 hours.
 Type=simple
 # Self-locating wrapper: derives its root from its own path. As checked in, it
 # runs from a checkout (mew-dev, openclaw); bin/sync-linux-device-runtime

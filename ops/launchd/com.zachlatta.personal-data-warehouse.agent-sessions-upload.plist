@@ -12,9 +12,9 @@
     </array>
 
     <!-- Resident: the wrapper watches the transcripts for a five-minute
-         window (a pass every two seconds), posts the heartbeat and exits;
-         KeepAlive starts the next window. ThrottleInterval spaces relaunches
-         after a window that failed fast. -->
+         window (2 s while active, backing off up to 30 s once idle for 10 min),
+         posts the heartbeat and exits; KeepAlive starts the next window.
+         ThrottleInterval spaces relaunches after a window that failed fast. -->
     <key>KeepAlive</key>
     <true/>
 

@@ -191,8 +191,10 @@ def test_agent_sessions_uploader_is_resident_and_ships_within_seconds() -> None:
     Measured 2026-11-08 over seven days, Claude Code, Codex, OpenClaw and Argon
     turns landed p50 3-4 min, p99 6-7 min, and the device's share was the
     five-minute timer (systemd) or StartInterval (launchd). The wrapper now
-    runs `--watch`: a pass every two seconds for five minutes, then it exits so
-    the heartbeat is posted, and the supervisor starts the next window at once.
+    runs `--watch`: a pass every two seconds while transcripts are active
+    (backing off up to 30 s once idle for 10 min) for five minutes, then it
+    exits so the heartbeat is posted, and the supervisor starts the next window
+    at once.
     There is no timer left to disarm: on 2026-11-06 a restarted user manager
     left the old one "active (elapsed)" and mew-dev uploaded nothing for 13 h.
     """

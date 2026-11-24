@@ -15,7 +15,8 @@ const Usage = `pdw ingest agent-sessions - upload local AI agent CLI session tra
 
 USAGE
   pdw ingest agent-sessions [--mode incremental|full] [--limit N] [--batch-size N]
-                            [--watch DURATION] [--interval DURATION] [--max-interval DURATION]
+                            [--watch DURATION] [--interval DURATION]
+                            [--max-interval DURATION] [--idle-after DURATION]
                             [--state-file PATH] [--lock-file PATH]
 
 Tails ~/.claude/projects, ~/.codex/sessions, ~/.openclaw/agents/main/sessions,
@@ -29,17 +30,22 @@ FLAGS
   --limit N                Maximum lines to upload this run; 0 (default) is unlimited.
                            Bounds a first backfill.
   --batch-size N           Maximum lines per uploaded batch (default 20000).
-  --watch DURATION         Stay resident for DURATION (e.g. 300s), passing over the
-                           transcripts every --interval and shipping each new line
-                           within seconds; transcripts whose size, mtime and inode
-                           did not move are skipped, and consecutive idle passes
-                           back off exponentially up to --max-interval (resetting to
-                           --interval immediately on activity). The run then exits
-                           so its wrapper can post the heartbeat and the supervisor
-                           (systemd Restart=always, launchd KeepAlive) starts the
-                           next one. A failed pass ends the window with a failure.
-  --interval DURATION      Base pause between --watch passes (default 2s).
-  --max-interval DURATION  Maximum pause between idle --watch passes (default 60s).
+  --watch DURATION         Stay resident for DURATION (e.g. 300s), polling every
+                           --interval while any transcript or store was modified
+                           within --idle-after; transcripts whose size, mtime and
+                           inode did not move are skipped. Once no transcript or
+                           store has been modified for --idle-after (checked from
+                           on-disk mtimes so idle hosts back off from pass 1 after
+                           each restart), the pause backs off up to --max-interval
+                           and resets to --interval immediately on new activity
+                           (first line after a long idle waits at most --max-interval).
+                           The run then exits so its wrapper can post the heartbeat
+                           and the supervisor (systemd Restart=always, launchd
+                           KeepAlive) starts the next one. A failed pass ends the
+                           window with a failure.
+  --interval DURATION      Base pause between --watch passes while active (default 2s).
+  --max-interval DURATION  Maximum pause between idle --watch passes (default 30s).
+  --idle-after DURATION    Transcript inactivity duration before backing off (default 10m).
   --state-file PATH        Incremental upload state (default: the Application Support
                            state database).
   --lock-file PATH         Nonblocking lock used to avoid overlapping LaunchAgent runs
@@ -65,6 +71,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	watch := fs.Duration("watch", 0, "")
 	interval := fs.Duration("interval", DefaultWatchInterval, "")
 	maxInterval := fs.Duration("max-interval", DefaultMaxWatchInterval, "")
+	idleAfter := fs.Duration("idle-after", DefaultIdleAfter, "")
 	if _, code, done := common.ParseArgs(fs, args, Usage, stdout, stderr); done {
 		return code
 	}
@@ -85,6 +92,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	if *maxInterval <= 0 {
 		return common.UsageError(fs, stderr, "--max-interval must be positive")
+	}
+	if *idleAfter < 0 {
+		return common.UsageError(fs, stderr, "--idle-after must not be negative")
 	}
 
 	env, err := common.LoadProjectDotenv(getenv)
@@ -137,7 +147,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Observe:           client.PostSourceObservation,
 	}
 	if *watch > 0 {
-		return runWatch(runner, *watch, *interval, *maxInterval, stdout, stderr)
+		return runWatch(runner, *watch, *interval, *maxInterval, *idleAfter, stdout, stderr)
 	}
 	summary, err := runner.Sync()
 	if err != nil {
@@ -154,32 +164,37 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	return 0
 }
 
-// DefaultWatchInterval is the base pause between --watch passes while
-// transcripts are active, keeping the device's share of landing latency to
-// about a second.
+// DefaultWatchInterval is the base pause between --watch passes while any
+// transcript or store was modified within DefaultIdleAfter, keeping the
+// device's share of active-session landing latency to about a second.
 const DefaultWatchInterval = 2 * time.Second
 
-// DefaultMaxWatchInterval caps exponential backoff when consecutive passes
-// find nothing new, so an idle host (e.g. a Mac with no local agents running)
-// runs ~11 passes per five-minute window instead of ~137.
-const DefaultMaxWatchInterval = 60 * time.Second
+// DefaultMaxWatchInterval caps the pause between passes once a host has had no
+// transcript or store modifications for DefaultIdleAfter. On an idle host this
+// runs ~10 passes per five-minute window (well under 1% CPU on porygon); the
+// first line written after a long idle waits at most 30 s before resetting to
+// DefaultWatchInterval.
+const DefaultMaxWatchInterval = 30 * time.Second
 
-// idleBackoffGracePasses is how many consecutive idle passes stay at the base
-// interval before doubling begins, so brief pauses between turns in an active
-// session do not add latency.
-const idleBackoffGracePasses = 3
+// DefaultIdleAfter is how long all transcripts and the OpenClaw store must be
+// unmodified before --watch backs off from DefaultWatchInterval. Long enough
+// that ordinary model-thinking gaps (40–120 s) stay at 2 s with zero added
+// latency; judged from on-disk mtimes so an already-idle host backs off from
+// pass 1 of every five-minute window.
+const DefaultIdleAfter = 10 * time.Minute
 
 // defaultMtimeSettleWindow guards against coarse-mtime / same-tick rewrites.
 const defaultMtimeSettleWindow = 2 * time.Second
 
-// runWatch is `--watch`: Sync until the window closes, backing off
-// exponentially when idle and resetting to interval immediately on activity.
-// The Runner keeps its unchanged-file memory across passes (and seeds it from
-// persisted state across restarts), so only transcripts that changed are read.
-// A failed pass ends the window non-zero (the wrapper records it; the
-// supervisor restarts the uploader); a blocked network ends it as a deliberate
-// skip, exactly as a one-shot run reports one.
-func runWatch(runner *Runner, window, interval, maxInterval time.Duration, stdout, stderr io.Writer) int {
+// runWatch is `--watch`: Sync until the window closes, staying at interval
+// while any transcript or store has been modified within idleAfter and backing
+// off up to maxInterval once the host has been quiet for idleAfter (including
+// from pass 1 after a restart when on-disk mtimes are already older than
+// idleAfter or no transcripts exist). Any new lines or fresh mtime resets the
+// pause to interval immediately. A failed pass ends the window non-zero (the
+// wrapper records it; the supervisor restarts the uploader); a blocked network
+// ends it as a deliberate skip, exactly as a one-shot run reports one.
+func runWatch(runner *Runner, window, interval, maxInterval, idleAfter time.Duration, stdout, stderr io.Writer) int {
 	if maxInterval < interval {
 		maxInterval = interval
 	}
@@ -188,7 +203,7 @@ func runWatch(runner *Runner, window, interval, maxInterval time.Duration, stdou
 	deadline := time.Now().Add(window)
 	var total Summary
 	passes := 0
-	idlePasses := 0
+	var lastActivity time.Time
 	currentInterval := interval
 	for {
 		summary, err := runner.Sync()
@@ -206,17 +221,27 @@ func runWatch(runner *Runner, window, interval, maxInterval time.Duration, stdou
 			fmt.Fprintf(stderr, "pdw ingest agent-sessions: %v\n", err)
 			return common.ExitFailure
 		}
-		if summary.LinesSelected > 0 || summary.LinesSkipped > 0 || summary.LimitReached || summary.FilesWithNewLines > 0 {
-			idlePasses = 0
+		now := time.Now().UTC()
+		if summary.LatestModTime.After(lastActivity) {
+			lastActivity = summary.LatestModTime
+		}
+		active := summary.LinesSelected > 0 || summary.LinesSkipped > 0 || summary.LimitReached || summary.FilesWithNewLines > 0
+		if active {
+			lastActivity = now
 			currentInterval = interval
-		} else {
-			idlePasses++
-			if idlePasses > idleBackoffGracePasses && currentInterval < maxInterval {
+		} else if lastActivity.IsZero() || now.Sub(lastActivity) >= idleAfter {
+			// Already idle past idleAfter (including pass 1 after a 5-minute
+			// restart on an idle host or a host with zero transcripts).
+			if passes == 1 {
+				currentInterval = maxInterval
+			} else if currentInterval < maxInterval {
 				currentInterval *= 2
 				if currentInterval > maxInterval {
 					currentInterval = maxInterval
 				}
 			}
+		} else {
+			currentInterval = interval
 		}
 		rem := time.Until(deadline)
 		if rem < interval {

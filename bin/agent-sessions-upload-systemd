@@ -36,9 +36,10 @@ elif ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  # Resident window: a pass every two seconds ships each new line within
-  # seconds; after the window the heartbeat below is posted and the
-  # supervisor (systemd Restart=always / launchd KeepAlive) starts the next.
+  # Resident window: polls every 2 s while transcripts are active and backs off
+  # up to 30 s once idle for 10 min; after the window the heartbeat below is
+  # posted and the supervisor (systemd Restart=always / launchd KeepAlive) starts
+  # the next.
   "$PDW" ingest agent-sessions --mode incremental --watch "${AGENT_SESSIONS_WATCH_WINDOW:-300s}" >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi

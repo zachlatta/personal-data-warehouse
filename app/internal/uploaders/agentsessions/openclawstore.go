@@ -57,7 +57,11 @@ func (r *Runner) readOpenClawStore(batch *pendingBatch, remaining *int, summary 
 		return nil
 	}
 	// A write lands in the WAL first, so both files make the signature.
-	sig, _ := signatureOf(path, path+"-wal")
+	sig, found := signatureOf(path, path+"-wal")
+	if !found {
+		return nil
+	}
+	r.recordLatestModTime(summary, sig)
 	storeKey := "openclaw-store:" + path
 	if r.unchanged(storeKey, sig) {
 		summary.FilesUnchanged++

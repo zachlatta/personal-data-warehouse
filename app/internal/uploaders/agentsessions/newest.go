@@ -19,8 +19,9 @@ import (
 // hide the lines it never read. marts_ops.source_upstream_health compares it
 // with what landed in base_<tool>.events for the same session.
 const (
-	// observeInterval paces observations: the resident watcher runs a pass
-	// every two seconds, and the evidence only needs the collector's cadence.
+	// observeInterval paces observations: the resident watcher polls every two
+	// seconds while active (backing off when idle), and the evidence only needs
+	// the collector's cadence.
 	observeInterval = 5 * time.Minute
 	// observeTailBytes is how much of each transcript's end is read.
 	observeTailBytes = 256 << 10
