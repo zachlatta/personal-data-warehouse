@@ -372,21 +372,6 @@ def test_discovery_records_session_bytes_so_the_outage_does_not_measure_them(war
     assert len(state['batches']['completed']) == 1
 
 
-def test_the_rebuild_pages_by_the_adapter_batch_not_the_scrub_page(warehouse, monkeypatch):
-    """Each rebuild page re-reads and sorts the whole group's temporary view, so
-    500-row pages made regeneration superlinear in a session's size."""
-    from personal_data_warehouse import scrub_conversation_cards as m
-    from personal_data_warehouse.timeline import TimelineSyncEngine
-    rows = [dict(event(), event_uuid=f't{i}', seq=i + 1, text=f'turn {i}', raw_json='{}') for i in range(1200)]
-    warehouse._insert_rows('claude_code_events', rows, AGENT_SESSION_EVENT_COLUMNS)
-    fetched = []
-    original = TimelineSyncEngine._fetch
-    monkeypatch.setattr(TimelineSyncEngine, '_fetch', lambda self, sql, params: fetched.append(params['limit']) or original(self, sql, params))
-    keys, _ = m.rebuild_sessions(warehouse, {('claude_code', 'test-session')}, 500, ScrubSelector('credentials'))
-    assert len([k for k in keys if k[0] == 'agent_session_turn']) == 1200
-    assert len(fetched) == 4  # one page and one empty page per adapter
-
-
 def test_sanitize_does_not_confirm_derived_copies_the_rebuild_replaces(warehouse, monkeypatch):
     """A derived row of a session already being rebuilt is regenerated or masked
     in place whatever its count, so confirming it in sanitize was wasted time."""

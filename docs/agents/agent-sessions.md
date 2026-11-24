@@ -648,9 +648,7 @@ later run rechecks only the source rows of completed sessions written since then
 (a secret re-ingested into a completed session still stops the run), instead of
 every finished row. The timed window does not compute the left-alone statistic
 (discovery reports it), does not confirm a derived copy of a session it is about
-to rebuild (the rebuild replaces or masks it either way), and reads the rebuild in
-pages of the adapter's batch size (each page re-reads the group's temporary view);
-each progress save validates the checkpoint in time linear in its size.
+to rebuild (the rebuild replaces or masks it either way); each progress save validates the checkpoint in time linear in its size.
 If a group overruns its transaction, it rolls back and the writers restart;
 rerun `apply` with a smaller `--max-group-mb` or `--max-canonical-rows` (completed
 groups are skipped). The whole plan may hold at most 500 matching

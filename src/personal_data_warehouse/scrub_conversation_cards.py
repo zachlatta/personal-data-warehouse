@@ -949,9 +949,8 @@ def rebuild_sessions(warehouse, sessions, page_size, selector=None):
         adapter = adapter_by_name(name)
         watermark_ts, watermark_id = stamp, ''
         while True:
-            # Pages of the adapter batch size: each page re-reads and sorts the whole temporary view.
             sql=adapter.incremental_sql.replace('@ai_conversation_events','pg_temp.card_scrub_events')
-            rows = engine._fetch(sql, dict(watermark_ts=watermark_ts, watermark_id=watermark_id, limit=max(page_size, adapter.batch_size)))
+            rows = engine._fetch(sql, dict(watermark_ts=watermark_ts, watermark_id=watermark_id, limit=page_size))
             if not rows:
                 break
             selected = []
