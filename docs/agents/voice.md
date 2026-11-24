@@ -281,6 +281,19 @@ hints), a word the same text also uses in lowercase, or a different first letter
 makes the same sound (Kristen/Cristen). The source transcript was never affected; repair is
 re-enrichment.
 
+**Contact nicknames are candidate hints, never a source of truth or a rewrite rule (2026-11-23).**
+Until `...-agent-v12`, `load_contact_alias_hints` queried only `marts_contacts.contacts.nicknames`
+and hid every contact whose actual `given_name` matched the spoken name, the prompt steered the
+agent to prefer a contact nickname over exact contact matches, and `apply_contact_alias_corrections`
+blindly regex-replaced every bare occurrence of any matched nickname across the entire result JSON
+(`title`, `summary`, `transcript`, `evidence`, and even `transcript_corrections.original`). Whenever
+a common first name was stored as another contact's nickname, every recording mentioning a colleague
+with that first name was misattributed and rewritten into the nickname holder's legal given name.
+`apply_contact_alias_corrections` is removed, `load_contact_alias_hints` now returns competing
+`given_name` contacts and an `is_ambiguous` flag alongside each nickname match, and `...-agent-v12`
+requires topic-specific, contemporaneous evidence to disambiguate a spoken first name — keeping it
+as spoken when ambiguous.
+
 **The identity hints read the timeline search, not the raw Slack heap.**
 `load_event_identity_hints` gives the agent messages that name the event and a person.
 Until 2026-10-27 the Slack part ILIKE-scanned `base_slack.messages` across the 104-day

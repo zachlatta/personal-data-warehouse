@@ -21,7 +21,7 @@ from personal_data_warehouse.apple_voice_memos_transcription import ASSEMBLYAI_K
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
-AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v11"
+AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v12"
 DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
 LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS = 12_000
@@ -43,6 +43,7 @@ SECTIONED_SUMMARY_MAX_REQUIRED_CHARS = 6_000
 PROMPT_TRANSCRIPT_WITHOUT_SEGMENTS_MAX_CHARS = 60_000
 PROMPT_CONTACT_ALIAS_HINTS_LIMIT = 20
 PROMPT_CONTACT_ALIAS_TERMS_LIMIT = 40
+PROMPT_COMPETING_CONTACTS_LIMIT = 8
 PROMPT_EVENT_IDENTITY_TERMS_LIMIT = 8
 PROMPT_EVENT_IDENTITY_FIRST_NAMES_LIMIT = 12
 PROMPT_EVENT_IDENTITY_HINTS_LIMIT = 18
@@ -267,10 +268,6 @@ class VoiceMemosEnrichmentRunner:
                     recording=recording,
                     transcript_segments=transcript_segments,
                     result=result,
-                )
-                result = apply_contact_alias_corrections(
-                    result=result,
-                    contact_alias_hints=contact_alias_hints,
                 )
                 result = withhold_low_confidence_resolved_speaker_names(result)
                 # An enrichment is current while created after its transcript, so
@@ -552,6 +549,7 @@ def load_contact_alias_hints(
             ),
             nickname_matches AS (
                 SELECT
+                    mt.normalized_term,
                     mt.mention,
                     c.source,
                     c.account,
@@ -575,25 +573,71 @@ def load_contact_alias_hints(
                 WHERE c.display_name != ''
                 ORDER BY mt.mention, c.source_updated_at DESC, c.display_name
                 LIMIT {PROMPT_CONTACT_ALIAS_HINTS_LIMIT}
+            ),
+            competing_given_name_contacts AS (
+                SELECT
+                    nm.normalized_term,
+                    nm.display_name AS alias_display_name,
+                    count(DISTINCT lower(c2.display_name)) AS other_given_name_match_count,
+                    COALESCE(
+                        jsonb_agg(
+                            jsonb_build_object(
+                                'canonical_name', c2.display_name,
+                                'primary_email', c2.primary_email,
+                                'organization', c2.organization,
+                                'job_title', c2.job_title
+                            )
+                            ORDER BY (c2.organization != '') DESC, c2.source_updated_at DESC, c2.display_name
+                        ) FILTER (WHERE c2.display_name IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS competing_contacts_json
+                FROM (SELECT DISTINCT normalized_term, display_name FROM nickname_matches) nm
+                LEFT JOIN (
+                    SELECT DISTINCT ON (lower(given_name), lower(display_name))
+                        lower(given_name) AS normalized_given_name,
+                        display_name,
+                        primary_email,
+                        organization,
+                        job_title,
+                        source_updated_at
+                    FROM @clean_contacts
+                    WHERE display_name != '' AND given_name != ''
+                    ORDER BY lower(given_name), lower(display_name), (organization != '') DESC, source_updated_at DESC
+                ) c2
+                  ON c2.normalized_given_name = nm.normalized_term
+                 AND lower(c2.display_name) != lower(nm.display_name)
+                GROUP BY nm.normalized_term, nm.display_name
             )
             SELECT
-                mention,
-                source,
-                account,
-                source_kind,
-                card_id,
-                display_name,
-                given_name,
-                family_name,
-                primary_email,
-                organization,
-                job_title,
-                nicknames::text
-            FROM nickname_matches
+                nm.mention,
+                nm.source,
+                nm.account,
+                nm.source_kind,
+                nm.card_id,
+                nm.display_name,
+                nm.given_name,
+                nm.family_name,
+                nm.primary_email,
+                nm.organization,
+                nm.job_title,
+                nm.nicknames::text,
+                COALESCE(cg.other_given_name_match_count, 0) AS other_given_name_match_count,
+                COALESCE(cg.competing_contacts_json::text, '[]') AS competing_contacts_json
+            FROM nickname_matches nm
+            LEFT JOIN competing_given_name_contacts cg
+              ON cg.normalized_term = nm.normalized_term
+             AND cg.alias_display_name = nm.display_name
             """
         )
     except Exception:
         return []
+
+    distinct_targets_by_mention: dict[str, set[str]] = {}
+    for row in rows:
+        mention_key = str(row[0]).strip().casefold()
+        target_key = str(row[5]).strip().casefold()
+        if mention_key and target_key:
+            distinct_targets_by_mention.setdefault(mention_key, set()).add(target_key)
 
     hints: list[dict[str, Any]] = []
     for (
@@ -609,10 +653,16 @@ def load_contact_alias_hints(
         organization,
         job_title,
         nicknames_json,
+        other_given_name_match_count,
+        competing_contacts_json,
     ) in rows:
+        mention_str = str(mention)
+        competing_contacts = competing_contacts_from_json(str(competing_contacts_json or "[]"))
+        other_count = int(other_given_name_match_count or 0)
+        is_ambiguous = other_count > 0 or len(distinct_targets_by_mention.get(mention_str.strip().casefold(), set())) > 1
         hints.append(
             {
-                "mention": str(mention),
+                "mention": mention_str,
                 "canonical_name": str(display_name),
                 "given_name": str(given_name),
                 "family_name": str(family_name),
@@ -624,9 +674,37 @@ def load_contact_alias_hints(
                 "source_kind": str(source_kind),
                 "account": str(account),
                 "card_id": str(card_id),
+                "is_ambiguous": is_ambiguous,
+                "other_given_name_match_count": other_count,
+                "competing_contacts": competing_contacts[:PROMPT_COMPETING_CONTACTS_LIMIT],
             }
         )
     return hints
+
+
+def competing_contacts_from_json(value: str) -> list[dict[str, str]]:
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    contacts: list[dict[str, str]] = []
+    for item in payload:
+        if not isinstance(item, Mapping):
+            continue
+        canonical_name = str(item.get("canonical_name") or "").strip()
+        if not canonical_name:
+            continue
+        contacts.append(
+            {
+                "canonical_name": canonical_name,
+                "primary_email": str(item.get("primary_email") or "").strip(),
+                "organization": str(item.get("organization") or "").strip(),
+                "job_title": str(item.get("job_title") or "").strip(),
+            }
+        )
+    return contacts
 
 
 def contact_alias_terms(
@@ -1279,64 +1357,6 @@ def dedupe_event_identity_snippets(snippets: Sequence[Mapping[str, Any]]) -> lis
         seen.add(key)
         deduped.append(compact)
     return deduped
-
-
-def apply_contact_alias_corrections(
-    *,
-    result: Mapping[str, Any],
-    contact_alias_hints: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    replacements = contact_alias_replacements(contact_alias_hints)
-    if not replacements:
-        return dict(result)
-    return _rewrite_contact_alias_value(dict(result), replacements)
-
-
-def contact_alias_replacements(contact_alias_hints: Sequence[Mapping[str, Any]]) -> list[tuple[str, str]]:
-    replacements: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for hint in contact_alias_hints:
-        canonical_name = str(hint.get("canonical_name") or "").strip()
-        given_name = str(hint.get("given_name") or "").strip() or canonical_name.split(" ", 1)[0]
-        if not canonical_name and not given_name:
-            continue
-        aliases = [str(hint.get("mention") or "").strip()]
-        raw_aliases = hint.get("aliases") or []
-        if isinstance(raw_aliases, str):
-            aliases.append(raw_aliases.strip())
-        elif isinstance(raw_aliases, Sequence):
-            aliases.extend(str(alias).strip() for alias in raw_aliases)
-        for alias in aliases:
-            if not alias:
-                continue
-            replacement = canonical_name if " " in alias else given_name
-            key = alias.casefold()
-            if key in seen or alias == replacement:
-                continue
-            seen.add(key)
-            replacements.append((alias, replacement))
-    return replacements
-
-
-def _rewrite_contact_alias_value(value: Any, replacements: Sequence[tuple[str, str]]) -> Any:
-    if isinstance(value, str):
-        return _rewrite_contact_alias_text(value, replacements)
-    if isinstance(value, Mapping):
-        return {key: _rewrite_contact_alias_value(item, replacements) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_rewrite_contact_alias_value(item, replacements) for item in value]
-    return value
-
-
-def _rewrite_contact_alias_text(text: str, replacements: Sequence[tuple[str, str]]) -> str:
-    rewritten = text
-    for alias, replacement in replacements:
-        if " " in alias.strip():
-            pattern = re.compile(rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])")
-        else:
-            pattern = re.compile(rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])(?!(?:\s+[A-Z][a-z]+))")
-        rewritten = pattern.sub(replacement, rewritten)
-    return rewritten
 
 
 LOW_CONFIDENCE_RESOLVED_SPEAKER_THRESHOLD = 0.9
@@ -2296,7 +2316,7 @@ def enrichment_user_prompt(*, input_file: str = AGENT_USER_PROMPT_INPUT_FILE) ->
                 "contents": [
                     "recording metadata and transcript length fields",
                     "calendar_candidates with compact attendee identity hints",
-                    "contact_alias_hints from human-edited contact nicknames when transcript names match",
+                    "contact_alias_hints from contact nicknames when transcript names match, including competing contacts who share that given name and an is_ambiguous flag",
                     "event_identity_hints with compact Slack/Gmail/Drive snippets for event-specific team and first-name resolution",
                     "truncated source transcript",
                     "diarized_segments",
@@ -2373,7 +2393,7 @@ def enrichment_instructions() -> list[str]:
         "participants means actual people who speak or are strongly evidenced as present. Do not include calendar invitees merely because they were invited, especially if responseStatus is needsAction and there is no transcript evidence they attended.",
         "If you select a calendar event, start_at and end_at must come from that calendar event or verified warehouse context.",
         "Do not leave participants as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, search the address/name first, then use schema-discovered Slack/email identity SQL if needed before finalizing participants or speaker_map.",
-        "Do not stop at a one-token name like a Slack display_name or calendar first name. Search Gmail/calendar/Slack context around the event title, email local part, usernames, candidate briefs, and prior messages until you find a full preferred/legal name or have clear evidence none is available.",
+        "Do not stop at a one-token name like a Slack display_name or calendar first name when topic-relevant evidence can resolve it. Search Gmail/calendar/Slack/message context around the event title, email local part, usernames, and prior messages about the same topic; if multiple people share that first name and no topic-relevant evidence identifies which one, keep the spoken first name and do not guess a surname.",
         "When a speaker is identified only by a first name, use calendar attendee emails plus Slack/email identity evidence to resolve the full name.",
         "Calendar candidates may include identity_hints for attendee emails. Use possible_names from identity_hints for attendee and speaker names when supported by transcript evidence.",
         "When transcript, title, or calendar context names an event, program, trip, or retreat, use event_identity_hints and focused warehouse queries to identify the event's likely team, staff, organizers, roster, and attendees before accepting a full name for a first-name-only speaker.",
@@ -2382,9 +2402,9 @@ def enrichment_instructions() -> list[str]:
         "Normalize spoken name mentions in transcript to verified participant spellings when ASR produces a close variant, especially in greetings and introductions.",
         "Keep the spelling of a name as the source transcript has it unless warehouse evidence (an email signature, a contact card, a calendar attendee, a roster) shows a different spelling; your own memory of a public figure is not evidence. Every other mention is rewritten to match the name you choose, so a wrong spelling spreads.",
         "If the transcript says a person or organization name differently than the calendar candidate, query for that spoken name/project before deciding.",
-        "contact_alias_hints come from human-edited Google Contacts nicknames. Use them as a source-of-truth candidate for bare first-name references, nicknames, and ASR name variants, then verify with recent Slack/Gmail/calendar context before expanding the name in summary, action items, evidence, or transcript.",
-        "Do not expand a bare first-name third-party reference to a stale or merely exact contact match when a human-edited contact alias points to another current person.",
-        "After resolving a contact alias, use the canonical name or appropriate given name in final summary, action items, evidence, transcript, speaker_map, and participants. Do not carry the raw alias string into final fields unless a provenance note explicitly requires the original wording.",
+        "contact_alias_hints are candidate nickname matches, NOT a source of truth or default preference over contacts whose actual given_name matches the spoken name. Check is_ambiguous and competing_contacts: when multiple people share a first name or nickname, disambiguate only with topic-specific, contemporaneous evidence (call_metadata, calendar attendees, or Slack/SMS/email threads about the same topic or incident). An unrelated email or a contact nickname alone is never evidence that a person was present or referenced.",
+        "Never assign a surname or expand a spoken first name unless topic-relevant evidence identifies which person it is. When a spoken first name remains ambiguous, keep the name exactly as spoken in speaker_map, speaker_turns, summary, and transcript, omit the unverified full name from participants, and note the ambiguity in evidence.",
+        "Keep valid spoken first names as spoken in transcript unless warehouse evidence proves an actual ASR mishearing; never rewrite a spoken name into a different person's legal given name based on a contact nickname.",
         "For technical/product terms that are unclear or unfamiliar, query Slack/Gmail for likely spelling variants and use the spelling supported by warehouse evidence.",
         "Correct ASR domain-term errors in transcript, for example Hack Club not Hat Club, Hackatime not Hackertime/Hacker Time, Stardance not Start Dance, OpenRouter, OpenAI, Anthropic, Congressional App Challenge, Challenger, Framework, Spindrift, and Pellegrino.",
         "recording.recorded_at is the recording's absolute start time. Match calendar events against it together with transcript evidence.",
@@ -2487,6 +2507,17 @@ def prompt_identity_hints(identity_hints: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def prompt_contact_alias_hint(hint: Mapping[str, Any]) -> dict[str, Any]:
+    raw_competing = hint.get("competing_contacts") or []
+    competing_contacts = [
+        {
+            "canonical_name": str(item.get("canonical_name") or ""),
+            "primary_email": str(item.get("primary_email") or ""),
+            "organization": str(item.get("organization") or ""),
+            "job_title": str(item.get("job_title") or ""),
+        }
+        for item in raw_competing[:PROMPT_COMPETING_CONTACTS_LIMIT]
+        if isinstance(item, Mapping) and str(item.get("canonical_name") or "").strip()
+    ]
     return {
         "mention": str(hint.get("mention") or ""),
         "canonical_name": str(hint.get("canonical_name") or ""),
@@ -2500,6 +2531,9 @@ def prompt_contact_alias_hint(hint: Mapping[str, Any]) -> dict[str, Any]:
         "source_kind": str(hint.get("source_kind") or ""),
         "account": str(hint.get("account") or ""),
         "card_id": str(hint.get("card_id") or ""),
+        "is_ambiguous": bool(hint.get("is_ambiguous", False)),
+        "other_given_name_match_count": int(hint.get("other_given_name_match_count") or 0),
+        "competing_contacts": competing_contacts,
     }
 
 
