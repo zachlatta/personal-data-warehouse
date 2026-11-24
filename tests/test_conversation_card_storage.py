@@ -307,14 +307,15 @@ def test_missing_canonical_session_refuses_to_delete_derived_row(warehouse):
     assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0] == 1
 
 
-def test_missing_canonical_turn_refuses_to_delete_derived_row(warehouse):
+def test_missing_canonical_turn_is_masked_in_place_not_deleted(warehouse):
     row = event()
     warehouse.insert_agent_session_events([dict(row, text='safe content', raw_json='{}')])
     warehouse._command("""INSERT INTO @timeline_events (adapter,event_id,source,context,search_text)
       VALUES ('agent_session_turn','claude_code|test-session|999','claude_code','claude_code|test-session',%s)""", (row['text'],))
-    with pytest.raises(RuntimeError, match='canonical event missing'):
-        scrub(warehouse, apply=True)
-    assert warehouse._query('SELECT count(*) FROM @timeline_events')[0][0] == 1
+    scrub(warehouse, apply=True)
+    [stale] = warehouse._query("SELECT search_text FROM @timeline_events WHERE event_id='claude_code|test-session|999'")
+    assert '4111111111111111' not in stale[0] and 'CVV' in stale[0]
+    assert scrub(warehouse) == []
 
 
 @pytest.mark.parametrize('name', ['review6_phone_prefix', 'review6_independent_order_ids'] + [

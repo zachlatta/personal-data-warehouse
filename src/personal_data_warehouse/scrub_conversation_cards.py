@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import os
 import html
@@ -774,11 +775,23 @@ def _apply_plan(warehouse, plan, page_size, workers, selector=None, *, planned_o
         else: chunks.append((row['chunk_id'],row['text_sha256'],key,identity))
     phase('regenerate_timeline')
     new_keys, regenerated = rebuild_sessions(warehouse,active,page_size,selector)
-    if any((*key,identity) not in regenerated for key,identity in old_timeline) or any((*key,identity) not in regenerated for _,_,key,identity in chunks):
+    # A stale copy is one the canonical rebuild no longer produces (an older
+    # turn builder, or a source event a re-upload removed); timeline sync never
+    # deletes it. It is masked where it is, not deleted. A key the rebuild DID
+    # write, but for another session, is not stale: refuse it as before.
+    stale_keys=({(key,identity) for key,identity in old_timeline if (*key,identity) not in regenerated}|
+                {(key,identity) for _,_,key,identity in chunks if (*key,identity) not in regenerated})
+    if any(key in new_keys for key,_ in stale_keys):
         raise RuntimeError('canonical event missing for derived copy; no changes committed')
+    stale_events={key for key,_ in stale_keys}
     for (adapter,event_id),_ in old_timeline:
-        if (adapter,event_id) not in new_keys:
+        if (adapter,event_id) not in new_keys and (adapter,event_id) not in stale_events:
             warehouse._command('DELETE FROM @timeline_events WHERE adapter=%s AND event_id=%s',(adapter,event_id))
+    phase('mask_stale_copies')
+    stale_rows=[(table,row) for (table,_),row in current.items()
+                if table in DERIVED and ((row['adapter'],row['event_id']),session_identity(row)) in stale_keys]
+    _mask_stale_copies(warehouse,stale_rows,workers,selector,page_size)
+    chunks=[c for c in chunks if (c[2],c[3]) not in stale_keys]
     phase('regenerate_chunks_embeddings')
     if planned_only:
         # Include canonical chunks created since discovery, including events
@@ -790,6 +803,44 @@ def _apply_plan(warehouse, plan, page_size, workers, selector=None, *, planned_o
         batch=chunks[offset:offset+500]
         warehouse._command('DELETE FROM @search_chunk_embeddings WHERE text_sha256 = ANY(%s)',([c[1] for c in batch],))
         warehouse._command('DELETE FROM @search_chunks WHERE chunk_id = ANY(%s)',([c[0] for c in batch],))
+
+
+def _mask_stale_copies(warehouse, rows, workers, selector, page_size):
+    """Mask selected spans in derived copies the rebuild cannot regenerate.
+
+    The row is kept and only changed columns are written; a copy with nothing
+    selected stays byte-identical. A masked timeline row takes a new seq so the
+    chunk builder re-chunks it from the masked text; a masked chunk gets its
+    new text hash and built_at (the embedding drain's watermark), and the old
+    hash's embedding is dropped, as for a regenerated chunk.
+    """
+    updates={}; old_shas=[]
+    with ConfirmationPool(workers,selector) as pool:
+        for offset in range(0,len(rows),page_size):
+            batch=rows[offset:offset+page_size]
+            for (table,row),cleaned in zip(batch,pool.redacted([row for _,row in batch]),strict=True):
+                keys=POSTGRES_TABLES[table].primary_key
+                columns=[k for k in row if k not in keys and cleaned[k]!=row[k]]
+                if not columns: continue
+                sets=[f'{k}=%s' for k in columns]
+                values=[Json(cleaned[k]) if isinstance(cleaned[k],(dict,list)) else cleaned[k] for k in columns]
+                if table=='timeline_events':
+                    sets+=['seq=nextval(%s::regclass)','updated_at=now()']
+                    values.append(warehouse.sql_relation('timeline_events_seq'))
+                else:
+                    if 'text' in columns:
+                        sets+=['text_sha256=%s','char_count=%s']
+                        values+=[hashlib.sha256(cleaned['text'].encode()).hexdigest(),len(cleaned['text'])]
+                        old_shas.append(row['text_sha256'])
+                    sets.append('built_at=now()')
+                updates.setdefault((table,tuple(sets)),[]).append(tuple(values)+tuple(row[k] for k in keys))
+    for (table,sets),params in updates.items():
+        keys=POSTGRES_TABLES[table].primary_key
+        sql=f'UPDATE @{table} SET '+','.join(sets)+' WHERE '+' AND '.join(f'{k}=%s' for k in keys)
+        with warehouse._connection.cursor() as cursor:
+            execute_batch(cursor,warehouse._expand_relations(sql),params,page_size=100)
+    for offset in range(0,len(old_shas),500):
+        warehouse._command('DELETE FROM @search_chunk_embeddings WHERE text_sha256 = ANY(%s)',(old_shas[offset:offset+500],))
 
 
 def rebuild_sessions(warehouse, sessions, page_size, selector=None):
@@ -931,7 +982,7 @@ def main():
     parser.add_argument('--session-batches',action='store_true',help='apply complete sessions in separate bounded transactions')
     parser.add_argument('--planned-only',action='store_true',help='credentials only: indexed planned-session repair; unrelated sessions require full post-restore verify')
     parser.add_argument('--writers-paused',action='store_true',help='acknowledge external writer shutdown and guaranteed restoration')
-    parser.add_argument('--max-canonical-rows',type=int,default=10000)
+    parser.add_argument('--max-canonical-rows',type=int,default=5000)
     parser.add_argument('--max-groups',type=int,help='session batches: stop after N groups; a rerun resumes')
     parser.add_argument('--report-html', type=Path, help='counts-only table for the private email body')
     add_selector_arguments(parser)

@@ -111,7 +111,7 @@ def restore(directory):
     if failures: raise RuntimeError('writer restoration failed; rerun restore using the saved state')
 
 
-def apply(directory, max_canonical_rows=10000, max_source_rows=500, max_plan_rows=20000, max_groups=None,
+def apply(directory, max_canonical_rows=5000, max_source_rows=500, max_plan_rows=20000, max_groups=None,
           large_session_window_seconds=None):
     # A group that overruns its 60-second transaction rolls back; rerunning
     # apply with a cap just above the largest session isolates it.
@@ -193,7 +193,7 @@ def main():
     parser.add_argument('phase',choices=('plan','apply','restore','verify','cleanup',
                                         'archive-plan','archive-apply','archive-verify'))
     parser.add_argument('--state-dir',type=Path,required=True)
-    parser.add_argument('--max-canonical-rows',type=int,default=10000,help='apply only: canonical rows per session group')
+    parser.add_argument('--max-canonical-rows',type=int,default=5000,help='apply only: canonical rows per session group')
     parser.add_argument('--max-source-rows',type=int,default=500,help='apply only: matching source rows the whole plan may hold')
     parser.add_argument('--max-plan-rows',type=int,default=20000,help='apply only: source and derived rows the whole plan may hold')
     parser.add_argument('--max-groups',type=int,help='apply only: session groups per writer outage; rerun apply to resume')

@@ -629,7 +629,9 @@ remain the final guard against an unaccounted writer.
 
 Apply records a new `before-stop.json` before the first stop. It executes
 `docker stop --time 30 <dagster-id> <app-id>`, runs only DB apply
-with `--session-batches --planned-only --writers-paused --max-canonical-rows 10000`.
+with `--session-batches --planned-only --writers-paused --max-canonical-rows 5000`
+(production regenerates about 4 ms per canonical row, so a 5,000-row group takes about
+20 s; 10,000-row groups overran the 60-second transaction).
 If a group overruns its transaction, it rolls back and the writers restart;
 rerun `apply --max-canonical-rows <largest session's rows>` so that session runs
 alone (completed groups are skipped). The whole plan may hold at most 500 matching
@@ -680,7 +682,17 @@ Credential verification exits nonzero if a secret remains. Database repair uses 
 same canonical session regeneration, partial-title/snippet replacement and
 chunk/embedding invalidation as the card repair: the rebuilt timeline rows get a new
 `seq`, and their old chunks and embeddings are deleted so the builders regenerate
-them from masked text. The credential SQL prefilter (`credential_redaction.SQL_PREFILTER`)
+them from masked text. A **stale derived copy** (a timeline turn row or search chunk
+of an affected session that the canonical rebuild no longer produces, because an older
+turn builder wrote it or a re-upload removed its source event; timeline sync never
+deletes such rows) is masked **in place**: the same selector masks its stored columns,
+the row is kept, a masked timeline row takes a new `seq` (so the chunk builder
+re-chunks it from the masked text), and a masked chunk gets its new `text_sha256`,
+`char_count` and `built_at` while the old hash's embedding is deleted. A stale copy
+with nothing selected is left byte-identical. Only a key the rebuild wrote for
+**another** session still refuses the group (`canonical event missing for derived
+copy`), and a session with no canonical source at all still refuses (`canonical
+source missing`). The credential SQL prefilter (`credential_redaction.SQL_PREFILTER`)
 is a case-insensitive superset of every rule's anchor after removing backslashes,
 including the `\u00XX` units an anchor character can be escaped as. Python confirms
 every prefiltered row. Full discovery keeps the existing
@@ -692,7 +704,7 @@ New selected source keys **within a planned session** abort for rediscovery.
 Timeline reads use `(adapter,event_id)` and canonical chunks use their indexed
 `anchor`; late-built chunks for rebuilt events are removed too. Chunk/embedding
 deletes and saved-key confirmation are batched. Complete-session groups accept
-up to 30,000 canonical rows (`--max-canonical-rows`, default 10,000), so a session
+up to 30,000 canonical rows (`--max-canonical-rows`, default 5,000), so a session
 larger than the legacy 5,000-row cap can be repaired without splitting its
 canonical regeneration. Oversized groups
 still fail the CLI as incomplete. This explicit mode repairs the plan, **not
