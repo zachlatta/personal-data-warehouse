@@ -32,46 +32,85 @@ type argonSummary struct {
 	parentSessionID string
 }
 
-func discoverArgon(root string) []SessionFile {
+type argonSummaryCacheEntry struct {
+	sig       fileSignature
+	hasSig    bool
+	summaries map[string]argonSummary
+}
+
+type argonMetaCache struct {
+	byDB map[string]argonSummaryCacheEntry
+}
+
+func (c *argonMetaCache) summariesFor(agyRoot string) map[string]argonSummary {
+	dbPath := filepath.Join(agyRoot, "conversation_summaries.db")
+	sig, found := signatureOf(dbPath, dbPath+"-wal")
+	if c.byDB == nil {
+		c.byDB = map[string]argonSummaryCacheEntry{}
+	}
+	if cached, ok := c.byDB[dbPath]; ok && cached.hasSig == found && (!found || cached.sig == sig) {
+		return cached.summaries
+	}
+	var summaries map[string]argonSummary
+	if found {
+		summaries = loadArgonSummaries(dbPath)
+	} else {
+		summaries = map[string]argonSummary{}
+	}
+	c.byDB[dbPath] = argonSummaryCacheEntry{sig: sig, hasSig: found, summaries: summaries}
+	return summaries
+}
+
+func (c *argonMetaCache) sessionMeta(path, sessionID string) map[string]any {
+	sessionDir := filepath.Dir(filepath.Dir(filepath.Dir(path)))
+	agyRoot := argonRootDir(sessionDir)
+	summary := c.summariesFor(agyRoot)[sessionID]
+	if summary.title == "" {
+		summary.title = readArgonAnnotationTitle(filepath.Join(agyRoot, "annotations", sessionID+".pbtxt"))
+	}
+	meta := map[string]any{}
+	if summary.cwd != "" {
+		meta["cwd"] = summary.cwd
+	}
+	if summary.title != "" {
+		meta["title"] = summary.title
+	}
+	if summary.parentSessionID != "" {
+		meta["parent_session_id"] = summary.parentSessionID
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	return meta
+}
+
+func discoverArgon(root string, loadMeta bool) []SessionFile {
+	if strings.TrimSpace(root) == "" {
+		return nil
+	}
+	root = common.ExpandUser(root)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
 	var files []SessionFile
-	summariesByRoot := map[string]map[string]argonSummary{}
-	walkJSONL(root, func(path, name string) {
-		if name != argonTranscriptName {
-			return
+	var cache argonMetaCache
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
 		}
-		logsDir := filepath.Dir(path)
-		sysDir := filepath.Dir(logsDir)
-		if filepath.Base(logsDir) != "logs" || filepath.Base(sysDir) != ".system_generated" {
-			return
+		sessionID := entry.Name()
+		path := filepath.Join(root, sessionID, ".system_generated", "logs", argonTranscriptName)
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
 		}
-		sessionDir := filepath.Dir(sysDir)
-		sessionID := filepath.Base(sessionDir)
-		agyRoot := argonRootDir(sessionDir)
-		summaries, loaded := summariesByRoot[agyRoot]
-		if !loaded {
-			summaries = loadArgonSummaries(filepath.Join(agyRoot, "conversation_summaries.db"))
-			summariesByRoot[agyRoot] = summaries
-		}
-		summary := summaries[sessionID]
-		if summary.title == "" {
-			summary.title = readArgonAnnotationTitle(filepath.Join(agyRoot, "annotations", sessionID+".pbtxt"))
-		}
-		file := SessionFile{Tool: ArgonTool, SessionID: sessionID, Path: path}
-		meta := map[string]any{}
-		if summary.cwd != "" {
-			meta["cwd"] = summary.cwd
-		}
-		if summary.title != "" {
-			meta["title"] = summary.title
-		}
-		if summary.parentSessionID != "" {
-			meta["parent_session_id"] = summary.parentSessionID
-		}
-		if len(meta) > 0 {
-			file.Session = meta
+		file := sessionFileWithInfo(ArgonTool, sessionID, path, info)
+		if loadMeta {
+			file.Session = cache.sessionMeta(path, sessionID)
 		}
 		files = append(files, file)
-	})
+	}
 	return files
 }
 

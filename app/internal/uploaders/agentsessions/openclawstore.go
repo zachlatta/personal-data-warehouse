@@ -85,7 +85,7 @@ func (r *Runner) readOpenClawStore(batch *pendingBatch, remaining *int, summary 
 			summary.LimitReached = true
 			return nil
 		}
-		_, nextSeq, err := r.startPosition(session.stateKey, 0)
+		_, nextSeq, err := r.startPosition(session.stateKey, fileSignature{}, false)
 		if err != nil {
 			return err
 		}
@@ -108,7 +108,7 @@ func (r *Runner) readOpenClawStore(batch *pendingBatch, remaining *int, summary 
 				summary.LinesSkipped++
 				continue
 			}
-			batch.add(r.envelope(file, seq, parsed), session.stateKey, 0, seq+1)
+			batch.add(r.envelope(file, seq, parsed), session.stateKey, 0, seq+1, fileSignature{}, false)
 			selected++
 			if r.Limit > 0 {
 				*remaining--

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"time"
@@ -52,11 +53,14 @@ type Runner struct {
 	BatchSize         int
 	BeforeUploadCheck func() string
 	// SkipUnchanged is the resident watcher's mode (`--watch`): a transcript
-	// whose size and mtime are what they were when a previous pass of this
-	// Runner left it fully shipped is passed over without a state lookup or
-	// a read, and idle passes log nothing. A pass every two seconds over
-	// thousands of transcripts then costs one directory walk.
+	// whose size, mtime and inode are what they were when a previous pass left
+	// it fully shipped is passed over without a state lookup or a read, and
+	// idle passes log nothing.
 	SkipUnchanged bool
+	// MtimeSettleWindow guards against coarse-mtime / same-tick rewrites: a
+	// file modified more recently than Now()-MtimeSettleWindow is not marked
+	// unchanged until its mtime settles.
+	MtimeSettleWindow time.Duration
 	// Observe posts each tool's newest event (contract C11); nil disables it.
 	Observe ingestclient.ObservationPoster
 
@@ -66,13 +70,29 @@ type Runner struct {
 	// fully uploaded; pass holds this pass's candidates until it succeeds.
 	shipped map[string]fileSignature
 	pass    map[string]fileSignature
+	// progress caches file_state in memory after a single bulk LoadAll so a
+	// restarted watcher does not issue thousands of per-file SQLite SELECTs.
+	progress       map[string]FileProgress
+	progressLoaded bool
+	backfillSigs   map[string]fileSignature
+	argonMeta      argonMetaCache
 }
 
 // fileSignature is what a watcher compares between passes. An append moves
-// the size; a SQLite write moves the database's or its WAL's mtime.
+// the size; an in-place rewrite moves modTime; an atomic rename replacement
+// moves inode; a SQLite write moves the database's or its WAL's mtime.
 type fileSignature struct {
 	size    int64
 	modTime int64
+	inode   uint64
+}
+
+func signatureFromInfo(info fs.FileInfo) fileSignature {
+	return fileSignature{
+		size:    info.Size(),
+		modTime: info.ModTime().UnixNano(),
+		inode:   fileInode(info),
+	}
 }
 
 func signatureOf(paths ...string) (fileSignature, bool) {
@@ -87,8 +107,10 @@ func signatureOf(paths ...string) (fileSignature, bool) {
 			continue
 		}
 		found = true
-		sig.size = sig.size*31 + info.Size()
-		sig.modTime = sig.modTime*31 + info.ModTime().UnixNano()
+		s := signatureFromInfo(info)
+		sig.size = sig.size*31 + s.size
+		sig.modTime = sig.modTime*31 + s.modTime
+		sig.inode = sig.inode*31 + s.inode
 	}
 	return sig, found
 }
@@ -102,39 +124,54 @@ func (r *Runner) unchanged(key string, sig fileSignature) bool {
 	return ok && shipped == sig
 }
 
+func (r *Runner) isSettled(sig fileSignature) bool {
+	if r.MtimeSettleWindow <= 0 {
+		return true
+	}
+	mod := time.Unix(0, sig.modTime)
+	return r.Now().Sub(mod) >= r.MtimeSettleWindow
+}
+
 // caughtUp records that key was read to its end this pass; it becomes
-// skippable once the pass's uploads succeed.
+// skippable once the pass's uploads succeed and its mtime has settled.
 func (r *Runner) caughtUp(key string, sig fileSignature) {
-	if r.SkipUnchanged {
+	if r.SkipUnchanged && r.isSettled(sig) {
 		r.pass[key] = sig
 	}
+}
+
+type pendingProgress struct {
+	offset int64
+	lineNo int64
+	sig    fileSignature
+	hasSig bool
 }
 
 type pendingBatch struct {
 	batchSize int
 	records   []map[string]any
-	pending   map[string][2]int64 // path -> (offset, line_no) of its last buffered line
+	pending   map[string]pendingProgress // path -> last buffered line progress + pre-read sig
 	order     []string
 	batches   int
 }
 
 func newPendingBatch(size int) *pendingBatch {
-	return &pendingBatch{batchSize: size, pending: map[string][2]int64{}}
+	return &pendingBatch{batchSize: size, pending: map[string]pendingProgress{}}
 }
 
-func (b *pendingBatch) add(record map[string]any, path string, offset, lineNo int64) {
+func (b *pendingBatch) add(record map[string]any, path string, offset, lineNo int64, sig fileSignature, hasSig bool) {
 	b.records = append(b.records, record)
 	if _, seen := b.pending[path]; !seen {
 		b.order = append(b.order, path)
 	}
-	b.pending[path] = [2]int64{offset, lineNo}
+	b.pending[path] = pendingProgress{offset: offset, lineNo: lineNo, sig: sig, hasSig: hasSig}
 }
 
 func (b *pendingBatch) full() bool { return len(b.records) >= b.batchSize }
 
 func (b *pendingBatch) reset() {
 	b.records = nil
-	b.pending = map[string][2]int64{}
+	b.pending = map[string]pendingProgress{}
 	b.order = nil
 	b.batches++
 }
@@ -159,8 +196,17 @@ func (r *Runner) Sync() (Summary, error) {
 	if r.SkipUnchanged && r.shipped == nil {
 		r.shipped = map[string]fileSignature{}
 	}
+	if r.Mode == "incremental" && r.State != nil && !r.progressLoaded {
+		loaded, err := r.State.LoadAll()
+		if err != nil {
+			return Summary{}, err
+		}
+		r.progress = loaded
+		r.progressLoaded = true
+	}
 	r.pass = map[string]fileSignature{}
-	files := Discover(r.Dirs)
+	r.backfillSigs = map[string]fileSignature{}
+	files := discoverFiles(r.Dirs, false)
 	r.observeNewest(files)
 	if !r.SkipUnchanged {
 		r.Logger.Infof("Discovered %d agent session transcript file(s)", len(files))
@@ -206,6 +252,18 @@ func (r *Runner) Sync() (Summary, error) {
 	if err := r.flush(batch); err != nil {
 		return summary, err
 	}
+	if r.State != nil && len(r.backfillSigs) > 0 {
+		if err := r.State.BackfillSignatures(r.backfillSigs); err != nil {
+			return summary, err
+		}
+		for path, sig := range r.backfillSigs {
+			p := r.progress[path]
+			p.LastSize = sig.size
+			p.LastMtimeNs = sig.modTime
+			p.LastInode = sig.inode
+			r.progress[path] = p
+		}
+	}
 	summary.BatchesUploaded = batch.batches
 	for key, sig := range r.pass {
 		r.shipped[key] = sig
@@ -229,22 +287,47 @@ type fileResult struct {
 }
 
 func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, summary *Summary) (fileResult, bool, error) {
-	sig, found := signatureOf(file.Path)
-	if !found {
-		return fileResult{}, false, nil
+	sig := file.sig
+	if !file.hasSig {
+		var found bool
+		sig, found = signatureOf(file.Path)
+		if !found {
+			return fileResult{}, false, nil
+		}
 	}
 	if r.unchanged(file.Path, sig) {
 		summary.FilesUnchanged++
 		return fileResult{}, false, nil
 	}
+	// Fast path across process restarts: if persisted state recorded this
+	// exact signature (size, mtime, inode) and it has settled, skip without
+	// opening or reading the file.
+	if r.Mode == "incremental" && r.SkipUnchanged && r.progressLoaded && r.isSettled(sig) {
+		if p, ok := r.progress[file.Path]; ok && p.LastSize >= 0 &&
+			p.LastSize == sig.size && p.LastMtimeNs == sig.modTime && p.LastInode == sig.inode {
+			r.caughtUp(file.Path, sig)
+			summary.FilesUnchanged++
+			return fileResult{}, false, nil
+		}
+	}
 	size := sig.size
-	startOffset, startLine, err := r.startPosition(file.Path, size)
+	startOffset, startLine, err := r.startPosition(file.Path, sig, true)
 	if err != nil {
 		return fileResult{}, false, err
 	}
 	if size <= startOffset {
+		// Already caught up. Backfill signature for pre-upgrade state rows so
+		// future restarts skip immediately and detect same-size rewrites/renames.
+		if r.Mode == "incremental" && r.progressLoaded {
+			if p, ok := r.progress[file.Path]; ok && p.LastSize < 0 && r.isSettled(sig) {
+				r.backfillSigs[file.Path] = sig
+			}
+		}
 		r.caughtUp(file.Path, sig)
 		return fileResult{}, true, nil
+	}
+	if file.Tool == ArgonTool && file.Session == nil {
+		file.Session = r.argonMeta.sessionMeta(file.Path, file.SessionID)
 	}
 	handle, err := os.Open(file.Path)
 	if err != nil {
@@ -256,6 +339,7 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 	}
 	data := make([]byte, size-startOffset)
 	n, _ := readFull(handle, data)
+	shortRead := int64(n) < size-startOffset
 	data = data[:n]
 
 	offset := startOffset
@@ -277,7 +361,7 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 			result.skipped++
 			continue
 		}
-		batch.add(r.envelope(file, seq, parsed), file.Path, offset, lineNo)
+		batch.add(r.envelope(file, seq, parsed), file.Path, offset, lineNo, sig, true)
 		result.selected++
 		if batch.full() {
 			if err := r.flush(batch); err != nil {
@@ -285,7 +369,7 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 			}
 		}
 	}
-	if !result.deferred {
+	if !result.deferred && !shortRead {
 		// Read to the end (a trailing partial line stays in the size, so
 		// finishing it moves the signature and brings the file back).
 		r.caughtUp(file.Path, sig)
@@ -293,7 +377,7 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 	if result.selected == 0 && offset != startOffset {
 		// Consumed only skipped/blank lines; advance so we do not reprocess
 		// them next run. (Files with selected lines commit via flush.)
-		if err := r.commit(file.Path, offset, lineNo); err != nil {
+		if err := r.commit(file.Path, offset, lineNo, sig, !result.deferred && !shortRead); err != nil {
 			return result, true, err
 		}
 	}
@@ -346,7 +430,7 @@ func (r *Runner) flush(batch *pendingBatch) error {
 	// lines whose records are in this just-uploaded batch.
 	for _, path := range batch.order {
 		progress := batch.pending[path]
-		if err := r.commit(path, progress[0], progress[1]); err != nil {
+		if err := r.commit(path, progress.offset, progress.lineNo, progress.sig, progress.hasSig); err != nil {
 			return err
 		}
 	}
@@ -355,26 +439,81 @@ func (r *Runner) flush(batch *pendingBatch) error {
 	return nil
 }
 
-func (r *Runner) startPosition(path string, size int64) (int64, int64, error) {
+func (r *Runner) startPosition(path string, sig fileSignature, hasSig bool) (int64, int64, error) {
 	if r.Mode != "incremental" || r.State == nil {
 		return 0, 0, nil
 	}
-	progress, err := r.State.ProgressFor(path)
-	if err != nil {
-		return 0, 0, err
+	var (
+		progress FileProgress
+		err      error
+	)
+	if r.progressLoaded {
+		var ok bool
+		progress, ok = r.progress[path]
+		if !ok {
+			progress = FileProgress{Path: path, LastSize: -1}
+		}
+	} else {
+		progress, err = r.State.ProgressFor(path)
+		if err != nil {
+			return 0, 0, err
+		}
 	}
-	if progress.UploadedOffset > size {
+	if !hasSig {
+		return progress.UploadedOffset, progress.UploadedLines, nil
+	}
+	if progress.UploadedOffset > sig.size {
 		// File was truncated/rotated; re-read from the beginning.
+		return 0, 0, nil
+	}
+	if progress.LastInode != 0 && sig.inode != 0 && progress.LastInode != sig.inode {
+		// File was atomically replaced (rename/recreate); re-read from the beginning.
+		return 0, 0, nil
+	}
+	if progress.UploadedOffset == sig.size && sig.size > 0 && progress.LastSize >= 0 && progress.LastMtimeNs != 0 && progress.LastMtimeNs != sig.modTime {
+		// Same-size in-place rewrite; re-read from the beginning.
 		return 0, 0, nil
 	}
 	return progress.UploadedOffset, progress.UploadedLines, nil
 }
 
-func (r *Runner) commit(path string, offset, lineNo int64) error {
+func (r *Runner) commit(path string, offset, lineNo int64, sig fileSignature, hasSig bool) error {
 	if r.State == nil {
 		return nil
 	}
-	return r.State.RecordProgress(path, offset, lineNo, r.Now())
+	var (
+		lastSize    int64 = -1
+		lastMtimeNs int64
+		lastInode   uint64
+	)
+	// Only persist the file signature when we reached the end of the file (or
+	// it is settled); a deferred mid-file commit must not claim the whole file
+	// was processed at sig.
+	if hasSig && offset >= sig.size && r.isSettled(sig) {
+		lastSize = sig.size
+		lastMtimeNs = sig.modTime
+		lastInode = sig.inode
+	} else if hasSig {
+		// Still record inode and mtime so rename/rewrite is detected even on
+		// partially-shipped or freshly-written files, while LastSize=-1 keeps
+		// the restart fast-skip disabled until fully settled.
+		lastMtimeNs = sig.modTime
+		lastInode = sig.inode
+	}
+	if err := r.State.RecordProgressWithSignature(path, offset, lineNo, lastSize, lastMtimeNs, lastInode, r.Now()); err != nil {
+		return err
+	}
+	if r.progressLoaded {
+		r.progress[path] = FileProgress{
+			Path:           path,
+			UploadedOffset: offset,
+			UploadedLines:  lineNo,
+			LastSize:       lastSize,
+			LastMtimeNs:    lastMtimeNs,
+			LastInode:      lastInode,
+		}
+	}
+	return nil
 }
 
 func (r *Runner) runNetworkCheck() error {

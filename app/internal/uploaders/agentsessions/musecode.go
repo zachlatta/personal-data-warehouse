@@ -1,6 +1,7 @@
 package agentsessions
 
 import (
+	"io/fs"
 	"path/filepath"
 	"strings"
 )
@@ -27,12 +28,15 @@ func defaultMuseCodeSessions(getenv func(string) string) string {
 
 func discoverMuseCode(root string) []SessionFile {
 	var files []SessionFile
-	walkJSONL(root, func(path, name string) {
+	skip := func(name string) bool {
+		return name == ".msp-view-v1" || name == ".spool" || name == "tool-outputs" || name == "approval-review"
+	}
+	walkJSONLSkipping(root, skip, func(path, name string, info fs.FileInfo) {
 		if name != museCodeTranscriptName {
 			return
 		}
 		dir := filepath.Dir(path)
-		file := SessionFile{Tool: MuseCodeTool, SessionID: filepath.Base(dir), Path: path}
+		file := sessionFileWithInfo(MuseCodeTool, filepath.Base(dir), path, info)
 		if parent := filepath.Dir(dir); filepath.Base(parent) == "subagent" {
 			file.Session = map[string]any{"parent_session_id": filepath.Base(filepath.Dir(parent))}
 		}

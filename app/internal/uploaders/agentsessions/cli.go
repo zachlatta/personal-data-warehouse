@@ -15,7 +15,7 @@ const Usage = `pdw ingest agent-sessions - upload local AI agent CLI session tra
 
 USAGE
   pdw ingest agent-sessions [--mode incremental|full] [--limit N] [--batch-size N]
-                            [--watch DURATION] [--interval DURATION]
+                            [--watch DURATION] [--interval DURATION] [--max-interval DURATION]
                             [--state-file PATH] [--lock-file PATH]
 
 Tails ~/.claude/projects, ~/.codex/sessions, ~/.openclaw/agents/main/sessions,
@@ -25,22 +25,25 @@ empty to disable that tool on this host), coalesces new lines into gzipped JSONL
 batches and posts them to the app's /ingest/agent-sessions/batch endpoint.
 
 FLAGS
-  --mode MODE         incremental (default; resume from the state file) or full.
-  --limit N           Maximum lines to upload this run; 0 (default) is unlimited.
-                      Bounds a first backfill.
-  --batch-size N      Maximum lines per uploaded batch (default 20000).
-  --watch DURATION    Stay resident for DURATION (e.g. 300s), passing over the
-                      transcripts every --interval and shipping each new line
-                      within seconds; transcripts whose size and mtime did not
-                      move are skipped. The run then exits so its wrapper can
-                      post the heartbeat and the supervisor (systemd
-                      Restart=always, launchd KeepAlive) starts the next one.
-                      A failed pass ends the window with a failure.
-  --interval DURATION Pause between --watch passes (default 2s).
-  --state-file PATH   Incremental upload state (default: the Application Support
-                      state database).
-  --lock-file PATH    Nonblocking lock used to avoid overlapping LaunchAgent runs
-                      (default: beside the state file).
+  --mode MODE              incremental (default; resume from the state file) or full.
+  --limit N                Maximum lines to upload this run; 0 (default) is unlimited.
+                           Bounds a first backfill.
+  --batch-size N           Maximum lines per uploaded batch (default 20000).
+  --watch DURATION         Stay resident for DURATION (e.g. 300s), passing over the
+                           transcripts every --interval and shipping each new line
+                           within seconds; transcripts whose size, mtime and inode
+                           did not move are skipped, and consecutive idle passes
+                           back off exponentially up to --max-interval (resetting to
+                           --interval immediately on activity). The run then exits
+                           so its wrapper can post the heartbeat and the supervisor
+                           (systemd Restart=always, launchd KeepAlive) starts the
+                           next one. A failed pass ends the window with a failure.
+  --interval DURATION      Base pause between --watch passes (default 2s).
+  --max-interval DURATION  Maximum pause between idle --watch passes (default 60s).
+  --state-file PATH        Incremental upload state (default: the Application Support
+                           state database).
+  --lock-file PATH         Nonblocking lock used to avoid overlapping LaunchAgent runs
+                           (default: beside the state file).
 
 ENVIRONMENT
   AGENT_SESSIONS_ACCOUNT (else GMAIL_ACCOUNTS[0])   Account the uploads are keyed by.
@@ -61,6 +64,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	batchSize := fs.Int("batch-size", DefaultBatchSize, "")
 	watch := fs.Duration("watch", 0, "")
 	interval := fs.Duration("interval", DefaultWatchInterval, "")
+	maxInterval := fs.Duration("max-interval", DefaultMaxWatchInterval, "")
 	if _, code, done := common.ParseArgs(fs, args, Usage, stdout, stderr); done {
 		return code
 	}
@@ -78,6 +82,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	if *interval <= 0 {
 		return common.UsageError(fs, stderr, "--interval must be positive")
+	}
+	if *maxInterval <= 0 {
+		return common.UsageError(fs, stderr, "--max-interval must be positive")
 	}
 
 	env, err := common.LoadProjectDotenv(getenv)
@@ -130,7 +137,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Observe:           client.PostSourceObservation,
 	}
 	if *watch > 0 {
-		return runWatch(runner, *watch, *interval, stdout, stderr)
+		return runWatch(runner, *watch, *interval, *maxInterval, stdout, stderr)
 	}
 	summary, err := runner.Sync()
 	if err != nil {
@@ -147,22 +154,42 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	return 0
 }
 
-// DefaultWatchInterval is the pause between --watch passes. Measured
-// 2026-11-08 on mew-dev, a pass over 5,376 transcripts that skips the
-// unchanged ones is one directory walk, so two seconds costs little and
-// keeps the device's share of landing latency to about a second.
+// DefaultWatchInterval is the base pause between --watch passes while
+// transcripts are active, keeping the device's share of landing latency to
+// about a second.
 const DefaultWatchInterval = 2 * time.Second
 
-// runWatch is `--watch`: Sync every interval until the window closes. The
-// Runner keeps its unchanged-file memory across passes, so only transcripts
-// that grew are read. A failed pass ends the window non-zero (the wrapper
-// records it; the supervisor restarts the uploader); a blocked network ends
-// it as a deliberate skip, exactly as a one-shot run reports one.
-func runWatch(runner *Runner, window, interval time.Duration, stdout, stderr io.Writer) int {
+// DefaultMaxWatchInterval caps exponential backoff when consecutive passes
+// find nothing new, so an idle host (e.g. a Mac with no local agents running)
+// runs ~11 passes per five-minute window instead of ~137.
+const DefaultMaxWatchInterval = 60 * time.Second
+
+// idleBackoffGracePasses is how many consecutive idle passes stay at the base
+// interval before doubling begins, so brief pauses between turns in an active
+// session do not add latency.
+const idleBackoffGracePasses = 3
+
+// defaultMtimeSettleWindow guards against coarse-mtime / same-tick rewrites.
+const defaultMtimeSettleWindow = 2 * time.Second
+
+// runWatch is `--watch`: Sync until the window closes, backing off
+// exponentially when idle and resetting to interval immediately on activity.
+// The Runner keeps its unchanged-file memory across passes (and seeds it from
+// persisted state across restarts), so only transcripts that changed are read.
+// A failed pass ends the window non-zero (the wrapper records it; the
+// supervisor restarts the uploader); a blocked network ends it as a deliberate
+// skip, exactly as a one-shot run reports one.
+func runWatch(runner *Runner, window, interval, maxInterval time.Duration, stdout, stderr io.Writer) int {
+	if maxInterval < interval {
+		maxInterval = interval
+	}
 	runner.SkipUnchanged = true
+	runner.MtimeSettleWindow = defaultMtimeSettleWindow
 	deadline := time.Now().Add(window)
 	var total Summary
 	passes := 0
+	idlePasses := 0
+	currentInterval := interval
 	for {
 		summary, err := runner.Sync()
 		passes++
@@ -179,10 +206,27 @@ func runWatch(runner *Runner, window, interval time.Duration, stdout, stderr io.
 			fmt.Fprintf(stderr, "pdw ingest agent-sessions: %v\n", err)
 			return common.ExitFailure
 		}
-		if time.Until(deadline) < interval {
+		if summary.LinesSelected > 0 || summary.LinesSkipped > 0 || summary.LimitReached || summary.FilesWithNewLines > 0 {
+			idlePasses = 0
+			currentInterval = interval
+		} else {
+			idlePasses++
+			if idlePasses > idleBackoffGracePasses && currentInterval < maxInterval {
+				currentInterval *= 2
+				if currentInterval > maxInterval {
+					currentInterval = maxInterval
+				}
+			}
+		}
+		rem := time.Until(deadline)
+		if rem < interval {
 			break
 		}
-		time.Sleep(interval)
+		sleep := currentInterval
+		if sleep > rem {
+			sleep = rem
+		}
+		time.Sleep(sleep)
 	}
 	fmt.Fprintf(stdout, "Agent sessions watch complete: passes=%d files=%d lines=%d skipped=%d batches=%d\n",
 		passes, total.FilesSeen, total.LinesSelected, total.LinesSkipped, total.BatchesUploaded)

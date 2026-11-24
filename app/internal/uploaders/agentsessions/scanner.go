@@ -46,9 +46,11 @@ type SessionFile struct {
 	SessionID string
 	Path      string
 	// Session is per-transcript metadata no single line carries, shipped on
-	// every line's record (Muse only: what kind of session it is, which loop
-	// opened it, and the model serving it).
+	// every line's record (Muse, Muse Code, Argon).
 	Session map[string]any
+
+	sig    fileSignature
+	hasSig bool
 }
 
 // Dirs names each tool's transcript root; an empty root disables that tool.
@@ -110,13 +112,17 @@ func lookup(getenv common.Getenv, name string) (string, bool) {
 // Discover lists every transcript under the configured roots, in a stable
 // order so batching is deterministic across runs.
 func Discover(dirs Dirs) []SessionFile {
+	return discoverFiles(dirs, true)
+}
+
+func discoverFiles(dirs Dirs, loadArgonMeta bool) []SessionFile {
 	var files []SessionFile
 	files = append(files, discoverClaudeCode(dirs.ClaudeProjects)...)
 	files = append(files, discoverCodex(dirs.CodexSessions)...)
 	files = append(files, discoverOpenClaw(dirs.OpenClawSessions)...)
 	files = append(files, discoverPi(dirs.PiSessions)...)
 	files = append(files, discoverMuseCode(dirs.MuseCodeSessions)...)
-	files = append(files, discoverArgon(dirs.ArgonSessions)...)
+	files = append(files, discoverArgon(dirs.ArgonSessions, loadArgonMeta)...)
 	files = append(files, discoverMuse(dirs.MuseAgents)...)
 	sort.Slice(files, func(i, j int) bool {
 		if files[i].Tool != files[j].Tool {
@@ -127,7 +133,11 @@ func Discover(dirs Dirs) []SessionFile {
 	return files
 }
 
-func walkJSONL(root string, visit func(path, name string)) {
+func walkJSONL(root string, visit func(path, name string, info fs.FileInfo)) {
+	walkJSONLSkipping(root, nil, visit)
+}
+
+func walkJSONLSkipping(root string, skipDir func(name string) bool, visit func(path, name string, info fs.FileInfo)) {
 	if strings.TrimSpace(root) == "" {
 		return
 	}
@@ -137,59 +147,82 @@ func walkJSONL(root string, visit func(path, name string)) {
 		return
 	}
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path != root && skipDir != nil && skipDir(d.Name()) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}
-		if info, err := d.Info(); err != nil || !info.Mode().IsRegular() {
+		var fi fs.FileInfo
+		if d.Type().IsRegular() {
+			fi, err = d.Info()
+		} else {
+			fi, err = os.Stat(path)
+		}
+		if err != nil || !fi.Mode().IsRegular() {
 			return nil
 		}
-		visit(path, d.Name())
+		visit(path, d.Name(), fi)
 		return nil
 	})
 }
 
+func sessionFileWithInfo(tool, sessionID, path string, info fs.FileInfo) SessionFile {
+	return SessionFile{
+		Tool:      tool,
+		SessionID: sessionID,
+		Path:      path,
+		sig:       signatureFromInfo(info),
+		hasSig:    true,
+	}
+}
+
 func discoverClaudeCode(root string) []SessionFile {
 	var files []SessionFile
-	walkJSONL(root, func(path, name string) {
+	// tool-results holds spilled tool outputs (.txt), never session transcripts.
+	walkJSONLSkipping(root, func(name string) bool { return name == "tool-results" }, func(path, name string, info fs.FileInfo) {
 		// journal.jsonl is Claude Code's journal feature, not a session
 		// transcript; shipping it created a fake session_id='journal' session.
 		if name == "journal.jsonl" {
 			return
 		}
-		files = append(files, SessionFile{Tool: ClaudeCodeTool, SessionID: ClaudeSessionID(name), Path: path})
+		files = append(files, sessionFileWithInfo(ClaudeCodeTool, ClaudeSessionID(name), path, info))
 	})
 	return files
 }
 
 func discoverCodex(root string) []SessionFile {
 	var files []SessionFile
-	walkJSONL(root, func(path, name string) {
+	walkJSONL(root, func(path, name string, info fs.FileInfo) {
 		if !strings.HasPrefix(name, "rollout-") {
 			return
 		}
-		files = append(files, SessionFile{Tool: CodexTool, SessionID: CodexSessionID(name), Path: path})
+		files = append(files, sessionFileWithInfo(CodexTool, CodexSessionID(name), path, info))
 	})
 	return files
 }
 
 func discoverOpenClaw(root string) []SessionFile {
 	var files []SessionFile
-	walkJSONL(root, func(path, name string) {
+	walkJSONL(root, func(path, name string, info fs.FileInfo) {
 		if strings.HasSuffix(name, openClawSidecarSuffix) {
 			return
 		}
-		files = append(files, SessionFile{Tool: OpenClawTool, SessionID: OpenClawSessionID(name), Path: path})
+		files = append(files, sessionFileWithInfo(OpenClawTool, OpenClawSessionID(name), path, info))
 	})
 	return files
 }
 
 func discoverPi(root string) []SessionFile {
 	var files []SessionFile
-	walkJSONL(root, func(path, name string) {
-		files = append(files, SessionFile{Tool: PiTool, SessionID: PiSessionID(name), Path: path})
+	walkJSONL(root, func(path, name string, info fs.FileInfo) {
+		files = append(files, sessionFileWithInfo(PiTool, PiSessionID(name), path, info))
 	})
 	return files
 }

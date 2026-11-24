@@ -3,6 +3,7 @@ package agentsessions
 import (
 	"bufio"
 	"encoding/json"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -42,17 +43,14 @@ var museChatSources = map[string]bool{
 
 func discoverMuse(root string) []SessionFile {
 	var files []SessionFile
-	walkJSONL(root, func(path, name string) {
+	walkJSONL(root, func(path, name string, info fs.FileInfo) {
 		if filepath.Base(filepath.Dir(path)) != "sessions" {
 			return
 		}
 		id := stem(name)
-		files = append(files, SessionFile{
-			Tool:      MuseTool,
-			SessionID: id,
-			Path:      path,
-			Session:   museSessionMeta(path, id),
-		})
+		file := sessionFileWithInfo(MuseTool, id, path, info)
+		file.Session = museSessionMeta(path, id)
+		files = append(files, file)
 	})
 	return files
 }
@@ -188,12 +186,8 @@ type museManifestFile struct {
 // files share.
 func MuseManifest(agentsRoot string, cache MuseManifestCache) ([]MuseManifestEntry, error) {
 	files := map[string][]museManifestFile{}
-	walkJSONL(agentsRoot, func(path, name string) {
+	walkJSONL(agentsRoot, func(path, name string, info fs.FileInfo) {
 		if filepath.Base(filepath.Dir(path)) != "sessions" {
-			return
-		}
-		info, err := os.Stat(path)
-		if err != nil {
 			return
 		}
 		id := stem(name)
