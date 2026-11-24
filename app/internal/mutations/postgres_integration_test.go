@@ -883,3 +883,107 @@ func TestCreateRequestAndUpdateEmailResolveDisplayNames(t *testing.T) {
 		t.Fatalf("updated cc = %#v", got)
 	}
 }
+
+func TestCreateRequestHandlesGroupSharedSendersAndConflictingContacts(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("clean_contact_points"))); err != nil {
+		t.Skipf("cannot create contacts schema in this database: %v", err)
+	}
+	if _, err := execContext(ctx, store.db, `
+		CREATE TABLE IF NOT EXISTS @clean_contact_points (
+			point_type text,
+			normalized_value text,
+			display_name text,
+			source_updated_at timestamptz
+		)
+	`); err != nil {
+		t.Skipf("cannot create clean_contact_points in this database: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("gmail_messages"))); err != nil {
+		t.Skipf("cannot create gmail schema in this database: %v", err)
+	}
+	if _, err := execContext(ctx, store.db, `
+		CREATE TABLE IF NOT EXISTS @gmail_messages (
+			account text, message_id text, thread_id text, internal_date timestamptz,
+			label_ids text[], is_deleted bigint, body_html text, body_text text,
+			from_address text, payload_json text, rfc822_message_id text, references_header text, in_reply_to_header text,
+			PRIMARY KEY (account, message_id)
+		)
+	`); err != nil {
+		t.Skipf("cannot create gmail_messages in this database: %v", err)
+	}
+	_, _ = execContext(ctx, store.db, `ALTER TABLE @gmail_messages ADD COLUMN IF NOT EXISTS payload_json text`)
+
+	suffix := time.Now().UnixNano()
+	sender := fmt.Sprintf("sender-edge-%d@example.test", suffix)
+	groupAddr := fmt.Sprintf("support-group-%d@example.test", suffix)
+	sharedAddr := fmt.Sprintf("notifications-%d@example.test", suffix)
+	conflictFallback := fmt.Sprintf("conflict-fb-%d@example.test", suffix)
+	conflictBare := fmt.Sprintf("conflict-bare-%d@example.test", suffix)
+
+	if _, err := execContext(ctx, store.db, `
+		INSERT INTO @clean_contact_points (point_type, normalized_value, display_name, source_updated_at)
+		VALUES
+			('email', $1, 'Ada Example', '2026-10-01 00:00:00+00'),
+			('email', $2, 'Old Card Name', '2026-10-05 00:00:02+00'),
+			('email', $2, 'New Card Name', '2026-10-05 00:00:01+00'),
+			('email', $3, 'Stale Person', '2026-10-05 00:00:02+00'),
+			('email', $3, 'Other Person', '2026-10-05 00:00:01+00')
+	`, sender, conflictFallback, conflictBare); err != nil {
+		t.Fatalf("seed clean_contact_points: %v", err)
+	}
+	if _, err := execContext(ctx, store.db, `
+		INSERT INTO @gmail_messages (account, message_id, thread_id, internal_date, label_ids, is_deleted, from_address, payload_json)
+		VALUES
+			($1, $2, 't-g1', '2026-10-06 00:00:00+00', ARRAY['INBOX'], 0, $3, $4),
+			($1, $5, 't-g2', '2026-10-05 00:00:00+00', ARRAY['INBOX'], 0, $3, $6),
+			($1, $7, 't-s1', '2026-10-06 00:00:00+00', ARRAY['INBOX'], 0, $8, $9),
+			($1, $10, 't-s2', '2026-10-05 00:00:00+00', ARRAY['INBOX'], 0, $8, $11),
+			($1, $12, 't-c1', '2026-10-06 00:00:00+00', ARRAY['INBOX'], 0, $13, $14),
+			($1, $15, 't-c2', '2026-10-05 00:00:00+00', ARRAY['INBOX'], 0, $13, $16),
+			($1, $17, 't-b1', '2026-10-06 00:00:00+00', ARRAY['INBOX'], 0, $18, $19),
+			($1, $20, 't-b2', '2026-10-05 00:00:00+00', ARRAY['INBOX'], 0, $18, $21)
+	`,
+		sender,
+		fmt.Sprintf("msg-g1-%d", suffix), groupAddr, fmt.Sprintf(`{"headers":[{"name":"From","value":"Alice  via Support Group <%s>"}]}`, groupAddr),
+		fmt.Sprintf("msg-g2-%d", suffix), fmt.Sprintf(`{"headers":[{"name":"From","value":"Bob via Support Group <%s>"}]}`, groupAddr),
+		fmt.Sprintf("msg-s1-%d", suffix), sharedAddr, fmt.Sprintf(`{"headers":[{"name":"From","value":"Alice Example <%s>"}]}`, sharedAddr),
+		fmt.Sprintf("msg-s2-%d", suffix), fmt.Sprintf(`{"headers":[{"name":"From","value":"Bob Example <%s>"}]}`, sharedAddr),
+		fmt.Sprintf("msg-c1-%d", suffix), conflictFallback, fmt.Sprintf(`{"headers":[{"name":"From","value":"Consistent Gmail Name <%s>"}]}`, conflictFallback),
+		fmt.Sprintf("msg-c2-%d", suffix), fmt.Sprintf(`{"headers":[{"name":"From","value":"Consistent Gmail Name <%s>"}]}`, conflictFallback),
+		fmt.Sprintf("msg-b1-%d", suffix), conflictBare, fmt.Sprintf(`{"headers":[{"name":"From","value":"Alias One <%s>"}]}`, conflictBare),
+		fmt.Sprintf("msg-b2-%d", suffix), fmt.Sprintf(`{"headers":[{"name":"From","value":"Alias Two <%s>"}]}`, conflictBare),
+	); err != nil {
+		t.Fatalf("seed gmail_messages: %v", err)
+	}
+
+	created, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title:       "Edge cases",
+		Reason:      "integration test",
+		RequestedBy: "test",
+		Mutations: []MutationInput{{
+			Type:         GmailSendEmailOperation,
+			Account:      sender,
+			DeliveryMode: "send",
+			Message: map[string]any{
+				"to":        []string{groupAddr, sharedAddr},
+				"cc":        []string{conflictFallback, conflictBare},
+				"subject":   "Checking edge cases",
+				"body_text": "Hello.",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	msg := mapFromAny(created.Mutations[0].Payload["message"])
+	wantTo := []string{"Support Group <" + groupAddr + ">", sharedAddr}
+	if !reflect.DeepEqual(stringSliceFromAny(msg["to"]), wantTo) {
+		t.Fatalf("to = %#v, want %#v", msg["to"], wantTo)
+	}
+	wantCC := []string{"Consistent Gmail Name <" + conflictFallback + ">", conflictBare}
+	if !reflect.DeepEqual(stringSliceFromAny(msg["cc"]), wantCC) {
+		t.Fatalf("cc = %#v, want %#v", msg["cc"], wantCC)
+	}
+}

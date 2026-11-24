@@ -102,10 +102,14 @@ func gmailAddressLookupTargets(mutations []storedMutation) (accounts []string, r
 	return accounts, recipients
 }
 
+type contactDisplayNameRow struct {
+	Email       string
+	DisplayName string
+}
+
 func (s *PostgresStore) lookupContactDisplayNames(ctx context.Context, emails []string) map[string]string {
-	out := map[string]string{}
 	if len(emails) == 0 {
-		return out
+		return map[string]string{}
 	}
 	rows, err := queryContext(ctx, s.db, `
 		SELECT normalized_value, display_name
@@ -116,20 +120,46 @@ func (s *PostgresStore) lookupContactDisplayNames(ctx context.Context, emails []
 		ORDER BY normalized_value, source_updated_at DESC, display_name ASC
 	`, emails)
 	if err != nil {
-		return out
+		return map[string]string{}
 	}
 	defer rows.Close()
+	candidates := []contactDisplayNameRow{}
 	for rows.Next() {
-		var normalized, displayName string
-		if err := rows.Scan(&normalized, &displayName); err != nil {
-			return out
+		var row contactDisplayNameRow
+		if err := rows.Scan(&row.Email, &row.DisplayName); err != nil {
+			return map[string]string{}
 		}
-		email := strings.ToLower(strings.TrimSpace(normalized))
-		name := cleanDisplayName(displayName)
+		candidates = append(candidates, row)
+	}
+	return resolveConsistentContactDisplayNames(candidates)
+}
+
+// resolveConsistentContactDisplayNames returns a display name only when all
+// contact cards for an email address agree (ignoring case and whitespace).
+// When cards disagree (e.g. a recycled address with two different people), the
+// email is omitted so the caller falls back to consistent Gmail From headers
+// or leaves the address bare.
+func resolveConsistentContactDisplayNames(rows []contactDisplayNameRow) map[string]string {
+	firstName := map[string]string{}
+	firstKey := map[string]string{}
+	conflicted := map[string]bool{}
+	for _, row := range rows {
+		email := strings.ToLower(strings.TrimSpace(row.Email))
+		name := cleanDisplayName(row.DisplayName)
 		if email == "" || name == "" || strings.EqualFold(name, email) {
 			continue
 		}
-		if _, exists := out[email]; !exists {
+		key := strings.ToLower(name)
+		if existingKey, exists := firstKey[email]; !exists {
+			firstName[email] = name
+			firstKey[email] = key
+		} else if existingKey != key {
+			conflicted[email] = true
+		}
+	}
+	out := make(map[string]string, len(firstName))
+	for email, name := range firstName {
+		if !conflicted[email] {
 			out[email] = name
 		}
 	}
@@ -183,16 +213,49 @@ func (s *PostgresStore) lookupGmailFromDisplayName(ctx context.Context, email st
 		return ""
 	}
 	defer rows.Close()
+	headers := []string{}
 	for rows.Next() {
 		var fromHeader string
 		if err := rows.Scan(&fromHeader); err != nil {
 			return ""
 		}
-		if name := cleanDisplayName(gmailHeaderDisplayName(fromHeader)); name != "" && !strings.EqualFold(name, email) {
-			return name
+		headers = append(headers, fromHeader)
+	}
+	return resolveConsistentGmailFromDisplayName(email, headers)
+}
+
+// resolveConsistentGmailFromDisplayName extracts a recipient's display name
+// from recent Gmail From headers only when every non-empty header agrees
+// (ignoring case and whitespace). Google Group rewrites ("Person via Group")
+// normalize to the group name ("Group"), and shared/varying senders (e.g.
+// notifications@github.com) with multiple distinct names return "".
+func resolveConsistentGmailFromDisplayName(email string, fromHeaders []string) string {
+	chosen := ""
+	chosenKey := ""
+	for _, fromHeader := range fromHeaders {
+		name := normalizeGmailFromDisplayName(cleanDisplayName(gmailHeaderDisplayName(fromHeader)))
+		if name == "" || strings.EqualFold(name, email) {
+			continue
+		}
+		key := strings.ToLower(name)
+		if chosen == "" {
+			chosen = name
+			chosenKey = key
+		} else if key != chosenKey {
+			return ""
 		}
 	}
-	return ""
+	return chosen
+}
+
+func normalizeGmailFromDisplayName(name string) string {
+	lower := strings.ToLower(name)
+	if idx := strings.Index(lower, " via "); idx > 0 {
+		if group := strings.TrimSpace(name[idx+len(" via "):]); group != "" {
+			return group
+		}
+	}
+	return name
 }
 
 func escapeLikeLiteral(value string) string {

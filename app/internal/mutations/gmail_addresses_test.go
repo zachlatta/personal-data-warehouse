@@ -151,3 +151,82 @@ func TestGmailEmailViewIncludesFromAndFallsBackToAccount(t *testing.T) {
 		t.Fatalf("fallback variant[0].from = %q, want %q", got, withoutFrom.Account)
 	}
 }
+
+func TestResolveConsistentGmailFromDisplayName(t *testing.T) {
+	cases := []struct {
+		name    string
+		email   string
+		headers []string
+		want    string
+	}{
+		{
+			name:    "single consistent person",
+			email:   "ada@example.test",
+			headers: []string{"Ada Example <ada@example.test>", "ada@example.test", "ada  example <ada@example.test>"},
+			want:    "Ada Example",
+		},
+		{
+			name:  "google group via rewrites resolve to group name",
+			email: "support@example.test",
+			headers: []string{
+				"Alice  via Support Group <support@example.test>",
+				"Bob via Support Group <support@example.test>",
+				"Support Group <support@example.test>",
+			},
+			want: "Support Group",
+		},
+		{
+			name:  "shared sender with varying names is skipped",
+			email: "notifications@example.test",
+			headers: []string{
+				"Alice Example <notifications@example.test>",
+				"Bob Example <notifications@example.test>",
+			},
+			want: "",
+		},
+		{
+			name:  "conflicting via group names are skipped",
+			email: "list@example.test",
+			headers: []string{
+				"Alice via Group One <list@example.test>",
+				"Bob via Group Two <list@example.test>",
+			},
+			want: "",
+		},
+		{
+			name:    "bare headers only returns empty",
+			email:   "bare@example.test",
+			headers: []string{"bare@example.test", ""},
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveConsistentGmailFromDisplayName(tc.email, tc.headers); got != tc.want {
+				t.Fatalf("resolveConsistentGmailFromDisplayName(%q, %v) = %q, want %q", tc.email, tc.headers, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveConsistentContactDisplayNames(t *testing.T) {
+	candidates := []contactDisplayNameRow{
+		// Trivially equivalent (case + extra spaces) -> agrees, keeps newest spelling.
+		{Email: "agree@example.test", DisplayName: "Ada Example"},
+		{Email: "agree@example.test", DisplayName: "ada   example"},
+		// Conflicting people on one address -> omitted so caller falls back to Gmail / bare.
+		{Email: "conflict@example.test", DisplayName: "Stale Person"},
+		{Email: "conflict@example.test", DisplayName: "Current Person"},
+		// Same as email address is ignored.
+		{Email: "only-email@example.test", DisplayName: "only-email@example.test"},
+		{Email: "only-email@example.test", DisplayName: "Real Name"},
+	}
+	got := resolveConsistentContactDisplayNames(candidates)
+	want := map[string]string{
+		"agree@example.test":      "Ada Example",
+		"only-email@example.test": "Real Name",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveConsistentContactDisplayNames() = %#v, want %#v", got, want)
+	}
+}
