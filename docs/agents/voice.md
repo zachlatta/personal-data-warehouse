@@ -290,9 +290,11 @@ blindly regex-replaced every bare occurrence of any matched nickname across the 
 a common first name was stored as another contact's nickname, every recording mentioning a colleague
 with that first name was misattributed and rewritten into the nickname holder's legal given name.
 `apply_contact_alias_corrections` is removed, `load_contact_alias_hints` now returns competing
-`given_name` contacts and an `is_ambiguous` flag alongside each nickname match, and `...-agent-v12`
-requires topic-specific, contemporaneous evidence to disambiguate a spoken first name — keeping it
-as spoken when ambiguous.
+`given_name` contacts (ranked by 180-day interaction counts across messages, Gmail, and calendar
+before applying the display cap, with `recent_interaction_count` on both the nickname holder and
+each competing contact) and an `is_ambiguous` flag alongside each nickname match, and `...-agent-v12`
+uses topic-specific evidence, recent interaction counts, and any explicit prior clarification from
+Zach in `timeline.events` — keeping a spoken first name as spoken when ambiguity remains.
 
 **The identity hints read the timeline search, not the raw Slack heap.**
 `load_event_identity_hints` gives the agent messages that name the event and a person.

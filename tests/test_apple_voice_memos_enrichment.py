@@ -1156,6 +1156,7 @@ def test_load_contact_alias_hints_reads_human_edited_contact_nicknames() -> None
             "account": "account@example.com",
             "card_id": "people/c1",
             "is_ambiguous": False,
+            "recent_interaction_count": 0,
             "other_given_name_match_count": 0,
             "competing_contacts": [],
         }
@@ -1164,37 +1165,49 @@ def test_load_contact_alias_hints_reads_human_edited_contact_nicknames() -> None
 
 def test_load_contact_alias_hints_marks_nickname_colliding_with_given_name_ambiguous() -> None:
     class Warehouse:
-        def _query(self, _sql):
-            return [
-                (
-                    "Alex",
-                    "google_people",
-                    "account@example.com",
-                    "google_contacts",
-                    "people/c2",
-                    "Alexander Vance",
-                    "Alexander",
-                    "Vance",
-                    "alexvance@example.org",
-                    "Example Org",
-                    "Fellow",
-                    '[{"value":"Alex"}]',
-                    2,
-                    '[{"canonical_name":"Alex Rivera","primary_email":"alex@example.org","organization":"Example Org","job_title":"Tech Lead"},{"canonical_name":"Alex Chen","primary_email":"alex@other.example","organization":"","job_title":""}]',
-                )
-            ]
+        def _query(self, sql):
+            if "competing_given_name_contacts" in sql:
+                return [
+                    (
+                        "Alex",
+                        "google_people",
+                        "account@example.com",
+                        "google_contacts",
+                        "people/c2",
+                        "Alexander Vance",
+                        "Alexander",
+                        "Vance",
+                        "alexvance@example.org",
+                        "Example Org",
+                        "Fellow",
+                        '[{"value":"Alex"}]',
+                        2,
+                        '[{"canonical_name":"Alex Chen","primary_email":"alex@other.example","emails":["alex@other.example"],"organization":"Other Org","job_title":""},{"canonical_name":"Alex Rivera","primary_email":"alex@example.org","emails":["alex@example.org"],"organization":"Example Org","job_title":"Tech Lead"}]',
+                    )
+                ]
+            if "@marts_messages_messages" in sql:
+                return [("alex rivera", 42)]
+            if "@gmail_messages" in sql:
+                return [("alex@example.org", 15), ("alexvance@example.org", 2)]
+            if "@calendar_events" in sql:
+                return [('[{"email":"alex@example.org"}]',), ('[{"email":"alexvance@example.org"}]',)]
+            return []
 
     hints = load_contact_alias_hints(
         Warehouse(),
-        recording={"title": "Call", "transcript_text": "Thanks for joining, Alex."},
+        recording={"title": "Call", "transcript_text": "Thanks for joining, Alex.", "recorded_at": datetime(2026, 3, 10, tzinfo=UTC)},
         transcript_segments=[],
     )
 
     assert len(hints) == 1
     assert hints[0]["canonical_name"] == "Alexander Vance"
     assert hints[0]["is_ambiguous"] is True
+    assert hints[0]["recent_interaction_count"] == 3
     assert hints[0]["other_given_name_match_count"] == 2
+    # Close collaborator Alex Rivera ranks #1 ahead of alphabetically earlier Alex Chen
     assert [c["canonical_name"] for c in hints[0]["competing_contacts"]] == ["Alex Rivera", "Alex Chen"]
+    assert hints[0]["competing_contacts"][0]["recent_interaction_count"] == 58
+    assert hints[0]["competing_contacts"][1]["recent_interaction_count"] == 0
 
 
 def test_enrichment_runner_does_not_blindly_rewrite_contact_nicknames(monkeypatch) -> None:
@@ -1279,6 +1292,8 @@ def test_enrichment_prompt_treats_contact_nicknames_as_non_authoritative_candida
 
     assert "NOT a source of truth" in prompt
     assert "competing_contacts" in prompt
+    assert "recent_interaction_count" in prompt
+    assert "explicit prior identity clarification" in prompt
     assert "unrelated email or a contact nickname alone is never evidence" in prompt
     assert "keep the name exactly as spoken" in prompt
     assert "source-of-truth candidate" not in prompt
