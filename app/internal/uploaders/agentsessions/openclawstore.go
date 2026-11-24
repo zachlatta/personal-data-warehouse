@@ -74,7 +74,6 @@ func (r *Runner) readOpenClawStore(batch *pendingBatch, remaining *int, summary 
 	if !found {
 		return nil
 	}
-	r.recordLatestModTime(summary, sig)
 	storeKey := "openclaw-store:" + path
 	if r.unchanged(storeKey, sig) {
 		summary.FilesUnchanged++

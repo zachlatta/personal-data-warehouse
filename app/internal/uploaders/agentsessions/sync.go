@@ -36,8 +36,8 @@ type Summary struct {
 	// SkipUnchanged pass passed over because nothing about them moved.
 	FilesUnchanged int
 	// LatestModTime is the newest non-future real modification time seen
-	// across all discovered transcripts and the OpenClaw store this pass.
-	// Zero when no files exist or all mtimes are in the future.
+	// across all discovered transcripts this pass. Zero when no files exist
+	// or all mtimes are in the future.
 	LatestModTime time.Time
 }
 

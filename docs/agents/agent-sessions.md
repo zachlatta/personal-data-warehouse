@@ -18,7 +18,7 @@ line by line, through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist`
 - Wrapper script: `bin/agent-sessions-upload-launchd`
 - Run cadence: resident (`KeepAlive`, `RunAtLoad`, 10 s `ThrottleInterval`): each run is a
-  five-minute `--watch` window (2 s while any transcript or store was modified within
+  five-minute `--watch` window (2 s while any transcript was modified within
   `--idle-after` 10 m, backing off up to `--max-interval` 30 s when idle), then the
   heartbeat, then the next window
 - Command: `pdw ingest agent-sessions --mode incremental --watch 300s` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
@@ -86,14 +86,14 @@ tick, a 60 s inbox sensor and a Dagster run start (~5 s), then a fast lane that 
 for two rows because the `agent_session` roll-up's plan is costed at 1.6M and Postgres spent
 5.4 s per query compiling JIT code for a 2 ms query. Now:
 
-- the device runs `--watch`: a pass every two seconds while any transcript or the OpenClaw
-  store was modified within `--idle-after` (10 m, so a 40-120 s thinking gap adds nothing).
-  After that, on transcript-file hosts, the pause grows to `--max-interval` (30 s) and
-  returns to two seconds on the first new line. Hosts with an OpenClaw SQLite store on disk
-  do not back off and stay at `--interval` (2 s), because delaying the first turn after a
-  quiet spell lets it land inside OpenClaw's whole-store rewrite behind a large batch.
-  Idleness is read from on-disk mtimes (far-future ones ignored), so an idle
-  host backs off from the first pass of every window. Before this, porygon ran 137 passes a
+- the device runs `--watch`: a pass every two seconds while any transcript was modified within
+  `--idle-after` (10 m, so a 40-120 s thinking gap adds nothing). After that, on
+  transcript-file hosts, the pause grows to `--max-interval` (30 s) and returns to two
+  seconds on the first new line. Hosts with an OpenClaw SQLite store on disk never back off
+  and stay at `--interval` (2 s), because delaying the first turn after a quiet spell lets
+  it land inside OpenClaw's whole-store rewrite behind a large batch. Idleness is read from
+  on-disk transcript mtimes (far-future ones ignored), so an idle transcript-file host backs
+  off from the first pass of every window. Before this, porygon ran 137 passes a
   window and 10% of a core with nothing to upload (2026-11-24). A window ends after five
   minutes (`AGENT_SESSIONS_WATCH_WINDOW`) so the wrapper posts the heartbeat; a failed pass
   ends it early and non-zero;
@@ -295,7 +295,8 @@ a resident **systemd user service** (zrl has `Linger=yes`, so user units run wit
   Its heartbeat reports the `openclaw` pipeline unless the unit sets
   `AGENT_SESSIONS_HEARTBEAT_PIPELINES` (comma-separated pipeline names).
 - Run cadence: resident. The service is `Type=simple`, `Restart=always` (`RestartSec=5`), and
-  each run is one five-minute `--watch` window, as on the Macs. There is no timer: on
+  each run is one five-minute `--watch` window, as on the Macs, except that a host with an
+  OpenClaw SQLite store polls every two seconds and never backs off. There is no timer: on
   2026-11-06 a restarted user manager left the old five-minute timer `active (elapsed)` with
   `Trigger: n/a`, and mew-dev uploaded nothing for 13 hours.
 - Run log: `~/.local/state/personal-data-warehouse/agent-sessions-upload.run.log`;

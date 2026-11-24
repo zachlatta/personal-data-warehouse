@@ -529,54 +529,6 @@ func TestRunWatchStaysAtBaseIntervalForRecentlyModifiedTranscript(t *testing.T) 
 	}
 }
 
-// A recently modified OpenClaw store (< idle-after) with no transcripts
-// and already uploaded must keep runWatch at the base interval.
-func TestRunWatchStaysAtBaseIntervalForRecentlyModifiedOpenClawStore(t *testing.T) {
-	root := t.TempDir()
-	db, dirs := newOpenClawStore(t, root)
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		t.Fatal(err)
-	}
-	addEvent(t, db, "sess-1", 0, `{"type":"message","n":0}`)
-	recent := time.Now().Add(-10 * time.Second)
-	for _, path := range []string{dirs.OpenClawStore, dirs.OpenClawStore + "-wal"} {
-		if err := os.Chtimes(path, recent, recent); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	env := map[string]string{
-		"AGENT_SESSIONS_ACCOUNT":                "zach@example.com",
-		"AGENT_SESSIONS_DEVICE":                 "test-device",
-		"AGENT_SESSIONS_CLAUDE_PROJECTS_DIR":    filepath.Join(root, "none-claude"),
-		"AGENT_SESSIONS_CODEX_SESSIONS_DIR":     filepath.Join(root, "none-codex"),
-		"AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR":  dirs.OpenClawSessions,
-		"AGENT_SESSIONS_PI_SESSIONS_DIR":        filepath.Join(root, "none-pi"),
-		"AGENT_SESSIONS_MUSE_CODE_SESSIONS_DIR": filepath.Join(root, "none-muse-code"),
-		"AGENT_SESSIONS_ARGON_SESSIONS_DIR":     filepath.Join(root, "none-argon"),
-		"PDW_INGEST_PROJECT_DIR":                root,
-	}
-	app := testfixtures.NewFakeApp(t)
-	cfg := ingestclient.Config{BaseURL: app.URL(), Token: "secret"}
-	if code, _, errOut := runCLI(t, stateArgs(root), env, cfg); code != 0 {
-		t.Fatalf("seed run failed: code=%d stderr=%q", code, errOut)
-	}
-
-	// Pass 1 uploads 0 lines and discovers 0 transcript files; only the OpenClaw
-	// store's recent mtime keeps the watcher at 15ms instead of 250ms.
-	args := append([]string{"--watch", "300ms", "--interval", "15ms", "--max-interval", "250ms", "--idle-after", "10m"}, stateArgs(root)...)
-	code, out, errOut := runCLI(t, args, env, cfg)
-	if code != 0 {
-		t.Fatalf("code=%d stderr=%q out=%q", code, errOut, out)
-	}
-	if !strings.Contains(out, "lines=0 ") {
-		t.Fatalf("expected 0 new lines on seeded watch, got %q", out)
-	}
-	if passes := parseWatchPasses(t, out); passes < 8 {
-		t.Fatalf("recently modified OpenClaw store must stay at base interval: got passes=%d (want >=8, out=%q)", passes, out)
-	}
-}
-
 // L1: a host with an OpenClaw SQLite store never backs off even when the store
 // and transcripts have been idle past --idle-after; the same host without a
 // store backs off from pass 1.

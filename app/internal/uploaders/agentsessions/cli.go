@@ -31,21 +31,23 @@ FLAGS
                            Bounds a first backfill.
   --batch-size N           Maximum lines per uploaded batch (default 20000).
   --watch DURATION         Stay resident for DURATION (e.g. 300s), polling every
-                           --interval while any transcript or store was modified
-                           within --idle-after; transcripts whose size, mtime and
-                           inode did not move are skipped. Once no transcript or
-                           store has been modified for --idle-after (checked from
-                           on-disk mtimes so idle hosts back off from pass 1 after
-                           each restart), the pause backs off up to --max-interval
-                           and resets to --interval immediately on new activity
-                           (first line after a long idle waits at most --max-interval).
+                           --interval while any transcript was modified within
+                           --idle-after; transcripts whose size, mtime and inode
+                           did not move are skipped. Once no transcript has been
+                           modified for --idle-after (checked from on-disk mtimes
+                           so idle hosts back off from pass 1 after each restart),
+                           the pause backs off up to --max-interval and resets to
+                           --interval immediately on new activity (first line
+                           after a long idle waits at most --max-interval). A host
+                           with an OpenClaw SQLite store never backs off.
                            The run then exits so its wrapper can post the heartbeat
                            and the supervisor (systemd Restart=always, launchd
                            KeepAlive) starts the next one. A failed pass ends the
                            window with a failure.
   --interval DURATION      Base pause between --watch passes while active (default 2s).
   --max-interval DURATION  Maximum pause between idle --watch passes (default 30s).
-  --idle-after DURATION    Transcript inactivity duration before backing off (default 10m).
+  --idle-after DURATION    Transcript inactivity duration before backing off (default
+                           10m); no effect on a host with an OpenClaw SQLite store.
   --state-file PATH        Incremental upload state (default: the Application Support
                            state database).
   --lock-file PATH         Nonblocking lock used to avoid overlapping LaunchAgent runs
@@ -165,22 +167,23 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 }
 
 // DefaultWatchInterval is the base pause between --watch passes while any
-// transcript or store was modified within DefaultIdleAfter, keeping the
-// device's share of active-session landing latency to about a second.
+// transcript was modified within DefaultIdleAfter (always, on a host with an
+// OpenClaw SQLite store), keeping the device's share of active-session landing
+// latency to about a second.
 const DefaultWatchInterval = 2 * time.Second
 
-// DefaultMaxWatchInterval caps the pause between passes once a host has had no
-// transcript or store modifications for DefaultIdleAfter. On an idle host this
-// runs ~10 passes per five-minute window (well under 1% CPU on porygon); the
-// first line written after a long idle waits at most 30 s before resetting to
-// DefaultWatchInterval.
+// DefaultMaxWatchInterval caps the pause between passes once a host without an
+// OpenClaw SQLite store has had no transcript modifications for
+// DefaultIdleAfter. On an idle host this runs ~10 passes per five-minute window
+// (well under 1% CPU on porygon); the first line written after a long idle
+// waits at most 30 s before resetting to DefaultWatchInterval.
 const DefaultMaxWatchInterval = 30 * time.Second
 
-// DefaultIdleAfter is how long all transcripts and the OpenClaw store must be
-// unmodified before --watch backs off from DefaultWatchInterval. Long enough
-// that ordinary model-thinking gaps (40–120 s) stay at 2 s with zero added
-// latency; judged from on-disk mtimes so an already-idle host backs off from
-// pass 1 of every five-minute window.
+// DefaultIdleAfter is how long all transcripts must be unmodified before
+// --watch backs off from DefaultWatchInterval. Long enough that ordinary
+// model-thinking gaps (40–120 s) stay at 2 s with zero added latency; judged
+// from on-disk mtimes so an already-idle host backs off from pass 1 of every
+// five-minute window. A host with an OpenClaw SQLite store never backs off.
 const DefaultIdleAfter = 10 * time.Minute
 
 // defaultMtimeSettleWindow guards the OpenClaw store against a write in the
@@ -188,13 +191,14 @@ const DefaultIdleAfter = 10 * time.Minute
 const defaultMtimeSettleWindow = 2 * time.Second
 
 // runWatch is `--watch`: Sync until the window closes, staying at interval
-// while any transcript or store has been modified within idleAfter and backing
-// off up to maxInterval once the host has been quiet for idleAfter (including
-// from pass 1 after a restart when on-disk mtimes are already older than
-// idleAfter or no transcripts exist). Any new lines or fresh mtime resets the
-// pause to interval immediately. A failed pass ends the window non-zero (the
-// wrapper records it; the supervisor restarts the uploader); a blocked network
-// ends it as a deliberate skip, exactly as a one-shot run reports one.
+// while any transcript has been modified within idleAfter and backing off up to
+// maxInterval once the host has been quiet for idleAfter (including from pass 1
+// after a restart when on-disk mtimes are already older than idleAfter or no
+// transcripts exist). Any new lines or fresh mtime resets the pause to interval
+// immediately. A host with an OpenClaw SQLite store never backs off (see
+// hasOpenClawStore). A failed pass ends the window non-zero (the wrapper records
+// it; the supervisor restarts the uploader); a blocked network ends it as a
+// deliberate skip, exactly as a one-shot run reports one.
 func runWatch(runner *Runner, window, interval, maxInterval, idleAfter time.Duration, stdout, stderr io.Writer) int {
 	if maxInterval < interval {
 		maxInterval = interval
