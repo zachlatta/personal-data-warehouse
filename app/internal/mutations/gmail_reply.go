@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"strings"
 	"time"
 )
@@ -322,4 +323,74 @@ func gmailMessageWithReplyParent(message map[string]any, row gmailReplyParentRow
 		out = quoted
 	}
 	return out
+}
+
+func gmailEmailHasReplyQuote(message map[string]any) bool {
+	bodyHTML := strings.ToLower(stringFromAny(message["body_html"]))
+	if strings.Contains(bodyHTML, "gmail_quote") {
+		return true
+	}
+	bodyText := strings.ReplaceAll(stringFromAny(message["body_text"]), "\r\n", "\n")
+	return strings.Contains(bodyText, "\nOn ") && strings.Contains(bodyText, " wrote:")
+}
+
+func gmailMessageWithReplyQuote(message map[string]any, row gmailReplyParentRow) (map[string]any, bool) {
+	if gmailEmailHasReplyQuote(message) {
+		return message, false
+	}
+	quoteHTML := gmailReplyQuoteHTML(row)
+	quoteText := gmailReplyQuoteText(row)
+	if quoteHTML == "" && quoteText == "" {
+		return message, false
+	}
+	out := cloneMap(message)
+	bodyText := stringFromAny(out["body_text"])
+	bodyHTML := strings.TrimSpace(stringFromAny(out["body_html"]))
+	if bodyHTML == "" && bodyText != "" {
+		bodyHTML = emailPlainTextToHTML(bodyText)
+	}
+	if quoteHTML != "" {
+		out["body_html"] = joinEmailHTML(bodyHTML, quoteHTML)
+	}
+	if quoteText != "" {
+		out["body_text"] = joinEmailText(bodyText, quoteText)
+	}
+	return out, true
+}
+
+func gmailReplyQuoteHTML(row gmailReplyParentRow) string {
+	bodyHTML := strings.TrimSpace(htmlBodyFragment(row.BodyHTML))
+	if bodyHTML == "" {
+		bodyHTML = emailPlainTextToHTML(row.BodyText)
+	}
+	if strings.TrimSpace(htmlFragmentText(bodyHTML)) == "" && !strings.Contains(strings.ToLower(bodyHTML), "<img") {
+		return ""
+	}
+	return `<div class="gmail_quote gmail_quote_container"><div dir="ltr" class="gmail_attr">` +
+		html.EscapeString(gmailReplyQuoteAttribution(row)) +
+		`<br></div><blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">` +
+		bodyHTML +
+		`</blockquote></div>`
+}
+
+func gmailReplyQuoteText(row gmailReplyParentRow) string {
+	bodyText := strings.TrimSpace(row.BodyText)
+	if bodyText == "" {
+		bodyText = htmlEmailText(row.BodyHTML)
+	}
+	if bodyText == "" {
+		return ""
+	}
+	return gmailReplyQuoteAttribution(row) + "\n" + quoteEmailText(bodyText)
+}
+
+func gmailReplyQuoteAttribution(row gmailReplyParentRow) string {
+	from := strings.TrimSpace(row.FromAddress)
+	if from == "" {
+		from = "someone"
+	}
+	if row.InternalDate.IsZero() {
+		return "On " + from + " wrote:"
+	}
+	return "On " + row.InternalDate.Format("Mon, Jan 2, 2006 at 3:04 PM") + ", " + from + " wrote:"
 }
