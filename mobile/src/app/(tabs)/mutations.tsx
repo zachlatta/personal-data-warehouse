@@ -67,7 +67,9 @@ export default function MutationsScreen() {
   // Opening the app, coming back to it, or returning to this tab shows what
   // is new without a pull. Before 2026-11-25 this read only on tab focus,
   // which an Android app resumed from the background never fires.
-  const live = useLiveRefresh(() => void load(true));
+  // Until a list is known (a cold start with an empty cache) the read shows
+  // the spinner, so the tab is not two bare headers while it waits.
+  const live = useLiveRefresh(() => void load(known));
   const pull = useCallback(() => {
     live.loaded();
     void load();
