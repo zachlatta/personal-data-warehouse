@@ -254,7 +254,9 @@ def test_timed_out_agent_is_stopped_before_refreshed_auth_is_persisted(tmp_path)
     assert stop_index < persist_index
 
 
-def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path) -> None:
+def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path, monkeypatch) -> None:
+    # The fake build must not queue behind a real build of this tag elsewhere.
+    monkeypatch.setenv("AGENT_IMAGE_LOCK_DIR", str(tmp_path / "locks"))
     calls = []
     volume_copy_calls = 0
     image = default_agent_docker_image()
@@ -761,67 +763,6 @@ def test_claude_status_command_checks_auth_not_updater_doctor() -> None:
     assert "type=volume,src=pdw-agent-auth,dst=/agent-auth" in command
     assert "claude auth status" in command[-1]
     assert "claude doctor" not in command[-1]
-
-
-def test_default_agent_docker_image_uses_agent_image_inputs_hash(tmp_path) -> None:
-    dockerfile = tmp_path / "agent.Dockerfile"
-    entrypoint = tmp_path / "agent-entrypoint.sh"
-    dockerfile.write_text("FROM alpine\n", encoding="utf-8")
-    entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
-
-    image = default_agent_docker_image(
-        repository="pdw-agent",
-        dockerfile_path=dockerfile,
-        entrypoint_path=entrypoint,
-    )
-    first = image.rsplit(":", 1)[1]
-
-    entrypoint.write_text("#!/bin/sh\necho changed\n", encoding="utf-8")
-    changed = default_agent_docker_image(
-        repository="pdw-agent",
-        dockerfile_path=dockerfile,
-        entrypoint_path=entrypoint,
-    )
-
-    assert image.startswith("pdw-agent:")
-    assert len(first) == 6
-    assert changed != image
-
-
-def test_default_agent_docker_image_tracks_the_pdw_cli_source(tmp_path) -> None:
-    """The image bakes in a compiled `pdw`, so CLI edits must rebuild it.
-
-    Hashing only the Dockerfile would leave every agent run on a stale binary
-    after a CLI change, with no signal that it happened.
-    """
-
-    dockerfile = tmp_path / "agent.Dockerfile"
-    entrypoint = tmp_path / "agent-entrypoint.sh"
-    cli_dir = tmp_path / "app" / "cmd" / "pdw-cli"
-    cli_dir.mkdir(parents=True)
-    dockerfile.write_text("FROM alpine\n", encoding="utf-8")
-    entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
-    (tmp_path / "app" / "go.mod").write_text("module example\n", encoding="utf-8")
-    (cli_dir / "run.go").write_text("package main\n", encoding="utf-8")
-
-    def image_now() -> str:
-        return default_agent_docker_image(
-            repository="pdw-agent",
-            dockerfile_path=dockerfile,
-            entrypoint_path=entrypoint,
-            cli_source_dir=tmp_path / "app",
-        )
-
-    before = image_now()
-    (cli_dir / "run.go").write_text("package main\n// changed\n", encoding="utf-8")
-    after = image_now()
-
-    # A test-only .go file is not shipped in the binary and must not churn the tag.
-    (cli_dir / "run_test.go").write_text("package main\n", encoding="utf-8")
-    with_test_file = image_now()
-
-    assert after != before
-    assert with_test_file == after
 
 
 def test_dagster_image_ships_every_input_the_agent_image_build_needs() -> None:

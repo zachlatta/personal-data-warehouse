@@ -153,6 +153,10 @@ def test_every_image_input_moves_the_tag(fake_tree, edit) -> None:
     assert tag_of(fake_tree) != before
 
 
+def test_the_tag_is_the_repository_and_a_short_hash(fake_tree) -> None:
+    assert re.fullmatch(r"pdw-agent:[0-9a-f]{6}", tag_of(fake_tree))
+
+
 def test_build_flags_are_part_of_the_tag(fake_tree, monkeypatch) -> None:
     before = tag_of(fake_tree)
     monkeypatch.setattr(agent_runner, "AGENT_IMAGE_BUILD_FLAGS", ("--build-arg", "EXAMPLE=1"))
