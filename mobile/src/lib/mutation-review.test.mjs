@@ -801,7 +801,7 @@ test('a send_email mutation becomes an editable composer: variants, the selected
   assert.equal(review.deliveryMode, 'send');
   assert.equal(review.variants[0].from, 'Ada Example <sender@example.test>');
   assert.deepEqual(
-    gmailEmailUpdateInput(review.variants[0], { to: '"Doe, Jane" <jane@example.test>, Ada Example <ada@example.test>', cc: '', bcc: '', subject: 'Re: quote', editorText: 'Hi' }, 'send').message.to,
+    gmailEmailUpdateInput(review.variants[0], { to: '"Doe, Jane" <jane@example.test>, Ada Example <ada@example.test>', cc: '', bcc: '', subject: 'Re: quote', editorHTML: '<p>Hi</p>', bodyEdited: true }, 'send').message.to,
     ['"Doe, Jane" <jane@example.test>', 'Ada Example <ada@example.test>'],
   );
   assert.equal(review.hasVariants, true);
@@ -809,7 +809,9 @@ test('a send_email mutation becomes an editable composer: variants, the selected
   assert.equal(review.selectedVariantId, 'variant-2');
   const softer = review.variants[1];
   assert.equal(softer.title, 'Softer');
-  assert.equal(softer.editorText, 'Maybe.');
+  assert.equal(softer.editorHTML, '<div>Maybe.</div>');
+  // The body is edited as HTML; the server's legacy editor_text is for old builds only.
+  assert.equal('editorText' in softer, false);
   assert.equal(softer.signatureText, 'Zach');
   assert.equal(softer.quotedText, 'older');
   assert.deepEqual(softer.cc, ['boss@example.test']);
@@ -845,7 +847,7 @@ test('a send_email mutation without variants offers its one message as the only 
   assert.equal(review.hasVariants, false);
   assert.equal(review.variants.length, 1);
   assert.equal(review.variants[0].id, '');
-  assert.equal(review.variants[0].editorText, 'Sounds good.');
+  assert.equal(review.variants[0].editorHTML, '<div>Sounds good.</div>');
   assert.equal(review.selectedVariantId, '');
 });
 
@@ -853,40 +855,49 @@ test('a send_email mutation with no server view falls back to the payload messag
   const mutation = sendEmailMutation({ email: undefined });
   const review = gmailEmailReview(mutation);
   assert.equal(review.variants.length, 1);
-  assert.equal(review.variants[0].editorText, 'Sounds good.');
+  assert.equal(review.variants[0].editorHTML, '<div>Sounds good.</div>');
   assert.deepEqual(review.variants[0].to, ['vendor@example.test']);
 });
 
-test('the edited plain text is assembled into the body the server splits again: editor, signature, quote', () => {
+test('the edited rich HTML is assembled into the body the server splits again: editor, signature, quote', () => {
   const body = assembleEmailBody({
-    editorText: 'Hi there,\n\nSee <you> Monday.\nThanks  \n\n',
+    editorHTML: '<p>Hi there,</p><ol><li><strong>First:</strong> See <a href="https://example.org">https://example.org</a></li><li>Second</li></ol><p>Thanks</p>',
     signatureHTML: '<div class="gmail_signature"><b>Zach</b></div>',
     signatureText: 'Zach',
     quotedHTML: '<div class="gmail_quote">older</div>',
-    quotedText: 'older',
+    quotedText: '> older',
   });
-  // Gmail's composer: a <div> per line and <div><br></div> per blank line.
-  assert.equal(body.body_html, '<div>Hi there,</div><div><br></div><div>See &lt;you&gt; Monday.</div><div>Thanks</div><div><br></div><div class="gmail_signature"><b>Zach</b></div><div><br></div><div class="gmail_quote">older</div>');
-  assert.equal(body.body_text, 'Hi there,\n\nSee <you> Monday.\nThanks\n\nZach\n\nolder\n');
-  const bare = assembleEmailBody({ editorText: 'Just this.', signatureHTML: '', signatureText: '', quotedHTML: '', quotedText: '' });
-  assert.equal(bare.body_html, '<div>Just this.</div>');
+  assert.equal(
+    body.body_html,
+    '<p>Hi there,</p><ol><li><strong>First:</strong> See <a href="https://example.org">https://example.org</a></li><li>Second</li></ol><p>Thanks</p><div><br></div><div class="gmail_signature"><b>Zach</b></div><div><br></div><div class="gmail_quote">older</div>',
+  );
+  assert.equal(body.body_text, 'Hi there,\n\n1. First: See https://example.org\n2. Second\n\nThanks\n\nZach\n\n> older\n');
+  const bare = assembleEmailBody({ editorHTML: '<p>Just this.</p>', signatureHTML: '', signatureText: '', quotedHTML: '', quotedText: '' });
+  assert.equal(bare.body_html, '<p>Just this.</p>');
   assert.equal(bare.body_text, 'Just this.\n');
 });
 
-test('the update input carries the recipients split, the assembled body and the reply headers', () => {
+test('the update input carries the recipients split, rich HTML body, and preserves untouched body on metadata edits', () => {
   const review = gmailEmailReview(sendEmailMutation());
-  const input = gmailEmailUpdateInput(review.variants[1], { to: 'a@example.test, b@example.test\nc@example.test', cc: '', bcc: ' d@example.test ', subject: '  Re: quote  ', editorText: 'Maybe not.' }, 'draft');
+  const input = gmailEmailUpdateInput(review.variants[1], { to: 'a@example.test, b@example.test\nc@example.test', cc: '', bcc: ' d@example.test ', subject: '  Re: quote  ', editorHTML: '<p>Maybe <strong>not</strong>.</p>', bodyEdited: true }, 'draft');
   assert.equal(input.delivery_mode, 'draft');
   assert.equal(input.selected_variant_id, 'variant-2');
+  assert.equal(input.editor_format, 'html');
+  assert.equal(input.body_edited, true);
   assert.deepEqual(input.message.to, ['a@example.test', 'b@example.test', 'c@example.test']);
   assert.deepEqual(input.message.cc, []);
   assert.deepEqual(input.message.bcc, ['d@example.test']);
   assert.equal(input.message.subject, 'Re: quote');
-  assert.equal(input.message.body_html, '<div>Maybe not.</div><div><br></div><div class="gmail_signature"><b>Zach</b></div><div><br></div><div class="gmail_quote">older</div>');
+  assert.equal(input.message.body_html, '<p>Maybe <strong>not</strong>.</p><div><br></div><div class="gmail_signature"><b>Zach</b></div><div><br></div><div class="gmail_quote">older</div>');
   assert.equal(input.message.body_text, 'Maybe not.\n\nZach\n\nolder\n');
   assert.equal(input.message.reply_to_thread_id, 't-9');
   assert.equal(input.message.in_reply_to, '<m1@example.test>');
   assert.deepEqual(input.message.references, ['<m1@example.test>']);
+
+  // Metadata-only edit (bodyEdited: false) keeps original body untouched.
+  const metaOnly = gmailEmailUpdateInput(review.variants[1], { to: 'a@example.test', cc: '', bcc: '', subject: 'New subject', editorHTML: review.variants[1].editorHTML, bodyEdited: false }, 'send');
+  assert.equal(metaOnly.body_edited, false);
+  assert.equal(metaOnly.message.subject, 'New subject');
 });
 
 test('requestLifecycle reports an agent withdrawal with its reason and replacement', () => {
@@ -956,7 +967,7 @@ test('email review exposes attachments without losing them on a body edit', () =
   const review = gmailEmailReview({ provider: 'gmail', operation: 'gmail.send_email',
     email: { message: { to: ['a@example.test'], subject: 'Files', body_text: 'Attached', attachments: [attachment] } } });
   assert.deepEqual(review.variants[0].attachments, [attachment]);
-  const input = gmailEmailUpdateInput(review.variants[0], { to: 'a@example.test', cc: '', bcc: '', subject: 'Edited', editorText: 'Edited' }, 'draft');
+  const input = gmailEmailUpdateInput(review.variants[0], { to: 'a@example.test', cc: '', bcc: '', subject: 'Edited', editorHTML: '<p>Edited</p>', bodyEdited: true }, 'draft');
   // Omit attachment edits on mobile: the server preserves the selected variant's bytes.
   assert.equal(Object.hasOwn(input.message, 'attachments'), false);
 });
@@ -1095,10 +1106,10 @@ test('the editor text keeps the paragraphs of every body shape', () => {
   }
 });
 
-test('a body with no server editor text is read with its paragraphs', () => {
+test('a body with no server editor text is edited as its server editor HTML', () => {
   const review = gmailEmailReview({ provider: 'gmail', operation: 'gmail.send_email',
     email: { message: { to: ['a@example.test'], subject: 's', editor_html: '<p>One.</p><p>Two.</p>' } } });
-  assert.equal(review.variants[0].editorText, 'One.\n\nTwo.');
+  assert.equal(review.variants[0].editorHTML, '<p>One.</p><p>Two.</p>');
 });
 
 // --- saving on the way to sending --------------------------------------------

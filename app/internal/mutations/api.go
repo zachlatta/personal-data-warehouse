@@ -58,6 +58,8 @@ const (
 type apiUpdateEmailBody struct {
 	DeliveryMode      string         `json:"delivery_mode"`
 	SelectedVariantID string         `json:"selected_variant_id"`
+	EditorFormat      string         `json:"editor_format,omitempty"`
+	BodyEdited        *bool          `json:"body_edited,omitempty"`
 	Message           map[string]any `json:"message"`
 }
 

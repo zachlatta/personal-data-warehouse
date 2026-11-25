@@ -160,6 +160,14 @@ type UpdateGmailEmailMutationInput struct {
 	DeliveryMode      string
 	Message           map[string]any
 	SelectedVariantID string
+	// EditorFormat is "html" when the client edited the rich HTML directly
+	// (web contenteditable or mobile WebView editor), or "" for older
+	// plain-text clients whose plain-div edits are patched onto stored HTML.
+	EditorFormat string
+	// BodyEdited, when explicitly false, tells the server the reviewer only
+	// changed metadata (To/Cc/Bcc/Subject/delivery_mode/attachments) and the
+	// stored body_html/body_text must stay untouched.
+	BodyEdited *bool
 }
 
 // UpdateSlackMessageMutationInput is what a reviewer may change on a Slack

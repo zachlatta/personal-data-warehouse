@@ -66,6 +66,14 @@ func gmailEmailMessageView(email map[string]any, fallbackAccount ...string) map[
 	fullBodyHTML := bodyHTML
 	bodyHTML, quotedHTML := splitGmailQuotedHTML(bodyHTML)
 	editorHTML, signatureHTML := splitEmailBodyAndSignatureHTML(bodyHTML)
+	sanitizedEditorHTML := sanitizeEmailEditorHTML(editorHTML)
+	quotedText := ""
+	if strings.TrimSpace(quotedHTML) != "" {
+		_, quotedText = splitEmailQuotedText(bodyText)
+		if quotedText == "" {
+			quotedText = htmlEmailText(quotedHTML)
+		}
+	}
 	from := strings.TrimSpace(stringFromAny(email["from"]))
 	if from == "" && len(fallbackAccount) > 0 {
 		from = strings.TrimSpace(fallbackAccount[0])
@@ -79,12 +87,12 @@ func gmailEmailMessageView(email map[string]any, fallbackAccount ...string) map[
 		"subject":            stringFromAny(email["subject"]),
 		"body_text":          bodyText,
 		"body_html":          fullBodyHTML,
-		"editor_html":        editorHTML,
-		"editor_text":        htmlEmailText(editorHTML),
+		"editor_html":        sanitizedEditorHTML,
+		"editor_text":        htmlEmailText(sanitizedEditorHTML),
 		"signature_html":     sanitizeGmailSignaturePreviewHTML(signatureHTML),
 		"signature_text":     htmlFragmentText(signatureHTML),
 		"quoted_html":        quotedHTML,
-		"quoted_text":        htmlEmailText(quotedHTML),
+		"quoted_text":        quotedText,
 		"reply_to_thread_id": stringFromAny(email["reply_to_thread_id"]),
 		"forward_message_id": stringFromAny(email["forward_message_id"]),
 		"in_reply_to":        stringFromAny(email["in_reply_to"]),
@@ -290,6 +298,8 @@ func gmailEmailUpdateInputFromJSON(body apiUpdateEmailBody) UpdateGmailEmailMuta
 		DeliveryMode:      strings.TrimSpace(body.DeliveryMode),
 		Message:           message,
 		SelectedVariantID: strings.TrimSpace(body.SelectedVariantID),
+		EditorFormat:      strings.ToLower(strings.TrimSpace(body.EditorFormat)),
+		BodyEdited:        body.BodyEdited,
 	}
 }
 

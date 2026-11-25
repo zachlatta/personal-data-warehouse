@@ -2407,8 +2407,12 @@ func updatedGmailEmailPayload(mutation Mutation, input UpdateGmailEmailMutationI
 			break
 		}
 	}
+	existingMessage := cloneMap(mergedMessage)
 	for key, value := range input.Message {
 		mergedMessage[key] = value
+	}
+	if err := reconcileUpdatedGmailBody(existingMessage, mergedMessage, input); err != nil {
+		return nil, nil, "", err
 	}
 	if err := validateEmailAttachments(mergedMessage["attachments"]); err != nil {
 		return nil, nil, "", err
@@ -2642,119 +2646,6 @@ func emailPlainTextToHTML(value string) string {
 		out.WriteString("</div>")
 	}
 	return out.String()
-}
-
-var emailTextBlockTags = []string{"div", "li", "tr", "blockquote", "ul", "ol", "table", "h1", "h2", "h3", "h4", "h5", "h6"}
-
-// htmlTagName reports a tag's lowercase name and whether it closes, for a
-// lowercased "<...>" slice.
-func htmlTagName(tag string) (string, bool) {
-	body := strings.TrimPrefix(strings.TrimSuffix(tag, ">"), "<")
-	closing := strings.HasPrefix(body, "/")
-	body = strings.TrimPrefix(body, "/")
-	end := strings.IndexAny(body, " \t\n/")
-	if end >= 0 {
-		body = body[:end]
-	}
-	return body, closing
-}
-
-func isEmailTextBlock(name string) bool {
-	for _, block := range emailTextBlockTags {
-		if name == block {
-			return true
-		}
-	}
-	return false
-}
-
-// htmlEmailText is the plain text a reader sees in an email body, with its
-// paragraphs: a line per block or <br>, and a blank line for each empty
-// Gmail <div><br></div> and between <p>s. htmlFragmentText, by contrast,
-// drops every blank line, which is right for a signature and wrong for a
-// body — the phone edits this text and writes it back as the email.
-func htmlEmailText(value string) string {
-	value = strings.ReplaceAll(value, "\r\n", "\n")
-	lower := strings.ToLower(value)
-	lines := []string{}
-	current := strings.Builder{}
-	emptyLine := false // a <br> closed an otherwise empty block: Gmail's blank line
-	softBlank := false // a </p> ended a paragraph; the next line starts after a blank one
-	emit := func(line string) {
-		if softBlank && len(lines) > 0 && line != "" {
-			lines = append(lines, "")
-		}
-		softBlank = false
-		lines = append(lines, line)
-	}
-	pending := func() string {
-		collapsed := strings.Join(strings.FieldsFunc(current.String(), func(r rune) bool { return r == ' ' || r == '\n' || r == '\t' }), " ")
-		return strings.TrimSpace(html.UnescapeString(collapsed))
-	}
-	flush := func(keepEmpty bool) {
-		text := pending()
-		current.Reset()
-		if text != "" || keepEmpty {
-			emit(text)
-		}
-	}
-	nextClosesBlock := func(from int) bool {
-		rest := strings.TrimLeft(lower[from:], " \t\n")
-		if !strings.HasPrefix(rest, "</") {
-			return false
-		}
-		end := strings.IndexByte(rest, '>')
-		if end < 0 {
-			return false
-		}
-		name, _ := htmlTagName(rest[:end+1])
-		return name == "p" || isEmailTextBlock(name)
-	}
-	for index := 0; index < len(value); {
-		if value[index] != '<' {
-			current.WriteByte(value[index])
-			index++
-			continue
-		}
-		end := strings.IndexByte(value[index:], '>')
-		if end < 0 {
-			current.WriteString(value[index:])
-			break
-		}
-		name, closing := htmlTagName(lower[index : index+end+1])
-		index += end + 1
-		switch {
-		case name == "br":
-			if nextClosesBlock(index) {
-				// A trailing <br> ends the block's own line; on its own it is
-				// Gmail's empty line.
-				if pending() == "" {
-					emptyLine = true
-				}
-				continue
-			}
-			flush(true)
-		case name == "p" && !closing:
-			flush(false)
-		case name == "p" && closing:
-			flush(emptyLine)
-			emptyLine = false
-			softBlank = true
-		case isEmailTextBlock(name) && !closing:
-			flush(false)
-		case isEmailTextBlock(name) && closing:
-			flush(emptyLine)
-			emptyLine = false
-		}
-	}
-	flush(false)
-	for len(lines) > 0 && lines[0] == "" {
-		lines = lines[1:]
-	}
-	for len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-	return strings.Join(lines, "\n")
 }
 
 func extractGmailSignatureHTML(bodyHTML string) string {

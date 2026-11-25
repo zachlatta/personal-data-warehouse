@@ -1671,7 +1671,9 @@ export type GmailEmailVariant = {
   cc: string[];
   bcc: string[];
   subject: string;
-  editorText: string;
+  bodyHTML: string;
+  bodyText: string;
+  editorHTML: string;
   signatureHTML: string;
   signatureText: string;
   quotedHTML: string;
@@ -1732,8 +1734,9 @@ function decodeHTMLEntities(value: string): string {
 }
 
 function gmailEmailVariant(raw: Record<string, unknown>, fallback: { id: string; title: string; selected: boolean }): GmailEmailVariant {
-  const editorHTML = text(raw.editor_html);
-  const editorText = typeof raw.editor_text === 'string' ? raw.editor_text.replace(/\s+$/, '') : editorHTML ? htmlEmailText(editorHTML) : text(raw.body_text);
+  const rawBodyHTML = text(raw.body_html);
+  const rawBodyText = text(raw.body_text);
+  const editorHTML = text(raw.editor_html) || (rawBodyText ? emailPlainTextToHTML(rawBodyText) : '');
   const signatureHTML = text(raw.signature_html);
   return {
     id: text(raw.id) || fallback.id,
@@ -1745,7 +1748,9 @@ function gmailEmailVariant(raw: Record<string, unknown>, fallback: { id: string;
     cc: list(raw.cc),
     bcc: list(raw.bcc),
     subject: text(raw.subject),
-    editorText,
+    bodyHTML: rawBodyHTML,
+    bodyText: rawBodyText,
+    editorHTML,
     signatureHTML,
     signatureText: typeof raw.signature_text === 'string' ? raw.signature_text.trim() : htmlFragmentText(signatureHTML),
     quotedHTML: text(raw.quoted_html),
@@ -1810,10 +1815,8 @@ function htmlTagName(tag: string): { name: string; closing: boolean } {
   return { name: (end >= 0 ? body.slice(0, end) : body).toLowerCase(), closing };
 }
 
-// The server's htmlEmailText (postgres.go): the text a reader sees, with its
-// paragraphs — a line per block or <br>, a blank line for each empty Gmail
-// <div><br></div> and between <p>s. The phone edits this text and writes it
-// back as the email, so a lost blank line is a lost paragraph break.
+// The server's htmlEmailText (email_html.go): the text a reader sees, with its
+// paragraphs, numbered/bulleted lists, headings, and table rows.
 export function htmlEmailText(value: string): string {
   const source = value.replace(/\r\n/g, '\n');
   const lower = source.toLowerCase();
@@ -1821,6 +1824,7 @@ export function htmlEmailText(value: string): string {
   let current = '';
   let emptyLine = false;
   let softBlank = false;
+  const listStack: { ordered: boolean; count: number }[] = [];
   const emit = (line: string) => {
     if (softBlank && lines.length && line !== '') lines.push('');
     softBlank = false;
@@ -1853,18 +1857,54 @@ export function htmlEmailText(value: string): string {
     }
     const { name, closing } = htmlTagName(lower.slice(index, end + 1));
     index = end + 1;
+    if (name === 'script' || name === 'style') {
+      if (!closing) {
+        const closeIdx = lower.indexOf(`</${name}`, index);
+        if (closeIdx >= 0) {
+          const closeEnd = source.indexOf('>', closeIdx);
+          index = closeEnd >= 0 ? closeEnd + 1 : source.length;
+        }
+      }
+      continue;
+    }
     if (name === 'br') {
       if (nextClosesBlock(index)) {
         if (!pending()) emptyLine = true;
         continue;
       }
       flush(true);
-    } else if (name === 'p' && !closing) {
+    } else if (name === 'p' || /^h[1-6]$/.test(name) || name === 'blockquote') {
+      if (!closing) {
+        flush(false);
+      } else {
+        flush(emptyLine);
+        emptyLine = false;
+        softBlank = true;
+      }
+    } else if (name === 'ol' || name === 'ul') {
       flush(false);
-    } else if (name === 'p') {
-      flush(emptyLine);
-      emptyLine = false;
-      softBlank = true;
+      if (!closing) {
+        if (listStack.length === 0 && lines.length) softBlank = true;
+        listStack.push({ ordered: name === 'ol', count: 0 });
+      } else {
+        listStack.pop();
+        if (listStack.length === 0) softBlank = true;
+      }
+    } else if (name === 'li') {
+      if (!closing) {
+        flush(false);
+        if (listStack.length > 0) {
+          const top = listStack[listStack.length - 1];
+          top.count += 1;
+          const indent = '  '.repeat(listStack.length - 1);
+          current += top.ordered ? `${indent}${top.count}. ` : `${indent}- `;
+        }
+      } else {
+        flush(emptyLine);
+        emptyLine = false;
+      }
+    } else if ((name === 'td' || name === 'th') && closing) {
+      if (pending()) current += '\t';
     } else if (EMAIL_TEXT_BLOCKS.has(name) && !closing) {
       flush(false);
     } else if (EMAIL_TEXT_BLOCKS.has(name)) {
@@ -1883,13 +1923,14 @@ function normalizeEmailText(value: string): string {
   return lines.filter((line, index) => line.trim() !== '' || (index > 0 && index < lines.length - 1)).join('\n').trim();
 }
 
-// assembleEmailBody is the web editor's assembly (mutation_view.js): editor,
-// then signature, then the quoted thread, separated by an empty div (HTML) or
-// a blank line (text). The server splits the stored body on exactly those
-// seams the next time it builds the view, so the order is load-bearing.
-export function assembleEmailBody(parts: { editorText: string; signatureHTML: string; signatureText: string; quotedHTML: string; quotedText: string }): { body_html: string; body_text: string } {
-  const editorText = parts.editorText.replace(/\s+$/, '');
-  const body_html = [editorText.trim() ? emailPlainTextToHTML(editorText) : '', parts.signatureHTML.trim(), parts.quotedHTML.trim()].filter(Boolean).join('<div><br></div>');
+// assembleEmailBody is the web editor's assembly (mutation_view.js): editor
+// HTML, then signature, then the quoted thread, separated by an empty div
+// (HTML) or a blank line (text). The server splits the stored body on exactly
+// those seams the next time it builds the view, so the order is load-bearing.
+export function assembleEmailBody(parts: { editorHTML: string; signatureHTML: string; signatureText: string; quotedHTML: string; quotedText: string }): { body_html: string; body_text: string } {
+  const editorHTML = parts.editorHTML.trim();
+  const editorText = htmlEmailText(editorHTML).replace(/\s+$/, '');
+  const body_html = [editorHTML, parts.signatureHTML.trim(), parts.quotedHTML.trim()].filter(Boolean).join('<div><br></div>');
   const body_text = `${[editorText, normalizeEmailText(parts.signatureText), normalizeEmailText(parts.quotedText)].filter(Boolean).join('\n\n')}\n`;
   return { body_html, body_text };
 }
@@ -1918,11 +1959,13 @@ export function splitEmailAddressList(value: string): string[] {
   return fields;
 }
 
-export type GmailEmailEdits = { to: string; cc: string; bcc: string; subject: string; editorText: string };
+export type GmailEmailEdits = { to: string; cc: string; bcc: string; subject: string; editorHTML: string; bodyEdited: boolean };
 
 export type GmailEmailUpdateInput = {
   delivery_mode: 'send' | 'draft';
   selected_variant_id: string;
+  editor_format: 'html';
+  body_edited: boolean;
   message: {
     to: string[];
     cc: string[];
@@ -1936,19 +1979,39 @@ export type GmailEmailUpdateInput = {
   };
 };
 
-// The body of POST …/mutations/<id>/update-email: the edited fields over the
-// variant's own reply headers, which the phone never shows and must not drop.
-export function gmailEmailUpdateInput(variant: GmailEmailVariant, edits: GmailEmailEdits, deliveryMode: 'send' | 'draft'): GmailEmailUpdateInput {
-  const body = assembleEmailBody({
-    editorText: edits.editorText,
+// The variant's stored body, rebuilt from its parts only when the server sent
+// none (a payload without an email view).
+function storedEmailBody(variant: GmailEmailVariant): { body_html: string; body_text: string } {
+  if (variant.bodyHTML && variant.bodyText) return { body_html: variant.bodyHTML, body_text: variant.bodyText };
+  const rebuilt = assembleEmailBody({
+    editorHTML: variant.editorHTML,
     signatureHTML: variant.signatureHTML,
     signatureText: variant.signatureText,
     quotedHTML: variant.quotedHTML,
     quotedText: variant.quotedText,
   });
+  return { body_html: variant.bodyHTML || rebuilt.body_html, body_text: variant.bodyText || rebuilt.body_text };
+}
+
+// The body of POST …/mutations/<id>/update-email: the edited fields over the
+// variant's own reply headers, which the phone never shows and must not drop.
+// When bodyEdited is false (only To/Cc/Bcc/Subject/delivery mode changed), the
+// variant's stored body_html and body_text are preserved verbatim.
+export function gmailEmailUpdateInput(variant: GmailEmailVariant, edits: GmailEmailEdits, deliveryMode: 'send' | 'draft'): GmailEmailUpdateInput {
+  const body = edits.bodyEdited
+    ? assembleEmailBody({
+        editorHTML: edits.editorHTML,
+        signatureHTML: variant.signatureHTML,
+        signatureText: variant.signatureText,
+        quotedHTML: variant.quotedHTML,
+        quotedText: variant.quotedText,
+      })
+    : storedEmailBody(variant);
   return {
     delivery_mode: deliveryMode,
     selected_variant_id: variant.id,
+    editor_format: 'html',
+    body_edited: edits.bodyEdited,
     message: {
       to: splitEmailAddressList(edits.to),
       cc: splitEmailAddressList(edits.cc),
@@ -1964,7 +2027,14 @@ export function gmailEmailUpdateInput(variant: GmailEmailVariant, edits: GmailEm
 }
 
 export function gmailEmailEditsFor(variant: GmailEmailVariant): GmailEmailEdits {
-  return { to: variant.to.join(', '), cc: variant.cc.join(', '), bcc: variant.bcc.join(', '), subject: variant.subject, editorText: variant.editorText };
+  return {
+    to: variant.to.join(', '),
+    cc: variant.cc.join(', '),
+    bcc: variant.bcc.join(', '),
+    subject: variant.subject,
+    editorHTML: variant.editorHTML,
+    bodyEdited: false,
+  };
 }
 
 // --- request lifecycle ------------------------------------------------------

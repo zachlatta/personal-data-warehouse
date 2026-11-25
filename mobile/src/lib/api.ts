@@ -298,6 +298,8 @@ export async function restoreMutation(config: AppConfig, requestId: string, muta
 export type UpdateEmailMutationInput = {
   delivery_mode: 'send' | 'draft';
   selected_variant_id: string;
+  editor_format?: 'html';
+  body_edited?: boolean;
   message: Record<string, unknown>;
 };
 

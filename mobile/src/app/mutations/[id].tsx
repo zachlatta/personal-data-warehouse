@@ -12,6 +12,7 @@ import { GmailOverview, GmailThreadRow, type GmailScope } from '@/components/gma
 import { CalendarMutationCard } from '@/components/calendar-mutation-review';
 import { AppleContactMutationCard } from '@/components/apple-contact-mutation-review';
 import { ContactMutationCard } from '@/components/contact-mutation-review';
+import { EmailFormatToolbar } from '@/components/email-rich-editor';
 import { GmailEmailComposeCard } from '@/components/gmail-email-compose-review';
 import { GmailSettingsCard } from '@/components/gmail-settings-review';
 import { SlackMarkReadCard } from '@/components/slack-read-review';
@@ -114,9 +115,9 @@ function MutationCard(props: Parameters<typeof MutationCardBody>[0]) {
   );
 }
 
-function MutationCardBody({ mutation, pending, busy, onRemove, onSaveSlackMessage, onSaveTextMessage, onPendingChange, requestReason, alone, locked }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; onSaveTextMessage?: (input: UpdateTextMessageMutationInput) => Promise<void>; onPendingChange?: (edit: PendingEdit | null) => void; requestReason?: string; alone?: boolean; locked?: boolean }) {
+function MutationCardBody({ mutation, pending, busy, onRemove, onSaveSlackMessage, onSaveTextMessage, onPendingChange, onEditorToolbarChange, onRegisterEmailFlush, requestReason, alone, locked }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; onSaveTextMessage?: (input: UpdateTextMessageMutationInput) => Promise<void>; onPendingChange?: (edit: PendingEdit | null) => void; onEditorToolbarChange?: (exec: ((command: string) => void) | null) => void; onRegisterEmailFlush?: (flush: (() => Promise<UpdateEmailMutationInput | null>) | null) => void; requestReason?: string; alone?: boolean; locked?: boolean }) {
   const theme = useTheme();
-  if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onRemove={onRemove} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'email', input } : null)} requestReason={requestReason} alone={alone} locked={locked} />;
+  if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onRemove={onRemove} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'email', input } : null)} onEditorToolbarChange={onEditorToolbarChange} onRegisterEmailFlush={onRegisterEmailFlush} requestReason={requestReason} alone={alone} locked={locked} />;
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
   if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveSlackMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'slack', input } : null)} requestReason={requestReason} locked={locked} alone={alone} />;
   if (isTextMessageSendMutation(mutation)) return <TextMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveTextMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'text', input } : null)} requestReason={requestReason} locked={locked} alone={alone} />;
@@ -357,7 +358,16 @@ function MutationReview({ id }: { id: string | undefined }) {
   // a ref (they change on every keystroke); the summary the button reads is
   // state, and changes only when the count or the draft mode does.
   const pendingEdits = useRef<Record<string, PendingEdit>>({});
+  const emailFlushers = useRef<Record<string, () => Promise<UpdateEmailMutationInput | null>>>({});
+  const registerEmailFlush = useCallback((mutationId: string, flush: (() => Promise<UpdateEmailMutationInput | null>) | null) => {
+    if (flush) emailFlushers.current[mutationId] = flush;
+    else delete emailFlushers.current[mutationId];
+  }, []);
   const [pendingSummary, setPendingSummary] = useState({ count: 0, draft: false });
+  const [editorExec, setEditorExec] = useState<((command: string) => void) | null>(null);
+  const handleEditorToolbarChange = useCallback((exec: ((command: string) => void) | null) => {
+    setEditorExec(() => exec);
+  }, []);
   const markPending = useCallback((mutationId: string, edit: PendingEdit | null) => {
     if (edit) pendingEdits.current[mutationId] = edit;
     else delete pendingEdits.current[mutationId];
@@ -494,7 +504,16 @@ function MutationReview({ id }: { id: string | undefined }) {
   const approve = async () => {
     if (!request) return;
     let current = request;
-    const edits = Object.entries(pendingEdits.current);
+    // Pull live HTML directly from every mounted email editor WebView so
+    // tapping Approve immediately after a keystroke or backspace always saves
+    // exactly what is on screen (never a stale or debounced state value).
+    const flushed: Record<string, PendingEdit> = { ...pendingEdits.current };
+    for (const [mutationId, flush] of Object.entries(emailFlushers.current)) {
+      const latest = await flush();
+      if (latest) flushed[mutationId] = { kind: 'email', input: latest };
+      else delete flushed[mutationId];
+    }
+    const edits = Object.entries(flushed);
     if (edits.length) {
       setBusy(true);
       try {
@@ -740,7 +759,7 @@ function MutationReview({ id }: { id: string | undefined }) {
                   <ThemedText type="small" themeColor="textSecondary">Approval includes these actions too.</ThemedText>
                   {otherMutations.map((mutation) => (
                     <MutationCard key={mutation.id} mutation={mutation} pending={pending} busy={busy} onRemove={() => remove(mutation)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)}
-                onSaveTextMessage={(input) => saveTextMessage(mutation, input)} onPendingChange={(edit) => markPending(mutation.id, edit)} requestReason={request.reason} locked={scroll.locked} />
+                onSaveTextMessage={(input) => saveTextMessage(mutation, input)} onPendingChange={(edit) => markPending(mutation.id, edit)} onEditorToolbarChange={handleEditorToolbarChange} onRegisterEmailFlush={(flush) => registerEmailFlush(mutation.id, flush)} requestReason={request.reason} locked={scroll.locked} />
                   ))}
                 </View>
               ) : null}
@@ -807,6 +826,8 @@ function MutationReview({ id }: { id: string | undefined }) {
                 onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)}
                 onSaveTextMessage={(input) => saveTextMessage(mutation, input)}
                 onPendingChange={(edit) => markPending(mutation.id, edit)}
+                onEditorToolbarChange={handleEditorToolbarChange}
+                onRegisterEmailFlush={(flush) => registerEmailFlush(mutation.id, flush)}
                 locked={scroll.locked}
                 requestReason={request.reason}
                 alone={requestMutations.length === 1}
@@ -818,6 +839,7 @@ function MutationReview({ id }: { id: string | undefined }) {
             ) : null}
           </ScrollView>
         )}
+        {pending && editorExec ? <EmailFormatToolbar onCommand={editorExec} /> : null}
         {pending ? (
           <View
             style={[

@@ -17,10 +17,22 @@ back it, all behind the static bearer the CLI uses:
   (`…/supersede`, offered when `can_supersede`). Every `gmail.send_email` mutation
   carries an `email` view-model (delivery mode, variants with the selected one marked,
   each body split into editable part / signature / quoted thread, the reply thread) so
-  no client re-derives it. Each part is carried as HTML for the web's contenteditable
-  and as plain text (`editor_text`, `signature_text`, `quoted_text`) for the phone's
-  TextInput; both clients reassemble editor + signature + quote in that order, which
-  is the seam the server splits on next time. The actor is `app:<client_name>`. It executes nothing.
+  no client re-derives it. Both the web SPA (`contenteditable`) and the phone app
+  (`EmailRichEditor` in `mobile/src/components/email-rich-editor.tsx`, backed by a
+  CSP-protected `react-native-webview`) edit `editor_html` directly as rich WYSIWYG
+  HTML so links, bold/italic, ordered/unordered lists, headings, tables, inline images
+  and styles survive edits; both clients reassemble editor + signature + quote in that
+  order, send `editor_format: "html"` and `body_edited` (leaving `body_html`/`body_text`
+  untouched when only To/Cc/Bcc/Subject or delivery mode changed), and save unsaved
+  edits automatically on Approve. For older mobile builds that still send plain
+  `<div>`-wrapped text, `reconcileUpdatedGmailBody` (`app/internal/mutations/email_html.go`)
+  patches only the changed text spans onto the stored rich HTML DOM instead of replacing
+  it, sanitizes incoming editor HTML, and keeps `body_text` (including list markers and
+  `> ` quote prefixes) consistent with `body_html`; an old-client edit it cannot map
+  without changing text or formatting is refused with 409
+  (`ErrOldClientEditUnsupported`) rather than sent wrong. The editor's tag and
+  attribute allow-list lives in Go, `mutation_view.js` and `email-editor.ts`;
+  `TestEmailEditorAllowListsMatchOnServerWebAndPhone` keeps the three equal. The actor is `app:<client_name>`. It executes nothing.
   **Agents get one control over a request after proposing it, and it is not editing.** Since
   2026-09-24 `withdraw_mutation` (reason required) moves a *pending* request to `withdrawn`, and
   `propose_mutation` with `replaces_request_id` + `replaces_reason` withdraws the request it

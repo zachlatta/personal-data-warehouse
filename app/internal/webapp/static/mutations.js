@@ -232,14 +232,24 @@ function stripTrailingEmptyBlocks(root) {
 
 function renderComposer(request, mutation, variant, deliveryMode, hasVariants, actions) {
   const form = h("form", "composer");
-  const state = { deliveryMode };
+  const baseline = {
+    deliveryMode,
+    to: V.stringSlice(variant.to).join(", "),
+    cc: V.stringSlice(variant.cc).join(", "),
+    bcc: V.stringSlice(variant.bcc).join(", "),
+    subject: V.str(variant.subject),
+    editorHTML: V.sanitizeEmailEditorHTML(V.str(variant.editor_html)) || "<div><br></div>",
+  };
+  const state = { deliveryMode, bodyEdited: false, dirty: false };
 
   const modes = h("div", "delivery");
   const modeName = "delivery-" + mutation.id + "-" + (variant.id || "default");
+  const modeRadios = {};
   for (const [value, label] of [["send", "Send email"], ["draft", "Create draft"]]) {
     const lab = h("label", "delivery-opt");
     const radio = h("input"); radio.type = "radio"; radio.name = modeName; radio.value = value; radio.checked = deliveryMode === value;
-    radio.addEventListener("change", () => { if (radio.checked) state.deliveryMode = value; });
+    modeRadios[value] = radio;
+    radio.addEventListener("change", () => { if (radio.checked) { state.deliveryMode = value; updateDirty(); } });
     lab.appendChild(radio); lab.appendChild(h("span", "", label));
     modes.appendChild(lab);
   }
@@ -257,21 +267,24 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
   fields.appendChild(fromRow);
   const inputs = {};
   for (const [key, label, value] of [
-    ["to", "To", V.stringSlice(variant.to).join(", ")],
-    ["cc", "Cc", V.stringSlice(variant.cc).join(", ")],
-    ["bcc", "Bcc", V.stringSlice(variant.bcc).join(", ")],
-    ["subject", "Subject", V.str(variant.subject)],
+    ["to", "To", baseline.to],
+    ["cc", "Cc", baseline.cc],
+    ["bcc", "Bcc", baseline.bcc],
+    ["subject", "Subject", baseline.subject],
   ]) {
     const lab = h("label", "cfield");
     lab.appendChild(h("span", "lab", label));
     const input = h("input"); input.value = value; input.autocomplete = "off";
+    input.addEventListener("input", () => updateDirty());
     inputs[key] = input;
     lab.appendChild(input);
     fields.appendChild(lab);
   }
   form.appendChild(fields);
 
-  let attachments = [...V.emailAttachments(variant)];
+  const baselineAttachments = [...V.emailAttachments(variant)];
+  let attachments = [...baselineAttachments];
+  let attachmentsChanged = false;
   const attachmentWrap = h("div", "attachments");
   const attachmentError = h("div", "bad");
   const picker = h("input"); picker.type = "file"; picker.multiple = true;
@@ -281,7 +294,7 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
     clear(attachmentWrap);
     attachmentWrap.appendChild(h("strong", "", "Attachments"));
     attachmentWrap.appendChild(attachmentList(attachments, index => {
-      attachments.splice(index, 1); paintAttachments();
+      attachments.splice(index, 1); attachmentsChanged = true; paintAttachments(); updateDirty();
     }));
     attachmentWrap.appendChild(picker);
     attachmentWrap.appendChild(attachmentError);
@@ -309,7 +322,9 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
       }
       V.checkAttachmentLimits([...attachments, ...added]);
       attachments.push(...added);
+      attachmentsChanged = true;
       paintAttachments();
+      updateDirty();
     } catch (err) { attachmentError.textContent = errorText(err); }
     finally { readingAttachments = false; picker.disabled = false; picker.value = ""; }
   });
@@ -323,12 +338,36 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
   const editor = h("div", "editor");
   editor.contentEditable = "true";
   editor.spellcheck = true;
-  // editor_html is server-produced from the stored message (already split
-  // from its signature and quote); seeding a contenteditable with it is the
-  // one place innerHTML with server data is intended here.
-  editor.innerHTML = V.str(variant.editor_html) || "<div><br></div>";
-  for (const [label, command, title] of [["B", "bold", "Bold"], ["I", "italic", "Italic"], ["• list", "insertUnorderedList", "Bulleted list"], ["1. list", "insertOrderedList", "Numbered list"]]) {
-    const b = button(label, "tb", () => { editor.focus(); document.execCommand(command, false, null); });
+  // editor_html is sanitized both server-side (email_html.go) and client-side
+  // (sanitizeEmailEditorHTML) before seeding the contenteditable composer.
+  editor.innerHTML = baseline.editorHTML;
+  const baselineNormalizedHTML = stripTrailingEmptyBlocks(editor);
+  editor.addEventListener("input", () => {
+    state.bodyEdited = stripTrailingEmptyBlocks(editor) !== baselineNormalizedHTML;
+    updateDirty();
+  });
+  editor.addEventListener("paste", (ev) => {
+    const dt = ev.clipboardData;
+    if (!dt) return;
+    ev.preventDefault();
+    const html = dt.getData("text/html");
+    if (html) {
+      const clean = V.sanitizePastedHTML(html);
+      if (clean) document.execCommand("insertHTML", false, clean);
+    } else {
+      const text = dt.getData("text/plain");
+      if (text) document.execCommand("insertText", false, text);
+    }
+    state.bodyEdited = stripTrailingEmptyBlocks(editor) !== baselineNormalizedHTML;
+    updateDirty();
+  });
+  for (const [label, command, title] of [["B", "bold", "Bold"], ["I", "italic", "Italic"], ["• list", "insertUnorderedList", "Bulleted list"], ["1. list", "insertOrderedList", "Numbered list"], ["Undo", "undo", "Undo"]]) {
+    const b = button(label, "tb", () => {
+      editor.focus();
+      document.execCommand(command, false, null);
+      state.bodyEdited = stripTrailingEmptyBlocks(editor) !== baselineNormalizedHTML;
+      updateDirty();
+    });
     b.title = title;
     toolbar.appendChild(b);
   }
@@ -338,7 +377,7 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
   let signatureNode = null;
   if (signatureHTML) {
     signatureNode = h("div", "signature");
-    signatureNode.innerHTML = signatureHTML; // sanitized server-side (email_view.go)
+    signatureNode.innerHTML = V.sanitizeEmailEditorHTML(signatureHTML);
     editorWrap.appendChild(signatureNode);
   }
   const quotedHTML = V.trimStr(variant.quoted_html);
@@ -352,19 +391,26 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
   const errorNode = h("div", "bad");
   form.appendChild(errorNode);
 
-  async function submit(deliveryOverride) {
-    if (readingAttachments) { errorNode.textContent = "Wait for attachments to finish reading."; return; }
-    const body = V.assembleEmailBody({
-      editorHTML: stripTrailingEmptyBlocks(editor),
-      editorText: editor.innerText,
-      signatureHTML,
-      signatureText: signatureNode ? signatureNode.innerText : "",
-      quotedHTML,
-      quotedText: V.str(variant.quoted_text),
-    });
-    const input = {
+  function buildInput(deliveryOverride) {
+    state.bodyEdited = stripTrailingEmptyBlocks(editor) !== baselineNormalizedHTML;
+    const body = state.bodyEdited
+      ? V.assembleEmailBody({
+          editorHTML: V.sanitizeEmailEditorHTML(stripTrailingEmptyBlocks(editor)),
+          editorText: editor.innerText,
+          signatureHTML,
+          signatureText: signatureNode ? signatureNode.innerText : "",
+          quotedHTML,
+          quotedText: V.str(variant.quoted_text),
+        })
+      : {
+          body_html: V.str(variant.body_html),
+          body_text: V.str(variant.body_text),
+        };
+    return {
       delivery_mode: deliveryOverride || state.deliveryMode,
       selected_variant_id: V.str(variant.id),
+      editor_format: "html",
+      body_edited: state.bodyEdited,
       message: {
         to: V.splitEmailAddressList(inputs.to.value),
         cc: V.splitEmailAddressList(inputs.cc.value),
@@ -378,20 +424,69 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
         references: V.stringSlice(variant.references),
       },
     };
+  }
+
+  async function save(deliveryOverride, { reload = true } = {}) {
+    if (readingAttachments) { errorNode.textContent = "Wait for attachments to finish reading."; throw new Error("Wait for attachments to finish reading."); }
     errorNode.textContent = "";
     try {
-      await mutations.updateEmail(request.id, mutation.id, input);
-      mutationsChanged();
-      actions.reload();
-    } catch (err) { errorNode.textContent = errorText(err); }
+      await mutations.updateEmail(request.id, mutation.id, buildInput(deliveryOverride));
+      state.bodyEdited = false;
+      state.dirty = false;
+      if (actions.setPendingSave) actions.setPendingSave(mutation.id, null);
+      if (reload) {
+        mutationsChanged();
+        actions.reload();
+      }
+    } catch (err) {
+      errorNode.textContent = errorText(err);
+      throw err;
+    }
+  }
+
+  async function submit(deliveryOverride) {
+    try { await save(deliveryOverride, { reload: true }); } catch { /* error shown in errorNode */ }
   }
 
   const buttons = h("div", "cactions");
   const primary = button(hasVariants ? "Use this version" : "Save email changes", "primary", () => submit(null));
   const draft = button("Save as draft instead", "", () => submit("draft"));
-  buttons.appendChild(primary); buttons.appendChild(draft);
+  const revert = button("Revert", "subtle", () => {
+    state.deliveryMode = baseline.deliveryMode;
+    for (const [val, radio] of Object.entries(modeRadios)) radio.checked = val === baseline.deliveryMode;
+    inputs.to.value = baseline.to;
+    inputs.cc.value = baseline.cc;
+    inputs.bcc.value = baseline.bcc;
+    inputs.subject.value = baseline.subject;
+    attachments = [...baselineAttachments];
+    attachmentsChanged = false;
+    paintAttachments();
+    editor.innerHTML = baseline.editorHTML;
+    state.bodyEdited = false;
+    errorNode.textContent = "";
+    updateDirty();
+  });
+  revert.hidden = true;
+  buttons.appendChild(primary); buttons.appendChild(draft); buttons.appendChild(revert);
   form.appendChild(buttons);
   form.addEventListener("submit", (ev) => { ev.preventDefault(); submit(null); });
+
+  function updateDirty() {
+    const metadataDirty =
+      state.deliveryMode !== baseline.deliveryMode ||
+      inputs.to.value !== baseline.to ||
+      inputs.cc.value !== baseline.cc ||
+      inputs.bcc.value !== baseline.bcc ||
+      inputs.subject.value !== baseline.subject ||
+      attachmentsChanged;
+    state.dirty = state.bodyEdited || metadataDirty;
+    revert.hidden = !state.dirty;
+    if (actions.setPendingSave) {
+      const active = !form.parentElement || !form.parentElement.hidden;
+      actions.setPendingSave(mutation.id, active && state.dirty ? () => save(null, { reload: false }) : null);
+    }
+  }
+  form._syncPendingSave = updateDirty;
   return form;
 }
 
@@ -406,6 +501,8 @@ function renderComposerPanels(request, mutation, email, actions) {
       const tab = button(variant.title || "Version " + (index + 1), "vtab" + (variant.selected ? " active" : ""), () => {
         tabs.querySelectorAll(".vtab").forEach((t, i) => t.classList.toggle("active", i === index));
         panels.forEach((panel, i) => { panel.hidden = i !== index; });
+        const activeForm = panels[index] && panels[index].firstChild;
+        if (activeForm && activeForm._syncPendingSave) activeForm._syncPendingSave();
       });
       tabs.appendChild(tab);
     });
@@ -1532,11 +1629,24 @@ function renderDecisionDock(request, actions) {
     copy.appendChild(h("span", "", count + " reviewed action" + V.plural(count)));
     dock.appendChild(copy);
     const controls = h("div", "decision-controls");
-    controls.appendChild(button("Approve " + count, "ok", async () => {
-      if (!confirmDialog("Approve? " + count + " mutation" + V.plural(count) + " will run upstream.")) return;
+    const approveBtn = button("Approve " + count, "ok", async () => {
+      const pendingSaves = actions.pendingSaves ? actions.pendingSaves() : [];
+      const prompt = pendingSaves.length
+        ? "Save edits and approve? " + count + " mutation" + V.plural(count) + " will run upstream."
+        : "Approve? " + count + " mutation" + V.plural(count) + " will run upstream.";
+      if (!confirmDialog(prompt)) return;
       errorNode.textContent = "";
-      try { await mutations.approve(request.id); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
-    }));
+      try {
+        for (const saveFn of pendingSaves) await saveFn();
+        await mutations.approve(request.id);
+        mutationsChanged();
+        actions.reload();
+      } catch (err) { errorNode.textContent = errorText(err); }
+    });
+    dock._updateApproveLabel = (dirtyCount) => {
+      approveBtn.textContent = dirtyCount > 0 ? "Save & Approve " + count : "Approve " + count;
+    };
+    controls.appendChild(approveBtn);
     const reason = h("input"); reason.placeholder = "denial reason (optional)"; reason.className = "reason";
     controls.appendChild(reason);
     controls.appendChild(button("Deny", "danger", async () => {
@@ -1696,7 +1806,20 @@ function paintDetail(root, ctx, request, actions, refreshing) {
   clear(root);
   root.appendChild(link(LIST_PATH, "← All requests", "back"));
   root.appendChild(renderRequestHeader(request));
-  const decision = renderDecisionDock(request, actions);
+  const pendingSaves = new Map();
+  let decision = null;
+  const pageActions = {
+    ...actions,
+    setPendingSave(mutationId, fn) {
+      if (fn) pendingSaves.set(mutationId, fn);
+      else pendingSaves.delete(mutationId);
+      if (decision && decision._updateApproveLabel) decision._updateApproveLabel(pendingSaves.size);
+    },
+    pendingSaves() {
+      return [...pendingSaves.values()];
+    },
+  };
+  decision = renderDecisionDock(request, pageActions);
   if (decision) root.appendChild(decision);
   const context = renderContext(request.context);
   if (context) root.appendChild(context);
@@ -1712,7 +1835,7 @@ function paintDetail(root, ctx, request, actions, refreshing) {
     for (const item of V.groupMutations(list)) {
       if (item.kind === "gmail") sect.appendChild(renderGmailGroup(item));
       else if (item.kind === "contact") sect.appendChild(renderContactGroup(item));
-      else sect.appendChild(renderMutation(request, item.mutation, actions));
+      else sect.appendChild(renderMutation(request, item.mutation, pageActions));
     }
     root.appendChild(sect);
   }

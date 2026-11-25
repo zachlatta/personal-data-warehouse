@@ -233,10 +233,20 @@ form.composer { border: 1px solid var(--border); border-radius: var(--radius); p
 .editor-wrap { margin-top: 12px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
 .toolbar { display: flex; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--border); background: var(--surface-2); }
 .toolbar button.tb { min-height: 28px; padding: 0 9px; box-shadow: none; }
-.editor { min-height: 160px; padding: 12px 14px; outline: none; font: 14px/1.6 var(--font); color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.editor { min-height: 160px; padding: 12px 14px; outline: none; font: 14px/1.6 var(--font); color: var(--email-canvas-text); background: var(--email-canvas-bg); word-break: break-word; overflow-wrap: anywhere; }
 .editor:focus { box-shadow: inset 0 0 0 2px var(--ring); }
-.editor ul, .editor ol { margin-left: 22px; }
-.signature { padding: 10px 14px; border-top: 1px dashed var(--border); color: var(--text-2); font-size: 13px; }
+.editor p { margin: 0 0 10px; }
+.editor p:last-child { margin-bottom: 0; }
+.editor ul, .editor ol { margin: 0 0 10px; padding-left: 24px; }
+.editor li { margin: 0 0 4px; }
+.editor h1, .editor h2, .editor h3, .editor h4, .editor h5, .editor h6 { margin: 12px 0 6px; line-height: 1.3; }
+.editor blockquote { margin: 8px 0; padding-left: 12px; border-left: 3px solid var(--email-canvas-border); color: var(--email-canvas-muted); }
+.editor table { border-collapse: collapse; margin: 8px 0; max-width: 100%; }
+.editor td, .editor th { border: 1px solid var(--email-canvas-border); padding: 4px 8px; text-align: left; }
+.editor a { color: var(--email-canvas-link); text-decoration: underline; }
+.editor img { max-width: 100%; height: auto; }
+.editor pre { white-space: pre-wrap; margin: 8px 0; }
+.signature { padding: 10px 14px; border-top: 1px dashed var(--email-canvas-border); background: var(--email-canvas-bg); color: var(--email-canvas-muted); font-size: 13px; }
 .signature img { max-width: 100%; height: auto; }
 .editor-wrap details.gquoted { padding: 8px 14px 12px; }
 .cactions { display: flex; gap: 8px; margin-top: 12px; align-items: center; }

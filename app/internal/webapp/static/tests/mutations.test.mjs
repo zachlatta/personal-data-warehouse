@@ -823,3 +823,122 @@ test("policyChangeTable lines each value up under its own header, apart from the
   assert.deepEqual(table.rows[0].cells, ["match.heat_setpoint", "min 55, max 72", "min 50, max 72", "widens"]);
   assert.equal(table.rows[0].widens, true);
 });
+
+// Minimal HTML DOMParser for Node unit tests so sanitizeEmailEditorHTML and
+// sanitizePastedHTML execute their real DOMParser + sanitizeNodeTree code path.
+function withTestDOMParser(fn) {
+  const VOID = new Set(["br", "hr", "img", "col", "input", "meta", "link", "base", "embed", "source"]);
+  const decode = (s) => s
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  const escAttr = (s) => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+  const escText = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  class Node {
+    constructor(nodeType) { this.nodeType = nodeType; this.childNodes = []; this.parentNode = null; }
+    get firstChild() { return this.childNodes[0] || null; }
+    get nextSibling() {
+      if (!this.parentNode) return null;
+      const i = this.parentNode.childNodes.indexOf(this);
+      return i >= 0 ? this.parentNode.childNodes[i + 1] || null : null;
+    }
+    appendChild(n) {
+      if (n.parentNode) n.parentNode.removeChild(n);
+      n.parentNode = this; this.childNodes.push(n); return n;
+    }
+    insertBefore(n, ref) {
+      if (n.parentNode) n.parentNode.removeChild(n);
+      n.parentNode = this;
+      const i = ref ? this.childNodes.indexOf(ref) : -1;
+      if (i < 0) this.childNodes.push(n); else this.childNodes.splice(i, 0, n);
+      return n;
+    }
+    removeChild(n) {
+      const i = this.childNodes.indexOf(n);
+      if (i >= 0) { this.childNodes.splice(i, 1); n.parentNode = null; }
+      return n;
+    }
+  }
+  class Text extends Node { constructor(data) { super(3); this.data = data; } }
+  class Comment extends Node { constructor(data) { super(8); this.data = data; } }
+  class Element extends Node {
+    constructor(tag) { super(1); this.tagName = tag.toUpperCase(); this._attrs = new Map(); }
+    get attributes() { return Array.from(this._attrs, ([name, value]) => ({ name, value })); }
+    setAttribute(name, value) { this._attrs.set(name.toLowerCase(), String(value)); }
+    removeAttribute(name) { this._attrs.delete(name.toLowerCase()); }
+    get innerHTML() {
+      return this.childNodes.map((c) => {
+        if (c.nodeType === 3) return escText(c.data);
+        if (c.nodeType === 8) return `<!--${c.data}-->`;
+        const tag = c.tagName.toLowerCase();
+        const attrs = Array.from(c._attrs, ([k, v]) => ` ${k}="${escAttr(v)}"`).join("");
+        return VOID.has(tag) ? `<${tag}${attrs}>` : `<${tag}${attrs}>${c.innerHTML}</${tag}>`;
+      }).join("");
+    }
+  }
+  function parseHTML(raw) {
+    const body = new Element("body");
+    const stack = [body];
+    let i = 0;
+    while (i < raw.length) {
+      const lt = raw.indexOf("<", i);
+      if (lt < 0) { stack[stack.length - 1].appendChild(new Text(decode(raw.slice(i)))); break; }
+      if (lt > i) stack[stack.length - 1].appendChild(new Text(decode(raw.slice(i, lt))));
+      if (raw.startsWith("<!--", lt)) {
+        const end = raw.indexOf("-->", lt + 4);
+        stack[stack.length - 1].appendChild(new Comment(raw.slice(lt + 4, end < 0 ? raw.length : end)));
+        i = end < 0 ? raw.length : end + 3;
+        continue;
+      }
+      let j = lt + 1, q = "";
+      while (j < raw.length) {
+        const ch = raw[j];
+        if (q) { if (ch === q) q = ""; } else if (ch === '"' || ch === "'") q = ch; else if (ch === ">") break;
+        j += 1;
+      }
+      if (j >= raw.length) { stack[stack.length - 1].appendChild(new Text(raw.slice(lt))); break; }
+      const rawTag = raw.slice(lt + 1, j);
+      i = j + 1;
+      const m = /^\s*(\/)?\s*([a-zA-Z][a-zA-Z0-9:-]*)([\s\S]*)$/.exec(rawTag);
+      if (!m) { stack[stack.length - 1].appendChild(new Text(`<${rawTag}>`)); continue; }
+      const closing = Boolean(m[1]), tag = m[2].toLowerCase(), rest = m[3] || "";
+      if (closing) {
+        for (let k = stack.length - 1; k > 0; k--) {
+          if (stack[k].tagName.toLowerCase() === tag) { stack.length = k; break; }
+        }
+        continue;
+      }
+      const el = new Element(tag);
+      const attrRe = /([a-zA-Z_:][a-zA-Z0-9_.:-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`/]+)))?/g;
+      let am;
+      while ((am = attrRe.exec(rest)) !== null) el.setAttribute(am[1], decode(am[2] ?? am[3] ?? am[4] ?? ""));
+      stack[stack.length - 1].appendChild(el);
+      const selfClose = /\/\s*$/.test(rest) || VOID.has(tag);
+      if (!selfClose && raw.toLowerCase().indexOf(`</${tag}`, i) >= 0) stack.push(el);
+    }
+    return { body };
+  }
+  const prev = globalThis.DOMParser;
+  globalThis.DOMParser = class { parseFromString(raw) { return parseHTML(raw); } };
+  try { return fn(); } finally { globalThis.DOMParser = prev; }
+}
+
+test("sanitizeEmailEditorHTML strips executable markup via DOMParser while preserving entities, http images, and visible on...= text", () => withTestDOMParser(() => {
+  const dirty = '<p>Hi <strong>Alex</strong>, set once = 5 and only=yes, then onclick="x" in the docs.</p><ol><li><a href="https://example.org/x?a=1&amp;b=2">link</a></li><li><a href="javascript:alert(1)">bad</a></li></ol><script>alert(2)</script><style>body{display:none}</style><img src="http://example.org/a.png?x=1&amp;w=2" alt="A &amp; B" onerror="alert(3)"><span style="font-family:&#34;Helvetica Neue&#34;,Arial">t</span><svg/onload=alert(4)>';
+  const clean = V.sanitizeEmailEditorHTML(dirty);
+  assert.doesNotMatch(clean, /<script|<style|<svg|onerror|onload|javascript:|&amp;amp;/i);
+  assert.match(clean, /set once = 5 and only=yes, then onclick="x" in the docs\./);
+  assert.match(clean, /<strong>Alex<\/strong>/);
+  assert.ok(clean.includes('href="https://example.org/x?a=1&amp;b=2"'));
+  assert.ok(clean.includes('src="http://example.org/a.png?x=1&amp;w=2"'));
+  assert.ok(clean.includes('alt="A &amp; B"'));
+  assert.ok(clean.includes('font-family:&quot;Helvetica Neue&quot;,Arial'));
+}));
+
+test("sanitizePastedHTML removes scripts, svg, comments, and class/data attributes via DOMParser while keeping semantic tags", () => withTestDOMParser(() => {
+  const pasted = '<!--StartFragment--><p class="MsoNormal" data-id="1">Hello <em>world</em> once = 7</p><img src=\'x\'onerror=\'window.__x=1\'><svg/onload=window.__x=1><script>evil()</script><ul><li class="x">One</li></ul>';
+  const clean = V.sanitizePastedHTML(pasted);
+  assert.doesNotMatch(clean, /StartFragment|<script|<svg|onerror|onload|MsoNormal|data-id|class=/i);
+  assert.match(clean, /Hello <em>world<\/em> once = 7/);
+  assert.match(clean, /<ul><li>One<\/li><\/ul>/);
+}));

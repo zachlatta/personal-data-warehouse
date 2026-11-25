@@ -578,6 +578,110 @@ export function normalizeEmailText(value) {
     .filter((line, index, lines) => line.trim() !== "" || (index > 0 && index < lines.length - 1)).join("\n").trim();
 }
 
+const DROP_SUBTREE_ELEMENTS = new Set([
+  "script", "style", "svg", "math", "iframe", "frame", "frameset", "object",
+  "embed", "applet", "noscript", "template", "form", "input", "button",
+  "select", "textarea", "base", "meta", "link", "xmp", "noembed", "plaintext",
+  "audio", "video", "source", "canvas", "marquee",
+]);
+
+const ALLOWED_EDITOR_ELEMENTS = new Set([
+  "p", "div", "br", "span", "strong", "b", "em", "i", "u", "s", "strike",
+  "del", "ins", "sub", "sup", "a", "ul", "ol", "li", "h1", "h2", "h3", "h4",
+  "h5", "h6", "blockquote", "pre", "code", "hr", "table", "thead", "tbody",
+  "tfoot", "tr", "th", "td", "caption", "colgroup", "col", "img", "font",
+  "center", "small", "big", "abbr", "cite", "dl", "dt", "dd", "section",
+  "article", "header", "footer",
+]);
+
+const ALLOWED_EDITOR_ATTRS = new Set([
+  "href", "src", "alt", "title", "target", "rel", "style", "class", "dir",
+  "align", "valign", "width", "height", "colspan", "rowspan", "cellpadding",
+  "cellspacing", "border", "color", "face", "size", "start", "type",
+  "role", "bgcolor", "background", "nowrap",
+]);
+
+function isSafeURL(raw, isSrc) {
+  const cleaned = str(raw).replace(/[\u0000-\u0020\u007f]+/g, "").toLowerCase();
+  if (!cleaned || cleaned.startsWith("#") || cleaned.startsWith("/")) return true;
+  for (const prefix of ["http://", "https://", "mailto:", "tel:", "cid:"]) {
+    if (cleaned.startsWith(prefix)) return true;
+  }
+  if (isSrc) {
+    for (const prefix of ["data:image/png", "data:image/jpeg", "data:image/jpg", "data:image/gif", "data:image/webp"]) {
+      if (cleaned.startsWith(prefix)) return true;
+    }
+  }
+  return !cleaned.includes(":");
+}
+
+function isSafeStyle(raw) {
+  const lower = str(raw).replace(/[\u0000-\u0020\u007f]+/g, "").toLowerCase();
+  for (const bad of ["javascript:", "vbscript:", "expression(", "@import", "behavior:", "-moz-binding"]) {
+    if (lower.includes(bad)) return false;
+  }
+  const idx = lower.indexOf("url(");
+  if (idx >= 0) {
+    const rest = lower.slice(idx + 4).replace(/^["']+/, "");
+    if (!rest.startsWith("https://") && !rest.startsWith("http://")) return false;
+  }
+  return true;
+}
+
+function sanitizeNodeTree(parent, { stripClass = false } = {}) {
+  for (let child = parent.firstChild; child;) {
+    const next = child.nextSibling;
+    if (child.nodeType === 8) { // Comment
+      parent.removeChild(child);
+    } else if (child.nodeType === 1) { // Element
+      const tag = child.tagName.toLowerCase();
+      if (DROP_SUBTREE_ELEMENTS.has(tag)) {
+        parent.removeChild(child);
+      } else if (!ALLOWED_EDITOR_ELEMENTS.has(tag)) {
+        sanitizeNodeTree(child, { stripClass });
+        while (child.firstChild) parent.insertBefore(child.firstChild, child);
+        parent.removeChild(child);
+      } else {
+        for (const attr of Array.from(child.attributes)) {
+          const name = attr.name.toLowerCase();
+          if (!ALLOWED_EDITOR_ATTRS.has(name) || (stripClass && name === "class")) {
+            child.removeAttribute(attr.name);
+            continue;
+          }
+          if (name === "href" || name === "src" || name === "background") {
+            if (!isSafeURL(attr.value, name !== "href")) child.setAttribute(attr.name, "#");
+          } else if (name === "style" && !isSafeStyle(attr.value)) {
+            child.removeAttribute(attr.name);
+          }
+        }
+        sanitizeNodeTree(child, { stripClass });
+      }
+    }
+    child = next;
+  }
+}
+
+// sanitizeEmailEditorHTML parses HTML into an inert DOM document (DOMParser)
+// with a strict element/attribute allow-list so executable markup never runs
+// and visible text (including "once = 5", "only=yes", etc.) is never altered.
+export function sanitizeEmailEditorHTML(value) {
+  const raw = str(value);
+  if (!raw.trim()) return "";
+  const doc = new DOMParser().parseFromString(raw, "text/html");
+  sanitizeNodeTree(doc.body, { stripClass: false });
+  return doc.body.innerHTML.trim();
+}
+
+// sanitizePastedHTML parses clipboard HTML into an inert DOM document with the
+// same allow-list while stripping noisy class attributes.
+export function sanitizePastedHTML(value) {
+  const raw = str(value);
+  if (!raw.trim()) return "";
+  const doc = new DOMParser().parseFromString(raw, "text/html");
+  sanitizeNodeTree(doc.body, { stripClass: true });
+  return doc.body.innerHTML.trim();
+}
+
 // assembleEmailBody is what the old form's editor sync produced for the
 // hidden body_html/body_text fields: editor, then signature, then the quoted
 // thread, in that order, separated by an empty div (HTML) or a blank line

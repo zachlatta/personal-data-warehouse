@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { EmailAttachments } from '@/components/email-attachment-preview';
+import { EmailHtmlBody } from '@/components/email-html-body';
+import { EmailRichEditor } from '@/components/email-rich-editor';
 import { Avatar } from '@/components/avatar';
 import { StatusPill } from '@/components/status-pill';
 import { ThemedText } from '@/components/themed-text';
@@ -9,6 +11,7 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useReviewDraftState } from '@/hooks/use-review-draft-state';
 import type { Mutation, UpdateEmailMutationInput } from '@/lib/api';
+import { emailEditorResetKey, stripTrailingEmptyBlocksHtml } from '@/lib/email-editor';
 import { cleanSnippet, formatWhen } from '@/lib/format';
 import {
   emailSignatureSummary,
@@ -27,7 +30,14 @@ const DANGER = '#E5636D';
 type DeliveryMode = 'send' | 'draft';
 
 function sameEdits(a: GmailEmailEdits, b: GmailEmailEdits): boolean {
-  return a.to === b.to && a.cc === b.cc && a.bcc === b.bcc && a.subject === b.subject && a.editorText === b.editorText;
+  return (
+    a.to === b.to &&
+    a.cc === b.cc &&
+    a.bcc === b.bcc &&
+    a.subject === b.subject &&
+    a.bodyEdited === b.bodyEdited &&
+    (!a.bodyEdited || a.editorHTML === b.editorHTML)
+  );
 }
 
 // What is being replied to, above the reply: the message just answered is
@@ -142,6 +152,8 @@ export function GmailEmailComposeCard({
   busy,
   onRemove,
   onPendingChange,
+  onEditorToolbarChange,
+  onRegisterEmailFlush,
   requestReason,
   alone,
   locked,
@@ -151,6 +163,8 @@ export function GmailEmailComposeCard({
   busy: boolean;
   onRemove: () => void;
   onPendingChange?: (input: UpdateEmailMutationInput | null) => void;
+  onEditorToolbarChange?: (exec: ((command: string) => void) | null) => void;
+  onRegisterEmailFlush?: (flush: (() => Promise<UpdateEmailMutationInput | null>) | null) => void;
   requestReason?: string;
   alone?: boolean;
   locked?: boolean;
@@ -166,13 +180,17 @@ export function GmailEmailComposeCard({
   const [signatureOpen, setSignatureOpen] = useState(false);
   const [copiesOpen, setCopiesOpen] = useState(false);
   const [focused, setFocused] = useState(false);
+  const [revertCount, setRevertCount] = useState(0);
   const focus = useMemo<InputFocus>(() => ({ onFocus: () => setFocused(true), onBlur: () => setFocused(false) }), []);
   const variant: GmailEmailVariant = review.variants.find((item) => item.id === selectedId) ?? review.variants[0];
-  const current = edits[variant.id] ?? gmailEmailEditsFor(variant);
+  const baselineEdit = useMemo(() => gmailEmailEditsFor(variant), [variant]);
+  const baselineNormalizedHTML = useMemo(() => stripTrailingEmptyBlocksHtml(variant.editorHTML), [variant.editorHTML]);
+  const current = edits[variant.id] ?? baselineEdit;
   const removed = mutation.status === 'removed' || mutation.status === 'skipped' || mutation.status === 'rejected';
   const editable = pending && !busy && !removed;
   const inputsEditable = editable && (focused || !locked);
-  const dirty = !sameEdits(current, gmailEmailEditsFor(variant)) || selectedId !== review.selectedVariantId || deliveryMode !== review.deliveryMode;
+  const dirty = !sameEdits(current, baselineEdit) || selectedId !== review.selectedVariantId || deliveryMode !== review.deliveryMode;
+  const editorResetKey = emailEditorResetKey(draftKey, variant.id, revertCount, baselineSignature);
   // Empty Cc and Bcc rows were blank lines on every email; each appears when
   // it holds something or when asked for.
   const showCc = copiesOpen || Boolean(current.cc.trim());
@@ -198,13 +216,58 @@ export function GmailEmailComposeCard({
     return () => reporter.current?.(null);
   }, []);
 
-  const setField = (key: keyof GmailEmailEdits) => (value: string) => {
-    setEdits((all) => ({ ...all, [variant.id]: { ...(all[variant.id] ?? gmailEmailEditsFor(variant)), [key]: value } }));
+  const snapshotReaderRef = useRef<(() => Promise<string>) | null>(null);
+  const latestFlushState = useRef({ editable, variant, current, baselineEdit, baselineNormalizedHTML, deliveryMode, selectedId, review });
+  useEffect(() => {
+    latestFlushState.current = { editable, variant, current, baselineEdit, baselineNormalizedHTML, deliveryMode, selectedId, review };
+  }, [editable, variant, current, baselineEdit, baselineNormalizedHTML, deliveryMode, selectedId, review]);
+  const registerFlushRef = useRef(onRegisterEmailFlush);
+  useEffect(() => {
+    registerFlushRef.current = onRegisterEmailFlush;
+  }, [onRegisterEmailFlush]);
+  useEffect(() => {
+    const flush = async (): Promise<UpdateEmailMutationInput | null> => {
+      const s = latestFlushState.current;
+      if (!s.editable) return null;
+      let nextCurrent = s.current;
+      if (snapshotReaderRef.current) {
+        const liveHtml = await snapshotReaderRef.current();
+        const cleaned = stripTrailingEmptyBlocksHtml(liveHtml);
+        const bodyEdited = cleaned !== s.baselineNormalizedHTML;
+        nextCurrent = {
+          ...s.current,
+          editorHTML: bodyEdited ? cleaned : s.variant.editorHTML,
+          bodyEdited,
+        };
+      }
+      const isDirty = !sameEdits(nextCurrent, s.baselineEdit) || s.selectedId !== s.review.selectedVariantId || s.deliveryMode !== s.review.deliveryMode;
+      return isDirty ? gmailEmailUpdateInput(s.variant, nextCurrent, s.deliveryMode) : null;
+    };
+    registerFlushRef.current?.(flush);
+    const reg = registerFlushRef;
+    return () => reg.current?.(null);
+  }, []);
+
+  const setField = (key: 'to' | 'cc' | 'bcc' | 'subject') => (value: string) => {
+    setEdits((all) => ({ ...all, [variant.id]: { ...(all[variant.id] ?? baselineEdit), [key]: value } }));
+  };
+  const onChangeHtml = (rawHtml: string) => {
+    const cleaned = stripTrailingEmptyBlocksHtml(rawHtml);
+    const bodyEdited = cleaned !== baselineNormalizedHTML;
+    setEdits((all) => ({
+      ...all,
+      [variant.id]: {
+        ...(all[variant.id] ?? baselineEdit),
+        editorHTML: bodyEdited ? cleaned : variant.editorHTML,
+        bodyEdited,
+      },
+    }));
   };
   const revert = () => {
     setSelectedId(review.selectedVariantId);
     setDeliveryMode(review.deliveryMode);
     setEdits(Object.fromEntries(review.variants.map((item) => [item.id, gmailEmailEditsFor(item)])));
+    setRevertCount((n) => n + 1);
   };
 
   return (
@@ -265,40 +328,46 @@ export function GmailEmailComposeCard({
         {showCc ? <Field label="Cc" value={current.cc} onChange={setField('cc')} editable={inputsEditable} focus={focus} keyboardType="email-address" /> : null}
         {showBcc ? <Field label="Bcc" value={current.bcc} onChange={setField('bcc')} editable={inputsEditable} focus={focus} keyboardType="email-address" /> : null}
         <Field label="Subject" value={current.subject} onChange={setField('subject')} editable={inputsEditable} focus={focus} autoCapitalize="sentences" />
-        <TextInput
-          accessibilityLabel="Email body"
-          value={current.editorText}
-          onChangeText={setField('editorText')}
-          editable={inputsEditable}
+        <EmailRichEditor
+          initialHtml={current.editorHTML}
+          resetKey={editorResetKey}
+          editable={editable}
+          locked={locked}
+          onChangeHtml={onChangeHtml}
           onFocus={focus.onFocus}
           onBlur={focus.onBlur}
-          multiline
-          scrollEnabled={false}
-          textAlignVertical="top"
-          placeholder="Write the email"
-          placeholderTextColor={theme.textSecondary}
-          style={[styles.body, { color: theme.text }]}
+          onToolbarCommandChange={onEditorToolbarChange}
+          onRegisterSnapshotReader={(reader) => { snapshotReaderRef.current = reader; }}
         />
         {variant.attachments.length > 0 ? (
           <View style={[styles.signature, { borderTopColor: theme.backgroundSelected }]}>
             <EmailAttachments key={variant.id} attachments={variant.attachments} />
           </View>
         ) : null}
-        {variant.signatureText ? (
+        {variant.signatureText || variant.signatureHTML ? (
           <View style={[styles.signature, { borderTopColor: theme.backgroundSelected }]}>
             <Pressable accessibilityRole="button" accessibilityState={{ expanded: signatureOpen }} accessibilityLabel={signatureOpen ? 'Hide signature' : 'Show signature'} onPress={() => setSignatureOpen((value) => !value)} style={styles.quoteToggle}>
-              {signatureOpen
-                ? <ThemedText type="small" themeColor="textSecondary" selectable>{variant.signatureText}</ThemedText>
-                : <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>Signature · {signatureSummary || 'show'}</ThemedText>}
+              <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
+                {signatureOpen ? 'Hide signature' : `Signature · ${signatureSummary || 'show'}`}
+              </ThemedText>
             </Pressable>
+            {signatureOpen
+              ? (variant.signatureHTML
+                  ? <EmailHtmlBody html={variant.signatureHTML} />
+                  : <ThemedText type="small" themeColor="textSecondary" selectable>{variant.signatureText}</ThemedText>)
+              : null}
           </View>
         ) : null}
-        {variant.quotedText ? (
+        {variant.quotedText || variant.quotedHTML ? (
           <View style={[styles.signature, { borderTopColor: theme.backgroundSelected }]}>
             <Pressable accessibilityRole="button" accessibilityState={{ expanded: quotedOpen }} onPress={() => setQuotedOpen((value) => !value)} style={styles.quoteToggle}>
               <ThemedText type="small" style={styles.link}>{`${quotedOpen ? 'Hide' : 'Show'} ${review.forward?.quoteLabel ?? 'quoted thread'}`}</ThemedText>
             </Pressable>
-            {quotedOpen ? <ThemedText type="small" themeColor="textSecondary" selectable>{variant.quotedText}</ThemedText> : null}
+            {quotedOpen
+              ? (variant.quotedHTML
+                  ? <EmailHtmlBody html={variant.quotedHTML} />
+                  : <ThemedText type="small" themeColor="textSecondary" selectable>{variant.quotedText}</ThemedText>)
+              : null}
           </View>
         ) : null}
       </View>
@@ -355,7 +424,6 @@ const styles = StyleSheet.create({
   fieldRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, minHeight: 44, borderBottomWidth: StyleSheet.hairlineWidth },
   fieldLabel: { width: 52 },
   fieldInput: { flex: 1, minHeight: 44, fontSize: 15, paddingVertical: 12 },
-  body: { minHeight: 140, paddingVertical: 12, fontSize: 16, lineHeight: 24 },
   signature: { borderTopWidth: StyleSheet.hairlineWidth, paddingVertical: 10, gap: 6 },
   quoteToggle: { minHeight: 32, justifyContent: 'center', alignSelf: 'flex-start' },
   thread: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 10, paddingHorizontal: 12 },
