@@ -208,73 +208,73 @@ func TestRunnerReuploadsTruncatedFile(t *testing.T) {
 	}
 }
 
-func TestRunnerReuploadsSameSizeRenamedReplacementEvenWithIdenticalMtime(t *testing.T) {
+// A torn stat or touch (mtime moves while size stays equal to the committed
+// offset) must ship nothing — both within a running watcher and after a restart —
+// and a subsequent append must ship only the new tail line.
+func TestRunnerTornStatAndTouchShipNothingThenAppendShipsTail(t *testing.T) {
 	root := t.TempDir()
-	transcript := filepath.Join(root, "replaced.jsonl")
-	origTime := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
-	os.WriteFile(transcript, []byte("{\"a\":1}\n"), 0o644)
-	os.Chtimes(transcript, origTime, origTime)
-
-	state, _ := OpenState(filepath.Join(t.TempDir(), "s.sqlite"), "z@x")
-	defer state.Close()
-	uploads := &fakeUploads{}
-	runner := newRunner(t, root, uploads, state)
-	runner.SkipUnchanged = true
-
-	if s, err := runner.Sync(); err != nil || s.LinesSelected != 1 {
-		t.Fatalf("first = %+v, %v", s, err)
+	transcript := filepath.Join(root, "torn.jsonl")
+	t1 := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	t2 := t1.Add(5 * time.Second)
+	t3 := t1.Add(10 * time.Second)
+	if err := os.WriteFile(transcript, []byte("{\"a\":1}\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-
-	// Atomically replace with a different file of the EXACT same size and mtime.
-	tmp := filepath.Join(root, "tmp.new")
-	os.WriteFile(tmp, []byte("{\"a\":2}\n"), 0o644)
-	os.Chtimes(tmp, origTime, origTime)
-	if err := os.Rename(tmp, transcript); err != nil {
+	if err := os.Chtimes(transcript, t1, t1); err != nil {
 		t.Fatal(err)
 	}
 
-	s, err := runner.Sync()
-	if err != nil || s.LinesSelected != 1 || len(uploads.batches) != 2 {
-		t.Fatalf("same-size renamed replacement must be uploaded: %+v, %v, batches=%d", s, err, len(uploads.batches))
-	}
-	if got := uploads.batches[1][0]["record"].(map[string]any)["line"].(map[string]any)["a"].(float64); got != 2 {
-		t.Fatalf("got line a=%v, want 2", got)
-	}
-}
-
-func TestRunnerReuploadsSameSizeInPlaceRewrite(t *testing.T) {
-	root := t.TempDir()
-	transcript := filepath.Join(root, "rewrite.jsonl")
-	t1 := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
-	t2 := t1.Add(5 * time.Second)
-	os.WriteFile(transcript, []byte("{\"a\":1}\n"), 0o644)
-	os.Chtimes(transcript, t1, t1)
-
-	state, _ := OpenState(filepath.Join(t.TempDir(), "s.sqlite"), "z@x")
-	defer state.Close()
-	uploads := &fakeUploads{}
-	runner := newRunner(t, root, uploads, state)
-	runner.SkipUnchanged = true
-
-	if s, err := runner.Sync(); err != nil || s.LinesSelected != 1 {
-		t.Fatalf("first = %+v, %v", s, err)
-	}
-
-	// Rewrite in place (same inode, same size, newer mtime).
-	f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_TRUNC, 0o644)
+	statePath := filepath.Join(t.TempDir(), "s.sqlite")
+	state1, err := OpenState(statePath, "z@x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.WriteString("{\"a\":7}\n")
-	f.Close()
-	os.Chtimes(transcript, t2, t2)
-
-	s, err := runner.Sync()
-	if err != nil || s.LinesSelected != 1 || len(uploads.batches) != 2 {
-		t.Fatalf("same-size in-place rewrite must be uploaded: %+v, %v, batches=%d", s, err, len(uploads.batches))
+	uploads := &fakeUploads{}
+	r1 := newRunner(t, root, uploads, state1)
+	r1.SkipUnchanged = true
+	if s, err := r1.Sync(); err != nil || s.LinesSelected != 1 || len(uploads.batches) != 1 {
+		t.Fatalf("initial sync = %+v, %v, batches=%d", s, err, len(uploads.batches))
 	}
-	if got := uploads.batches[1][0]["record"].(map[string]any)["line"].(map[string]any)["a"].(float64); got != 7 {
-		t.Fatalf("got line a=%v, want 7", got)
+
+	// Simulate torn stat / touch: mtime advances while size == uploaded_offset.
+	if err := os.Chtimes(transcript, t2, t2); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := r1.Sync(); err != nil || s.LinesSelected != 0 || len(uploads.batches) != 1 {
+		t.Fatalf("torn stat / touch must ship nothing in-process: %+v, %v, batches=%d", s, err, len(uploads.batches))
+	}
+	state1.Close()
+
+	// Touch again and simulate a restart: fresh State + Runner must still ship nothing.
+	if err := os.Chtimes(transcript, t3, t3); err != nil {
+		t.Fatal(err)
+	}
+	state2, err := OpenState(statePath, "z@x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state2.Close()
+	r2 := newRunner(t, root, uploads, state2)
+	r2.SkipUnchanged = true
+	if s, err := r2.Sync(); err != nil || s.LinesSelected != 0 || len(uploads.batches) != 1 {
+		t.Fatalf("touch across restart must ship nothing: %+v, %v, batches=%d", s, err, len(uploads.batches))
+	}
+
+	// Now append a second line: only the new tail line (seq=1) ships.
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("{\"a\":2}\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if s, err := r2.Sync(); err != nil || s.LinesSelected != 1 || len(uploads.batches) != 2 {
+		t.Fatalf("append after torn stat must ship only new line: %+v, %v, batches=%d", s, err, len(uploads.batches))
+	}
+	rec := uploads.batches[1][0]["record"].(map[string]any)
+	if rec["seq"].(float64) != 1 || rec["line"].(map[string]any)["a"].(float64) != 2 {
+		t.Fatalf("unexpected appended record: %v", rec)
 	}
 }
 
@@ -657,71 +657,6 @@ func TestRunnerSkipsOpenClawStoreWithWALUnderSettleWindow(t *testing.T) {
 	}
 }
 
-// A same-size rewrite inside the 2s settle window must still upload its new line,
-// both within the same Runner and across a restart + after settling.
-func TestRunnerReuploadsSameSizeRewriteInsideSettleWindow(t *testing.T) {
-	root := t.TempDir()
-	transcript := filepath.Join(root, "racy-rewrite.jsonl")
-	baseNow := time.Date(2026, 5, 21, 12, 0, 10, 0, time.UTC)
-	t1 := baseNow.Add(-500 * time.Millisecond)
-	t2 := baseNow.Add(-100 * time.Millisecond)
-	os.WriteFile(transcript, []byte("{\"a\":1}\n"), 0o644)
-	os.Chtimes(transcript, t1, t1)
-
-	statePath := filepath.Join(t.TempDir(), "s.sqlite")
-	state1, _ := OpenState(statePath, "z@x")
-	uploads := &fakeUploads{}
-	now := baseNow
-	r1 := newRunner(t, root, uploads, state1)
-	r1.SkipUnchanged = true
-	r1.MtimeSettleWindow = 2 * time.Second
-	r1.Now = func() time.Time { return now }
-
-	if s, err := r1.Sync(); err != nil || s.LinesSelected != 1 {
-		t.Fatalf("pass 1 = %+v, %v", s, err)
-	}
-
-	// Same-size in-place rewrite while STILL inside the 2s settle window.
-	f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.WriteString("{\"a\":2}\n")
-	f.Close()
-	os.Chtimes(transcript, t2, t2)
-
-	// 1) Same runner must upload {"a":2}.
-	s2, err := r1.Sync()
-	if err != nil || s2.LinesSelected != 1 || len(uploads.batches) != 2 {
-		t.Fatalf("same-size rewrite inside settle window must upload: %+v, %v, batches=%d", s2, err, len(uploads.batches))
-	}
-	if got := uploads.batches[1][0]["record"].(map[string]any)["line"].(map[string]any)["a"].(float64); got != 2 {
-		t.Fatalf("got a=%v, want 2", got)
-	}
-
-	// 2) Rewrite again to {"a":3} inside settle window, then simulate restart AFTER settling.
-	t3 := baseNow.Add(-50 * time.Millisecond)
-	f, _ = os.OpenFile(transcript, os.O_WRONLY|os.O_TRUNC, 0o644)
-	f.WriteString("{\"a\":3}\n")
-	f.Close()
-	os.Chtimes(transcript, t3, t3)
-	state1.Close()
-
-	state2, _ := OpenState(statePath, "z@x")
-	defer state2.Close()
-	r2 := newRunner(t, root, uploads, state2)
-	r2.SkipUnchanged = true
-	r2.MtimeSettleWindow = 2 * time.Second
-	r2.Now = func() time.Time { return baseNow.Add(10 * time.Second) }
-	s3, err := r2.Sync()
-	if err != nil || s3.LinesSelected != 1 || len(uploads.batches) != 3 {
-		t.Fatalf("same-size rewrite across restart must upload (never masked by backfill): %+v, %v, batches=%d", s3, err, len(uploads.batches))
-	}
-	if got := uploads.batches[2][0]["record"].(map[string]any)["line"].(map[string]any)["a"].(float64); got != 3 {
-		t.Fatalf("got a=%v, want 3", got)
-	}
-}
-
 // argonMetaCache must not cache a failed SQLite read.
 func TestArgonMetaCacheDoesNotCacheFailedSQLiteRead(t *testing.T) {
 	root := t.TempDir()
@@ -788,61 +723,87 @@ func TestRunnerStateLossReuploadsCleanly(t *testing.T) {
 	}
 }
 
-func TestRunnerUpgradesLegacyStateAndBackfillsSignatures(t *testing.T) {
-	root := t.TempDir()
-	transcript := filepath.Join(root, "legacy.jsonl")
-	oldTime := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
-	content := []byte("{\"a\":1}\n")
-	os.WriteFile(transcript, content, 0o644)
-	os.Chtimes(transcript, oldTime, oldTime)
+// OpenState must work cleanly with both a 4-column DB (e741abef) and a 6-column
+// DB carrying last_mtime_ns/last_inode (68297f3f), shipping nothing on upgrade
+// and committing subsequent appends without dropping user data.
+func TestOpenStateWorksWithBothLegacyAndExtraColumnSchemas(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		createSQL string
+		insertSQL string
+	}{
+		{
+			name: "4_col_e741abef",
+			createSQL: `CREATE TABLE file_state (
+				path TEXT PRIMARY KEY,
+				uploaded_offset INTEGER NOT NULL DEFAULT 0,
+				uploaded_lines INTEGER NOT NULL DEFAULT 0,
+				last_uploaded_at TEXT NOT NULL DEFAULT ''
+			)`,
+			insertSQL: `INSERT INTO file_state VALUES (?, ?, 1, '2026-05-20T12:00:00+00:00')`,
+		},
+		{
+			name: "6_col_68297f3f",
+			createSQL: `CREATE TABLE file_state (
+				path TEXT PRIMARY KEY,
+				uploaded_offset INTEGER NOT NULL DEFAULT 0,
+				uploaded_lines INTEGER NOT NULL DEFAULT 0,
+				last_uploaded_at TEXT NOT NULL DEFAULT '',
+				last_mtime_ns INTEGER NOT NULL DEFAULT 0,
+				last_inode INTEGER NOT NULL DEFAULT 0
+			)`,
+			insertSQL: `INSERT INTO file_state VALUES (?, ?, 1, '2026-05-20T12:00:00+00:00', 12345, 67890)`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			transcript := filepath.Join(root, "existing.jsonl")
+			content := []byte("{\"a\":1}\n")
+			if err := os.WriteFile(transcript, content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			statePath := filepath.Join(t.TempDir(), "state.sqlite")
+			rawDB, err := common.OpenSQLite(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rawDB.Exec(`
+				CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+				INSERT INTO metadata VALUES ('schema_version', '1'), ('account', 'z@x');
+			`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rawDB.Exec(tc.createSQL); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rawDB.Exec(tc.insertSQL, transcript, int64(len(content))); err != nil {
+				t.Fatal(err)
+			}
+			rawDB.Close()
 
-	// Build a pre-upgrade state DB without last_mtime_ns/last_inode.
-	statePath := filepath.Join(t.TempDir(), "legacy.sqlite")
-	rawDB, err := common.OpenSQLite(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rawDB.Exec(`
-		CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
-		INSERT INTO metadata VALUES ('schema_version', '1'), ('account', 'z@x');
-		CREATE TABLE file_state (
-			path TEXT PRIMARY KEY,
-			uploaded_offset INTEGER NOT NULL DEFAULT 0,
-			uploaded_lines INTEGER NOT NULL DEFAULT 0,
-			last_uploaded_at TEXT NOT NULL DEFAULT ''
-		);
-		INSERT INTO file_state VALUES (?, ?, 1, '2026-05-20T12:00:00+00:00');
-	`, transcript, int64(len(content))); err != nil {
-		t.Fatal(err)
-	}
-	rawDB.Close()
+			state, err := OpenState(statePath, "z@x")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer state.Close()
+			uploads := &fakeUploads{}
+			runner := newRunner(t, root, uploads, state)
+			runner.SkipUnchanged = true
+			if s, err := runner.Sync(); err != nil || s.LinesSelected != 0 || len(uploads.batches) != 0 {
+				t.Fatalf("must ship nothing on upgrade: %+v, %v, batches=%d", s, err, len(uploads.batches))
+			}
 
-	// First run after upgrade must NOT re-upload, and must backfill signature.
-	state1, err := OpenState(statePath, "z@x")
-	if err != nil {
-		t.Fatal(err)
-	}
-	uploads := &fakeUploads{}
-	r1 := newRunner(t, root, uploads, state1)
-	r1.SkipUnchanged = true
-	s1, err := r1.Sync()
-	if err != nil || s1.LinesSelected != 0 || len(uploads.batches) != 0 {
-		t.Fatalf("upgraded run must not re-upload already-shipped file: %+v, %v, batches=%d", s1, err, len(uploads.batches))
-	}
-	state1.Close()
-
-	// After a restart the backfilled signature detects a same-size rewrite, so
-	// hosts that upgrade are covered without waiting for each file to grow.
-	state2, _ := OpenState(statePath, "z@x")
-	defer state2.Close()
-	r2 := newRunner(t, root, uploads, state2)
-	r2.SkipUnchanged = true
-	if s2, err := r2.Sync(); err != nil || s2.LinesSelected != 0 {
-		t.Fatalf("a backfilled file must not be re-uploaded: %+v, %v", s2, err)
-	}
-	os.WriteFile(transcript, []byte("{\"a\":2}\n"), 0o644)
-	if s3, err := r2.Sync(); err != nil || s3.LinesSelected != 1 {
-		t.Fatalf("a same-size rewrite of a backfilled file must upload: %+v, %v", s3, err)
+			// Appending a new line must commit cleanly against either schema.
+			f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.WriteString("{\"a\":2}\n")
+			f.Close()
+			if s, err := runner.Sync(); err != nil || s.LinesSelected != 1 || len(uploads.batches) != 1 {
+				t.Fatalf("append after upgrade must upload 1 line: %+v, %v, batches=%d", s, err, len(uploads.batches))
+			}
+		})
 	}
 }
 

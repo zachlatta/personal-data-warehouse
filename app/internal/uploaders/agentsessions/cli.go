@@ -32,8 +32,8 @@ FLAGS
   --batch-size N           Maximum lines per uploaded batch (default 20000).
   --watch DURATION         Stay resident for DURATION (e.g. 300s), polling every
                            --interval while any transcript was modified within
-                           --idle-after; transcripts whose size, mtime and inode
-                           did not move are skipped. Once no transcript has been
+                           --idle-after; transcripts whose size and mtime did not
+                           move are skipped. Once no transcript has been
                            modified for --idle-after (checked from on-disk mtimes
                            so idle hosts back off from pass 1 after each restart),
                            the pause backs off up to --max-interval and resets to
@@ -187,7 +187,7 @@ const DefaultMaxWatchInterval = 30 * time.Second
 const DefaultIdleAfter = 10 * time.Minute
 
 // defaultMtimeSettleWindow guards the OpenClaw store against a write in the
-// same mtime tick as the read (transcript files use persisted mtime/inode).
+// same mtime tick as the read.
 const defaultMtimeSettleWindow = 2 * time.Second
 
 // runWatch is `--watch`: Sync until the window closes, staying at interval

@@ -97,15 +97,12 @@ for two rows because the `agent_session` roll-up's plan is costed at 1.6M and Po
   window and 10% of a core with nothing to upload (2026-11-24). A window ends after five
   minutes (`AGENT_SESSIONS_WATCH_WINDOW`) so the wrapper posts the heartbeat; a failed pass
   ends it early and non-zero;
-- a transcript whose size, mtime and inode did not move costs the one `stat` discovery makes,
+- a transcript whose size and mtime did not move costs the one `stat` discovery makes,
   and the OpenClaw store one of its database and WAL (a store modified in the last two seconds
   is read again, in case a write shared the read's mtime tick). Discovery skips the
   subdirectories that hold no transcripts and lists Argon's `brain` one level deep.
-  `file_state` keeps each transcript's offset, mtime and inode, and a restarted watcher loads
+  `file_state` keeps each transcript's offset and line count, and a restarted watcher loads
   it in one query;
-- **a moved mtime at the same size, or a new inode, re-ships the transcript from byte 0**, so a
-  same-size rewrite or an atomic replacement is not missed. A `touch` or a restore from backup
-  therefore re-ships what it touched; ingest dedupes by primary key;
 - the app NOTIFYs `pdw_agent_sessions_landing` when it stores a batch, and the resident
   `agent_sessions_landing_worker` in the Dagster container runs the asset's own
   `ingest_agent_sessions_inbox` (one advisory lock, so the worker and a sensor run never

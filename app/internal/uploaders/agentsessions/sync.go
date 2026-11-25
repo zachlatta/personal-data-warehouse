@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"os"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
@@ -58,9 +57,9 @@ type Runner struct {
 	BatchSize         int
 	BeforeUploadCheck func() string
 	// SkipUnchanged is the resident watcher's mode (`--watch`): a transcript
-	// whose size, mtime and inode are what they were when a previous pass left
-	// it fully shipped is passed over without a state lookup or a read, and
-	// idle passes log nothing.
+	// whose size and mtime are what they were when a previous pass left it
+	// fully shipped is passed over without a state lookup or a read, and idle
+	// passes log nothing.
 	SkipUnchanged bool
 	// MtimeSettleWindow guards the OpenClaw store against a write in the same
 	// mtime tick as the read: a source modified more recently than
@@ -77,22 +76,17 @@ type Runner struct {
 	pass    map[string]fileSignature
 	// progress caches file_state in memory after a single bulk LoadAll so a
 	// restarted watcher does not issue thousands of per-file SQLite SELECTs.
-	progress map[string]FileProgress
-	// backfill holds this pass's signatures for caught-up file_state rows that
-	// predate signature tracking.
-	backfill  map[string]fileSignature
+	progress  map[string]FileProgress
 	argonMeta argonMetaCache
 }
 
 // fileSignature is what a watcher compares between passes. An append moves
-// the size; an in-place rewrite moves modTime; an atomic rename replacement
-// moves inode; a SQLite write moves the database's or its WAL's mtime.
+// the size; a SQLite write moves the database's or its WAL's mtime.
 // latestModTime is always a real UnixNano timestamp (the max across all paths
 // in signatureOf) so settle checks never inspect a hashed/overflowed modTime.
 type fileSignature struct {
 	size          int64
 	modTime       int64
-	inode         uint64
 	latestModTime int64
 }
 
@@ -101,16 +95,8 @@ func signatureFromInfo(info fs.FileInfo) fileSignature {
 	return fileSignature{
 		size:          info.Size(),
 		modTime:       mt,
-		inode:         fileInode(info),
 		latestModTime: mt,
 	}
-}
-
-func fileInode(info fs.FileInfo) uint64 {
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		return st.Ino
-	}
-	return 0
 }
 
 // signatureOf combines a database and its sidecars into one signature.
@@ -132,7 +118,6 @@ func signatureOf(paths ...string) (fileSignature, bool) {
 		found = true
 		sig.size = sig.size*31 + s.size
 		sig.modTime = sig.modTime*31 + s.modTime
-		sig.inode = sig.inode*31 + s.inode
 	}
 	return sig, found
 }
@@ -179,37 +164,31 @@ func (r *Runner) caughtUp(key string, sig fileSignature) {
 	}
 }
 
-type pendingProgress struct {
-	offset int64
-	lineNo int64
-	sig    fileSignature
-}
-
 type pendingBatch struct {
 	batchSize int
 	records   []map[string]any
-	pending   map[string]pendingProgress // path -> last buffered line progress + pre-read sig
+	pending   map[string][2]int64 // path -> (offset, line_no) of its last buffered line
 	order     []string
 	batches   int
 }
 
 func newPendingBatch(size int) *pendingBatch {
-	return &pendingBatch{batchSize: size, pending: map[string]pendingProgress{}}
+	return &pendingBatch{batchSize: size, pending: map[string][2]int64{}}
 }
 
-func (b *pendingBatch) add(record map[string]any, path string, offset, lineNo int64, sig fileSignature) {
+func (b *pendingBatch) add(record map[string]any, path string, offset, lineNo int64) {
 	b.records = append(b.records, record)
 	if _, seen := b.pending[path]; !seen {
 		b.order = append(b.order, path)
 	}
-	b.pending[path] = pendingProgress{offset: offset, lineNo: lineNo, sig: sig}
+	b.pending[path] = [2]int64{offset, lineNo}
 }
 
 func (b *pendingBatch) full() bool { return len(b.records) >= b.batchSize }
 
 func (b *pendingBatch) reset() {
 	b.records = nil
-	b.pending = map[string]pendingProgress{}
+	b.pending = map[string][2]int64{}
 	b.order = nil
 	b.batches++
 }
@@ -242,7 +221,6 @@ func (r *Runner) Sync() (Summary, error) {
 		r.progress = loaded
 	}
 	r.pass = map[string]fileSignature{}
-	r.backfill = map[string]fileSignature{}
 	files := Discover(r.Dirs)
 	r.observeNewest(files)
 	if !r.SkipUnchanged {
@@ -289,17 +267,6 @@ func (r *Runner) Sync() (Summary, error) {
 	if err := r.flush(batch); err != nil {
 		return summary, err
 	}
-	if len(r.backfill) > 0 {
-		if err := r.State.BackfillSignatures(r.backfill); err != nil {
-			return summary, err
-		}
-		for path, sig := range r.backfill {
-			p := r.progress[path]
-			p.LastMtimeNs = sig.modTime
-			p.LastInode = sig.inode
-			r.progress[path] = p
-		}
-	}
 	summary.BatchesUploaded = batch.batches
 	for key, sig := range r.pass {
 		r.shipped[key] = sig
@@ -330,11 +297,8 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 		return fileResult{}, false, nil
 	}
 	size := sig.size
-	startOffset, startLine := r.startPosition(file.Path, sig)
+	startOffset, startLine := r.startPosition(file.Path, size)
 	if size <= startOffset {
-		if p, ok := r.progress[file.Path]; ok && p.LastMtimeNs == 0 {
-			r.backfill[file.Path] = sig
-		}
 		r.caughtUp(file.Path, sig)
 		return fileResult{}, true, nil
 	}
@@ -373,7 +337,7 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 			result.skipped++
 			continue
 		}
-		batch.add(r.envelope(file, seq, parsed), file.Path, offset, lineNo, sig)
+		batch.add(r.envelope(file, seq, parsed), file.Path, offset, lineNo)
 		result.selected++
 		if batch.full() {
 			if err := r.flush(batch); err != nil {
@@ -389,7 +353,7 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 	if result.selected == 0 && offset != startOffset {
 		// Consumed only skipped/blank lines; advance so we do not reprocess
 		// them next run. (Files with selected lines commit via flush.)
-		if err := r.commit(file.Path, offset, lineNo, sig); err != nil {
+		if err := r.commit(file.Path, offset, lineNo); err != nil {
 			return result, true, err
 		}
 	}
@@ -442,7 +406,7 @@ func (r *Runner) flush(batch *pendingBatch) error {
 	// lines whose records are in this just-uploaded batch.
 	for _, path := range batch.order {
 		progress := batch.pending[path]
-		if err := r.commit(path, progress.offset, progress.lineNo, progress.sig); err != nil {
+		if err := r.commit(path, progress[0], progress[1]); err != nil {
 			return err
 		}
 	}
@@ -451,42 +415,31 @@ func (r *Runner) flush(batch *pendingBatch) error {
 	return nil
 }
 
-// startPosition is where to resume a source. sig is the zero signature for an
-// OpenClaw store session, whose cursor is a seq rather than a byte offset.
-func (r *Runner) startPosition(path string, sig fileSignature) (offset, line int64) {
+// startPosition is where to resume a source. For an OpenClaw store session,
+// size is 0 and UploadedOffset is 0 so UploadedLines (the seq cursor) is returned.
+func (r *Runner) startPosition(path string, size int64) (offset, line int64) {
 	if r.Mode != "incremental" || r.State == nil {
 		return 0, 0
 	}
 	progress := r.progress[path]
-	if progress.UploadedOffset > sig.size {
+	if progress.UploadedOffset > size {
 		// File was truncated/rotated; re-read from the beginning.
-		return 0, 0
-	}
-	if progress.LastInode != 0 && sig.inode != 0 && progress.LastInode != sig.inode {
-		// File was atomically replaced (rename/recreate); re-read from the beginning.
-		return 0, 0
-	}
-	if progress.UploadedOffset == sig.size && sig.size > 0 && progress.LastMtimeNs != 0 && progress.LastMtimeNs != sig.modTime {
-		// Same-size in-place rewrite; re-read from the beginning.
 		return 0, 0
 	}
 	return progress.UploadedOffset, progress.UploadedLines
 }
 
-// commit records what was shipped and the signature taken before it was read.
-func (r *Runner) commit(path string, offset, lineNo int64, sig fileSignature) error {
+func (r *Runner) commit(path string, offset, lineNo int64) error {
 	if r.State == nil {
 		return nil
 	}
-	if err := r.State.RecordProgress(path, offset, lineNo, sig, r.Now()); err != nil {
+	if err := r.State.RecordProgress(path, offset, lineNo, r.Now()); err != nil {
 		return err
 	}
 	if r.progress != nil {
 		r.progress[path] = FileProgress{
 			UploadedOffset: offset,
 			UploadedLines:  lineNo,
-			LastMtimeNs:    sig.modTime,
-			LastInode:      sig.inode,
 		}
 	}
 	return nil

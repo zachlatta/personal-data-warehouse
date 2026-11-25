@@ -81,10 +81,10 @@ func TestStateRoundTripsAndResetsOnAccountChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := state.RecordProgress("/a.jsonl", 42, 3, fileSignature{modTime: 5, inode: 6}, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+	if err := state.RecordProgress("/a.jsonl", 42, 3, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
-	want := FileProgress{UploadedOffset: 42, UploadedLines: 3, LastMtimeNs: 5, LastInode: 6}
+	want := FileProgress{UploadedOffset: 42, UploadedLines: 3}
 	if progress, _ := state.LoadAll(); progress["/a.jsonl"] != want {
 		t.Fatalf("progress = %+v", progress)
 	}
