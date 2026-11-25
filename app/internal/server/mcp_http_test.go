@@ -164,22 +164,36 @@ func TestMCPServesToolsListForUnknownSessionID(t *testing.T) {
 	}
 }
 
-func TestMCPInitializeContentType(t *testing.T) {
+// TestMCPInitializeAcceptsJSONMediaTypeParameters pins the headers a client may
+// put on its first MCP request. Gemini signed in over OAuth and then had its
+// initialize refused with 415 because its Content-Type carried a charset
+// parameter, which the MCP SDK compared literally until v1.6.0. Media types are
+// case-insensitive and may carry parameters (RFC 9110 §8.3.1), so every
+// spelling of application/json must reach the handler, while a non-JSON or
+// unparseable Content-Type, a missing bearer and a foreign Origin still fail.
+func TestMCPInitializeAcceptsJSONMediaTypeParameters(t *testing.T) {
 	srv := newMCPTestServer(t)
 	token := oauthAccessToken(t, srv)
 	const body = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`
+	const accept = "application/json, text/event-stream"
 
 	for _, tc := range []struct {
 		name        string
 		contentType string
+		accept      string
 		origin      string
 		bearer      string
 		want        int
 	}{
 		{name: "JSON", contentType: "application/json", bearer: token, want: http.StatusOK},
 		{name: "JSON with charset", contentType: "application/json; charset=UTF-8", bearer: token, want: http.StatusOK},
+		{name: "JSON with spacing and casing", contentType: "Application/JSON ;charset=utf-8", bearer: token, want: http.StatusOK},
+		{name: "Accept with parameters and q-values", contentType: "application/json", accept: "application/json;q=0.9, text/event-stream;q=0.8", bearer: token, want: http.StatusOK},
+		{name: "Accept wildcard", contentType: "application/json", accept: "*/*", bearer: token, want: http.StatusOK},
+		{name: "Accept without event stream", contentType: "application/json", accept: "application/json", bearer: token, want: http.StatusBadRequest},
 		{name: "missing content type", bearer: token, want: http.StatusUnsupportedMediaType},
 		{name: "plain text", contentType: "text/plain", bearer: token, want: http.StatusUnsupportedMediaType},
+		{name: "JSON suffix type", contentType: "application/json-seq", bearer: token, want: http.StatusUnsupportedMediaType},
 		{name: "malformed parameters", contentType: "application/json; charset", bearer: token, want: http.StatusUnsupportedMediaType},
 		{name: "missing bearer", contentType: "application/json; charset=UTF-8", want: http.StatusUnauthorized},
 		{name: "cross-origin", contentType: "application/json; charset=UTF-8", origin: "https://other.example", bearer: token, want: http.StatusForbidden},
@@ -189,7 +203,10 @@ func TestMCPInitializeContentType(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			req.Header.Set("Accept", "application/json, text/event-stream")
+			req.Header.Set("Accept", accept)
+			if tc.accept != "" {
+				req.Header.Set("Accept", tc.accept)
+			}
 			if tc.contentType != "" {
 				req.Header.Set("Content-Type", tc.contentType)
 			}
@@ -211,15 +228,16 @@ func TestMCPInitializeContentType(t *testing.T) {
 			if resp.StatusCode != tc.want {
 				t.Fatalf("initialize status = %d, want %d: %s", resp.StatusCode, tc.want, raw)
 			}
-			if tc.want == http.StatusOK {
-				var rpc struct {
-					Result struct {
-						ProtocolVersion string `json:"protocolVersion"`
-					} `json:"result"`
-				}
-				if err := json.Unmarshal(raw, &rpc); err != nil || rpc.Result.ProtocolVersion != "2025-11-25" {
-					t.Fatalf("invalid initialize response: %s (decode error: %v)", raw, err)
-				}
+			if tc.want != http.StatusOK {
+				return
+			}
+			var rpc struct {
+				Result struct {
+					ProtocolVersion string `json:"protocolVersion"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(raw, &rpc); err != nil || rpc.Result.ProtocolVersion != "2025-11-25" {
+				t.Fatalf("invalid initialize response: %s (decode error: %v)", raw, err)
 			}
 		})
 	}

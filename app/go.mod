@@ -5,10 +5,10 @@ go 1.26.11
 require (
 	codeberg.org/readeck/go-readability/v2 v2.1.3
 	github.com/SherClockHolmes/webpush-go v1.4.0
-	github.com/google/jsonschema-go v0.4.2
+	github.com/google/jsonschema-go v0.4.3
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/minio/minio-go/v7 v7.0.83
-	github.com/modelcontextprotocol/go-sdk v1.5.0
+	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/tetratelabs/wazero v1.12.0
 	golang.org/x/net v0.62.0
 	golang.org/x/oauth2 v0.35.0

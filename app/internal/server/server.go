@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"mime"
 	"net/http"
 	"os"
 	"strings"
@@ -641,7 +640,10 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 		Stateless:    true,
 		Logger:       slog.Default().With("component", "mcp_streamable"),
 	})
-	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(normalizeMCPJSONContentType(mcpHandler))
+	// The SDK stopped checking Origin by default in v1.6.0, so a browser page on
+	// another origin is refused here instead (CSRF on a bearer-authenticated
+	// endpoint the OAuth connectors reach from their own servers, never a page).
+	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(http.NewCrossOriginProtection().Handler(mcpHandler))
 	mux.Handle("/mcp", withSearchSurface("mcp", mcpproxy.TraceMiddleware(protected)))
 
 	apiHandler := api.NewDynamicHandler(func(ctx context.Context) (*tool.Registry, error) {
@@ -864,24 +866,6 @@ func (w *statusResponseWriter) Flush() {
 	if ok {
 		flusher.Flush()
 	}
-}
-
-// The MCP SDK compares Content-Type literally. Give it the canonical form
-// when the request declares a valid JSON media type with parameters or casing.
-func normalizeMCPJSONContentType(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			contentTypes := r.Header.Values("Content-Type")
-			if len(contentTypes) == 1 && contentTypes[0] != "application/json" {
-				mediaType, _, err := mime.ParseMediaType(contentTypes[0])
-				if err == nil && mediaType == "application/json" {
-					r = r.Clone(r.Context())
-					r.Header.Set("Content-Type", "application/json")
-				}
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
