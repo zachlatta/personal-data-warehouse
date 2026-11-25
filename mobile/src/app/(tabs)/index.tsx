@@ -14,6 +14,8 @@ import { markEventOpen } from '@/lib/event-paint';
 import { formatWhen, humanSource, truncate } from '@/lib/format';
 import { useConfig } from '@/lib/session';
 import { prefetchTimelineItem, rememberTimelineItems } from '@/lib/timeline-cache';
+import { mergeFirstPage } from '@/lib/timeline-refresh';
+import { useLiveRefresh } from '@/hooks/use-live-refresh';
 import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 import { tick } from '@/lib/haptics';
 
@@ -29,14 +31,18 @@ type State = {
   hasMore: boolean;
   // A fetch is in flight for this generation; bumping it discards stale pages.
   generation: number;
-  fetching: 'none' | 'reset' | 'more';
+  // reset: start the list over (a pull, a tier change, a retry), spinner
+  // shown. refresh: the lifecycle's silent re-read of the newest page, laid
+  // over the rows already loaded (mergeFirstPage). more: the next page.
+  fetching: 'none' | 'reset' | 'refresh' | 'more';
   error: string | null;
 };
 
 type Action =
   | { type: 'reset'; tiers?: Priority[] }
+  | { type: 'refresh' }
   | { type: 'more' }
-  | { type: 'page'; generation: number; reset: boolean; items: TimelineItem[]; cursor?: string; hasMore: boolean }
+  | { type: 'page'; generation: number; kind: 'reset' | 'refresh' | 'more'; items: TimelineItem[]; cursor?: string; hasMore: boolean }
   | { type: 'error'; generation: number; message: string };
 
 // The last first page per tier set, for this process: switching tiers or
@@ -52,15 +58,28 @@ function reducer(state: State, action: Action): State {
       const items = firstPages.get(tierKey(tiers)) ?? (tierKey(tiers) === tierKey(state.tiers) ? state.items : []);
       return { ...state, tiers, items, cursor: undefined, hasMore: true, generation: state.generation + 1, fetching: 'reset', error: null };
     }
+    case 'refresh':
+      // A read already in flight is at least as new; let it finish.
+      if (state.fetching !== 'none') return state;
+      return { ...state, generation: state.generation + 1, fetching: 'refresh' };
     case 'more':
       if (state.fetching !== 'none' || !state.hasMore || !state.cursor) return state;
       return { ...state, generation: state.generation + 1, fetching: 'more', error: null };
-    case 'page':
+    case 'page': {
       if (action.generation !== state.generation) return state;
-      if (action.reset) firstPages.set(tierKey(state.tiers), action.items);
-      return { ...state, items: action.reset ? action.items : [...state.items, ...action.items], cursor: action.cursor, hasMore: action.hasMore, fetching: 'none' };
+      const page = { items: action.items, cursor: action.cursor, hasMore: action.hasMore };
+      if (action.kind !== 'more') firstPages.set(tierKey(state.tiers), action.items);
+      const next =
+        action.kind === 'reset' ? page
+        : action.kind === 'refresh' ? mergeFirstPage({ items: state.items, cursor: state.cursor, hasMore: state.hasMore }, page)
+        : { ...page, items: [...state.items, ...action.items] };
+      return { ...state, ...next, fetching: 'none', error: null };
+    }
     case 'error':
       if (action.generation !== state.generation) return state;
+      // A silent re-read that fails keeps the rows on screen without a
+      // banner; the next resume or minute tries again.
+      if (state.fetching === 'refresh' && state.items.length > 0) return { ...state, fetching: 'none' };
       return { ...state, fetching: 'none', error: action.message };
   }
 }
@@ -71,6 +90,11 @@ export default function TimelineScreen() {
   const router = useRouter();
   const [state, dispatch] = useReducer(reducer, { tiers: DEFAULT_TIERS, items: firstPages.get(tierKey(DEFAULT_TIERS)) ?? [], hasMore: true, generation: 1, fetching: 'reset', error: null });
   const { tiers, items, cursor, generation, fetching, error } = state;
+
+  // Opening the app, coming back to it, or returning to this tab shows what
+  // is new without a pull; before 2026-11-25 the list read only on mount, so
+  // a resumed Android app showed the rows from whenever it was first opened.
+  const live = useLiveRefresh(() => dispatch({ type: 'refresh' }));
 
   // Mount to the first frame with rows, once per mount (the feed's
   // screen_paint): cached says the rows came from this process's memory
@@ -104,14 +128,16 @@ export default function TimelineScreen() {
   // (reset vs. next page); this effect only carries it out.
   useEffect(() => {
     if (fetching === 'none') return;
-    const reset = fetching === 'reset';
+    const kind = fetching;
+    const reset = kind !== 'more';
+    if (reset) live.loaded();
     let cancelled = false;
     // A reset starts at now: the timeline is "what happened", and calendar
     // holds events years out that would otherwise open the list.
     listTimeline(config, { priorities: tiers, before: reset ? undefined : cursor, jump: reset ? new Date().toISOString() : undefined, limit: PAGE })
       .then((page) => {
         rememberTimelineItems(page.items);
-        if (!cancelled) dispatch({ type: 'page', generation, reset, items: page.items, cursor: page.next_cursor, hasMore: page.has_more });
+        if (!cancelled) dispatch({ type: 'page', generation, kind, items: page.items, cursor: page.next_cursor, hasMore: page.has_more });
       })
       .catch((e) => {
         if (!cancelled) dispatch({ type: 'error', generation, message: e instanceof Error ? e.message : String(e) });
@@ -162,6 +188,10 @@ export default function TimelineScreen() {
             />
           );
         }}
+        // A silent refresh puts new rows above the ones being read: hold the
+        // reader's place, unless they are at the top, where the new rows
+        // should come into view.
+        maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 40 }}
         onEndReachedThreshold={0.6}
         onEndReached={() => dispatch({ type: 'more' })}
         refreshControl={<RefreshControl refreshing={fetching === 'reset' && items.length > 0} onRefresh={() => dispatch({ type: 'reset' })} />}

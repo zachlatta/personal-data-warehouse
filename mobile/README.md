@@ -10,7 +10,10 @@ The Review tab preserves unsaved email, Slack, and text edits when navigating
 within the app session. Use Save without sending before closing the app to keep
 an edit on the server; unsaved message text is never written to a local file.
 Feed refreshes do not wait for analytics uploads, and background refreshes stage
-new cards without moving the current reading position.
+new cards without moving the current reading position. The Timeline and Review
+tabs re-read themselves when the app opens or comes back to the foreground, when
+the tab is shown, and once a minute while on screen, so nothing needs a pull to
+show what is new (`src/lib/live-refresh.ts`).
 
 The app talks to the same Go app the `pdw` CLI does and authenticates the same
 way — a static bearer `"<client_name>:<PDW_SECRET_TOKEN>"` — so signing in is

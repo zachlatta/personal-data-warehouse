@@ -1,4 +1,4 @@
-import { useFocusEffect, useRouter } from 'expo-router';
+import { useRouter } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import { Pressable, RefreshControl, SectionList, StyleSheet } from 'react-native';
 
@@ -9,10 +9,11 @@ import { PolicySwitches } from '@/components/policy-switches';
 import { STATUS_COLORS } from '@/components/status-pill';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { Spacing } from '@/constants/theme';
+import { useLiveRefresh } from '@/hooks/use-live-refresh';
 import { useTheme } from '@/hooks/use-theme';
 import { getMutationRequest, listMutationRequests, type MutationRequest } from '@/lib/api';
 import type { AppConfig } from '@/lib/config';
-import { peekMutationRequests, rememberMutationRequests } from '@/lib/mutation-cache';
+import { peekMutationRequests, rememberMutationRequests, subscribeMutationRequests } from '@/lib/mutation-cache';
 import { prefetchMutationRequest, prefetchPendingRequests } from '@/lib/review-prefetch';
 import { formatWhen } from '@/lib/format';
 import { policyBadge } from '@/lib/mutation-review';
@@ -34,48 +35,62 @@ export default function MutationsScreen() {
   const config = useConfig();
   const theme = useTheme();
   const router = useRouter();
-  // The last list paints at once; the focus effect below refreshes it.
+  // The last list paints at once; useLiveRefresh below re-reads it.
   const [requests, setRequests] = useState<MutationRequest[]>(() => peekMutationRequests() ?? []);
+  // Whether any list has been read yet, so a cold start does not claim
+  // "All caught up" before the first read lands.
+  const [known, setKnown] = useState(() => peekMutationRequests() !== null);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    setRefreshing(true);
-    setError(null);
-    try {
-      const list = rememberMutationRequests(await listMutationRequests(config));
-      setRequests(list);
-      prefetchPendingRequests((one) => getMutationRequest(config, one), list);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRefreshing(false);
-    }
-  }, [config]);
+  // silent: the lifecycle's re-read (focus, resume, once a minute) keeps the
+  // rows on screen with no spinner, and a failure leaves them without a
+  // banner when there are rows to show; a pull or a retry tap is not silent.
+  const load = useCallback(
+    async (silent = false) => {
+      if (!silent) setRefreshing(true);
+      try {
+        const list = rememberMutationRequests(await listMutationRequests(config));
+        setRequests(list);
+        setKnown(true);
+        setError(null);
+        prefetchPendingRequests((one) => getMutationRequest(config, one), list);
+      } catch (e) {
+        if (!silent || peekMutationRequests() === null) setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!silent) setRefreshing(false);
+      }
+    },
+    [config],
+  );
 
-  // Coming back from a review, the cache already knows what was decided:
-  // paint that first, so a request just approved is not still listed under
-  // "Needs review" while the refresh is in flight.
-  useFocusEffect(
-    useCallback(() => {
+  // Opening the app, coming back to it, or returning to this tab shows what
+  // is new without a pull. Before 2026-11-25 this read only on tab focus,
+  // which an Android app resumed from the background never fires.
+  const live = useLiveRefresh(() => void load(true));
+  const pull = useCallback(() => {
+    live.loaded();
+    void load();
+  }, [live, load]);
+
+  // The list repaints whenever the cache moves: a review decided (so a
+  // request just approved is not still under "Needs review" when this tab
+  // comes back), an alert received while open, or the badge's pending read.
+  // A decision held for undo is not "needs review" any more, though the
+  // server has not heard it yet; when it is sent (or undone) it repaints too.
+  const decided = useDecidedRequestIds();
+  useEffect(() => {
+    const repaint = () => {
       const cached = peekMutationRequests();
       if (cached) setRequests(cached.slice());
-      void load();
-    }, [load]),
-  );
-
-  // A decision being held for undo is not "needs review" any more, though the
-  // server has not heard it yet; when it is sent (or undone) the cache moves
-  // and the list repaints from it.
-  const decided = useDecidedRequestIds();
-  useEffect(
-    () =>
-      decisions.subscribe(() => {
-        const cached = peekMutationRequests();
-        if (cached) setRequests(cached.slice());
-      }),
-    [],
-  );
+    };
+    const unsubscribeCache = subscribeMutationRequests(repaint);
+    const unsubscribeDecisions = decisions.subscribe(repaint);
+    return () => {
+      unsubscribeCache();
+      unsubscribeDecisions();
+    };
+  }, []);
   const pending = requests.filter((r) => r.status === 'pending_review' && !decided.includes(r.id));
   const past = requests.filter((r) => r.status !== 'pending_review');
   const sections = [
@@ -86,7 +101,7 @@ export default function MutationsScreen() {
   return (
     <ThemedView style={styles.container}>
       {error ? (
-        <Pressable onPress={load} style={styles.errorBox}>
+        <Pressable onPress={pull} style={styles.errorBox}>
           <ThemedText style={styles.errorText}>{error} — tap to retry</ThemedText>
         </Pressable>
       ) : null}
@@ -95,7 +110,7 @@ export default function MutationsScreen() {
         sections={sections}
         ListFooterComponent={<PolicySwitches config={config} />}
         keyExtractor={(item) => item.id}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} />}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={pull} />}
         renderSectionHeader={({ section }) => (
           <ThemedView style={styles.sectionHeader}>
             <ThemedText type="smallBold" themeColor="textSecondary">
@@ -104,7 +119,7 @@ export default function MutationsScreen() {
           </ThemedView>
         )}
         renderSectionFooter={({ section }) =>
-          section.data.length === 0 && !refreshing && !error ? (
+          section.data.length === 0 && known && !refreshing && !error ? (
             <ThemedText type="small" themeColor="textSecondary" style={styles.empty}>
               {section.empty}
             </ThemedText>

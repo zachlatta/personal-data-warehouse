@@ -6,8 +6,19 @@ contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md
 ## Phone app (Android and iOS) and push notifications
 
 `mobile/` is an Expo app over the app's own HTTP API — the timeline, the mutation
-review queue, and push notifications; see `mobile/README.md`. Three server pieces
-back it, all behind the static bearer the CLI uses:
+review queue, and push notifications; see `mobile/README.md`. **The Timeline and Review
+lists keep themselves current** (since 2026-11-25): one `LiveRefresh` controller
+(`mobile/src/lib/live-refresh.ts`, hook `mobile/src/hooks/use-live-refresh.ts`) re-reads a
+list on tab focus, on every return to the foreground while it is focused, and every 60 s
+while both hold, with reads inside 10 s collapsed into one. Before that the Timeline read
+only on mount and Review only on tab focus, and an Android app resumed from the background
+is the same mounted, focused screen, so both showed old rows until a pull. The re-read is
+silent (no spinner; a failure keeps the rows), and the Timeline lays its newest page over the
+rows already loaded (`mergeFirstPage`, `mobile/src/lib/timeline-refresh.ts`) so a reader
+scrolled down keeps their place. A push drawn by the Android messaging service never reaches
+JS, so the minute tick, not the alert, is what brings a request that arrived while the app
+was open onto the list. Three server pieces back the app, all behind the static bearer the
+CLI uses:
 
 - `GET|POST /api/mutations/requests…` (`app/internal/mutations/api.go`) is THE review
   surface. Every `POST` there decides or edits a request and needs a reviewer principal:
