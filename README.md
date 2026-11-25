@@ -1543,9 +1543,23 @@ container; the agent container does not receive the Docker socket, Dagster env, 
 Google tokens, Slack tokens, or API keys.
 
 The agent resource and auth/bootstrap command build the agent image on demand. They derive a tag
-like `personal-data-warehouse-agent:<hash>` from the agent Dockerfile and entrypoint, check whether
-that image already exists locally, and build it only when missing. Do not set `AGENT_DOCKER_IMAGE`;
-the hash-derived tag is the only supported image path.
+like `personal-data-warehouse-agent:<hash>` from everything the build bakes into the image, check
+whether that image already exists locally, and build it only when missing. Do not set
+`AGENT_DOCKER_IMAGE`; the hash-derived tag is the only supported image path.
+
+The hash covers the agent Dockerfile, its entrypoint, `.dockerignore`, the build flags,
+`app/go.mod`/`go.sum` (and a `go.work` or `vendor/` if one appears), and every non-test file of each package the `pdw` CLI imports, with
+their `go:embed` files (`pdw_cli_source_files` walks the imports in Python, since the Dagster
+container has no Go; `tests/test_agent_image.py` checks it against `go list -deps`). A
+server-only or test-only Go edit keeps the tag and reuses the image. Callers that need a
+missing tag (pytest workers, overlapping runs, Dagster) take an `flock` on
+`$AGENT_IMAGE_LOCK_DIR` (default the temp dir) for that tag, re-check, and only one builds;
+the lock dies with its holder, so a failed or killed build leaves nothing behind and the next
+caller retries. In the Dockerfile, std and the CLI's third-party packages compile in a layer
+keyed on their package list, so a CLI edit recompiles only the module's own packages (Go step
+25.8 s → 5.1 s), and the Debian/npm layer is independent of both. Keep the Dockerfile free of
+BuildKit-only syntax: production builds it with the Dagster container's Docker 20.10 CLI,
+which has no buildx and uses the legacy builder.
 
 For Coolify, add two persistent Docker volumes and mount them into the Dagster app:
 

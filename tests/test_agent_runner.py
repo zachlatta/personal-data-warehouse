@@ -279,9 +279,10 @@ def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path
     result = ContainerAgentRunner(config, runner=fake_run).run(request)
 
     assert result.status == "completed"
-    assert calls[0] == ["docker", "image", "inspect", image]
-    assert calls[1][:2] == ["docker", "build"]
-    assert calls[1][calls[1].index("-t") + 1] == image
+    # Inspect, inspect again under the build lock, then build.
+    assert calls[:2] == [["docker", "image", "inspect", image]] * 2
+    assert calls[2][:2] == ["docker", "build"]
+    assert calls[2][calls[2].index("-t") + 1] == image
     agent_run_index = next(index for index, call in enumerate(calls) if call[:2] == ["docker", "run"] and image in call)
     build_index = next(index for index, call in enumerate(calls) if call[:2] == ["docker", "build"])
     assert build_index < agent_run_index
@@ -917,12 +918,13 @@ def test_ensure_agent_image_builds_when_image_is_missing(tmp_path) -> None:
         dockerfile_path=dockerfile,
         entrypoint_path=entrypoint,
         context_dir=context_dir,
+        lock_dir=tmp_path / "locks",
         runner=fake_run,
     )
 
     assert image.startswith("personal-data-warehouse-agent:")
-    assert calls[0][0] == ["docker", "image", "inspect", image]
-    assert calls[1][0] == ["docker", "build", "-f", str(dockerfile), "-t", image, str(context_dir)]
+    assert [call[0] for call in calls[:2]] == [["docker", "image", "inspect", image]] * 2
+    assert calls[2][0] == ["docker", "build", "-f", str(dockerfile), "-t", image, str(context_dir)]
 
 
 def test_agent_entrypoint_skips_codex_git_repo_check() -> None:

@@ -16,6 +16,7 @@ import re
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -73,8 +74,11 @@ DEFAULT_AGENT_IMAGE_REPOSITORY = "personal-data-warehouse-agent"
 DEFAULT_AGENT_DOCKERFILE_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent.Dockerfile"
 DEFAULT_AGENT_ENTRYPOINT_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent-entrypoint.sh"
 DEFAULT_AGENT_BUILD_CONTEXT_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_AGENT_DOCKERIGNORE_PATH = Path(__file__).resolve().parents[2] / ".dockerignore"
 # The image compiles the pdw CLI from this tree, so its sources are image inputs.
 DEFAULT_AGENT_CLI_SOURCE_DIR = Path(__file__).resolve().parents[2] / "app"
+# Extra `docker build` flags (build args, platform). Part of the image tag.
+AGENT_IMAGE_BUILD_FLAGS: tuple[str, ...] = ()
 DEFAULT_AGENT_TOOL_PROXY_BIND_HOST = "0.0.0.0"
 DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST = "host.docker.internal"
 DEFAULT_AGENT_MAX_PROMPT_CHARS = 900_000
@@ -1859,35 +1863,134 @@ def default_agent_docker_image(
     dockerfile_path: Path = DEFAULT_AGENT_DOCKERFILE_PATH,
     entrypoint_path: Path = DEFAULT_AGENT_ENTRYPOINT_PATH,
     cli_source_dir: Path = DEFAULT_AGENT_CLI_SOURCE_DIR,
+    dockerignore_path: Path = DEFAULT_AGENT_DOCKERIGNORE_PATH,
 ) -> str:
+    """The image tag, a hash of everything the build bakes into the image.
+
+    The tag is the build cache key (`ensure_agent_image` builds only when no
+    image carries it), so it covers the Dockerfile, the entrypoint, the
+    `.dockerignore`, the build flags, go.mod/go.sum and the files of every
+    package the `pdw` CLI imports, with their go:embed files. Nothing else:
+    hashing all of app/ rebuilt a 2.5 GB image on every server-only edit.
+    """
+
     digest = hashlib.sha256()
-    for path in (dockerfile_path, entrypoint_path, *pdw_cli_source_files(cli_source_dir)):
-        digest.update(str(path.name).encode("utf-8"))
+    digest.update(json.dumps(AGENT_IMAGE_BUILD_FLAGS).encode("utf-8"))
+    digest.update(b"\0")
+    inputs = [("docker/agent.Dockerfile", dockerfile_path), ("docker/agent-entrypoint.sh", entrypoint_path)]
+    if dockerignore_path.is_file():
+        inputs.append((".dockerignore", dockerignore_path))
+    inputs.extend(
+        (f"app/{path.relative_to(cli_source_dir).as_posix()}", path) for path in pdw_cli_source_files(cli_source_dir)
+    )
+    for name, path in inputs:
+        digest.update(name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return f"{repository}:{digest.hexdigest()[:6]}"
 
 
-def pdw_cli_source_files(cli_source_dir: Path) -> list[Path]:
-    """The Go sources compiled into the image's `pdw`, in a stable order.
+_GO_IMPORT_BLOCK_RE = re.compile(r"^import\s*\((.*?)^\)", re.MULTILINE | re.DOTALL)
+_GO_IMPORT_LINE_RE = re.compile(r'^import\s+(?:[\w.]+\s+)?"([^"]+)"', re.MULTILINE)
+_GO_IMPORT_SPEC_RE = re.compile(r'^\s*(?:[\w.]+\s+)?"([^"]+)"', re.MULTILINE)
+_GO_EMBED_RE = re.compile(r"^\s*//go:embed\s+(.+)$", re.MULTILINE)
+_GO_MODULE_RE = re.compile(r"^module\s+(\S+)", re.MULTILINE)
 
-    Test files are excluded: they never reach the binary, so letting them move
-    the image tag would rebuild the image on every test edit.
+
+def pdw_cli_source_files(cli_source_dir: Path, *, main_package: str = "cmd/pdw-cli") -> list[Path]:
+    """The files compiled or embedded into the image's `pdw`, in a stable order.
+
+    Walks the CLI's imports within the module from the main package, without
+    Go (the Dagster container that builds the image in production has none).
+    Every non-test file directly in a reached package directory counts (Go,
+    assembly, syso alike), plus whatever its go:embed patterns match. Build
+    constraints are ignored, so the walk can only over-reach. Test files and
+    packages the CLI never imports (the server) stay out: they never reach the
+    binary. `tests/test_agent_image.py` checks this against `go list -deps`.
     """
 
-    if not cli_source_dir.is_dir():
+    go_mod = cli_source_dir / "go.mod"
+    if not go_mod.is_file():
         return []
-    sources = [
-        path
-        for path in cli_source_dir.rglob("*.go")
-        if path.is_file() and not path.name.endswith("_test.go")
-    ]
-    for name in ("go.mod", "go.sum"):
-        manifest = cli_source_dir / name
-        if manifest.is_file():
-            sources.append(manifest)
+    module_match = _GO_MODULE_RE.search(go_mod.read_text(encoding="utf-8"))
+    if module_match is None:
+        raise RuntimeError(f"{go_mod} declares no module path")
+    module = module_match.group(1)
+    sources: set[Path] = {go_mod}
+    for name in ("go.sum", "go.work", "go.work.sum"):
+        if (cli_source_dir / name).is_file():
+            sources.add(cli_source_dir / name)
+    vendor = cli_source_dir / "vendor"
+    if vendor.is_dir():
+        sources.update(path for path in vendor.rglob("*") if path.is_file())
+
+    pending = [cli_source_dir / main_package]
+    seen: set[Path] = set()
+    while pending:
+        package_dir = pending.pop()
+        if package_dir in seen or not package_dir.is_dir():
+            continue
+        seen.add(package_dir)
+        for path in package_dir.iterdir():
+            if not path.is_file() or path.name.endswith("_test.go"):
+                continue
+            sources.add(path)
+            if path.suffix != ".go":
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for imported in _go_imports(text):
+                if imported == module or imported.startswith(module + "/"):
+                    pending.append(cli_source_dir / imported[len(module) :].lstrip("/"))
+            for line in _GO_EMBED_RE.findall(text):
+                sources.update(_go_embed_matches(package_dir, line))
     return sorted(sources)
+
+
+def _go_imports(text: str) -> list[str]:
+    imports = _GO_IMPORT_LINE_RE.findall(text)
+    for block in _GO_IMPORT_BLOCK_RE.findall(text):
+        imports.extend(_GO_IMPORT_SPEC_RE.findall(block))
+    return imports
+
+
+def _go_embed_matches(package_dir: Path, directive: str) -> set[Path]:
+    matches: set[Path] = set()
+    for raw in re.findall(r'"[^"]*"|`[^`]*`|\S+', directive):
+        pattern = raw.strip('"`').removeprefix("all:")
+        for match in package_dir.glob(pattern):
+            if match.is_file():
+                matches.add(match)
+            elif match.is_dir():
+                matches.update(path for path in match.rglob("*") if path.is_file())
+    return matches
+
+
+def agent_image_lock_path(image: str, *, lock_dir: Path | None = None) -> Path:
+    directory = lock_dir or Path(os.getenv("AGENT_IMAGE_LOCK_DIR") or tempfile.gettempdir())
+    return directory / f"{docker_safe_name(image.replace(':', '-'))}.build.lock"
+
+
+@contextmanager
+def _agent_image_build_lock(image: str, *, lock_dir: Path | None):
+    """Serialize builds of one tag across threads, workers and pytest runs.
+
+    An flock dies with its holder, so a crashed or killed build leaves nothing
+    that blocks or poisons the next attempt; the lock file itself is inert.
+    """
+
+    path = agent_image_lock_path(image, lock_dir=lock_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.info("waiting for another process building agent image %s", image)
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def ensure_agent_image(
@@ -1896,35 +1999,47 @@ def ensure_agent_image(
     entrypoint_path: Path = DEFAULT_AGENT_ENTRYPOINT_PATH,
     context_dir: Path = DEFAULT_AGENT_BUILD_CONTEXT_DIR,
     cli_source_dir: Path = DEFAULT_AGENT_CLI_SOURCE_DIR,
+    dockerignore_path: Path = DEFAULT_AGENT_DOCKERIGNORE_PATH,
+    lock_dir: Path | None = None,
     runner=subprocess.run,
 ) -> str:
     resolved_image = default_agent_docker_image(
         dockerfile_path=dockerfile_path,
         entrypoint_path=entrypoint_path,
         cli_source_dir=cli_source_dir,
+        dockerignore_path=dockerignore_path,
     )
-    inspect = runner(
-        ["docker", "image", "inspect", resolved_image],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if getattr(inspect, "returncode", 1) == 0:
+
+    def image_exists() -> bool:
+        inspect = runner(
+            ["docker", "image", "inspect", resolved_image],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return getattr(inspect, "returncode", 1) == 0
+
+    if image_exists():
         return resolved_image
-    build = runner(
-        [
-            "docker",
-            "build",
-            "-f",
-            str(dockerfile_path),
-            "-t",
-            resolved_image,
-            str(context_dir),
-        ],
-        check=False,
-    )
-    if getattr(build, "returncode", 1) != 0:
-        raise RuntimeError(f"failed to build agent Docker image {resolved_image}")
+    with _agent_image_build_lock(resolved_image, lock_dir=lock_dir):
+        # Whoever held the lock may have just built it.
+        if image_exists():
+            return resolved_image
+        build = runner(
+            [
+                "docker",
+                "build",
+                *AGENT_IMAGE_BUILD_FLAGS,
+                "-f",
+                str(dockerfile_path),
+                "-t",
+                resolved_image,
+                str(context_dir),
+            ],
+            check=False,
+        )
+        if getattr(build, "returncode", 1) != 0:
+            raise RuntimeError(f"failed to build agent Docker image {resolved_image}")
     return resolved_image
 
 
