@@ -208,10 +208,10 @@ func TestRunnerReuploadsTruncatedFile(t *testing.T) {
 	}
 }
 
-// A torn stat or touch (mtime moves while size stays equal to the committed
-// offset) must ship nothing — both within a running watcher and after a restart —
-// and a subsequent append must ship only the new tail line.
-func TestRunnerTornStatAndTouchShipNothingThenAppendShipsTail(t *testing.T) {
+// A moved mtime at the committed size (a torn stat under load, or a touch)
+// ships nothing, in a running watcher and after a restart; a later append
+// ships only the new line.
+func TestRunnerMtimeOnlyChangeShipsNothingThenAppendShipsTail(t *testing.T) {
 	root := t.TempDir()
 	transcript := filepath.Join(root, "torn.jsonl")
 	t1 := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
@@ -236,16 +236,16 @@ func TestRunnerTornStatAndTouchShipNothingThenAppendShipsTail(t *testing.T) {
 		t.Fatalf("initial sync = %+v, %v, batches=%d", s, err, len(uploads.batches))
 	}
 
-	// Simulate torn stat / touch: mtime advances while size == uploaded_offset.
+	// mtime moves while the size stays at the committed offset.
 	if err := os.Chtimes(transcript, t2, t2); err != nil {
 		t.Fatal(err)
 	}
 	if s, err := r1.Sync(); err != nil || s.LinesSelected != 0 || len(uploads.batches) != 1 {
-		t.Fatalf("torn stat / touch must ship nothing in-process: %+v, %v, batches=%d", s, err, len(uploads.batches))
+		t.Fatalf("an mtime-only change must ship nothing in-process: %+v, %v, batches=%d", s, err, len(uploads.batches))
 	}
 	state1.Close()
 
-	// Touch again and simulate a restart: fresh State + Runner must still ship nothing.
+	// Move it again and restart: a fresh State and Runner still ship nothing.
 	if err := os.Chtimes(transcript, t3, t3); err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestRunnerTornStatAndTouchShipNothingThenAppendShipsTail(t *testing.T) {
 		t.Fatalf("touch across restart must ship nothing: %+v, %v, batches=%d", s, err, len(uploads.batches))
 	}
 
-	// Now append a second line: only the new tail line (seq=1) ships.
+	// Append a second line: only it (seq 1) ships.
 	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +270,7 @@ func TestRunnerTornStatAndTouchShipNothingThenAppendShipsTail(t *testing.T) {
 	}
 	f.Close()
 	if s, err := r2.Sync(); err != nil || s.LinesSelected != 1 || len(uploads.batches) != 2 {
-		t.Fatalf("append after torn stat must ship only new line: %+v, %v, batches=%d", s, err, len(uploads.batches))
+		t.Fatalf("an append after an mtime-only change must ship only the new line: %+v, %v, batches=%d", s, err, len(uploads.batches))
 	}
 	rec := uploads.batches[1][0]["record"].(map[string]any)
 	if rec["seq"].(float64) != 1 || rec["line"].(map[string]any)["a"].(float64) != 2 {
@@ -723,17 +723,16 @@ func TestRunnerStateLossReuploadsCleanly(t *testing.T) {
 	}
 }
 
-// OpenState must work cleanly with both a 4-column DB (e741abef) and a 6-column
-// DB carrying last_mtime_ns/last_inode (68297f3f), shipping nothing on upgrade
-// and committing subsequent appends without dropping user data.
-func TestOpenStateWorksWithBothLegacyAndExtraColumnSchemas(t *testing.T) {
+// A state file with or without the last_mtime_ns/last_inode columns an
+// earlier release added ships nothing on upgrade and commits later appends.
+func TestOpenStateAcceptsFileStateWithOrWithoutSignatureColumns(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		createSQL string
 		insertSQL string
 	}{
 		{
-			name: "4_col_e741abef",
+			name: "without_signature_columns",
 			createSQL: `CREATE TABLE file_state (
 				path TEXT PRIMARY KEY,
 				uploaded_offset INTEGER NOT NULL DEFAULT 0,
@@ -743,7 +742,7 @@ func TestOpenStateWorksWithBothLegacyAndExtraColumnSchemas(t *testing.T) {
 			insertSQL: `INSERT INTO file_state VALUES (?, ?, 1, '2026-05-20T12:00:00+00:00')`,
 		},
 		{
-			name: "6_col_68297f3f",
+			name: "with_signature_columns",
 			createSQL: `CREATE TABLE file_state (
 				path TEXT PRIMARY KEY,
 				uploaded_offset INTEGER NOT NULL DEFAULT 0,
@@ -798,7 +797,9 @@ func TestOpenStateWorksWithBothLegacyAndExtraColumnSchemas(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			f.WriteString("{\"a\":2}\n")
+			if _, err := f.WriteString("{\"a\":2}\n"); err != nil {
+				t.Fatal(err)
+			}
 			f.Close()
 			if s, err := runner.Sync(); err != nil || s.LinesSelected != 1 || len(uploads.batches) != 1 {
 				t.Fatalf("append after upgrade must upload 1 line: %+v, %v, batches=%d", s, err, len(uploads.batches))

@@ -25,9 +25,9 @@ func DefaultStateFile() string {
 	return common.DefaultStateFile("agent-sessions-upload-state.sqlite")
 }
 
-// OpenState opens (or creates) the state file for account. Works with both the
-// 4-column table and databases that already carry extra columns (such as
-// last_mtime_ns/last_inode from an earlier release) without touching them.
+// OpenState opens (or creates) the state file for account. A file_state written
+// by an earlier release may also carry last_mtime_ns and last_inode; they
+// default to 0 and are left alone.
 func OpenState(path, account string) (*State, error) {
 	db, err := common.OpenStateDB(path, []string{
 		`CREATE TABLE IF NOT EXISTS file_state (
