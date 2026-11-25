@@ -236,3 +236,65 @@ func TestFeedGetShowsARemovedCardAndADeletedOnesSnapshot(t *testing.T) {
 		t.Fatalf("out=%s", out)
 	}
 }
+
+// A card id is a url, and a url can hold a comma: --score repeats, it never splits.
+func TestFeedRankScoreKeepsACommaInTheItemID(t *testing.T) {
+	srv := feedStub(t, `{"ranked":2}`)
+	_, stderr, code := runCLI(t, srv.URL, "", "feed", "rank",
+		"--score", "picks:https://example.com/topic,1.0.html=1",
+		"--score", "hn:1=0.5")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	var body struct {
+		Scores map[string]float64 `json:"scores"`
+	}
+	if err := json.Unmarshal(srv.lastBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Scores) != 2 || body.Scores["picks:https://example.com/topic,1.0.html"] != 1 || body.Scores["hn:1"] != 0.5 {
+		t.Fatalf("scores: %s", srv.lastBody)
+	}
+}
+
+func TestFeedStatsByTasteAsksForAndPrintsEachSection(t *testing.T) {
+	srv := feedStub(t, `{"since":"2026-11-10T00:00:00Z","sessions":1,"events_by_type":{},"sources":[],`+
+		`"by_taste":[{"taste":"Education and youth","items_seen":36,"items_opened":2,"open_share":0.06,"avg_engagement_score":1.5,"live_unseen":4},`+
+		`{"taste":"","items_seen":3,"items_opened":0,"open_share":0,"avg_engagement_score":null,"live_unseen":0}]}`)
+	out, stderr, code := runCLI(t, srv.URL, "", "feed", "stats", "--source", "picks", "--since", "14d", "--by", "taste")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(string(srv.lastBody), `"by":"taste"`) {
+		t.Fatalf("body: %s", srv.lastBody)
+	}
+	for _, want := range []string{
+		"per taste (since 2026-11-10):",
+		"  Education and youth                       seen=36 opened=2 open_share=0.06 avg_engagement=1.5 live_unseen=4\n",
+		"  (no taste)                                seen=3 opened=0 open_share=0 avg_engagement=- live_unseen=0\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestFeedStatsPrintsEachShareWithWhatHeWrote(t *testing.T) {
+	srv := feedStub(t, `{"since":"2026-11-22T00:00:00Z","sessions":1,"events_by_type":{},"sources":[],"shares":[`+
+		`{"item_id":"picks:https://example.com/contest","title":"A student game-dev contest","shared_at":"2026-11-24T01:20:11Z",`+
+		`"message":{"adapter":"gmail_email","event_id":"m1","snippet":"Worth a look:\na student game-dev contest"}},`+
+		`{"item_id":"picks:https://example.com/quiet","title":"Quiet card","shared_at":"2026-11-24T01:12:03Z","message":null}]}`)
+	out, stderr, code := runCLI(t, srv.URL, "", "feed", "stats", "--since", "2d")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	for _, want := range []string{
+		"shares:\n",
+		"  2026-11-24T01:20:11Z picks:https://example.com/contest  A student game-dev contest  -> gmail_email m1: Worth a look: a student game-dev contest\n",
+		"  2026-11-24T01:12:03Z picks:https://example.com/quiet  Quiet card  -> no message found\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+}

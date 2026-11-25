@@ -131,7 +131,8 @@ type saveOutput struct {
 
 type statsInput struct {
 	Source string `json:"source,omitempty"`
-	Since  string `json:"since,omitempty" jsonschema:"window for the per-source window_* fields (cards first seen since then), events_by_type and sitting starts (sessions): RFC3339, YYYY-MM-DD, or a duration back from now (7d, 24h); default 7d"`
+	Since  string `json:"since,omitempty" jsonschema:"window for the per-source window_* fields (cards first seen since then), events_by_type, sitting starts (sessions), shares and by_taste: RFC3339, YYYY-MM-DD, or a duration back from now (7d, 24h); default 7d"`
+	By     string `json:"by,omitempty" jsonschema:"taste: also return by_taste, one row per curation section (metadata.taste) with cards first seen in the window, how many were opened, open_share, average engagement_score and live_unseen cards still waiting; labels differing only by case, spaces or a trailing colon are merged"`
 }
 
 type eventsInput struct {
@@ -380,14 +381,20 @@ func Tools(store *Store) []tool.Tool {
 			DescriptionStr: "How the Feed tab is landing: per source, cards first seen since the window (window_items_seen, window_items_opened, window_items_engaged, " +
 				"window_avg_engagement_score, from marts_feed.item_engagement) beside the all-time fields (items, seen, engaged/open/dismiss rates, " +
 				"avg_engagement_score, dwell and read time, from marts_feed.source_engagement), event counts by type and sittings starting since a window (sessions; default 7d), the most engaged cards, " +
-				"and cards seen twice or more without any engagement. Sittings exclude emulators and always cover all sources; " +
-				"source filters apply to cards and event counts. Use it before writing the next batch. CLI: pdw feed stats.",
+				"and cards seen twice or more without any engagement. shares lists each share in the window with what Zach wrote when he sent it " +
+				"(message: the first self email or Slack message within 5 minutes after it whose text holds the card title's first 30 characters, or null). " +
+				"by: taste adds per-section results (by_taste). Sittings exclude emulators and always cover all sources; " +
+				"source filters apply to cards, event counts, shares and sections. Use it before writing the next batch. CLI: pdw feed stats.",
 			Handle: func(ctx context.Context, in statsInput) (Stats, error) {
 				since, err := sinceTime(in.Since, store.now(), 7*24*time.Hour)
 				if err != nil {
 					return Stats{}, toolError(err)
 				}
-				return store.Stats(ctx, strings.TrimSpace(in.Source), since)
+				by := strings.ToLower(strings.TrimSpace(in.By))
+				if by != "" && by != "taste" {
+					return Stats{}, &tool.InvalidInputError{Message: fmt.Sprintf("unknown by %q; valid: %s", in.By, strings.Join(StatsBreakdowns, ", "))}
+				}
+				return store.Stats(ctx, StatsQuery{Source: strings.TrimSpace(in.Source), Since: since, By: by})
 			},
 		},
 		&tool.Typed[eventsInput, eventsOutput]{

@@ -103,11 +103,11 @@ minutes), and takes 5 off a dismissal (a swipe left or the `...` menu). Rank his
 
 Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts automatic starts, and `watch_ms` records inline video viewing separately from reading. Inline video closes also count as reading only when their autoplay flag is false; historical closes without that flag count as reading when the item has a user-started media event. Unmuting an autoplay does not record a user-started play.
 
-{{if .CLI}}`pdw feed stats [--source S] [--since 7d]`{{else}}`feed_stats` `{"source": "...", "since": "7d"}`{{end}} — per source, the cards first seen in the window: seen, opened, engaged and average
+{{if .CLI}}`pdw feed stats [--source S] [--since 7d] [--by taste]`{{else}}`feed_stats` `{"source": "...", "since": "7d", "by": "taste"}`{{end}} — per source, the cards first seen in the window: seen, opened, engaged and average
 engagement_score, with the all-time average beside it ({{if .CLI}}a source with none seen shows `-`{{else}}`window_avg_engagement_score` is null when none were seen{{end}}, not 0); event counts in the window; the
 all-time most engaged cards; and cards seen twice or more with no engagement. {{if .CLI}}`--output json`{{else}}The result{{end}} also has the all-time
 counts, rates, dismissals, dwell and read time. Read it before writing
-the next batch, and write less of what he skips. {{if .CLI}}`pdw feed list` (`--view feed` is exactly what the Feed shows him) and `pdw feed events`{{else}}`feed_list` (`view: "feed"` is exactly what the Feed shows him) and `feed_events`{{end}} give per card and raw detail.
+the next batch, and write less of what he skips. Each share in the window is listed with what he wrote when he sent it (the self email or Slack message within 5 minutes whose text holds the card's title), or none. {{if .CLI}}`--by taste`{{else}}`"by": "taste"`{{end}} adds one row per section (`metadata.taste`, case, spaces and a trailing colon merged): cards seen, opened, `open_share`, average engagement_score and live unseen cards; read section caps from it, not a hand join. {{if .CLI}}`pdw feed list` (`--view feed` is exactly what the Feed shows him) and `pdw feed events`{{else}}`feed_list` (`view: "feed"` is exactly what the Feed shows him) and `feed_events`{{end}} give per card and raw detail.
 
 In SQL, cards are `base_feed.items`: the id column is `item_id` (a card is keyed by `source` + `item_key`; there
 is no bare `id`), and `base_feed.events.item_id` and `marts_feed.item_engagement.item_id` join to it.

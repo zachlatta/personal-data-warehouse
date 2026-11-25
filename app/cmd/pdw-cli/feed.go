@@ -42,7 +42,9 @@ USAGE
   pdw feed save ITEM_ID...              Put cards in Zach's read-later queue (the phone's
                                         Saved view), only when he asks; unsave takes them out.
   pdw feed list [flags]                 Cards with their engagement and version.
-  pdw feed stats [--source S] [--since 7d]
+  pdw feed stats [--source S] [--since 7d] [--by taste]
+                                        Per source, each share with what he wrote, and
+                                        with --by taste each section's results.
   pdw feed events [--item ID] [--type open,dismiss] [--since 7d] [-n 100]
 
 An order list puts those cards above every card you did not list, best first; use --score to place cards at exact weights.
@@ -103,6 +105,7 @@ EXAMPLES
   pdw feed list --view saved
   pdw feed list --all --url https://news.ycombinator.com/item?id=1
   pdw feed stats --since 7d
+  pdw feed stats --source picks --since 14d --by taste
   pdw sql "SELECT title, impressions, dwell_ms, opens, read_ms, engagement_score FROM marts_feed.item_engagement ORDER BY last_event_at DESC NULLS LAST LIMIT 20"
 `
 
@@ -440,7 +443,7 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		}
 		return call("feed_history", map[string]any{"item_id": fs.Arg(0), "source": source, "since": since, "limit": limit, "snapshots": full})
 	case "rank":
-		var scores stringList
+		var scores urlList
 		fs.Var(&scores, "score", "ITEM_ID=NUMBER (final = separates ID and score; repeatable)")
 		if err := parse(); err != nil {
 			return fail(err)
@@ -494,13 +497,18 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		return call("feed_list", map[string]any{"source": source, "view": view, "include_removed": all,
 			"include_dismissed": all, "limit": limit, "item_ids": fs.Args(), "urls": []string(urls)})
 	case "stats":
-		var source, since string
+		var source, since, by string
 		fs.StringVar(&source, "source", "", "source")
 		fs.StringVar(&since, "since", "", "window")
+		fs.StringVar(&by, "by", "", "taste")
 		if err := parse(); err != nil {
 			return fail(err)
 		}
-		return call("feed_stats", map[string]any{"source": source, "since": since})
+		input := map[string]any{"source": source, "since": since}
+		if by != "" {
+			input["by"] = by
+		}
+		return call("feed_stats", input)
 	case "events":
 		var item, source, since string
 		var types stringList
@@ -628,6 +636,30 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 				str(s, "source"), int(num(s, "window_items_seen")), int(num(s, "window_items_opened")),
 				int(num(s, "window_items_engaged")), averageOrDash(s, "window_avg_engagement_score"),
 				averageOrDash(s, "avg_engagement_score"))
+		}
+		if tastes := asList(out["by_taste"]); len(tastes) > 0 {
+			fmt.Fprintf(w, "per taste (since %s):\n", strings.SplitN(str(out, "since"), "T", 2)[0])
+			for _, t := range tastes {
+				label := str(t, "taste")
+				if label == "" {
+					label = "(no taste)"
+				}
+				fmt.Fprintf(w, "  %-40s  seen=%d opened=%d open_share=%s avg_engagement=%s live_unseen=%d\n", label,
+					int(num(t, "items_seen")), int(num(t, "items_opened")), averageOrDash(t, "open_share"),
+					averageOrDash(t, "avg_engagement_score"), int(num(t, "live_unseen")))
+			}
+		}
+		if shares := asList(out["shares"]); len(shares) > 0 {
+			fmt.Fprintln(w, "shares:")
+			for _, sh := range shares {
+				line := fmt.Sprintf("  %s %s  %s  -> ", str(sh, "shared_at"), str(sh, "item_id"), str(sh, "title"))
+				if m, ok := sh["message"].(map[string]any); ok {
+					line += fmt.Sprintf("%s %s: %s", str(m, "adapter"), str(m, "event_id"), strings.Join(strings.Fields(str(m, "snippet")), " "))
+				} else {
+					line += "no message found"
+				}
+				fmt.Fprintln(w, line)
+			}
 		}
 		for _, section := range []struct{ key, label string }{{"top_items", "most engaged"}, {"ignored", "seen twice+, no engagement"}} {
 			items := asList(out[section.key])

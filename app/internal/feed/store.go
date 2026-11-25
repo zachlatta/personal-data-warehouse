@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -484,18 +485,71 @@ type SourceStats struct {
 	WindowAvgScore     *float64 `json:"window_avg_engagement_score"`
 }
 
+// Share is one share event in the window and, when one matches, what Zach
+// wrote when he sent the card on.
+type Share struct {
+	ItemID   string         `json:"item_id"`
+	Source   string         `json:"source"`
+	Title    string         `json:"title"`
+	SharedAt time.Time      `json:"shared_at"`
+	Message  *SharedMessage `json:"message"`
+}
+
+// SharedMessage is the first self-priority email or Slack message on the
+// timeline within shareMessageWindow after the share whose snippet contains
+// the first shareTitlePrefix characters of the card's title (any case).
+type SharedMessage struct {
+	Adapter string `json:"adapter"`
+	EventID string `json:"event_id"`
+	Snippet string `json:"snippet"` // The first 200 characters.
+}
+
+const (
+	shareMessageWindow = "5 minutes"
+	shareTitlePrefix   = 30
+)
+
+// TasteStats is one curation section (the card's metadata.taste) for the
+// window. Labels that differ only by case, surrounding spaces or a trailing
+// colon are one section, shown in their most common spelling; Taste is ""
+// for cards without one.
+type TasteStats struct {
+	Taste       string   `json:"taste"`
+	ItemsSeen   int64    `json:"items_seen"`   // Cards first seen in the window.
+	ItemsOpened int64    `json:"items_opened"` // Of those, opened at least once.
+	OpenShare   *float64 `json:"open_share"`   // items_opened / items_seen, 2 places; null when none seen.
+	AvgScore    *float64 `json:"avg_engagement_score"`
+	LiveUnseen  int64    `json:"live_unseen"` // Not removed, not expired, never seen: what is still waiting.
+}
+
+// StatsQuery selects the window and the optional breakdown.
+type StatsQuery struct {
+	Source string
+	Since  time.Time
+	By     string // "" or "taste".
+}
+
 // Stats is the agent's read of how the feed is landing.
 type Stats struct {
 	Sources      []SourceStats    `json:"sources"`
 	EventsByType map[string]int64 `json:"events_by_type"`
 	Since        time.Time        `json:"since"`
 	Sessions     int64            `json:"sessions"` // Sittings starting in the window; all sources, emulator excluded.
+	Shares       []Share          `json:"shares"`
+	ByTaste      []TasteStats     `json:"by_taste,omitempty"`
 	TopItems     []Item           `json:"top_items"`
 	Ignored      []Item           `json:"ignored"`
 }
 
-func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stats, error) {
-	out := Stats{Sources: []SourceStats{}, EventsByType: map[string]int64{}, Since: since}
+// StatsBreakdowns are the values --by accepts.
+var StatsBreakdowns = []string{"taste"}
+
+func (s *Store) Stats(ctx context.Context, query StatsQuery) (Stats, error) {
+	source, since := query.Source, query.Since
+	out := Stats{Sources: []SourceStats{}, EventsByType: map[string]int64{}, Since: since, Shares: []Share{}}
+	if query.By != "" && query.By != "taste" {
+		return out, fmt.Errorf("unknown breakdown %q; valid: %s", query.By, strings.Join(StatsBreakdowns, ", "))
+	}
 	qctx, cancel := s.ctx(ctx)
 	defer cancel()
 	rows, err := s.DB.QueryContext(qctx, s.q(`
@@ -568,6 +622,14 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 		SELECT count(*) FROM @marts_feed_sessions WHERE started_at >= $1`), since).Scan(&out.Sessions); err != nil {
 		return out, err
 	}
+	if out.Shares, err = s.shares(qctx, source, since); err != nil {
+		return out, err
+	}
+	if query.By == "taste" {
+		if out.ByTaste, err = s.tasteStats(qctx, source, since); err != nil {
+			return out, err
+		}
+	}
 	sourceFilter := ""
 	args := []any{}
 	if source != "" {
@@ -587,4 +649,78 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 		WHERE e.impressions >= 2 AND e.engaged = 0 AND e.dismissed = 0`+sourceFilter+`
 		ORDER BY e.impressions DESC LIMIT 10`, args...)
 	return out, err
+}
+
+func (s *Store) shares(ctx context.Context, source string, since time.Time) ([]Share, error) {
+	rows, err := s.DB.QueryContext(ctx, s.q(`
+		SELECT e.item_id, i.source, i.title, e.occurred_at, m.adapter, m.event_id, m.snippet
+		FROM @feed_events e JOIN @feed_items i ON i.item_id = e.item_id
+		LEFT JOIN LATERAL (
+			SELECT t.adapter, t.event_id, left(t.snippet, 200) AS snippet
+			FROM @timeline_events t
+			WHERE t.priority = 'self' AND t.adapter IN ('gmail_email', 'slack_message')
+			  AND t.occurred_at >= e.occurred_at AND t.occurred_at <= e.occurred_at + interval '`+shareMessageWindow+`'
+			  AND btrim(i.title) <> ''
+			  AND strpos(lower(t.snippet), lower(left(btrim(i.title), $3))) > 0
+			ORDER BY t.occurred_at, t.adapter, t.event_id LIMIT 1
+		) m ON true
+		WHERE e.event_type = 'share' AND e.occurred_at >= $1 AND ($2 = '' OR i.source = $2)
+		ORDER BY e.occurred_at DESC, e.event_id`), since, source, shareTitlePrefix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Share{}
+	for rows.Next() {
+		var (
+			share                     Share
+			adapter, eventID, snippet sql.NullString
+		)
+		if err := rows.Scan(&share.ItemID, &share.Source, &share.Title, &share.SharedAt, &adapter, &eventID, &snippet); err != nil {
+			return nil, err
+		}
+		share.SharedAt = share.SharedAt.UTC()
+		if eventID.Valid {
+			share.Message = &SharedMessage{Adapter: adapter.String, EventID: eventID.String, Snippet: snippet.String}
+		}
+		out = append(out, share)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) tasteStats(ctx context.Context, source string, since time.Time) ([]TasteStats, error) {
+	rows, err := s.DB.QueryContext(ctx, s.q(`
+		WITH cards AS (
+			SELECT btrim(regexp_replace(btrim(COALESCE(i.metadata->>'taste', '')), ':+$', '')) AS label,
+			       e.first_seen_at, e.opens, e.engagement_score, e.removed_at, e.expires_at
+			FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+			WHERE ($2 = '' OR i.source = $2)
+		)
+		SELECT mode() WITHIN GROUP (ORDER BY label) AS taste,
+		       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
+		       count(*) FILTER (WHERE first_seen_at >= $1 AND opens > 0) AS opened,
+		       round(avg(engagement_score) FILTER (WHERE first_seen_at >= $1)::numeric, 2)::float8 AS avg_score,
+		       count(*) FILTER (WHERE first_seen_at IS NULL AND removed_at IS NULL
+		                        AND (expires_at IS NULL OR expires_at > now())) AS live_unseen
+		FROM cards GROUP BY lower(label)
+		HAVING count(*) FILTER (WHERE first_seen_at >= $1) > 0
+		    OR count(*) FILTER (WHERE first_seen_at IS NULL AND removed_at IS NULL AND (expires_at IS NULL OR expires_at > now())) > 0
+		ORDER BY seen DESC, taste`), since, source)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TasteStats{}
+	for rows.Next() {
+		var row TasteStats
+		if err := rows.Scan(&row.Taste, &row.ItemsSeen, &row.ItemsOpened, &row.AvgScore, &row.LiveUnseen); err != nil {
+			return nil, err
+		}
+		if row.ItemsSeen > 0 {
+			share := math.Round(float64(row.ItemsOpened)/float64(row.ItemsSeen)*100) / 100
+			row.OpenShare = &share
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }

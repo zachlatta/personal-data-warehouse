@@ -124,7 +124,7 @@ func postgresStore(t *testing.T) (*Store, time.Time) {
 	}
 	store.Expand = func(q string) string {
 		// Longest names first: @feed_items must not eat @feed_items_x.
-		for _, name := range []string{"marts_feed_item_engagement", "marts_feed_source_engagement", "marts_feed_sessions", "feed_item_versions", "feed_items", "feed_events"} {
+		for _, name := range []string{"marts_feed_item_engagement", "marts_feed_source_engagement", "marts_feed_sessions", "feed_item_versions", "feed_items", "feed_events", "timeline_events"} {
 			q = strings.ReplaceAll(q, "@"+name, relations[name])
 		}
 		return q
@@ -722,7 +722,7 @@ func TestPostgresFeedStatsCountSittings(t *testing.T) {
 			defer func() { store.Expand = expand }()
 			// The source only filters card/event statistics; visits span sources.
 			for _, source := range []string{"", "no-cards-for-this-source"} {
-				stats, err := store.Stats(context.Background(), source, now.Add(-24*time.Hour))
+				stats, err := store.Stats(context.Background(), StatsQuery{Source: source, Since: now.Add(-24 * time.Hour)})
 				if err != nil || stats.Sessions != 1 {
 					t.Fatalf("source=%q: want one sitting starting in window, got %d: %v", source, stats.Sessions, err)
 				}
@@ -767,7 +767,7 @@ func TestPostgresFeedStatsPerSourceHonorsTheWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stats, err := store.Stats(context.Background(), "window-stats", now.Add(-24*time.Hour))
+	stats, err := store.Stats(context.Background(), StatsQuery{Source: "window-stats", Since: now.Add(-24 * time.Hour)})
 	if err != nil || len(stats.Sources) != 1 {
 		t.Fatalf("stats: %+v, %v", stats.Sources, err)
 	}
@@ -783,11 +783,163 @@ func TestPostgresFeedStatsPerSourceHonorsTheWindow(t *testing.T) {
 	}
 
 	// A source with nothing new stays listed, with no average rather than a zero.
-	stale, err := store.Stats(context.Background(), "window-stats-stale", now.Add(-24*time.Hour))
+	stale, err := store.Stats(context.Background(), StatsQuery{Source: "window-stats-stale", Since: now.Add(-24 * time.Hour)})
 	if err != nil || len(stale.Sources) != 1 {
 		t.Fatalf("stale stats: %+v, %v", stale.Sources, err)
 	}
 	if s := stale.Sources[0]; s.WindowItemsSeen != 0 || s.WindowAvgScore != nil || s.ItemsSeen != 1 || s.AvgScore == nil {
 		t.Fatalf("stale source: %+v", s)
+	}
+}
+
+// A share is half a story: what Zach wrote when he sent the card on is in
+// his own mail or Slack minutes later. Stats pairs each share with the first
+// self email or Slack message within five minutes whose text carries the
+// card's title, and leaves the message null when nothing matches.
+func TestPostgresFeedStatsShowWhatHeWroteWithAShare(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	call(t, tools, "feed_push", map[string]any{"source": "share-stats", "items": []map[string]any{
+		{"key": "contest", "title": "A student game-dev contest ends with a ceremony in the capital"},
+		{"key": "quiet", "title": "Nobody wrote anything about this card at all"},
+	}})
+	defer store.DB.Exec(store.q("DELETE FROM @feed_items WHERE source = 'share-stats'"))
+	defer store.DB.Exec(store.q("DELETE FROM @timeline_events WHERE adapter IN ('gmail_email', 'slack_message') AND event_id LIKE 'share-stats-%'"))
+	at := func(d time.Duration) time.Time { return now.Add(d) }
+	mux := http.NewServeMux()
+	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
+	raw, _ := json.Marshal(map[string]any{"events": []map[string]any{
+		{"event_id": "ss1", "type": "share", "item_id": "share-stats:contest", "occurred_at": at(-2 * time.Hour).Format(time.RFC3339Nano)},
+		{"event_id": "ss2", "type": "share", "item_id": "share-stats:quiet", "occurred_at": at(-time.Hour).Format(time.RFC3339Nano)},
+	}})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(raw)))
+	if rec.Code != 200 {
+		t.Fatalf("POST events: %d %s", rec.Code, rec.Body.String())
+	}
+	long := "Worth a look for outreach: a student game-dev contest ends with a ceremony in the capital. " + strings.Repeat("More words. ", 30)
+	for _, e := range []struct {
+		adapter, id, priority, snippet string
+		at                             time.Time
+	}{
+		// An unrelated self email a minute after the share is not the message.
+		{"gmail_email", "share-stats-unrelated", "self", "Lunch on Thursday?", at(-2*time.Hour + time.Minute)},
+		{"gmail_email", "share-stats-match", "self", long, at(-2*time.Hour + 2*time.Minute)},
+		// Someone else's mail quoting the title is not what he wrote.
+		{"gmail_email", "share-stats-direct", "direct", long, at(-2*time.Hour + 30*time.Second)},
+		// Past five minutes it is a different conversation.
+		{"slack_message", "share-stats-late", "self", "Nobody wrote anything about this card at all", at(-time.Hour + 6*time.Minute)},
+	} {
+		// The priority is a literal so it coerces to the enum like the adapters' SQL.
+		if _, err := store.DB.Exec(store.q(fmt.Sprintf(`INSERT INTO @timeline_events (adapter, event_id, source, priority, occurred_at, snippet)
+			VALUES ($1, $2, 'test', '%s', $3, $4)`, e.priority)), e.adapter, e.id, e.at, e.snippet); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stats, err := store.Stats(context.Background(), StatsQuery{Source: "share-stats", Since: now.Add(-24 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Shares) != 2 {
+		t.Fatalf("shares: %+v", stats.Shares)
+	}
+	byItem := map[string]Share{}
+	for _, s := range stats.Shares {
+		byItem[s.ItemID] = s
+	}
+	contest := byItem["share-stats:contest"]
+	if contest.Message == nil || contest.Message.Adapter != "gmail_email" || contest.Message.EventID != "share-stats-match" {
+		t.Fatalf("contest share: %+v", contest)
+	}
+	if got := []rune(contest.Message.Snippet); len(got) != 200 || string(got) != string([]rune(long)[:200]) {
+		t.Fatalf("snippet is the first 200 characters: %q", contest.Message.Snippet)
+	}
+	if !contest.SharedAt.Equal(at(-2*time.Hour)) || contest.Title == "" {
+		t.Fatalf("contest share: %+v", contest)
+	}
+	if quiet := byItem["share-stats:quiet"]; quiet.Message != nil {
+		t.Fatalf("a share with no message has none: %+v", quiet.Message)
+	}
+}
+
+// The curation rules cap sections by how often they are opened; --by taste
+// gives that per label in one call, with labels differing only by case,
+// surrounding spaces or a trailing colon counted as one section.
+func TestPostgresFeedStatsByTaste(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	card := func(key, taste string) map[string]any {
+		return map[string]any{"key": key, "title": key, "metadata": map[string]any{"taste": taste}}
+	}
+	call(t, tools, "feed_push", map[string]any{"source": "taste-stats", "items": []map[string]any{
+		card("edu-1", "Education and youth"),
+		card("edu-2", "Education and youth:"),
+		card("edu-3", " education and youth "),
+		card("edu-unseen", "Education and youth"),
+		card("sci-1", "Science"),
+		card("sci-old", "Science"),
+		card("sci-unseen", "Science:"),
+		card("sci-removed", "Science"),
+		{"key": "plain", "title": "plain"},
+	}})
+	defer store.DB.Exec(store.q("DELETE FROM @feed_items WHERE source = 'taste-stats'"))
+	call(t, tools, "feed_remove", map[string]any{"item_ids": []string{"taste-stats:sci-removed"}})
+	at := func(d time.Duration) string { return now.Add(d).Format(time.RFC3339Nano) }
+	events := []map[string]any{}
+	for i, key := range []string{"edu-1", "edu-2", "edu-3", "sci-1", "plain"} {
+		events = append(events, map[string]any{"event_id": fmt.Sprintf("ts-i%d", i), "type": "impression", "item_id": "taste-stats:" + key, "occurred_at": at(-time.Hour), "dwell_ms": 400})
+	}
+	events = append(events,
+		map[string]any{"event_id": "ts-o1", "type": "open", "item_id": "taste-stats:edu-1", "occurred_at": at(-time.Hour)},
+		// Seen before the window: not this window's section result.
+		map[string]any{"event_id": "ts-old", "type": "impression", "item_id": "taste-stats:sci-old", "occurred_at": at(-48 * time.Hour), "dwell_ms": 400},
+		map[string]any{"event_id": "ts-o2", "type": "open", "item_id": "taste-stats:sci-old", "occurred_at": at(-48 * time.Hour)},
+	)
+	mux := http.NewServeMux()
+	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
+	raw, _ := json.Marshal(map[string]any{"events": events})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(raw)))
+	if rec.Code != 200 {
+		t.Fatalf("POST events: %d %s", rec.Code, rec.Body.String())
+	}
+	var eduAvg float64
+	if err := store.DB.QueryRow(store.q(`SELECT round(avg(engagement_score)::numeric, 2)::float8 FROM @marts_feed_item_engagement
+		WHERE item_id IN ('taste-stats:edu-1', 'taste-stats:edu-2', 'taste-stats:edu-3')`)).Scan(&eduAvg); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := store.Stats(context.Background(), StatsQuery{Source: "taste-stats", Since: now.Add(-24 * time.Hour), By: "taste"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]TasteStats{}
+	for _, row := range stats.ByTaste {
+		got[row.Taste] = row
+	}
+	if len(stats.ByTaste) != 3 {
+		t.Fatalf("want Education and youth, Science and the unlabelled cards: %+v", stats.ByTaste)
+	}
+	edu, ok := got["Education and youth"]
+	if !ok || edu.ItemsSeen != 3 || edu.ItemsOpened != 1 || edu.LiveUnseen != 1 || edu.AvgScore == nil || *edu.AvgScore != eduAvg ||
+		edu.OpenShare == nil || *edu.OpenShare != 0.33 {
+		t.Fatalf("education: %+v (avg want %v)", edu, eduAvg)
+	}
+	sci, ok := got["Science"]
+	if !ok || sci.ItemsSeen != 1 || sci.ItemsOpened != 0 || sci.LiveUnseen != 1 || sci.OpenShare == nil || *sci.OpenShare != 0 {
+		t.Fatalf("science: %+v", sci)
+	}
+	if plain, ok := got[""]; !ok || plain.ItemsSeen != 1 {
+		t.Fatalf("unlabelled: %+v", stats.ByTaste)
+	}
+
+	// Without --by the breakdown is not computed.
+	plain, err := store.Stats(context.Background(), StatsQuery{Source: "taste-stats", Since: now.Add(-24 * time.Hour)})
+	if err != nil || plain.ByTaste != nil {
+		t.Fatalf("by taste without asking: %+v %v", plain.ByTaste, err)
+	}
+	if _, err := store.Stats(context.Background(), StatsQuery{By: "colour"}); err == nil {
+		t.Fatal("an unknown --by must fail")
 	}
 }

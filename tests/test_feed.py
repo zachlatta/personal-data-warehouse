@@ -294,7 +294,8 @@ def test_item_engagement_reports_an_absent_timestamp_as_null_not_the_epoch(wareh
 @pytestmark_db
 def test_go_feed_module_against_the_same_provisioned_schema(warehouse):
     wh = warehouse
-    names = (*TABLES, *VIEWS, *FUNCTIONS)
+    # The share read in feed_stats joins the timeline.
+    names = (*TABLES, *VIEWS, *FUNCTIONS, "timeline_events")
     env = dict(
         os.environ,
         PDW_FEED_TEST_URL=os.environ["POSTGRES_DATABASE_URL"],

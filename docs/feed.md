@@ -263,6 +263,13 @@ phone, web ── POST /api/feed/events ──▶ base_feed.events ──▶ mar
   `marts_feed.item_engagement`: seen, opened, engaged, average score, `-` when none were seen),
   with the all-time average beside it. All-time items, dismissals, dwell and read time stay in the
   JSON, because a stale all-time score must not read as how a source is doing now.
+  `shares` pairs each share in the window with the first `self` `gmail_email` or `slack_message`
+  timeline event within 5 minutes after it whose snippet contains the card title's first 30
+  characters (case-insensitive), or `null`: a share's count said nothing about why he sent it.
+  `--by taste` adds `by_taste`, one row per `metadata.taste` section (labels that differ only by
+  case, surrounding spaces or a trailing colon merged; most common spelling shown): cards first
+  seen in the window, opened, `open_share`, average score and live unseen cards. Both are computed
+  in the Go query from existing relations, so no view change is needed.
   The marts count only Zach's devices (his phones and the web page): events from a build under test (client `android-emulator`,
   device `sdk_gphone*`, or a `*simulator*` client) are kept in `base_feed.events` but left out
   (`TEST_CLIENT_SQL` in `feed.py`). On 2026-10-24 an agent checking video autoplay on the emulator
