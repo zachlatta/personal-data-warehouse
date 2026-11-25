@@ -193,7 +193,7 @@ func TestMCPInitializeAcceptsJSONMediaTypeParameters(t *testing.T) {
 		{name: "Accept without event stream", contentType: "application/json", accept: "application/json", bearer: token, want: http.StatusBadRequest},
 		{name: "missing content type", bearer: token, want: http.StatusUnsupportedMediaType},
 		{name: "plain text", contentType: "text/plain", bearer: token, want: http.StatusUnsupportedMediaType},
-		{name: "JSON suffix type", contentType: "application/json-seq", bearer: token, want: http.StatusUnsupportedMediaType},
+		{name: "JSON look-alike type", contentType: "application/json-seq", bearer: token, want: http.StatusUnsupportedMediaType},
 		{name: "malformed parameters", contentType: "application/json; charset", bearer: token, want: http.StatusUnsupportedMediaType},
 		{name: "missing bearer", contentType: "application/json; charset=UTF-8", want: http.StatusUnauthorized},
 		{name: "cross-origin", contentType: "application/json; charset=UTF-8", origin: "https://other.example", bearer: token, want: http.StatusForbidden},
