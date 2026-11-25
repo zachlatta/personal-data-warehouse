@@ -1994,7 +1994,8 @@ function storedEmailBody(variant: GmailEmailVariant): { body_html: string; body_
 }
 
 // The body of POST …/mutations/<id>/update-email: the edited fields over the
-// variant's own reply headers, which the phone never shows and must not drop.
+// variant's own reply headers, which the phone never shows. The server keeps the
+// stored reply_to_message_id and re-derives the thread and headers from it.
 // When bodyEdited is false (only To/Cc/Bcc/Subject/delivery mode changed), the
 // variant's stored body_html and body_text are preserved verbatim.
 export function gmailEmailUpdateInput(variant: GmailEmailVariant, edits: GmailEmailEdits, deliveryMode: 'send' | 'draft'): GmailEmailUpdateInput {

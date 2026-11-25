@@ -122,6 +122,8 @@ export const mutations = {
     return (await request(requestPath(requestId, "mutations", mutationId, "remove"), { method: "POST" })).mutation;
   },
   // input: { delivery_mode, selected_variant_id, message: { to, cc, bcc, subject, body_text, body_html, reply_to_thread_id, in_reply_to, references } }
+  // The reply fields are echoed back as shown. The server keeps the stored reply_to_message_id
+  // (never sent from here) and re-derives the thread, in_reply_to and references from that message.
   async updateEmail(requestId, mutationId, input) {
     return (await request(requestPath(requestId, "mutations", mutationId, "update-email"), { method: "POST", body: input })).mutation;
   },
