@@ -93,3 +93,25 @@ func TestMutationHelpForNarrowsToOneTypeOrTheList(t *testing.T) {
 		}
 	}
 }
+
+// The help is what an agent reads before replying; it must name the field that
+// picks the parent and not teach the hand-built headers proposals now refuse.
+func TestMutationHelpTeachesReplyToMessageID(t *testing.T) {
+	one, err := MutationHelpFor(ProposeMutationHelpInput{Type: GmailSendEmailOperation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	email := one.Mutations[0]
+	var message string
+	for _, field := range email.Fields {
+		if field.Name == "message" {
+			message = field.Description
+		}
+	}
+	if !strings.Contains(message, "reply_to_message_id") || strings.Contains(message, "in_reply_to,") || strings.Contains(message, "references[]") {
+		t.Fatalf("message fields = %q", message)
+	}
+	if !strings.Contains(email.ExtraNotes, "reply_to_message_id") || !strings.Contains(email.ExtraNotes, "Never set in_reply_to") {
+		t.Fatalf("send_email notes = %q", email.ExtraNotes)
+	}
+}

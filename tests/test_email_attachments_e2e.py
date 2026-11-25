@@ -245,3 +245,75 @@ def test_email_forward_proposal_review_approval_delivery():
     attachments = list(email.iter_attachments())
     assert [part.get_filename() for part in attachments] == ["invoice-4831.pdf"]
     assert attachments[0].get_payload(decode=True) == b"%PDF-invoice"
+
+
+def _thread_message(*, message_id: str, internal_date: datetime, headers: dict[str, str], body: str) -> dict:
+    """One synced message in thread-demo, in Gmail's API "full" form."""
+    return {
+        "id": message_id,
+        "threadId": "thread-demo",
+        "historyId": "9",
+        "internalDate": str(int(internal_date.timestamp() * 1000)),
+        "labelIds": ["INBOX"],
+        "snippet": body,
+        "payload": {
+            "partId": "",
+            "mimeType": "text/plain",
+            "headers": [{"name": name, "value": value} for name, value in headers.items()],
+            "body": {"size": len(body), "data": _b64url(body.encode())},
+        },
+    }
+
+
+@pytest.mark.local_integration
+def test_email_reply_to_a_message_is_filed_in_its_thread_and_quotes_it():
+    """The 2026-11-24 detached replies, end to end.
+
+    The thread's latest message is a private aside forwarded to a colleague,
+    so the reply must name the partner's message, quote it and not the aside,
+    and reach Gmail with that thread's id: an In-Reply-To alone starts a new
+    conversation.
+    """
+    account = "replier@example.test"
+    ask = _thread_message(
+        message_id="ask-1",
+        internal_date=datetime(2026, 11, 24, 15, 0, tzinfo=UTC),
+        headers={
+            "From": "Partner <partner@partner.test>",
+            "To": account,
+            "Subject": "Friday demo",
+            "Message-ID": "<ask-1@partner.test>",
+        },
+        body="Can you join the demo on Friday?",
+    )
+    aside = _thread_message(
+        message_id="aside-2",
+        internal_date=datetime(2026, 11, 24, 16, 0, tzinfo=UTC),
+        headers={
+            "From": account,
+            "To": "colleague@example.test",
+            "Subject": "Fwd: Friday demo",
+            "Message-ID": "<aside-2@example.test>",
+            "In-Reply-To": "<ask-1@partner.test>",
+            "References": "<ask-1@partner.test>",
+        },
+        body="Private aside: not sure about this one.",
+    )
+    with _isolated_warehouse() as (warehouse, url):
+        synced_at = datetime(2026, 11, 24, 16, 5, tzinfo=UTC)
+        warehouse.insert_messages([message_to_row(account=account, message=m, synced_at=synced_at) for m in (ask, aside)])
+        _run_go_test("TestGmailReplyToMessageProposalReviewApproval", {"PDW_EMAIL_REPLY_TEST_URL": url})
+        with _fake_gmail() as (service, received):
+            _execute_claimed(warehouse, service, expected=1, actor="reply-e2e")
+
+    assert [path for path, _ in received] == ["/gmail/v1/users/me/messages/send?alt=json"]
+    sent = received[0][1]
+    assert sent["threadId"] == "thread-demo"
+    email = _parse_raw(sent["raw"])
+    assert email["In-Reply-To"] == "<ask-1@partner.test>"
+    assert email["References"] == "<ask-1@partner.test>"
+    text = email.get_body(preferencelist=("plain",)).get_content()
+    assert text.startswith("Yes, I'll be there.")
+    assert "> Can you join the demo on Friday?" in text
+    assert "Private aside" not in text
+    assert "Private aside" not in email.get_body(preferencelist=("html",)).get_content()

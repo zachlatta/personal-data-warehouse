@@ -78,9 +78,24 @@ CLI uses:
   [the Feed doc](../feed.md)). The old
   server-rendered review pages and their password cookie are gone; a still-set
   `PDW_MUTATION_UI_*` variable is reported as deprecated at startup.
+- **A reply names the message it answers, and PDW derives everything that threads it.**
+  `message.reply_to_message_id` (a `base_gmail.messages.message_id`) is read by primary
+  key at proposal time (`app/internal/mutations/gmail_reply.go`); `reply_to_thread_id`
+  alone means the thread's latest message. The parent supplies the Gmail thread id the
+  executor sends under, `In-Reply-To`, `References` and the quoted history, and is then
+  pinned as `reply_to_message_id` so a reviewer edit re-derives the same headers after
+  newer mail lands. A parent the warehouse lacks, or a message outside the named thread,
+  refuses the proposal. Agents may not write `in_reply_to`/`references`: on 2026-11-24
+  three approved replies did, without a thread id, to avoid quoting a private aside that
+  was the thread's latest message, and Gmail's `messages.send` filed each as a new
+  conversation, because it threads only by `threadId`. The executor also refuses a reply
+  with no thread id rather than send it detached. Resolving a bare `In-Reply-To` by
+  `rfc822_message_id` was rejected: that column is unindexed on an ~830k-row heap, and a
+  second way to name the parent is the trap that caused the bug.
+  `tests/test_email_attachments_e2e.py` drives it end to end.
 - **A forward is a `gmail.send_email`, not a type of its own.** `message.forward_message_id`
   (the original's `base_gmail.messages.message_id`) makes a send a forward the way
-  `reply_to_thread_id` makes it a reply, so variants, drafts, the signature and
+  `reply_to_message_id` makes it a reply, so variants, drafts, the signature and
   edit-before-approve all apply unchanged; the two are refused together, and the variants
   of a forward must all forward one message. At proposal time
   (`app/internal/mutations/gmail_forward.go`) the store reads the original from the

@@ -267,6 +267,21 @@ class GmailMutationExecutor:
                     result_json={"delivery_mode": delivery_mode},
                     error="an email is a reply (reply_to_thread_id) or a forward (forward_message_id), not both",
                 )
+            is_reply = bool(
+                str(message.get("in_reply_to") or "").strip() or str(message.get("reply_to_message_id") or "").strip()
+            )
+            if is_reply and not reply_to_thread_id and not forward_message_id:
+                # Gmail files a message sent without threadId as a new
+                # conversation, In-Reply-To or not (2026-11-24: three approved
+                # replies went out that way). The proposal derives the thread
+                # from the message replied to, so a reply without one is a
+                # malformed request, never something to send detached.
+                return GmailMutationResult(
+                    status="failed_terminal",
+                    result_json={"delivery_mode": delivery_mode},
+                    error="reply has no Gmail thread id (reply_to_thread_id), so Gmail would start a new thread; "
+                    "propose it again with reply_to_message_id",
+                )
             if reply_to_thread_id and not str(message.get("in_reply_to") or "").strip():
                 return GmailMutationResult(
                     status="failed_terminal",

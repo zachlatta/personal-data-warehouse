@@ -218,7 +218,7 @@ func TestUpdatedGmailEmailPayloadConvertsSendToDraft(t *testing.T) {
 	}
 }
 
-func TestApplyGmailReplyHeaderRowsPopulatesReplyMetadata(t *testing.T) {
+func TestApplyGmailReplyParentRowsPopulatesReplyMetadata(t *testing.T) {
 	mutations := []storedMutation{{
 		Provider:  "gmail",
 		Operation: GmailSendEmailOperation,
@@ -237,13 +237,17 @@ func TestApplyGmailReplyHeaderRowsPopulatesReplyMetadata(t *testing.T) {
 		},
 	}}
 
-	got := applyGmailReplyHeaderRows(mutations, []gmailReplyHeaderRow{{
+	got, err := applyGmailReplyParentRows(mutations, []gmailReplyParentRow{{
 		Account:          "zach@example.test",
+		MessageID:        "parent",
 		ThreadID:         "thread-1",
 		RFC822MessageID:  "<parent@example.test>",
 		ReferencesHeader: "<root@example.test>",
 		InReplyToHeader:  "<previous@example.test>",
 	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	message := mapFromAny(got[0].Payload["message"])
 	if message["in_reply_to"] != "<parent@example.test>" {
@@ -259,7 +263,7 @@ func TestApplyGmailReplyHeaderRowsPopulatesReplyMetadata(t *testing.T) {
 	}
 }
 
-func TestApplyGmailReplyHeaderRowsPopulatesVariantReplyMetadata(t *testing.T) {
+func TestApplyGmailReplyParentRowsPopulatesVariantReplyMetadata(t *testing.T) {
 	mutations := []storedMutation{{
 		Provider:  "gmail",
 		Operation: GmailSendEmailOperation,
@@ -297,12 +301,16 @@ func TestApplyGmailReplyHeaderRowsPopulatesVariantReplyMetadata(t *testing.T) {
 		},
 	}}
 
-	got := applyGmailReplyHeaderRows(mutations, []gmailReplyHeaderRow{{
+	got, err := applyGmailReplyParentRows(mutations, []gmailReplyParentRow{{
 		Account:          "zach@example.test",
+		MessageID:        "parent",
 		ThreadID:         "thread-1",
 		RFC822MessageID:  "<parent@example.test>",
 		ReferencesHeader: "<root@example.test>",
 	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	payload := got[0].Payload
 	message := mapFromAny(payload["message"])
@@ -326,7 +334,7 @@ func TestApplyGmailReplyHeaderRowsPopulatesVariantReplyMetadata(t *testing.T) {
 	}
 }
 
-func TestApplyGmailReplyQuoteRowsAddsGmailStyleHistoryAfterSignature(t *testing.T) {
+func TestApplyGmailReplyParentRowsAddsGmailStyleHistoryAfterSignature(t *testing.T) {
 	mutations := []storedMutation{{
 		Provider:  "gmail",
 		Operation: GmailSendEmailOperation,
@@ -346,14 +354,19 @@ func TestApplyGmailReplyQuoteRowsAddsGmailStyleHistoryAfterSignature(t *testing.
 		},
 	}}
 
-	got := applyGmailReplyQuoteRows(mutations, []gmailReplyQuoteRow{{
-		Account:      "zach@example.test",
-		ThreadID:     "thread-1",
-		FromAddress:  "Sender <sender@example.test>",
-		InternalDate: time.Date(2026, 5, 23, 18, 4, 0, 0, time.UTC),
-		BodyHTML:     `<p>Parent body</p>`,
-		BodyText:     "Parent body",
+	got, err := applyGmailReplyParentRows(mutations, []gmailReplyParentRow{{
+		Account:         "zach@example.test",
+		MessageID:       "parent",
+		ThreadID:        "thread-1",
+		RFC822MessageID: "<parent@example.test>",
+		FromAddress:     "Sender <sender@example.test>",
+		InternalDate:    time.Date(2026, 5, 23, 18, 4, 0, 0, time.UTC),
+		BodyHTML:        `<p>Parent body</p>`,
+		BodyText:        "Parent body",
 	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	message := mapFromAny(got[0].Payload["message"])
 	bodyHTML := stringFromAny(message["body_html"])

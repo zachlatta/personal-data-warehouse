@@ -813,6 +813,38 @@ def test_gmail_forward_of_a_message_gone_from_gmail_sends_nothing() -> None:
     assert service.draft_create_calls == []
 
 
+def test_gmail_send_email_executor_never_sends_a_reply_without_its_thread() -> None:
+    # 2026-11-24: three approved replies carried In-Reply-To/References but no
+    # thread id, and Gmail filed each as a new conversation.
+    for message_fields in (
+        {"in_reply_to": "<ask-1@partner.test>", "references": ["<ask-1@partner.test>"]},
+        {"reply_to_message_id": "ask-1"},
+    ):
+        for mode in ("send", "draft"):
+            service = FakeGmailService()
+            result = GmailMutationExecutor(settings=object(), service_factory=lambda account: service).execute(
+                {
+                    "provider": "gmail",
+                    "operation": GMAIL_SEND_EMAIL_OPERATION,
+                    "account": "zach@example.test",
+                    "payload_json": {
+                        "delivery_mode": mode,
+                        "message": {
+                            "to": ["partner@partner.test"],
+                            "subject": "Re: Demo",
+                            "body_text": "Yes.",
+                            **message_fields,
+                        },
+                    },
+                }
+            )
+
+            assert result.status == "failed_terminal"
+            assert "thread" in result.error
+            assert service.send_calls == []
+            assert service.draft_create_calls == []
+
+
 def test_gmail_forward_cannot_also_be_a_reply() -> None:
     service = FakeGmailService(
         originals={"orig-1": {"id": "orig-1", "threadId": "thread-orig", "raw": _original_message_raw()}}

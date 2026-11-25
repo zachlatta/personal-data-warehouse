@@ -10,7 +10,7 @@ import (
 )
 
 // A forward is a gmail.send_email whose message names forward_message_id,
-// the way a reply names reply_to_thread_id: one email type, so variants,
+// the way a reply names reply_to_message_id: one email type, so variants,
 // drafts, the reviewer's edit-before-approve and the signature all work on it
 // unchanged. At proposal time the original is read from the warehouse and
 // written into the body exactly as Gmail's own Forward composes it (note,
@@ -69,8 +69,8 @@ func validateGmailForward(messages []map[string]any) error {
 		}
 		forwarding++
 		forwardIDs[forwardID] = true
-		if strings.TrimSpace(stringFromAny(message["reply_to_thread_id"])) != "" {
-			return fmt.Errorf("Gmail email variant %d sets both reply_to_thread_id and forward_message_id; an email is a reply or a forward, not both", index+1)
+		if gmailMessageIsReply(message) {
+			return fmt.Errorf("Gmail email variant %d sets both a reply (reply_to_message_id or reply_to_thread_id) and forward_message_id; an email is a reply or a forward, not both", index+1)
 		}
 	}
 	if len(forwardIDs) > 1 || (forwarding > 0 && forwarding < len(messages)) {

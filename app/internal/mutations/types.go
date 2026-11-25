@@ -235,17 +235,16 @@ type MutationInput struct {
 }
 
 type GmailEmailVariantInput struct {
-	Title           string         `json:"title" jsonschema:"short two-word title shown on the review tab, like Direct Reply or Softer Ask"`
-	Message         map[string]any `json:"message,omitempty" jsonschema:"optional full email message object for this variant"`
-	To              []string       `json:"to,omitempty" jsonschema:"primary recipients for this variant; inherits top-level recipients when omitted"`
-	CC              []string       `json:"cc,omitempty" jsonschema:"carbon-copy recipients for this variant; inherits top-level cc when omitted"`
-	BCC             []string       `json:"bcc,omitempty" jsonschema:"blind-copy recipients for this variant; inherits top-level bcc when omitted"`
-	Subject         string         `json:"subject,omitempty" jsonschema:"subject for this variant; inherits top-level subject when omitted"`
-	BodyText        string         `json:"body_text,omitempty" jsonschema:"plain-text body for this variant"`
-	BodyHTML        string         `json:"body_html,omitempty" jsonschema:"HTML body for this variant"`
-	ReplyToThreadID string         `json:"reply_to_thread_id,omitempty" jsonschema:"Gmail thread ID to reply in; inherits top-level reply thread when omitted"`
-	InReplyTo       string         `json:"in_reply_to,omitempty" jsonschema:"optional RFC822 message id this variant replies to"`
-	References      []string       `json:"references,omitempty" jsonschema:"optional RFC822 References header values"`
+	Title            string         `json:"title" jsonschema:"short two-word title shown on the review tab, like Direct Reply or Softer Ask"`
+	Message          map[string]any `json:"message,omitempty" jsonschema:"optional full email message object for this variant"`
+	To               []string       `json:"to,omitempty" jsonschema:"primary recipients for this variant; inherits top-level recipients when omitted"`
+	CC               []string       `json:"cc,omitempty" jsonschema:"carbon-copy recipients for this variant; inherits top-level cc when omitted"`
+	BCC              []string       `json:"bcc,omitempty" jsonschema:"blind-copy recipients for this variant; inherits top-level bcc when omitted"`
+	Subject          string         `json:"subject,omitempty" jsonschema:"subject for this variant; inherits top-level subject when omitted"`
+	BodyText         string         `json:"body_text,omitempty" jsonschema:"plain-text body for this variant"`
+	BodyHTML         string         `json:"body_html,omitempty" jsonschema:"HTML body for this variant"`
+	ReplyToThreadID  string         `json:"reply_to_thread_id,omitempty" jsonschema:"Gmail thread ID whose latest message this variant replies to; inherits the top-level reply when omitted"`
+	ReplyToMessageID string         `json:"reply_to_message_id,omitempty" jsonschema:"Gmail message_id of the message this variant replies to; inherits the top-level reply when omitted"`
 }
 
 type Request struct {

@@ -63,7 +63,11 @@ authoritative when this list and it disagree.
   mark-read batches as conversations with permalinks; calendar proposals on a day grid
   with conflicts flagged.
 - **Email as Zach:** preserve CC lists on replies, reply in the thread you found, and
-  never send from a guessed account. To forward, set `message.forward_message_id` to the
+  never send from a guessed account. To reply, set `message.reply_to_message_id` to the
+  `base_gmail.messages.message_id` you are answering: PDW files the reply in its thread
+  and builds the headers and quote from that message (`reply_to_thread_id` alone answers
+  the thread's latest message). Never set `in_reply_to`/`references`; they are refused,
+  as headers without the thread start a new conversation. To forward, set `message.forward_message_id` to the
   original's `base_gmail.messages.message_id` and write only your note: the `Fwd:`
   subject, Gmail's forwarded block and the original's attachments are added for you. The reviewer can edit an email before approving it,
   drop one item from a batch without denying the rest, or mark a dead request superseded.

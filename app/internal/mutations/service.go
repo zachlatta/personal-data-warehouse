@@ -327,6 +327,9 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
 		for messageIndex, message := range messages {
+			if err := refuseHandBuiltReplyHeaders(message); err != nil {
+				return fmt.Errorf("mutation %d Gmail email variant %d %w", index, messageIndex+1, err)
+			}
 			if err := validateEmailAttachments(message["attachments"]); err != nil {
 				return fmt.Errorf("mutation %d: %w", index, err)
 			}
@@ -545,6 +548,15 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 	if account == "" && strings.TrimSpace(mutationType) == PolicyChangeOperation {
 		account = PolicyChangeAccount
 	}
+	if strings.TrimSpace(mutationType) == GmailSendEmailOperation {
+		// A variant's top-level fields are parsed into a struct that has no
+		// place for these, so they are refused here rather than dropped.
+		for variantIndex, variant := range mapSliceFromAny(raw["variants"]) {
+			if err := refuseHandBuiltReplyHeaders(variant); err != nil {
+				return MutationInput{}, fmt.Errorf("mutation %d Gmail email variant %d %w", index, variantIndex+1, err)
+			}
+		}
+	}
 	return MutationInput{
 		Schedule:           schedule,
 		Type:               strings.TrimSpace(mutationType),
@@ -694,17 +706,16 @@ func emailVariantInputsFromAny(value any) []GmailEmailVariantInput {
 	out := make([]GmailEmailVariantInput, 0, len(items))
 	for _, item := range items {
 		out = append(out, GmailEmailVariantInput{
-			Title:           stringFromAny(item["title"]),
-			Message:         mapFromAny(item["message"]),
-			To:              stringSliceFromAny(item["to"]),
-			CC:              stringSliceFromAny(item["cc"]),
-			BCC:             stringSliceFromAny(item["bcc"]),
-			Subject:         stringFromAny(item["subject"]),
-			BodyText:        stringFromAny(item["body_text"]),
-			BodyHTML:        stringFromAny(item["body_html"]),
-			ReplyToThreadID: stringFromAny(item["reply_to_thread_id"]),
-			InReplyTo:       stringFromAny(item["in_reply_to"]),
-			References:      stringSliceFromAny(item["references"]),
+			Title:            stringFromAny(item["title"]),
+			Message:          mapFromAny(item["message"]),
+			To:               stringSliceFromAny(item["to"]),
+			CC:               stringSliceFromAny(item["cc"]),
+			BCC:              stringSliceFromAny(item["bcc"]),
+			Subject:          stringFromAny(item["subject"]),
+			BodyText:         stringFromAny(item["body_text"]),
+			BodyHTML:         stringFromAny(item["body_html"]),
+			ReplyToThreadID:  stringFromAny(item["reply_to_thread_id"]),
+			ReplyToMessageID: stringFromAny(item["reply_to_message_id"]),
 		})
 	}
 	return out
