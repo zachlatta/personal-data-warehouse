@@ -390,11 +390,9 @@ func Tools(store *Store) []tool.Tool {
 				if err != nil {
 					return Stats{}, toolError(err)
 				}
-				by := strings.ToLower(strings.TrimSpace(in.By))
-				if by != "" && by != "taste" {
-					return Stats{}, &tool.InvalidInputError{Message: fmt.Sprintf("unknown by %q; valid: %s", in.By, strings.Join(StatsBreakdowns, ", "))}
-				}
-				return store.Stats(ctx, StatsQuery{Source: strings.TrimSpace(in.Source), Since: since, By: by})
+				stats, err := store.Stats(ctx, StatsQuery{Source: strings.TrimSpace(in.Source), Since: since,
+					By: strings.ToLower(strings.TrimSpace(in.By))})
+				return stats, toolError(err)
 			},
 		},
 		&tool.Typed[eventsInput, eventsOutput]{

@@ -939,7 +939,10 @@ func TestPostgresFeedStatsByTaste(t *testing.T) {
 	if err != nil || plain.ByTaste != nil {
 		t.Fatalf("by taste without asking: %+v %v", plain.ByTaste, err)
 	}
+	// An unknown --by is the caller's mistake, so the tool reports invalid input.
 	if _, err := store.Stats(context.Background(), StatsQuery{By: "colour"}); err == nil {
 		t.Fatal("an unknown --by must fail")
+	} else if _, ok := err.(*ValidationError); !ok {
+		t.Fatalf("an unknown --by is a ValidationError, got %T: %v", err, err)
 	}
 }

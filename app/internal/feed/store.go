@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -547,8 +548,8 @@ var StatsBreakdowns = []string{"taste"}
 func (s *Store) Stats(ctx context.Context, query StatsQuery) (Stats, error) {
 	source, since := query.Source, query.Since
 	out := Stats{Sources: []SourceStats{}, EventsByType: map[string]int64{}, Since: since, Shares: []Share{}}
-	if query.By != "" && query.By != "taste" {
-		return out, fmt.Errorf("unknown breakdown %q; valid: %s", query.By, strings.Join(StatsBreakdowns, ", "))
+	if query.By != "" && !slices.Contains(StatsBreakdowns, query.By) {
+		return out, invalid("unknown by %q; valid: %s", query.By, strings.Join(StatsBreakdowns, ", "))
 	}
 	qctx, cancel := s.ctx(ctx)
 	defer cancel()
@@ -692,7 +693,8 @@ func (s *Store) tasteStats(ctx context.Context, source string, since time.Time) 
 	rows, err := s.DB.QueryContext(ctx, s.q(`
 		WITH cards AS (
 			SELECT btrim(regexp_replace(btrim(COALESCE(i.metadata->>'taste', '')), ':+$', '')) AS label,
-			       e.first_seen_at, e.opens, e.engagement_score, e.removed_at, e.expires_at
+			       e.first_seen_at, e.opens, e.engagement_score,
+			       (e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3)) AS live_unseen
 			FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
 			WHERE ($2 = '' OR i.source = $2)
 		)
@@ -700,12 +702,10 @@ func (s *Store) tasteStats(ctx context.Context, source string, since time.Time) 
 		       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
 		       count(*) FILTER (WHERE first_seen_at >= $1 AND opens > 0) AS opened,
 		       round(avg(engagement_score) FILTER (WHERE first_seen_at >= $1)::numeric, 2)::float8 AS avg_score,
-		       count(*) FILTER (WHERE first_seen_at IS NULL AND removed_at IS NULL
-		                        AND (expires_at IS NULL OR expires_at > now())) AS live_unseen
+		       count(*) FILTER (WHERE live_unseen) AS live_unseen
 		FROM cards GROUP BY lower(label)
-		HAVING count(*) FILTER (WHERE first_seen_at >= $1) > 0
-		    OR count(*) FILTER (WHERE first_seen_at IS NULL AND removed_at IS NULL AND (expires_at IS NULL OR expires_at > now())) > 0
-		ORDER BY seen DESC, taste`), since, source)
+		HAVING count(*) FILTER (WHERE first_seen_at >= $1 OR live_unseen) > 0
+		ORDER BY seen DESC, taste`), since, source, s.now())
 	if err != nil {
 		return nil, err
 	}
