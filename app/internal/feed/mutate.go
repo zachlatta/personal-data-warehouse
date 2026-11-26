@@ -270,13 +270,7 @@ func (s *Store) attachPushStock(ctx context.Context, items []normalized, results
 				keys = append(keys, k)
 			}
 			rows, err := s.DB.QueryContext(qctx, s.q(`
-				WITH cards AS (
-					SELECT btrim(regexp_replace(btrim(COALESCE(i.metadata->>'taste', '')), ':+$', '')) AS label,
-					       e.first_seen_at, e.opens,
-					       (e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3)) AS live_unseen
-					FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
-					WHERE i.source = $2 AND NOT (i.item_id = ANY($5::text[]))
-				)
+				WITH cards AS (`+tasteCardsSQL(`i.source = $2 AND NOT (i.item_id = ANY($5::text[]))`)+`)
 				SELECT lower(label) AS key,
 				       mode() WITHIN GROUP (ORDER BY label) AS taste,
 				       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
@@ -310,16 +304,7 @@ func (s *Store) attachPushStock(ctx context.Context, items []normalized, results
 				keys = append(keys, k)
 			}
 			rows, err := s.DB.QueryContext(qctx, s.q(`
-				WITH cards AS (
-					SELECT DISTINCT i.item_id,
-					       `+tagNormExpr+` AS tag,
-					       e.first_seen_at, e.opens,
-					       (e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3)) AS live_unseen
-					FROM @feed_items i
-					JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
-					CROSS JOIN LATERAL unnest(i.tags) AS raw_tag
-					WHERE i.source = $2 AND NOT (i.item_id = ANY($5::text[]))
-				)
+				WITH cards AS (`+tagCardsSQL(`i.source = $2 AND NOT (i.item_id = ANY($5::text[]))`)+`)
 				SELECT tag,
 				       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
 				       count(*) FILTER (WHERE first_seen_at >= $1 AND opens > 0) AS opened,

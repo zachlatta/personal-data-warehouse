@@ -722,13 +722,7 @@ func (s *Store) shares(ctx context.Context, source string, since time.Time) ([]S
 
 func (s *Store) tasteStats(ctx context.Context, source string, since time.Time) ([]TasteStats, error) {
 	rows, err := s.DB.QueryContext(ctx, s.q(`
-		WITH cards AS (
-			SELECT btrim(regexp_replace(btrim(COALESCE(i.metadata->>'taste', '')), ':+$', '')) AS label,
-			       e.first_seen_at, e.opens, e.engagement_score,
-			       (e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3)) AS live_unseen
-			FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
-			WHERE ($2 = '' OR i.source = $2)
-		)
+		WITH cards AS (`+tasteCardsSQL(`$2 = '' OR i.source = $2`)+`)
 		SELECT mode() WITHIN GROUP (ORDER BY label) AS taste,
 		       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
 		       count(*) FILTER (WHERE first_seen_at >= $1 AND opens > 0) AS opened,
@@ -756,20 +750,34 @@ func (s *Store) tasteStats(ctx context.Context, source string, since time.Time) 
 	return out, rows.Err()
 }
 
-const tagNormExpr = `btrim(lower(regexp_replace(btrim(raw_tag), '[\s-]+', '-', 'g')), '-')`
+// tasteCardsSQL and tagCardsSQL are the per-card rows behind --by taste,
+// --by tag and a push's stock note, so all three count a section or tag
+// alike. $3 is now; where filters the cards. A section label drops case,
+// surrounding spaces and a trailing colon (normalizeTasteLabel is its Go
+// twin); a tag is lowercased with runs of spaces and hyphens as one hyphen
+// (normalizeTagKey).
+func tasteCardsSQL(where string) string {
+	return `
+		SELECT btrim(regexp_replace(btrim(COALESCE(i.metadata->>'taste', '')), ':+$', '')) AS label,
+		       e.first_seen_at, e.opens, e.engagement_score, ` + liveUnseenSQL + ` AS live_unseen
+		FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		WHERE ` + where
+}
+
+func tagCardsSQL(where string) string {
+	return `
+		SELECT DISTINCT i.item_id, btrim(lower(regexp_replace(btrim(raw_tag), '[\s-]+', '-', 'g')), '-') AS tag,
+		       e.first_seen_at, e.opens, e.engagement_score, ` + liveUnseenSQL + ` AS live_unseen
+		FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		CROSS JOIN LATERAL unnest(i.tags) AS raw_tag
+		WHERE ` + where
+}
+
+const liveUnseenSQL = `(e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3))`
 
 func (s *Store) tagStats(ctx context.Context, source string, since time.Time) ([]TagStats, error) {
 	rows, err := s.DB.QueryContext(ctx, s.q(`
-		WITH cards AS (
-			SELECT DISTINCT i.item_id,
-			       `+tagNormExpr+` AS tag,
-			       e.first_seen_at, e.opens, e.engagement_score,
-			       (e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3)) AS live_unseen
-			FROM @feed_items i
-			JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
-			CROSS JOIN LATERAL unnest(i.tags) AS raw_tag
-			WHERE ($2 = '' OR i.source = $2)
-		)
+		WITH cards AS (`+tagCardsSQL(`$2 = '' OR i.source = $2`)+`)
 		SELECT tag,
 		       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
 		       count(*) FILTER (WHERE first_seen_at >= $1 AND opens > 0) AS opened,
