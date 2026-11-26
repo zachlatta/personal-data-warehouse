@@ -241,6 +241,10 @@ class FileEnrichmentSource:
     # select photo_id so the context builder can look up capture time/GPS and
     # nearby calendar events.
     extra_columns: tuple[str, ...] = ()
+    # Mask payment cards and credentials (card_redaction.redact) in the stored
+    # enrichment text: set for sources whose images can be screenshots, which
+    # can show a key, token or card on screen.
+    redact_sensitive_text: bool = False
 
 
 GMAIL_SOURCE = FileEnrichmentSource(
@@ -353,6 +357,8 @@ PHOTOS_SOURCE = FileEnrichmentSource(
     vision_instructions=photo_vision_instructions(),
     # photo_id lets the context builder join back to photos.assets.
     extra_columns=("photo_id",),
+    # The Pixel's screenshots (and any photo) can show a key, token or card on screen.
+    redact_sensitive_text=True,
 )
 
 # Backwards-friendly aliases retained for the Gmail-specific call sites/tests
@@ -534,6 +540,10 @@ class FileAttachmentEnrichmentRunner:
             raise RuntimeError("agent output failed validation: " + "; ".join(issues[:5]))
 
         text = attachment_enrichment_text(output)
+        if text and self._source.redact_sensitive_text:
+            from personal_data_warehouse.card_redaction import redact
+
+            text = redact(text)
         status = STATUS_OK if text else STATUS_NOT_USEFUL
         if len(text) > self._text_max_chars:
             text = text[: self._text_max_chars]

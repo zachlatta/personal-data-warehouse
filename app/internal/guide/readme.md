@@ -1,7 +1,7 @@
 # Personal Data Warehouse (PDW) — the agent guide
 
-One warehouse for Zach's mail, chats, calendar, contacts, files, notes, photos, voice
-transcripts, health, finances and prior agent sessions across providers and machines.
+One warehouse for Zach's mail, chats, calendar, contacts, files, notes, photos, screenshots,
+voice transcripts, health, finances and prior agent sessions across providers and machines.
 Answer questions about his life from PDW, not from priors, not from a web search, not from a
 single-source connector. Built-in writes require human
 approval; connected MCP tools may write directly.
@@ -43,7 +43,7 @@ server's hint rather than guessing a second name. `marts_ops.agent_usage` measur
 | Read-only SQL | `pdw sql -q '<why>' '<SQL>'` (CSV by default; `--output json\|nd-json`; multi-line SQL: `--file q.sql` or stdin) |
 | One relation's exact columns | `pdw columns <schema.relation>` |
 | Every relation with row estimates, or one schema / layer | `pdw schema [marts_finance\|marts\|base_]` |
-| Other tools | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'`; built-ins: plain JSON object (no MCP content array); `--output text` prints it |
+| Other tools | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'` (`get_object --save <path>` downloads and converts HEIC); built-ins: plain JSON object (no MCP content array); `--output text` prints it |
 | A local uploader or credential publisher | `pdw ingest <source>`, `pdw slack\|chatgpt\|whoop\|hn publish-session` (topic `ingest`) |
 | Setup and upkeep | `pdw login`, `pdw config show`, `pdw version`, `pdw update --check` |
 
@@ -61,7 +61,7 @@ default CSV output, so `--output json` stays parseable through `2>&1`.
 | Read-only SQL | `query` `{"queries": [{"question": "<why>", "sql": "<SQL>"}], "format": "csv|json|ndjson"}` |
 | One relation's exact columns | `describe_table` `{"relation": "<schema.relation>"}` |
 | Every relation with row estimates, or one schema / layer | `schema_overview` `{}` or `{"schema": "marts_finance"}` |
-| Bytes of a stored attachment, photo, recording or Slack file | `get_object` `{"storage_file_id": "<id>"}` |
+| Bytes of a stored screenshot, photo, attachment, recording or Slack file | `get_object` `{"storage_file_id": "<id>", "inline": true}` (`inline` attaches PNG/JPEG/WebP ≤ 4 MiB) |
 | A reviewed write | `propose_mutation_help` `{}`, then `propose_mutation` (topic `mutations`) |
 | A push notification to Zach's phone | `notify` |
 | Zach's Feed (phone tab, laptop page) | `feed_push`, `feed_stats` (topic `feed`) |
@@ -86,8 +86,8 @@ attaches a `hint`, act on it.
 - `hybrid` (default) fuses semantic, BM25 and a gated literal leg by rank; `exact` for a
   literal phrase, email address, phone, amount, URL, path or id; `keyword` for BM25 only.
 - Scope by `sources` (`gmail`, `slack`, `apple_messages`, `whatsapp`, `calendar`, `drive`,
-  `contacts`, `notes`, `photos`, `voice_memos`/`transcripts`, `agent_session`, `finance`,
-  `whoop`, ...; an unknown token errors with the valid list) and `since` when the request
+  `contacts`, `notes`, `photos`, `screen_timelapse`, `voice_memos`/`transcripts`, `agent_session`,
+  `finance`, `whoop`, ...; an unknown token errors with the valid list) and `since` when the request
   gives a natural scope. A Drive file id searched with `exact` returns the file itself.
 - **Priority is the filter that turns the whole corpus into an answer.** `noise` is most
   of the timeline, so an attention question without a tier filter comes back as
@@ -145,6 +145,7 @@ More in topic `sql`.
 | chat | `marts_messages.messages` (iMessage + WhatsApp, sender-resolved), `base_slack.messages`, `marts_inbox.slack_items`, `marts_slack.huddles` |
 | calendar and contacts | `base_google_calendar.events`, `marts_contacts.contacts`, `marts_contacts.contact_points` |
 | files, notes, photos | `base_google_drive.files`, `derived_documents.google_drive_file_texts`, `base_apple_notes.notes`, `marts_photos.photos`, `marts_files.attachments` |
+| screens / screenshots | `marts_screen_timelapse.active_screens`, `base_screen_timelapse.screenshots` (periodic Mac & phone); `marts_photos.photos` (phone screenshots) |
 | voice and transcripts | `marts_voice_memos.recordings`, `marts_voice_memos.transcript_segments`, `marts_calendar.events_with_voice_memos` |
 | health | `marts_health.cycles`, `.sleeps`, `.recoveries`, `.workouts`; high-resolution `base_whoop_private.*` |
 | finance | `marts_finance.net_worth`, `.transactions`, `.accounts`, `.commitments`, `.tax_lots`, `.position_coverage` |
@@ -156,40 +157,29 @@ Topic `sources` has the per-domain detail; `agent-sessions`, `finance`, `health`
 
 ## Absence is not evidence
 
-The warehouse is complete for what it syncs and silent about what it cannot. Before
-reporting a negative, check the source's freshness (`marts_ops.pipeline_health`,
-`marts_ops.slack_conversation_health`) and the known gaps: nothing said in a Slack huddle
-reaches PDW (metadata only, `marts_slack.huddles`); a bank may hand Plaid only ~90 days
-of history, so older spending lives in the statement corpus
-(`base_manual_finance.documents`); Slack public channels Zach is not a member of are
-swept slowly. State the window and the
-freshness of what you read.
+Check freshness (`marts_ops.pipeline_health`, `marts_ops.slack_conversation_health`) and known
+gaps before reporting a negative: Slack huddles carry metadata only (`marts_slack.huddles`);
+Plaid banks may hand back only ~90 days (older statements: `base_manual_finance.documents`);
+public Slack channels Zach is not in sweep slowly. State the window and freshness.
 
 ## Connected MCP servers
 
-Tools named `<connection>__<tool>` call a live upstream MCP server, not the warehouse.
-They may write directly without PDW mutation review. {{if .CLI}}`pdw list` names them and `pdw call`
-invokes them.{{else}}They are not in the tool list: `connections` lists a connection's tools with their
-schemas and `connection_call` invokes one, so ~190 upstream definitions do not sit in every
-session's context.{{end}} Configure and authenticate on the web app's `/connections` page; see topic
-`connections` for discovery, access and limits.
+Tools named `<connection>__<tool>` call a live upstream MCP server, not the warehouse, and may
+write directly without PDW mutation review. {{if .CLI}}`pdw list` names them and `pdw call`
+invokes them.{{else}}`connections` lists them with schemas and `connection_call` invokes one.{{end}} Configure on `/connections`; see topic `connections`.
 
 ## Writes
 
-Built-in mutation tools do not write upstream directly. {{if .CLI}}`pdw call propose_mutation_help` lists the supported
-types; `pdw call propose_mutation --data '<json>'`{{else}}`propose_mutation_help` lists the supported
-types; `propose_mutation`{{end}} queues a request for human review and returns an
-`approval_url`. Gmail (send, archive, labels), Google Calendar and Contacts, Slack (send,
-mark read) and Apple Notes are supported. Topic `mutations`.
+Built-in mutation tools queue a request for human review (`approval_url`) rather than writing
+directly: {{if .CLI}}`pdw call propose_mutation_help` then `pdw call propose_mutation --data '<json>'`{{else}}`propose_mutation_help` then `propose_mutation`{{end}}
+(Gmail, Calendar, Contacts, Slack, Apple Notes, screen timelapse purge, Resideo; topic `mutations`).
 
 {{if .CLI -}}
 ## Setup
 
-`pdw login` saves the warehouse URL and token to `~/.config/pdw/config.json`; `PDW_API_URL`
-and `PDW_SECRET_TOKEN` override it. The binary self-updates in the background — leave that
-on, and when behaviour looks stale run `pdw version` and `pdw update --check` before
-debugging anything else. `pdw ingest <source>` runs a local uploader against the machine's
-own data and writes to the warehouse: never run it speculatively (topic `ingest`).
+`pdw login` saves URL and token to `~/.config/pdw/config.json` (`PDW_API_URL` / `PDW_SECRET_TOKEN`
+override). Leave self-update on (`pdw version`, `pdw update --check`). `pdw ingest <source>` runs
+a local uploader: never run it speculatively (topic `ingest`).
 
 {{end -}}
 ## Topics

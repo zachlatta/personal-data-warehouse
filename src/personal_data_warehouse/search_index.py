@@ -245,6 +245,13 @@ def _credential_masked_adapters() -> frozenset[str]:
     return frozenset(adapter.name for adapter in TIMELINE_ADAPTERS if adapter.mask_credentials)
 
 
+@functools.cache
+def _card_masked_adapters() -> frozenset[str]:
+    from personal_data_warehouse.timeline import TIMELINE_ADAPTERS
+
+    return frozenset(adapter.name for adapter in TIMELINE_ADAPTERS if adapter.mask_cards)
+
+
 def split_text(text: str, *, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> list[str]:
     """Split a document into chunks on line boundaries where possible.
 
@@ -351,15 +358,17 @@ class SearchChunkBuilder:
     def _plain_chunks(self, row: dict[str, Any]) -> list[_ChunkRow]:
         anchor = f"{row['adapter']}|{row['event_id']}"
         document = row["search_text"] or ""
-        if row["adapter"] in _credential_masked_adapters():
-            # A chunk is a window of an agent transcript: keep a marker the
-            # window cuts out of it and mask what the cut selects (derived_redaction).
+        if row["adapter"] in _credential_masked_adapters() or row["adapter"] in _card_masked_adapters():
+            # Keep markers intact across chunk boundaries and mask any fragment
+            # a window cut creates (credentials only for agent transcripts;
+            # credentials + payment cards for screen captures and photos).
             from personal_data_warehouse.derived_redaction import mask_window
 
+            include_cards = row["adapter"] in _card_masked_adapters()
             pieces = [
                 piece
                 for start, end in split_spans(document)
-                if len(piece := mask_window(document, start, end).strip()) >= CHUNK_MIN_CHARS
+                if len(piece := mask_window(document, start, end, include_cards=include_cards).strip()) >= CHUNK_MIN_CHARS
             ]
         else:
             pieces = split_text(document)

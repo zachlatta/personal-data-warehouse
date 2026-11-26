@@ -24,16 +24,23 @@ _TRAILING_PARTIAL = re.compile(
     r'\[(?:R(?:E(?:D(?:A(?:C(?:T(?:E(?:D(?::(?:[a-z_]+(?::[0-9a-f]{0,6})?)?)?)?)?)?)?)?)?)?)?\Z')
 
 
-def mask_cut(value: str, *, cut_end: bool = False) -> str:
+def mask_cut(value: str, *, cut_end: bool = False, include_cards: bool = False) -> str:
     """Mask a prefix copy (a title or snippet) of text that was masked whole.
 
     ``cut_end``: the value was cut at its cap, so a marker the cut went
-    through is dropped first. A copy with nothing selected and no cut marker is
-    returned unchanged. A masked fragment's marker can be longer than the
-    fragment, so a masked title may exceed its cap by up to one marker.
+    through is dropped first. ``include_cards``: also mask payment card numbers
+    and adjacent security codes via ``card_redaction.redact`` (used for screen
+    captures and manual screenshots; agent conversations stay credential-only).
+    A copy with nothing selected and no cut marker is returned unchanged. A
+    masked fragment's marker can be longer than the fragment, so a masked title
+    may exceed its cap by up to one marker.
     """
     if cut_end and (partial := _TRAILING_PARTIAL.search(value)):
         value = value[:partial.start()]
+    if include_cards:
+        from personal_data_warehouse.card_redaction import redact
+
+        return redact(value)
     return redact_credentials(value) if might_contain_credential(value) else value
 
 
@@ -44,7 +51,7 @@ def _marker_around(document: str, offset: int):
     return None
 
 
-def mask_window(document: str, start: int, end: int) -> str:
+def mask_window(document: str, start: int, end: int, *, include_cards: bool = False) -> str:
     """Mask ``document[start:end]`` (a search chunk), never splitting a marker.
 
     The document is known here, so a window edge inside a marker moves to the
@@ -54,4 +61,4 @@ def mask_window(document: str, start: int, end: int) -> str:
         start = marker.end()
     if marker := _marker_around(document, end):
         end = marker.start()
-    return mask_cut(document[start:end]) if start < end else ''
+    return mask_cut(document[start:end], include_cards=include_cards) if start < end else ''

@@ -1,27 +1,24 @@
 # PDW — the agent guide (brief)
 
 One warehouse for everything about Zach: Gmail, Slack, Calendar, Drive, Contacts, iMessage,
-WhatsApp, Notes, Photos, voice-memo transcripts, WHOOP health, finances, and every prior AI
+WhatsApp, Notes, Photos, screenshots, voice-memo transcripts, WHOOP health, finances, and every prior AI
 agent session. Any question about Zach's own life starts here. Reads are safe; built-in
 writes need human approval. Relation and column names change often — never trust memory,
 including this page. This is the brief; {{if .CLI}}`pdw readme full`{{else}}`readme` with `{"topic": "full"}`{{end}} is the long form.
 
 ## Workflow: search first, SQL second
 
-1. **Search** with the fewest, most distinctive words the answering record would contain
-   (a name, an id, a subject line, an amount) — not the question. On a miss drop words.
-{{if .CLI}}   `pdw search --priority {{.Attention}} '<terms>'`  (`-n 10` default; `--source`, `--since`, `--mode exact` for ids/paths/amounts; `--full` for long previews){{else}}   `search` `{"query": "<terms>", "priorities": {{jsonList (split .Attention)}}}` (also `sources`, `since`, `mode: exact` for ids/paths/amounts){{end}}
-2. **Read the conversation** around a hit (its email thread, Slack thread/channel, chat, or
-   neighbouring agent turns):
-{{if .CLI}}   `pdw context '<ref>'` (`--full` for whole texts); a hit's `sql:` line reads its source row verbatim{{else}}   `context` `{"ref": "<ref>"}` (`before`/`after` default 5, `full: true` for whole texts); a hit's `drill_sql` reads its source row verbatim{{end}}
+1. **Search** with the fewest, most distinctive words (name, id, subject, amount) — not the question. On a miss drop words.
+{{if .CLI}}   `pdw search --priority {{.Attention}} '<terms>'` (`-n 10`; `--source`, `--since`, `--mode exact`, `--full`){{else}}   `search` `{"query": "<terms>", "priorities": {{jsonList (split .Attention)}}}` (also `sources`, `since`, `mode: exact`){{end}}
+2. **Read the conversation** around a hit (email/Slack thread, chat, or neighbouring agent turns):
+{{if .CLI}}   `pdw context '<ref>'` (`--full` for whole texts); a hit's `sql:` line reads its source row verbatim{{else}}   `context` `{"ref": "<ref>"}` (`before`/`after` 5, `full: true` for whole texts); `drill_sql` reads its source row verbatim{{end}}
 3. **SQL** only for aggregates, joins, predicates and drill-down, walking
    `timeline.events` (bounded, priority-filtered) → `marts_*`/`derived_*` → `base_*`.
-4. **Columns before SQL, every time, and wait for them:** {{if .CLI}}`pdw columns <schema.relation>`; `pdw schema` only to find a relation you do not know.{{else}}`describe_table` `{"relation": "<schema.relation>"}`; `schema_overview` only to find a relation you do not know.{{end}}
-   Read the output before writing the query: a columns call run in parallel with the SQL, or
-   as a fallback after it, is still a guess.
+4. **Columns before SQL, every time, and wait for them:** {{if .CLI}}`pdw columns <schema.relation>`; `pdw schema` only for unknown relations.{{else}}`describe_table` `{"relation": "<schema.relation>"}`; `schema_overview` only for unknown relations.{{end}}
+   Read the output before writing SQL (parallel or fallback calls are still guesses).
 
-Do not open with schema discovery; do not `ILIKE` a raw `base_*` body column (it times out);
-after a 42703/42P01 read the server's hint — it lists the real columns — instead of guessing again.
+Never open with schema discovery or `ILIKE` a raw `base_*` body column (times out);
+after 42703/42P01 read the server's hint (it lists the real columns) instead of guessing.
 
 {{if .CLI -}}
 ## Command map
@@ -34,11 +31,11 @@ after a 42703/42P01 read the server's hint — it lists the real columns — ins
 | Read-only SQL | `pdw sql -q '<why>' '<SQL>'` (CSV by default; `--output json\|nd-json`; multi-line SQL via `--file` or stdin) |
 | One relation's exact columns | `pdw columns <schema.relation>` |
 | Every relation with row estimates, or one schema / layer | `pdw schema [marts_finance\|marts\|base_]` |
-| Other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`, connected `<connection>__<tool>`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'`; built-ins return a plain JSON object (no MCP content array); `--output text` prints it |
+| Other tools (`get_object --save <path>` for file/screenshot bytes, `notify`, `propose_mutation*`, `<conn>__<tool>`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'`; built-ins return a plain JSON object (no MCP content array); `--output text` prints it |
 | Put cards in Zach's Feed tab, read his engagement | `pdw feed push\|edit\|remove\|restore\|history\|stats` (topic `feed`) |
 | Setup | `pdw login`, `pdw version`, `pdw update --check`; uploaders: `pdw ingest <source>` (topic `ingest`) |
 
-Not commands: `pdw query` (it is `pdw sql`), `pdw tools` / `pdw connections` (`pdw list`), `pdw schema_overview`, `pdw describe_table`, `pdw call sql|query|search|context` (each is refused with the real one).
+Not commands: `pdw query` (`pdw sql`), `pdw tools`/`pdw connections` (`pdw list`), `pdw schema_overview`, `pdw describe_table`, `pdw call sql|query|search|context`.
 {{- else -}}
 ## Tool map
 
@@ -50,12 +47,12 @@ Not commands: `pdw query` (it is `pdw sql`), `pdw tools` / `pdw connections` (`p
 | Read-only SQL | `query` `{"queries": [{"question", "sql"}], "format": "csv|json|ndjson"}` (CSV by default) |
 | One relation's exact columns | `describe_table` `{"relation"}` |
 | Every relation with row estimates, or one schema / layer | `schema_overview` `{}` or `{"schema": "marts_finance"}` |
-| Bytes of a stored attachment, photo, recording or Slack file | `get_object` `{"storage_file_id"}` |
+| Stored screenshot/photo/file bytes | `get_object` `{"storage_file_id", "inline": true}` (auto-resizes PNG/JPEG ≤ 1568 px; use preview/thumbnail ids below) |
 | A reviewed write | `propose_mutation_help`, then `propose_mutation` (topic `mutations`) |
 | Connected upstream MCP servers (skills, tasks, other warehouses) | `connections` to list, `connection_call` to invoke (topic `connections`) |
 | A push notification to Zach's phone | `notify` |
 | Put cards in Zach's Feed tab, read his engagement | `feed_push`, `feed_update`, `feed_history`, `feed_stats` (topic `feed`) |
-| The `pdw` CLI in your own shell (a sandbox, VM or container) | `cli_authorize`, then run the one-line command it returns; the CLI's token lasts 24 h |
+| The `pdw` CLI in your own shell (a sandbox, VM or container) | `cli_authorize`, then run the one-line command it returns (24 h token) |
 {{- end}}
 
 ## Priority tiers (the filter that turns the corpus into an answer)
@@ -89,14 +86,17 @@ Not commands: `pdw query` (it is `pdw sql`), `pdw tools` / `pdw connections` (`p
   A mutation's status: `ops.upstream_mutation_requests.id` (not `request_id`), with `context_json`
   and `result_json`; its operations carry `request_id` and the type in `operation`.
 
+- **Screenshots (through PDW, not SSH):** phone screenshots → {{if .CLI}}`pdw search --source photos`{{else}}`search` `sources: ["photos"]`{{end}} / `marts_photos.photos` (`thumbnail_storage_file_id`); periodic frames (Mac & phone) → {{if .CLI}}`pdw search --source screen_timelapse` (omit `--priority` — frames are `noise`){{else}}`search` `sources: ["screen_timelapse"]` (omit `priorities` — frames are `noise`){{end}} or `marts_screen_timelapse.active_screens` (`preview_storage_file_id`); raw `base_screen_timelapse.screenshots`; view bytes via {{if .CLI}}`pdw call get_object --data '{"storage_file_id":"<id>"}' --save x.png`{{else}}`get_object` `{"storage_file_id":"<id>","inline":true}`{{end}}. (Manual Mac PNGs are not in PDW.)
+
 ## Where things live
 
 `timeline.events` (everything) · mail `base_gmail.messages`, `marts_inbox.gmail_threads` · chat
 `marts_messages.messages`, `base_slack.messages` · calendar/contacts `base_google_calendar.events`,
 `marts_contacts.contacts` · files/notes/photos `base_google_drive.files`, `base_apple_notes.notes`,
-`marts_photos.photos`, `marts_files.attachments` · voice `marts_voice_memos.recordings` · health
-`marts_health.*` · finance `marts_finance.net_worth`, `.transactions` · prior agent sessions
-`marts_ai_conversations.sessions`, `.events` · freshness `marts_ops.pipeline_health`.
+`marts_photos.photos`, `marts_files.attachments` · screens `marts_screen_timelapse.active_screens` ·
+voice `marts_voice_memos.recordings` · health `marts_health.*` · finance `marts_finance.net_worth`,
+`.transactions` · sessions `marts_ai_conversations.sessions`, `.events` · freshness
+`marts_ops.pipeline_health`.
 
 Absence is not evidence: check freshness before reporting a negative, and state the window.
 

@@ -219,6 +219,7 @@ func validateMCPArguments(input json.RawMessage, resolved *jsonschema.Resolved) 
 }
 
 func (t *Typed[I, O]) mcpCallToolResult(ctx context.Context, input I, hooks Hooks) *mcp.CallToolResult {
+	ctx = WithMCPContext(ctx)
 	if hooks.OnCall != nil {
 		hooks.OnCall(ctx, t.NameStr)
 	}

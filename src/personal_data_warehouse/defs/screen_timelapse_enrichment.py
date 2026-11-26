@@ -25,12 +25,15 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_job_in_progress
 from personal_data_warehouse.screen_timelapse_enrichment import (
+    DEFAULT_PREVIEW_BACKFILL_LIMIT,
     DEFAULT_SCREEN_DESCRIPTION_LOOKBACK,
     DEFAULT_SCREEN_DESCRIPTION_MAX_ERROR_ATTEMPTS,
     DEFAULT_TREE_TEXT_BACKFILL_LIMIT,
     SCREEN_DESCRIPTION_PROMPT_VERSION,
     ScreenTimelapseEnrichmentRunner,
     backfill_accessibility_tree_text,
+    backfill_screen_timelapse_previews,
+    count_screen_timelapse_previews_pending,
     load_screen_description_candidates,
 )
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
@@ -41,6 +44,7 @@ DEFAULT_SCREEN_TIMELAPSE_ENRICHMENT_BATCH_SIZE = 30
 SCREEN_TIMELAPSE_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 120
 SCREEN_TIMELAPSE_ENRICHMENT_ENABLED_ENV = "SCREEN_TIMELAPSE_ENRICHMENT_ENABLED"
 SCREEN_TIMELAPSE_ENRICHMENT_BATCH_SIZE_ENV = "SCREEN_TIMELAPSE_ENRICHMENT_BATCH_SIZE"
+SCREEN_TIMELAPSE_PREVIEW_BACKFILL_LIMIT_ENV = "SCREEN_TIMELAPSE_PREVIEW_BACKFILL_LIMIT"
 # How far back frames are read. 24 hours while the prompt is iterated on a
 # day of frames; widen it to backfill the history.
 SCREEN_TIMELAPSE_ENRICHMENT_LOOKBACK_HOURS_ENV = "SCREEN_TIMELAPSE_ENRICHMENT_LOOKBACK_HOURS"
@@ -78,6 +82,9 @@ def screen_timelapse_enrichment(context, agent: AgentResource) -> MaterializeRes
         trees_filled = backfill_accessibility_tree_text(
             warehouse, store, limit=DEFAULT_TREE_TEXT_BACKFILL_LIMIT, logger=context.log
         )
+        previews_filled = backfill_screen_timelapse_previews(
+            warehouse, store, limit=screen_timelapse_preview_backfill_limit(), logger=context.log
+        )
         summary = screen_timelapse_enrichment_runner(
             settings=settings,
             warehouse=warehouse,
@@ -89,6 +96,7 @@ def screen_timelapse_enrichment(context, agent: AgentResource) -> MaterializeRes
     return MaterializeResult(
         metadata={
             "trees_text_filled": MetadataValue.int(trees_filled),
+            "previews_filled": MetadataValue.int(previews_filled),
             "frames_seen": MetadataValue.int(summary.frames_seen),
             "frames_described": MetadataValue.int(summary.frames_described),
             "frames_reused": MetadataValue.int(summary.frames_reused),
@@ -140,15 +148,21 @@ def screen_timelapse_enrichment_backlog_sensor(context):
                 limit=1,
                 max_error_attempts=screen_timelapse_enrichment_max_error_attempts(),
             )
+            previews_pending = (
+                count_screen_timelapse_previews_pending(warehouse)
+                if not waiting and screen_timelapse_preview_backfill_limit() > 0
+                else 0
+            )
         except Exception as exc:
             # The descriptions table appears on the first run; never run DDL
             # from a sensor.
             return SkipReason(f"Screen timelapse tables are not ready yet: {exc}")
-        if not waiting:
-            return SkipReason("No screen timelapse frames are waiting to be read.")
+        if not waiting and not previews_pending:
+            return SkipReason("No screen timelapse frames or previews are waiting.")
     finally:
         warehouse.close()
-    return RunRequest(tags={"screen_timelapse_trigger": "enrichment_backlog"})
+    trigger = "enrichment_backlog" if waiting else "preview_backfill"
+    return RunRequest(tags={"screen_timelapse_trigger": trigger})
 
 
 def screen_timelapse_object_store(settings):
@@ -209,6 +223,11 @@ def screen_timelapse_enrichment_enabled() -> bool:
 def screen_timelapse_enrichment_batch_size() -> int:
     value = os.getenv(SCREEN_TIMELAPSE_ENRICHMENT_BATCH_SIZE_ENV, "").strip()
     return int(value) if value else DEFAULT_SCREEN_TIMELAPSE_ENRICHMENT_BATCH_SIZE
+
+
+def screen_timelapse_preview_backfill_limit() -> int:
+    value = os.getenv(SCREEN_TIMELAPSE_PREVIEW_BACKFILL_LIMIT_ENV, "").strip()
+    return int(value) if value else DEFAULT_PREVIEW_BACKFILL_LIMIT
 
 
 def screen_timelapse_enrichment_lookback() -> timedelta:

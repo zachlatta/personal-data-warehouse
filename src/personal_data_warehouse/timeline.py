@@ -150,17 +150,30 @@ TIMELINE_MASKED_COLUMNS = {
 }
 
 
-def masked_rows(rows: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
-    """Credential-mask TIMELINE_MASKED_COLUMNS of normalized rows (derived_redaction)."""
+def masked_rows(rows: list[tuple[Any, ...]], *, include_cards: bool = False) -> list[tuple[Any, ...]]:
+    """Mask TIMELINE_MASKED_COLUMNS of normalized rows (derived_redaction).
+
+    Payment-card masking is intentionally skipped on ``metadata`` JSON so
+    high-precision numeric fields (such as GPS ``lat``/``lon`` floats on photo
+    events) are never rewritten into strings; credential masking still runs on
+    ``metadata``.
+    """
     from personal_data_warehouse.derived_redaction import mask_cut
 
-    positions = [(TIMELINE_NORMALIZED_COLUMNS.index(name), cap) for name, cap in TIMELINE_MASKED_COLUMNS.items()]
+    positions = [
+        (name, TIMELINE_NORMALIZED_COLUMNS.index(name), cap)
+        for name, cap in TIMELINE_MASKED_COLUMNS.items()
+    ]
     result = []
     for row in rows:
         values = list(row)
-        for index, cap in positions:
+        for name, index, cap in positions:
             if isinstance(values[index], str):
-                values[index] = mask_cut(values[index], cut_end=cap is not None and len(values[index]) >= cap)
+                values[index] = mask_cut(
+                    values[index],
+                    cut_end=cap is not None and len(values[index]) >= cap,
+                    include_cards=include_cards and name != "metadata",
+                )
         result.append(tuple(values))
     return result
 
@@ -275,11 +288,16 @@ class TimelineAdapter:
     event_id_expression: str = ""
     # Mask credentials in title, snippet, metadata and search_text AFTER the
     # SQL has cut them (see derived_redaction). Set for adapters over agent
-    # transcripts, whose source rows are masked whole at ingest but whose cut
-    # copies can hold a fragment the full text never did. Not part of
-    # `adapter_signature`: masking is applied in Python to every row the
-    # engine writes, so it needs no re-walk of rows already stored.
+    # transcripts, screen captures and photos. Not part of `adapter_signature`:
+    # masking is applied in Python to every row the engine writes, so turning
+    # it on masks rows as they are next written and re-walks none already stored.
     mask_credentials: bool = False
+    # Also mask payment card numbers and adjacent security codes (card_redaction)
+    # in title, snippet, search_text and search chunks -- not metadata, whose
+    # JSON numbers (GPS lat/lon) card masking would turn into strings. Used for
+    # screen captures and photos, where a screen may show a card. Not part of
+    # `adapter_signature` either.
+    mask_cards: bool = False
 
 
 def _real_ts(*exprs: str) -> str:
@@ -316,6 +334,8 @@ def _simple_adapter(
     refresh_hours: float = 0.0,
     prune_sql: str = "",
     max_ingest_sql: str = "",
+    mask_credentials: bool = False,
+    mask_cards: bool = False,
 ) -> TimelineAdapter:
     if not priority.strip():
         raise ValueError(f"timeline adapter {name!r} must declare a priority expression")
@@ -483,6 +503,8 @@ def _simple_adapter(
         signature_max_ingest_sql=signature_max_ingest_sql,
         reconcile_sql=reconcile_sql,
         event_id_expression=event_id,
+        mask_credentials=mask_credentials,
+        mask_cards=mask_cards,
     )
 
 
@@ -1879,6 +1901,8 @@ _PHOTO = _simple_adapter(
     # Photos Zach took are his own actions.
     priority=TIMELINE_PRIORITY_SELF,
     refresh_hours=48,
+    mask_credentials=True,
+    mask_cards=True,
 )
 
 def _contact_update_adapter(*, name: str, source_table: str) -> TimelineAdapter:
@@ -3226,27 +3250,79 @@ _MUSE_FILE = _simple_adapter(
 # The screen timelapse (base_screen_timelapse.screenshots): a periodic image of
 # a device's whole screen. One event per capture MOMENT -- a Mac with two
 # displays writes two screenshots of one instant, and display 1 always exists
-# -- so "what was on the screen at 3pm" is one row per minute per device. The
-# frames are raw pixels, so the rows carry no search text: they are on the
-# timeline to be reached by time and device, and become searchable when an
-# enrichment step reads them. `noise`: passive telemetry about Zach, the tier
-# his own health telemetry is in, and what it shows (the message he typed,
-# the page he read) is already on the timeline as the event itself.
+# -- so "what was on the screen at 3pm" is one row per minute per device.
+# Undescribed, locked and off frames stay out of search (search_text = ''),
+# while completed active readings from derived_screen_timelapse.descriptions
+# (across all displays of the moment) populate title, snippet and search_text
+# so `pdw search --source screen_timelapse '<terms>'` finds what was on screen.
+# `noise`: passive telemetry about Zach, the tier his own health telemetry is
+# in, and what it shows (the message he typed, the page he read) is already on
+# the timeline as the event itself.
 _SCREEN_CAPTURE = _simple_adapter(
     name="screen_capture",
     source_table="screen_timelapse_screenshots",
     source="screen_timelapse",
     kind="screen_capture",
-    from_sql="@screen_timelapse_screenshots t",
+    from_sql="""@screen_timelapse_screenshots t
+    LEFT JOIN LATERAL (
+        SELECT
+            string_agg(
+                NULLIF(concat_ws(' — ', NULLIF(d.app, ''), NULLIF(d.window_title, '')), ''),
+                ' | ' ORDER BY d.display_index
+            ) FILTER (WHERE d.screen_state = 'active') AS active_title,
+            string_agg(
+                NULLIF(COALESCE(NULLIF(d.summary, ''), d.screen_text), ''),
+                E'\n' ORDER BY d.display_index
+            ) FILTER (WHERE d.screen_state = 'active') AS active_snippet,
+            string_agg(
+                NULLIF(
+                    concat_ws(
+                        ' ',
+                        NULLIF(d.app, ''),
+                        NULLIF(d.window_title, ''),
+                        NULLIF(d.summary, ''),
+                        NULLIF(d.screen_text, '')
+                    ),
+                    ''
+                ),
+                E'\n' ORDER BY d.display_index
+            ) FILTER (WHERE d.screen_state = 'active') AS active_search_text,
+            max(d.created_at) AS description_ingest_ts
+        FROM (
+            SELECT DISTINCT ON (r.display_index)
+                r.display_index, r.screen_state, r.app, r.window_title,
+                r.summary, r.screen_text, r.created_at
+            FROM @screen_timelapse_descriptions r
+            WHERE r.device = t.device
+              AND r.captured_at = t.captured_at
+              AND r.status = 'completed'
+            ORDER BY r.display_index, r.created_at DESC, r.sync_version DESC
+        ) d
+    ) enr ON TRUE""",
     where="t.display_index = 1",
+    changed_join_anchor="@screen_timelapse_screenshots t",
+    changed_join_sql="""JOIN (
+        SELECT device, captured_at
+        FROM @screen_timelapse_screenshots
+        WHERE display_index = 1 AND ingested_at >= %(watermark_ts)s
+        UNION
+        SELECT device, captured_at
+        FROM @screen_timelapse_descriptions
+        WHERE status = 'completed' AND created_at >= %(watermark_ts)s
+    ) _changed ON _changed.device = t.device AND _changed.captured_at = t.captured_at""",
+    max_ingest_sql="""SELECT GREATEST(
+        (SELECT max(ingested_at) FROM @screen_timelapse_screenshots WHERE display_index = 1),
+        (SELECT max(created_at) FROM @screen_timelapse_descriptions WHERE status = 'completed')
+    )""",
     event_id=(
         "concat_ws('|', t.device, "
         "to_char(t.captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'))"
     ),
     event_ts="t.captured_at",
-    ingest_ts="t.ingested_at",
+    ingest_ts="GREATEST(t.ingested_at, COALESCE(enr.description_ingest_ts, t.ingested_at))",
     actor="'me'",
-    title="concat(t.device, ' screen')",
+    title="COALESCE(NULLIF(enr.active_title, ''), concat(t.device, ' screen'))",
+    snippet=_snippet("COALESCE(enr.active_snippet, '')"),
     # A device's day is the "conversation": the frames before and after.
     context="concat_ws('|', t.device, to_char(t.captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'))",
     source_pk=(
@@ -3261,8 +3337,14 @@ _SCREEN_CAPTURE = _simple_adapter(
         "'size_bytes', t.size_bytes, "
         "'storage_file_id', t.storage_file_id)"
     ),
-    search_text="''",
+    search_text=(
+        "CASE WHEN COALESCE(enr.active_search_text, '') != '' "
+        "THEN concat_ws(' ', t.device, enr.active_search_text) ELSE '' END"
+    ),
     priority=TIMELINE_PRIORITY_NOISE,
+    refresh_hours=48,
+    mask_credentials=True,
+    mask_cards=True,
 )
 
 
@@ -5097,8 +5179,8 @@ class TimelineSyncEngine:
         """``masked=True``: the caller already applied ``masked_rows`` (the scrub checks them first)."""
         if not rows:
             return
-        if adapter.mask_credentials and not masked:
-            rows = masked_rows(rows)
+        if (adapter.mask_credentials or adapter.mask_cards) and not masked:
+            rows = masked_rows(rows, include_cards=adapter.mask_cards)
         invalid = [
             (str(row[0]) if row else "<missing event_id>", row[13] if len(row) > 13 else None)
             for row in rows

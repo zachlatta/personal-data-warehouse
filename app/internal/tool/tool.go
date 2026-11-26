@@ -54,6 +54,20 @@ type Tool interface {
 // without setting it preserves the historical "everywhere" default.
 type Surface int
 
+type mcpContextKey struct{}
+
+// WithMCPContext marks ctx as originating from the MCP transport.
+func WithMCPContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, mcpContextKey{}, true)
+}
+
+// IsMCPContext reports whether ctx came from an MCP tool invocation rather
+// than the HTTP/CLI surface.
+func IsMCPContext(ctx context.Context) bool {
+	v, _ := ctx.Value(mcpContextKey{}).(bool)
+	return v
+}
+
 const (
 	// SurfaceAll exposes the tool on every transport.
 	SurfaceAll Surface = iota

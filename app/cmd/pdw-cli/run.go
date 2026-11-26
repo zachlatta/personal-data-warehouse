@@ -1076,6 +1076,7 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	fs.SetOutput(io.Discard)
 	data := fs.String("data", "", "inline JSON request body")
 	output := fs.String("output", "json", "json, text, or structured")
+	save := fs.String("save", "", "get_object only: download to PATH, verify sha256, and convert HEIC to .png/.jpg")
 	// Accept the flag names agents commonly reach for as aliases instead of
 	// failing hard at parse time.
 	dataArgs := fs.String("args", "", "alias for --data")
@@ -1111,6 +1112,10 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	input, err := loadCallInput(inline, stdin)
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw call:", err)
+		return 2
+	}
+	if *save != "" && name != "get_object" {
+		fmt.Fprintln(stderr, "pdw call: --save is only supported with get_object")
 		return 2
 	}
 	if name == "get_object" && hasJSONField(input, "ref") {
@@ -1173,6 +1178,9 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	if message := topLevelToolError(out); message != "" {
 		fmt.Fprintln(stderr, "pdw call:", message)
 		return 1
+	}
+	if *save != "" {
+		return saveGetObjectResponse(out, *save, stdout, stderr)
 	}
 	if err := renderCallOutput(out, *output, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "pdw call: %s. The upstream call already executed; do not repeat a write just to change output format. Raw result follows:\n", err)

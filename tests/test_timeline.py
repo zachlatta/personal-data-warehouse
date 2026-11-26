@@ -5114,3 +5114,176 @@ def test_location_source_filter_reads_approximate_sample(warehouse):
     assert hits[0]["source"] == "android_location"
     assert hits[0]["source_pk"]["sample_id"] == "sample1"
     assert hits[0]["priority"] == "noise"
+
+
+def test_screen_capture_active_descriptions_populate_search_text(warehouse):
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    captured_at = _NOW - timedelta(hours=1.5)
+    # Initial run before descriptions land: raw frame has empty search_text.
+    engine = _engine(warehouse, adapters=[adapter_by_name("screen_capture")])
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    before = warehouse._query_dicts(
+        "SELECT title, snippet, search_text FROM @timeline_events "
+        "WHERE adapter = 'screen_capture' AND source_pk->>'device' = 'crobat'"
+    )
+    assert len(before) == 1
+    assert before[0]["title"] == "crobat screen"
+    assert before[0]["search_text"] == ""
+
+    # Insert active descriptions for display 1 and display 2, plus a locked
+    # reading on joltik that must remain out of search.
+    later = _NOW + timedelta(minutes=2)
+    warehouse.insert_screen_timelapse_descriptions(
+        [
+            {
+                "device": "crobat",
+                "captured_at": captured_at,
+                "display_index": 1,
+                "prompt_version": "v1",
+                "content_sha256": "sha-crobat-1",
+                "accessibility_tree_sha256": "sha-tree",
+                "provider": "test",
+                "model": "test-model",
+                "status": "completed",
+                "screen_state": "active",
+                "evidence": "both",
+                "app": "Example Browser",
+                "window_title": "Sidebar Review — Sample Workspace",
+                "summary": "Reviewing the right sidebar layout in the sample app.",
+                "screen_text": "Sidebar inspector panel toggle",
+                "created_at": later,
+                "sync_version": 1,
+            },
+            {
+                "device": "crobat",
+                "captured_at": captured_at,
+                "display_index": 2,
+                "prompt_version": "v1",
+                "content_sha256": "sha-crobat-2",
+                "accessibility_tree_sha256": "",
+                "provider": "test",
+                "model": "test-model",
+                "status": "completed",
+                "screen_state": "active",
+                "evidence": "screenshot",
+                "app": "Example Terminal",
+                "window_title": "Secondary Display Notes",
+                "summary": "Secondary monitor shows checklist items.",
+                "screen_text": "secondary-monitor-token",
+                "created_at": later,
+                "sync_version": 1,
+            },
+            {
+                "device": "joltik",
+                "captured_at": _NOW - timedelta(hours=1.25),
+                "display_index": 1,
+                "prompt_version": "v1",
+                "content_sha256": "sha-joltik-1",
+                "accessibility_tree_sha256": "",
+                "provider": "test",
+                "model": "test-model",
+                "status": "completed",
+                "screen_state": "locked",
+                "evidence": "screenshot",
+                "app": "LockScreen",
+                "window_title": "Locked",
+                "summary": "Phone screen is locked.",
+                "screen_text": "locked-phone-token",
+                "created_at": later,
+                "sync_version": 1,
+            },
+        ]
+    )
+
+    engine = _engine(warehouse, adapters=[adapter_by_name("screen_capture")])
+    try:
+        engine.run_incremental(adapter_names=["screen_capture"])
+    finally:
+        engine.close()
+
+    rows = {
+        r["source_pk"]["device"]: r
+        for r in warehouse._query_dicts(
+            "SELECT source_pk, title, snippet, search_text, priority FROM @timeline_events "
+            "WHERE adapter = 'screen_capture'"
+        )
+    }
+    assert rows["crobat"]["priority"] == "noise"
+    assert "Example Browser — Sidebar Review — Sample Workspace" in rows["crobat"]["title"]
+    assert "Reviewing the right sidebar layout" in rows["crobat"]["snippet"]
+    assert "Sidebar inspector panel toggle" in rows["crobat"]["search_text"]
+    assert "secondary-monitor-token" in rows["crobat"]["search_text"]
+    assert rows["joltik"]["title"] == "joltik screen"
+    assert rows["joltik"]["search_text"] == ""
+
+    hits = warehouse._query_dicts(
+        "SELECT source, source_pk, priority FROM @search_text_exact('Sidebar inspector panel', 10, sources => ARRAY['screen_timelapse'])"
+    )
+    assert len(hits) == 1
+    assert hits[0]["source"] == "screen_timelapse"
+    assert hits[0]["source_pk"]["device"] == "crobat"
+    assert hits[0]["priority"] == "noise"
+
+    # A later re-read that marks both displays off/locked must converge on
+    # incremental sync (via description_ingest_ts + changed_join_sql) and clear
+    # search_text and title.
+    even_later = later + timedelta(minutes=2)
+    warehouse.insert_screen_timelapse_descriptions(
+        [
+            {
+                "device": "crobat",
+                "captured_at": captured_at,
+                "display_index": 1,
+                "prompt_version": "v2",
+                "content_sha256": "sha-crobat-1",
+                "accessibility_tree_sha256": "sha-tree",
+                "provider": "test",
+                "model": "test-model",
+                "status": "completed",
+                "screen_state": "off",
+                "evidence": "screenshot",
+                "app": "",
+                "window_title": "",
+                "summary": "",
+                "screen_text": "",
+                "created_at": even_later,
+                "sync_version": 2,
+            },
+            {
+                "device": "crobat",
+                "captured_at": captured_at,
+                "display_index": 2,
+                "prompt_version": "v2",
+                "content_sha256": "sha-crobat-2",
+                "accessibility_tree_sha256": "",
+                "provider": "test",
+                "model": "test-model",
+                "status": "completed",
+                "screen_state": "locked",
+                "evidence": "screenshot",
+                "app": "",
+                "window_title": "",
+                "summary": "",
+                "screen_text": "",
+                "created_at": even_later,
+                "sync_version": 2,
+            },
+        ]
+    )
+    engine = _engine(warehouse, adapters=[adapter_by_name("screen_capture")])
+    try:
+        engine.run_incremental(adapter_names=["screen_capture"])
+    finally:
+        engine.close()
+    cleared = warehouse._query_dicts(
+        "SELECT title, snippet, search_text FROM @timeline_events "
+        "WHERE adapter = 'screen_capture' AND source_pk->>'device' = 'crobat'"
+    )
+    assert len(cleared) == 1
+    assert cleared[0]["title"] == "crobat screen"
+    assert cleared[0]["snippet"] == ""
+    assert cleared[0]["search_text"] == ""

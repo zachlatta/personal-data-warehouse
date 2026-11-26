@@ -58,7 +58,7 @@ and state the window and freshness.
 - `marts_photos.photos` — one row per deduplicated logical photo with its AI caption;
   `marts_photos.files` every rendition; raw in `base_apple_photos.files` (iPhone, to
   2026-10-23) and `base_android_photos.files` (the Pixel's camera, screenshots and saved
-  images, from the phone). Search scope `photos`.
+  images, from the phone). Search scope `photos` (`self`).
 - `marts_files.attachments` — one conformed row per attachment from Gmail, WhatsApp,
   iMessage, Android texts, Apple Notes and Slack, with `content_sha256`, `is_stored` and the
   `storage_*` columns; enrichment text in `derived_enrichment.file_attachment_enrichments`.
@@ -223,28 +223,32 @@ Every scan is also a `self` timeline event titled like "Duplex color scan, 4 pag
 source `scans` scopes to them. Their words come from the vision pass over each PDF's first
 page, so search finds a scan by what it says once that pass has run.
 
-## Screen timelapse (what was on a screen)
+## Screen timelapse (screenshots: what was on a screen)
 
-A periodic image of a device's whole screen, about once a minute while it is unlocked and
-in use: `device` `crobat` (the Mac), `pichu` (the Android phone, from 2026-10-23;
-WebP frames compressed on the phone and uploaded every five minutes, or deferred on
-cellular when Wi-Fi-only gating is enabled) and `joltik` (the iPhone before it).
-`base_screen_timelapse.screenshots` is one row per image: `device`,
-`captured_at`, `display_index` (a two-display Mac writes two per moment), `mime_type`,
-`storage_file_id`. `base_screen_timelapse.accessibility_trees` is the accessibility tree of
-the same moment, when the loop could read one; join on `(device, captured_at)`, and expect
-moments with only one of the two. Both are raw: the pixels and the tree are the stored
-object, so read one with `get_object`; a tree's text is also inline in `content_text`.
-A moment whose tree shows a card number is redacted at the source: the tree says
-`[redacted card number]`, a screen the number can be placed on is boxed out in red, and the
-moment's other screens are withheld, so expect such moments with fewer screenshots.
-`marts_screen_timelapse.active_screens` is what was on screen: one row per frame an agent
-judged in use (black, locked and not-yet-read frames are absent) with `app`, `window_title`,
-`summary`, `screen_text`, `evidence` (accessibility tree, screenshot or both) and the frame's
-`storage_file_id`. Frames captured or ingested in the last day are read. Timeline source
-`screen_timelapse`, kind `screen_capture`, one `noise` event per moment with no search text
-yet: reach it by device and time (`pdw context` on a frame shows the frames around it), not
-by search.
+**Read periodic and phone screenshots through PDW, not over SSH to slowking:**
+- **Phone screenshots** (Pixel screenshots) land in `marts_photos.photos` (raw in
+  `base_android_photos.files`), priority `self`, search scope `photos`. Manual Mac
+  `Screenshot *.png` files are not ingested into PDW.
+- **Periodic whole-screen captures** (about once a minute while unlocked and in use:
+  Mac, Pixel, and historical iPhone) land in PDW within minutes.
+
+**Exact short sequence for periodic screenshots:**
+1. Find matching frames: {{if .CLI}}`pdw search --source screen_timelapse '<terms>'`{{else}}call the search tool with `{"query": "<terms>", "sources": ["screen_timelapse"]}`{{end}}
+   (omit priority filter — frames are `noise`; active frames index their app, window title,
+   summary and screen text on `timeline.events`), or query `marts_screen_timelapse.active_screens`
+   (by `device`, `captured_at`, `app`, `window_title`, `summary`) to get `preview_storage_file_id`
+   (1568 px JPEG preview) or `storage_file_id` (original).
+   {{if .CLI}}`pdw context '<ref>'`{{else}}Calling the context tool on a hit{{end}} shows neighbouring frames on that device's day.
+2. Fetch a viewable image directly:
+   {{if .CLI}}`pdw call get_object --data '{"storage_file_id": "<id>"}' --save frame.png` (downloads, verifies SHA-256, and converts HEIC/WebP/AVIF to PNG/JPEG automatically; falls back to the real extension if no converter is installed).{{else}}`get_object` `{"storage_file_id": "<id>", "inline": true}` attaches the image directly as `ImageContent`, auto-downscaling PNG/JPEG larger than 1568 px or 4 MiB to JPEG. Pass `preview_storage_file_id` from `marts_screen_timelapse.active_screens` (so Mac HEIC and Pixel AVIF frames render inline) or `thumbnail_storage_file_id` from `marts_photos.photos`.{{end}}
+
+**Raw tables & redaction:** `base_screen_timelapse.screenshots` (`device`, `captured_at`,
+`display_index` — a two-display Mac writes two per moment — `mime_type`, `storage_file_id`)
+and `base_screen_timelapse.accessibility_trees` (join on `(device, captured_at)`; text is
+inline in `content_text`). Expect moments with only one of the two. A moment whose tree
+shows a card number is redacted at the source (`[redacted card number]`, boxed in red,
+other screens withheld). Undescribed, locked and off frames carry no search text and
+are reached by device and time.
 
 ## Muse
 

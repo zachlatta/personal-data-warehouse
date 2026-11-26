@@ -302,3 +302,36 @@ func TestBriefNamesTheMutationStatusKey(t *testing.T) {
 	}
 }
 
+func TestGuideCoversScreenshotsThroughPDW(t *testing.T) {
+	for _, surface := range []Surface{SurfaceCLI, SurfaceMCP} {
+		for _, topic := range []string{"", "full", "sources"} {
+			text := mustRender(t, surface, topic)
+			for _, want := range []string{
+				"marts_screen_timelapse.active_screens",
+				"base_screen_timelapse.screenshots",
+				"get_object",
+			} {
+				if !strings.Contains(text, want) {
+					t.Errorf("%s %q guide omits %q", surface, topic, want)
+				}
+			}
+		}
+		brief := mustRender(t, surface, "")
+		for _, want := range []string{"photos", "screen_timelapse", "noise", "preview_storage_file_id"} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("%s brief omits %q", surface, want)
+			}
+		}
+		if surface == SurfaceCLI && !strings.Contains(brief, "--save") {
+			t.Error("CLI brief omits --save for get_object")
+		}
+		if surface == SurfaceMCP && !strings.Contains(brief, `"inline"`) {
+			t.Error("MCP brief omits inline for get_object")
+		}
+		sources := mustRender(t, surface, "sources")
+		if !strings.Contains(sources, "screen_timelapse") {
+			t.Errorf("%s sources topic does not name search source screen_timelapse", surface)
+		}
+	}
+}
+

@@ -666,7 +666,7 @@ func MutationHelp() MutationHelpDocument {
 				},
 				ExtraNotes: "Find the moment by time and device in base_screen_timelapse.screenshots or marts_screen_timelapse.active_screens, or from a screen_capture timeline hit. " +
 					"The review lists the screenshots, the accessibility tree and the readings that go, with storage ids and no text, and how many other frames have the same bytes (those show the same thing: propose them too). " +
-					"After approval the cloud worker deletes, in one transaction, the matching base_screen_timelapse.screenshots rows, the moment's base_screen_timelapse.accessibility_trees row (one per moment, so it goes even when one display is named), their derived_screen_timelapse.descriptions readings and, when display 1 goes, the moment's screen_capture timeline event; " +
+					"After approval the cloud worker deletes, in one transaction, the matching base_screen_timelapse.screenshots rows, the moment's base_screen_timelapse.accessibility_trees row (one per moment, so it goes even when one display is named), their derived_screen_timelapse.descriptions readings, and clears the moment's search chunks/vectors while deleting (when display 1 goes) or recomputing (when only another display goes) the screen_capture timeline event; " +
 					"then it deletes each stored file from Drive and checks that Drive reports it gone, retrying until it does. The result lists the storage ids. " +
 					"The files on the device itself and the pgBackRest backups on slowking are not touched. If the device's uploader later sends a changed (redacted) copy of the file, that copy is ingested as new.",
 			},

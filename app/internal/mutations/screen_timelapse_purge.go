@@ -220,7 +220,8 @@ func screenTimelapsePurgePreview(target screenTimelapsePurgeTarget, moment scree
 		"removes_timeline":    removesEvent,
 		"same_content_frames": moment.SameContentFrames,
 		"effect": "Deletes these rows from base_screen_timelapse.screenshots, the moment's base_screen_timelapse.accessibility_trees row and its derived_screen_timelapse.descriptions readings, " +
-			"then each stored file in Drive. Files on the device itself and pgBackRest backups on slowking are not touched.",
+			"clears its search chunks/vectors and deletes (display 1) or recomputes (other displays) its screen_capture timeline event, " +
+			"then deletes each stored file in Drive. Files on the device itself and pgBackRest backups on slowking are not touched.",
 	}
 	if target.DisplayIndex > 0 {
 		preview["displays"] = target.DisplayIndex

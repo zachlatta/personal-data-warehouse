@@ -6,8 +6,10 @@ the point:
 
 1. **Rows, in one transaction.** The moment's screenshots (one display or all),
    its accessibility tree (one per moment, so it goes whichever display is
-   named), the agent readings of those frames, and -- when display 1 goes --
-   the moment's `screen_capture` timeline event. The same transaction writes
+   named), the agent readings of those frames, the moment's search chunks, and
+   the moment's `screen_capture` timeline event: deleted when display 1 goes,
+   otherwise rewritten from the remaining displays by the adapter's own query.
+   The same transaction writes
    the storage ids it removed into the mutation's own `result_json`, so the
    object list survives a crash or a failed Drive call.
 2. **Objects, after the commit.** Each stored file is deleted through the
@@ -34,7 +36,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from personal_data_warehouse.objectstore import ObjectNotFoundError
@@ -168,17 +170,26 @@ class ScreenTimelapsePurgeExecutor:
                         """
                         DELETE FROM @screen_timelapse_descriptions
                         WHERE device = %s AND captured_at = %s AND (%s = 0 OR display_index = %s)
+                        RETURNING display_index, content_sha256, 0::bigint,
+                                  preview_storage_backend, preview_storage_key, preview_storage_file_id
                         """
                     ),
                     (device, captured_at, display, display),
                 )
-                descriptions = cursor.rowcount or 0
+                desc_rows = cursor.fetchall()
+                descriptions = len(desc_rows)
+                previews = [
+                    _object_row(row, relation="screen_timelapse_descriptions")
+                    for row in desc_rows
+                    if row[5]
+                ]
                 timeline_event_ids: list[str] = []
                 search_chunks = 0
-                if any(row["display_index"] == 1 for row in screenshots) and warehouse._relation_exists(
-                    "timeline_events"
-                ):
+                if warehouse._relation_exists("timeline_events"):
                     event_id = self._capture_event_id(cursor, device, captured_at)
+                    # Always clear search_chunks (whose AFTER DELETE trigger
+                    # removes search_chunk_vectors in the same transaction) so
+                    # purged text from ANY display vanishes atomically.
                     if warehouse._relation_exists("search_chunks"):
                         cursor.execute(
                             warehouse._expand_relations(
@@ -187,13 +198,20 @@ class ScreenTimelapsePurgeExecutor:
                             (_SCREEN_CAPTURE_ADAPTER.name, event_id),
                         )
                         search_chunks = cursor.rowcount or 0
-                    cursor.execute(
-                        warehouse._expand_relations(
-                            "DELETE FROM @timeline_events WHERE adapter = %s AND event_id = %s RETURNING event_id"
-                        ),
-                        (_SCREEN_CAPTURE_ADAPTER.name, event_id),
-                    )
-                    timeline_event_ids = [str(row[0]) for row in cursor.fetchall()]
+                    if any(row["display_index"] == 1 for row in screenshots):
+                        cursor.execute(
+                            warehouse._expand_relations(
+                                "DELETE FROM @timeline_events WHERE adapter = %s AND event_id = %s RETURNING event_id"
+                            ),
+                            (_SCREEN_CAPTURE_ADAPTER.name, event_id),
+                        )
+                        timeline_event_ids = [str(row[0]) for row in cursor.fetchall()]
+                    else:
+                        # Display 1 remains, but the moment's timeline event
+                        # aggregates active descriptions across all displays:
+                        # recompute it from the remaining rows in the same
+                        # transaction so purged display-2+ text never lingers.
+                        self._refresh_remaining_timeline_event(cursor, device, captured_at, event_id)
                 recorded = {
                     "phase": PHASE_ROWS_DELETED,
                     "device": device,
@@ -207,7 +225,7 @@ class ScreenTimelapsePurgeExecutor:
                         "search_chunks": search_chunks,
                     },
                     "timeline_event_ids": timeline_event_ids,
-                    "objects": [*screenshots, *trees],
+                    "objects": [*screenshots, *trees, *previews],
                     "not_touched": list(NOT_TOUCHED),
                 }
                 cursor.execute(
@@ -230,6 +248,47 @@ class ScreenTimelapsePurgeExecutor:
             (device, captured_at),
         )
         return str(cursor.fetchone()[0])
+
+    def _refresh_remaining_timeline_event(self, cursor, device: str, captured_at: datetime, event_id: str) -> None:
+        """Rewrite the moment's event from the remaining displays, in this transaction.
+
+        The rows come from the adapter's own ``refresh_sql`` and are written by
+        the sync engine's own ``_upsert`` (masking included) on this connection,
+        the way ``scrub_conversation_cards`` regenerates agent events, so the
+        purge can never write an event the sync would not.
+        """
+        from personal_data_warehouse.timeline import TimelineSyncEngine
+
+        warehouse = self._warehouse
+        engine = TimelineSyncEngine(
+            source_url=warehouse._database_url,
+            source_schema=warehouse._schema,
+            dest_schema=warehouse._schema,
+        )
+        # Borrow this transaction for the read and the write; never connect.
+        engine._source_conn = engine._dest_conn = warehouse._connection
+        # The window is the one instant: event_ts == captured_at for every
+        # device, and the keyset bound sits just past it, so any event_id passes.
+        rows = engine._fetch(
+            _SCREEN_CAPTURE_ADAPTER.refresh_sql,
+            {
+                "cutoff_ts": captured_at,
+                "cursor_ts": captured_at + timedelta(microseconds=1),
+                "cursor_id": "",
+                "limit": 100,
+            },
+        )
+        engine._upsert(_SCREEN_CAPTURE_ADAPTER, [row for row in rows if row[0] == event_id])
+        # The chunks were deleted above. The upsert bumps seq only when the
+        # event's content changed, so bump it here too: the chunk builder
+        # rebuilds the remaining display's chunks either way.
+        cursor.execute(
+            warehouse._expand_relations(
+                "UPDATE @timeline_events SET seq = nextval(%s::regclass), updated_at = now() "
+                "WHERE adapter = %s AND event_id = %s"
+            ),
+            (warehouse.sql_relation("timeline_events_seq"), _SCREEN_CAPTURE_ADAPTER.name, event_id),
+        )
 
     def _delete_objects(self, recorded: Mapping[str, Any]) -> ScreenTimelapsePurgeResult:
         """Phase 2: delete each stored object and read back that it is gone."""
@@ -275,9 +334,11 @@ class ScreenTimelapsePurgeExecutor:
             SELECT 1 FROM @screen_timelapse_screenshots WHERE storage_file_id = %s
             UNION ALL
             SELECT 1 FROM @screen_timelapse_accessibility_trees WHERE storage_file_id = %s
+            UNION ALL
+            SELECT 1 FROM @screen_timelapse_descriptions WHERE preview_storage_file_id = %s
             LIMIT 1
             """,
-            (storage_file_id, storage_file_id),
+            (storage_file_id, storage_file_id, storage_file_id),
         )
         return bool(rows)
 

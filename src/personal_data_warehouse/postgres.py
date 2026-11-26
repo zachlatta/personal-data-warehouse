@@ -506,8 +506,8 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         ("android_notification", "android_notification_opened", "android_notification_action"),
         "COALESCE(t.metadata->>'package_name', t.kind)",
     ),
-    # Periodic whole-screen frames; the subsource is the device. They carry no
-    # search text until an enrichment step reads them.
+    # Periodic whole-screen frames; the subsource is the device. Active frames
+    # carry their app, window title, summary and screen text in search_text.
     (
         "screen_timelapse",
         ("screen_capture",),
@@ -12479,6 +12479,12 @@ class PostgresWarehouse:
                 s.storage_backend,
                 s.storage_key,
                 s.storage_file_id,
+                CASE
+                    WHEN d.preview_storage_file_id <> '' THEN d.preview_storage_file_id
+                    WHEN lower(s.mime_type) IN ('image/png', 'image/jpeg', 'image/webp', 'image/gif')
+                        THEN s.storage_file_id
+                    ELSE ''
+                END AS preview_storage_file_id,
                 s.storage_url,
                 t.storage_file_id AS accessibility_tree_storage_file_id,
                 d.model,

@@ -887,9 +887,11 @@ moment of one device; a general warehouse-row purge would be its own design.
   worker): phase one is ONE transaction that deletes the screenshots (first, so their row
   locks are what a racing writer waits on), the moment's accessibility tree (one per
   moment, so it goes even when one display is named: it can hold what that display
-  showed), the matching `derived_screen_timelapse.descriptions`, and, when display 1 goes,
-  the `screen_capture` event (and any search chunks) from `timeline.events`, computed
-  with the adapter's own `event_id_expression`. The same transaction writes the removed
+  showed), the matching `derived_screen_timelapse.descriptions`, clears the moment's
+  `derived_search.chunks` (whose delete trigger removes `derived_search.chunk_vectors` in
+  the same transaction), and deletes (when display 1 goes) or recomputes from remaining
+  displays (when only display 2+ goes) the `screen_capture` event in `timeline.events`,
+  computed with the adapter's own `event_id_expression`. The same transaction writes the removed
   storage ids into the mutation's `result_json` (phase `rows_deleted`). Phase two runs
   after the commit: `delete_object` on each file, then `get_metadata` must raise
   `ObjectNotFoundError`. Any failure is `failed_retryable` with the pending objects kept

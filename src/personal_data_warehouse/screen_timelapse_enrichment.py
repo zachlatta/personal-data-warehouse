@@ -39,8 +39,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import gzip
+import hashlib
 from io import BytesIO
 import json
+from pathlib import Path
+import tempfile
 from typing import Any
 
 from personal_data_warehouse.agent_runner import (
@@ -60,6 +63,12 @@ DEFAULT_SCREEN_DESCRIPTION_MAX_ERROR_ATTEMPTS = 3
 # Screens are dense with small text. The attachment pass's 1280 px makes a
 # Retina Mac frame (3600x2338) unreadable; 2048 keeps body text legible.
 SCREEN_IMAGE_MAX_EDGE = 2048
+# MCP ImageContent preview: <= 1568 px long-edge JPEG so Claude/MCP clients
+# render Mac HEIC and Pixel AVIF frames directly without server-side CGO decode.
+# PNG/JPEG/GIF are resized in pure Go on the fly and WebP is inlined directly.
+SCREEN_PREVIEW_MAX_EDGE = 1568
+SCREEN_PREVIEW_MIME_TYPES = ("image/heic", "image/heif", "image/avif")
+DEFAULT_PREVIEW_BACKFILL_LIMIT = 100
 # Measured 2026-10-24: a Mac tree 21 KB, the Pixel's 19 KB, the iPhone's
 # 133 KB. The caps only guard against a pathological tree: the inline copy
 # stops where the app's does (8 MiB), and the agent reads at most 400k chars.
@@ -521,12 +530,19 @@ class ScreenTimelapseEnrichmentRunner:
         if tree_name is None:
             # There was nothing else to read.
             output["evidence"] = "screenshot"
+        mime = str(candidate.get("mime_type") or "").strip().lower()
+        preview = (
+            _store_preview_jpeg(self._object_store, image)
+            if output.get("screen_state") == "active" and mime in SCREEN_PREVIEW_MIME_TYPES
+            else {}
+        )
         row = self._row(
             candidate,
             status=STATUS_COMPLETED,
             output=output,
             agent_run_id=result.run_id,
             model=result.model or self._model,
+            preview=preview,
         )
         self._warehouse.insert_screen_timelapse_descriptions([row])
         return row
@@ -547,6 +563,11 @@ class ScreenTimelapseEnrichmentRunner:
             output=output,
             agent_run_id=str(prior.get("agent_run_id", "")),
             model=str(prior.get("model", "")),
+            preview={
+                "preview_storage_backend": str(prior.get("preview_storage_backend", "")),
+                "preview_storage_key": str(prior.get("preview_storage_key", "")),
+                "preview_storage_file_id": str(prior.get("preview_storage_file_id", "")),
+            },
         )
         row["is_reused"] = 1
         row["attempts"] = 0
@@ -568,8 +589,10 @@ class ScreenTimelapseEnrichmentRunner:
         output: Mapping[str, Any],
         agent_run_id: str,
         model: str,
+        preview: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         created_at = self._now()
+        preview = preview or {}
         return {
             "device": candidate["device"],
             "captured_at": candidate["captured_at"],
@@ -592,6 +615,9 @@ class ScreenTimelapseEnrichmentRunner:
             "is_reused": 0,
             "agent_run_id": agent_run_id,
             "raw_result_json": json.dumps(dict(output), ensure_ascii=False, sort_keys=True) if output else "",
+            "preview_storage_backend": str(preview.get("preview_storage_backend", "")),
+            "preview_storage_key": str(preview.get("preview_storage_key", "")),
+            "preview_storage_file_id": str(preview.get("preview_storage_file_id", "")),
             "created_at": created_at,
             "sync_version": int(created_at.timestamp() * 1000),
         }
@@ -604,6 +630,120 @@ class ScreenTimelapseEnrichmentRunner:
         tool_call_rows = agent_run_tool_call_rows(result)
         if tool_call_rows:
             self._warehouse.insert_agent_run_tool_calls(tool_call_rows)
+
+
+def _store_preview_jpeg(object_store, image_bytes: bytes) -> dict[str, str]:
+    """Store a <= 1568 px content-addressed JPEG preview for MCP inline viewing."""
+    empty = {
+        "preview_storage_backend": "",
+        "preview_storage_key": "",
+        "preview_storage_file_id": "",
+    }
+    if object_store is None or not hasattr(object_store, "put_file"):
+        return empty
+    preview_bytes = normalized_model_image(image_bytes, max_edge=SCREEN_PREVIEW_MAX_EDGE)
+    preview_sha = hashlib.sha256(preview_bytes).hexdigest()
+    object_key = f"screen_timelapse/previews/{preview_sha[:2]}/{preview_sha}.jpg"
+    with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp:
+        tmp.write(preview_bytes)
+        tmp.flush()
+        stored = object_store.put_file(
+            path=Path(tmp.name),
+            object_key=object_key,
+            content_sha256=preview_sha,
+            content_type="image/jpeg",
+            skip_existing_check=False,
+        )
+    return {
+        "preview_storage_backend": str(stored.get("storage_backend") or ""),
+        "preview_storage_key": str(stored.get("storage_key") or ""),
+        "preview_storage_file_id": str(stored.get("storage_file_id") or ""),
+    }
+
+
+def count_screen_timelapse_previews_pending(warehouse) -> int:
+    """Count distinct active HEIC/HEIF/AVIF frames still missing a JPEG preview."""
+    rows = warehouse._query(
+        """
+        SELECT count(DISTINCT s.content_sha256)
+        FROM @screen_timelapse_descriptions d
+        JOIN @screen_timelapse_screenshots s
+          ON s.device = d.device
+         AND s.captured_at = d.captured_at
+         AND s.display_index = d.display_index
+        WHERE d.status = 'completed'
+          AND d.screen_state = 'active'
+          AND d.preview_storage_file_id = ''
+          AND s.storage_file_id <> ''
+          AND lower(s.mime_type) = ANY(%s)
+        """,
+        (list(SCREEN_PREVIEW_MIME_TYPES),),
+    )
+    return int(rows[0][0]) if rows else 0
+
+
+def backfill_screen_timelapse_previews(warehouse, object_store, *, limit: int, logger) -> int:
+    """Write <= 1568 px JPEG previews for active HEIC/HEIF/AVIF frames lacking one.
+
+    Zero LLM cost: fetches raw frame bytes once per distinct content_sha256,
+    encodes a JPEG preview, uploads content-addressed, and updates every
+    matching description row. PNG/JPEG/WebP/GIF frames do not need a stored
+    preview because MCP get_object inlines/resizes them directly.
+    """
+    rows = warehouse._query_dicts(
+        """
+        SELECT DISTINCT ON (s.content_sha256)
+            s.content_sha256,
+            s.storage_backend,
+            s.storage_key,
+            s.storage_file_id,
+            s.storage_url,
+            s.captured_at
+        FROM @screen_timelapse_descriptions d
+        JOIN @screen_timelapse_screenshots s
+          ON s.device = d.device
+         AND s.captured_at = d.captured_at
+         AND s.display_index = d.display_index
+        WHERE d.status = 'completed'
+          AND d.screen_state = 'active'
+          AND d.preview_storage_file_id = ''
+          AND s.storage_file_id <> ''
+          AND lower(s.mime_type) = ANY(%s)
+        ORDER BY s.content_sha256, s.captured_at DESC
+        LIMIT %s
+        """,
+        (list(SCREEN_PREVIEW_MIME_TYPES), int(limit)),
+    )
+    filled = 0
+    for row in rows:
+        try:
+            raw = object_store.get_object(_storage_ref(row, prefix=""))
+            preview = _store_preview_jpeg(object_store, raw)
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not block the rest
+            logger.warning("screen preview backfill failed for sha %s: %s", row["content_sha256"][:12], exc)
+            continue
+        if not preview["preview_storage_file_id"]:
+            continue
+        warehouse._command(
+            """
+            UPDATE @screen_timelapse_descriptions
+            SET preview_storage_backend = %s,
+                preview_storage_key = %s,
+                preview_storage_file_id = %s
+            WHERE content_sha256 = %s
+              AND preview_storage_file_id = ''
+            """,
+            (
+                preview["preview_storage_backend"],
+                preview["preview_storage_key"],
+                preview["preview_storage_file_id"],
+                row["content_sha256"],
+            ),
+        )
+        filled += 1
+    if rows:
+        logger.info("screen previews: filled %s of %s distinct active frames", filled, len(rows))
+    return filled
 
 
 def _storage_ref(candidate: Mapping[str, Any], *, prefix: str) -> dict[str, str]:

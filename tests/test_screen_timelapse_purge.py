@@ -402,6 +402,171 @@ def test_a_stale_executing_purge_is_reclaimable() -> None:
     assert (SCREEN_TIMELAPSE_PROVIDER, SCREEN_TIMELAPSE_PURGE_MOMENT_OPERATION) in RECLAIMABLE_IDEMPOTENT_OPERATIONS
 
 
+def test_purging_display_two_only_removes_display_two_text_chunks_and_vectors_atomically(warehouse) -> None:
+    warehouse.ensure_search_index_tables()
+    _screenshot(warehouse, MOMENT, 1, sha="sha-main", file_id="drive-shot-1")
+    _screenshot(warehouse, MOMENT, 2, sha="sha-side", file_id="drive-shot-2")
+    _tree(warehouse, MOMENT, file_id="drive-tree")
+    warehouse.insert_screen_timelapse_descriptions(
+        [
+            {
+                "device": DEVICE,
+                "captured_at": MOMENT,
+                "display_index": 1,
+                "prompt_version": "v1",
+                "content_sha256": "sha-main",
+                "status": "completed",
+                "screen_state": "active",
+                "app": "Example Browser",
+                "window_title": "Safe Primary Tab",
+                # Long and with runs of spaces, so a recompute that cuts or
+                # collapses the snippet differently from the adapter fails below.
+                "summary": "Primary monitor  shows safe workspace. " * 12,
+                "screen_text": "safe-display-one-text",
+                "created_at": MOMENT,
+            },
+            {
+                "device": DEVICE,
+                "captured_at": MOMENT,
+                "display_index": 2,
+                "prompt_version": "v1",
+                "content_sha256": "sha-side",
+                "status": "completed",
+                "screen_state": "active",
+                "app": "Example Wallet",
+                "window_title": "Sensitive Secondary Tab",
+                "summary": "Secondary monitor shows sensitive info.",
+                "screen_text": LEAKED_TEXT,
+                "created_at": MOMENT,
+            },
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    event_id = "laptop|2026-10-25T14:03:00Z"
+    before = warehouse._query_dicts(
+        "SELECT title, snippet, search_text, seq FROM @timeline_events WHERE adapter = 'screen_capture' AND event_id = %s",
+        (event_id,),
+    )
+    assert len(before) == 1
+    # Card digits in display 2 are masked on sync, while display 2's other text
+    # is present until display 2 is purged.
+    assert LEAKED_TEXT not in before[0]["search_text"]
+    assert "Sensitive Secondary Tab" in before[0]["search_text"]
+    assert "safe-display-one-text" in before[0]["search_text"]
+
+    # Seed a search chunk + embedding (which triggers search_chunk_vectors insert).
+    warehouse._command(
+        """
+        INSERT INTO @search_chunks (chunk_id, anchor, adapter, event_id, source, context,
+            occurred_at, chunk_index, text, text_sha256, char_count, built_at)
+        VALUES ('chunk-disp2', 'a', 'screen_capture', %s, 'screen_timelapse', 'laptop|2026-10-25',
+            %s, 0, %s, 'sha-chunk-disp2', %s, %s)
+        """,
+        (event_id, MOMENT, LEAKED_TEXT, len(LEAKED_TEXT), MOMENT),
+    )
+    if warehouse.pgvector_available() and warehouse._relation_exists("search_chunk_vectors"):
+        vec = "[" + ",".join(["0.01"] * 512) + "]"
+        warehouse._command(
+            """
+            INSERT INTO @search_chunk_embeddings (text_sha256, model, embedding, embedded_at)
+            VALUES ('sha-chunk-disp2', 'test-model', %s::halfvec, %s)
+            """,
+            (vec, MOMENT),
+        )
+        assert warehouse._query(
+            "SELECT count(*) FROM @search_chunk_vectors WHERE adapter = 'screen_capture' AND event_id = %s",
+            (event_id,),
+        ) == [(1,)]
+
+    mutation_id = _propose(warehouse, "req_purge_display_2", display_index=2)
+    drive = FakeDrive(["drive-shot-1", "drive-shot-2", "drive-tree"])
+    summary = _work(warehouse, drive)
+
+    assert summary.succeeded == 1
+    result = warehouse.get_upstream_mutation(mutation_id)["result_json"]
+    assert result["deleted"]["screen_timelapse_screenshots"] == 1
+    assert result["deleted"]["screen_timelapse_descriptions"] == 1
+    assert result["deleted"]["search_chunks"] == 1
+    assert result["deleted"]["timeline_events"] == 0
+
+    # Display 1 stays, display 2 is gone, and the timeline event was recomputed
+    # atomically with no trace of LEAKED_TEXT and a bumped seq.
+    after = warehouse._query_dicts(
+        "SELECT title, snippet, search_text, seq FROM @timeline_events WHERE adapter = 'screen_capture' AND event_id = %s",
+        (event_id,),
+    )
+    assert len(after) == 1
+    assert LEAKED_TEXT not in after[0]["title"]
+    assert LEAKED_TEXT not in after[0]["snippet"]
+    assert LEAKED_TEXT not in after[0]["search_text"]
+    assert "Sensitive Secondary Tab" not in after[0]["search_text"]
+    assert "safe-display-one-text" in after[0]["search_text"]
+    assert after[0]["seq"] > before[0]["seq"]
+
+    # Both search_chunks and search_chunk_vectors were cleared in the same transaction.
+    assert warehouse._query(
+        "SELECT count(*) FROM @search_chunks WHERE adapter = 'screen_capture' AND event_id = %s",
+        (event_id,),
+    ) == [(0,)]
+    if warehouse.pgvector_available() and warehouse._relation_exists("search_chunk_vectors"):
+        assert warehouse._query(
+            "SELECT count(*) FROM @search_chunk_vectors WHERE adapter = 'screen_capture' AND event_id = %s",
+            (event_id,),
+        ) == [(0,)]
+
+    # Recomputed (title, snippet, search_text, ingest_ts) must match a fresh
+    # _SCREEN_CAPTURE adapter sync bit-for-bit so the two queries cannot drift.
+    recomputed = warehouse._query_dicts(
+        "SELECT title, snippet, search_text, ingest_ts FROM @timeline_events WHERE adapter = 'screen_capture' AND event_id = %s",
+        (event_id,),
+    )[0]
+    warehouse._command(
+        "DELETE FROM @timeline_events WHERE adapter = 'screen_capture' AND event_id = %s",
+        (event_id,),
+    )
+    warehouse._command("DELETE FROM @timeline_sync_state WHERE adapter = 'screen_capture'")
+    _sync_timeline(warehouse)
+    fresh = warehouse._query_dicts(
+        "SELECT title, snippet, search_text, ingest_ts FROM @timeline_events WHERE adapter = 'screen_capture' AND event_id = %s",
+        (event_id,),
+    )[0]
+    assert recomputed == fresh
+
+
+def test_purge_deletes_unreferenced_preview_and_keeps_shared_preview(warehouse) -> None:
+    _screenshot(warehouse, MOMENT, 1, sha="sha-main", file_id="drive-shot-1")
+    _screenshot(warehouse, NEIGHBOUR, 1, sha="sha-shared", file_id="drive-next-1")
+    warehouse.insert_screen_timelapse_descriptions(
+        [
+            {
+                **_reading(MOMENT, 1, sha="sha-main", prompt_version="v1"),
+                "preview_storage_backend": "google_drive",
+                "preview_storage_key": "screen_timelapse/previews/unshared.jpg",
+                "preview_storage_file_id": "drive-preview-unique",
+            },
+            {
+                **_reading(MOMENT, 1, sha="sha-main", prompt_version="v2"),
+                "preview_storage_backend": "google_drive",
+                "preview_storage_key": "screen_timelapse/previews/shared.jpg",
+                "preview_storage_file_id": "drive-preview-shared",
+            },
+            {
+                **_reading(NEIGHBOUR, 1, sha="sha-shared", prompt_version="v2"),
+                "preview_storage_backend": "google_drive",
+                "preview_storage_key": "screen_timelapse/previews/shared.jpg",
+                "preview_storage_file_id": "drive-preview-shared",
+            },
+        ]
+    )
+    _propose(warehouse, "req_purge_previews")
+    drive = FakeDrive(["drive-shot-1", "drive-next-1", "drive-preview-unique", "drive-preview-shared"])
+    assert _work(warehouse, drive).succeeded == 1
+    assert "drive-preview-unique" in drive.deleted
+    assert "drive-preview-shared" not in drive.deleted
+    assert "drive-preview-shared" in drive.objects
+
+
 @contextmanager
 def _isolated_database() -> Iterator[tuple[PostgresWarehouse, str]]:
     """A database of its own at the default layout, which the Go store reads."""

@@ -484,3 +484,229 @@ def test_the_inline_text_column_reaches_a_tree_table_that_predates_it(warehouse)
 def test_tree_text_matches_what_the_app_writes() -> None:
     assert accessibility_tree_text(gzip.compress(b'{"a": "x\x00y"}')) == '{"a": "x\ufffdy"}'
     assert accessibility_tree_text(b"<hierarchy/>") == "<hierarchy/>"
+
+
+def test_active_frame_writes_preview_jpeg_and_backfill_fills_older_active_frames(warehouse) -> None:
+    from io import BytesIO
+    from PIL import Image
+    from personal_data_warehouse.objectstore.base import StoredObject
+    from personal_data_warehouse.screen_timelapse_enrichment import (
+        SCREEN_PREVIEW_MAX_EDGE,
+        backfill_screen_timelapse_previews,
+        count_screen_timelapse_previews_pending,
+    )
+
+    buf = BytesIO()
+    Image.new("RGB", (2400, 1200), (40, 80, 120)).save(buf, format="PNG")
+    big_png = buf.getvalue()
+
+    class PutFakeStore:
+        def __init__(self) -> None:
+            self.blobs: dict[str, bytes] = {"fid-raw": big_png, "fid-old": big_png, "fid-webp": big_png}
+            self.puts: list[tuple[str, bytes]] = []
+
+        def get_object(self, ref) -> bytes:
+            return self.blobs[ref["storage_file_id"]]
+
+        def put_file(self, *, path, object_key, content_sha256, content_type, skip_existing_check=False, **_):
+            data = path.read_bytes()
+            self.puts.append((object_key, data))
+            fid = f"fid-prev-{len(self.puts)}"
+            self.blobs[fid] = data
+            return StoredObject(
+                storage_backend="google_drive",
+                storage_key=object_key,
+                storage_file_id=fid,
+                storage_url="",
+            )
+
+    store = PutFakeStore()
+    now = datetime(2026, 11, 24, 15, 0, 0, tzinfo=UTC)
+    _screenshot(
+        warehouse, "crobat", now - timedelta(minutes=2),
+        sha="sha-new-active", file_id="fid-raw", mime="image/heic", ingested_at=now,
+    )
+    _screenshot(
+        warehouse, "pichu", now - timedelta(days=5),
+        sha="sha-old-active", file_id="fid-old", mime="image/avif", ingested_at=now - timedelta(days=5),
+    )
+    _screenshot(
+        warehouse, "pichu", now - timedelta(days=4),
+        sha="sha-webp-active", file_id="fid-webp", mime="image/webp", ingested_at=now - timedelta(days=4),
+    )
+    warehouse.insert_screen_timelapse_descriptions(
+        [
+            {
+                "device": "pichu",
+                "captured_at": now - timedelta(days=5),
+                "display_index": 1,
+                "prompt_version": "screen-description-v1",
+                "content_sha256": "sha-old-active",
+                "status": "completed",
+                "screen_state": "active",
+                "app": "Terminal",
+                "window_title": "Shell",
+                "summary": "Older AVIF active frame without preview.",
+                "screen_text": "hello world",
+                "created_at": now - timedelta(days=5),
+            },
+            {
+                "device": "pichu",
+                "captured_at": now - timedelta(days=4),
+                "display_index": 1,
+                "prompt_version": "screen-description-v1",
+                "content_sha256": "sha-webp-active",
+                "status": "completed",
+                "screen_state": "active",
+                "app": "Chrome",
+                "window_title": "Page",
+                "summary": "WebP active frame already MCP-viewable.",
+                "screen_text": "webp text",
+                "created_at": now - timedelta(days=4),
+            },
+        ]
+    )
+
+    runner = ScreenTimelapseEnrichmentRunner(
+        warehouse=warehouse,
+        agent=FakeAgent(),
+        object_store=store,
+        logger=Logger(),
+        provider="codex",
+        now=lambda: now,
+    )
+    summary = runner.sync(limit=5)
+    assert summary.frames_active == 1
+    assert len(store.puts) == 1
+    with Image.open(BytesIO(store.puts[0][1])) as prev_img:
+        assert max(prev_img.size) == SCREEN_PREVIEW_MAX_EDGE
+        assert prev_img.format == "JPEG"
+
+    active_rows = {
+        r["content_sha256"]: r
+        for r in warehouse._query_dicts("SELECT content_sha256, preview_storage_file_id FROM @marts_screen_timelapse_active_screens")
+    }
+    assert active_rows["sha-new-active"]["preview_storage_file_id"] == "fid-prev-1"
+    # Unpreviewed HEIC/AVIF frame exposes '' (never pretends the raw HEIC/AVIF is a preview).
+    assert active_rows["sha-old-active"]["preview_storage_file_id"] == ""
+    # WebP is directly viewable over MCP, so it exposes its own storage_file_id without needing backfill.
+    assert active_rows["sha-webp-active"]["preview_storage_file_id"] == "fid-webp"
+    assert count_screen_timelapse_previews_pending(warehouse) == 1
+
+    filled = backfill_screen_timelapse_previews(warehouse, store, limit=10, logger=Logger())
+    assert filled == 1
+    assert count_screen_timelapse_previews_pending(warehouse) == 0
+    active_after = {
+        r["content_sha256"]: r
+        for r in warehouse._query_dicts("SELECT content_sha256, preview_storage_file_id FROM @marts_screen_timelapse_active_screens")
+    }
+    assert active_after["sha-old-active"]["preview_storage_file_id"] == "fid-prev-2"
+
+
+def test_screen_capture_and_photo_mask_credentials_and_cards_in_timeline_and_chunks(warehouse) -> None:
+    from personal_data_warehouse.search_index import SearchChunkBuilder
+    from personal_data_warehouse.timeline import TIMELINE_ADAPTERS, TimelineSyncEngine
+
+    warehouse.ensure_timeline_tables()
+    warehouse.ensure_search_index_tables()
+    warehouse.ensure_photos_tables()
+    warehouse.ensure_file_attachment_enrichment_tables()
+
+    fake_secret = "a1b2c3d4" * 5
+    fake_token = f"pdw_testkey123456_{fake_secret}"
+    fake_card = "4111 1111 1111 1111"
+    now = datetime(2026, 11, 24, 16, 0, 0, tzinfo=UTC)
+
+    _screenshot(warehouse, "crobat", now, sha="sha-secret-screen", file_id="fid-secret-screen", mime="image/heic", ingested_at=now)
+    warehouse.insert_screen_timelapse_descriptions(
+        [
+            {
+                "device": "crobat",
+                "captured_at": now,
+                "display_index": 1,
+                "prompt_version": "screen-description-v1",
+                "content_sha256": "sha-secret-screen",
+                "status": "completed",
+                "screen_state": "active",
+                "app": "Browser",
+                "window_title": f"API Key {fake_token}",
+                "summary": f"Created token {fake_token} and card {fake_card}",
+                "screen_text": f"token={fake_token} card={fake_card} visible-safe-word",
+                "created_at": now,
+            }
+        ]
+    )
+    # Luhn-valid fractional digits on latitude (0.4111111111111111 -> 16-digit Visa Luhn)
+    # must stay a JSON number in metadata (never rewritten into a string by card masking).
+    luhn_lat = 0.4111111111111111
+    warehouse._command(
+        """
+        INSERT INTO @photo_assets (
+            photo_id, account, kind, capture_ts, latitude, longitude, best_file_sha256,
+            best_file_filename, best_file_mime_type, created_at, updated_at
+        ) VALUES (
+            'photo-secret-1', 'user@example.test', 'photo', %s, %s, -73.2121, 'sha-secret-photo',
+            'Screenshot 2026-11-24.png', 'image/png', %s, %s
+        )
+        """,
+        (now, luhn_lat, now, now),
+    )
+    warehouse.insert_attachment_enrichments(
+        [
+            {
+                "content_sha256": "sha-secret-photo",
+                "ai_provider": "agent_codex",
+                "ai_model": "test",
+                "ai_prompt_version": "v1",
+                "text": f"Screenshot showing token {fake_token} and card {fake_card} safe-photo-word",
+                "text_extraction_status": "ok",
+                "text_extraction_error": "",
+                "ai_base_url": "",
+                "ai_prompt_sha256": "",
+                "ai_prompt": "",
+                "ai_source_status": "",
+                "ai_elapsed_ms": 0,
+                "ai_processed_at": now,
+                "updated_at": now,
+                "sync_version": 1,
+            }
+        ]
+    )
+
+    by_name = {a.name: a for a in TIMELINE_ADAPTERS}
+    engine = TimelineSyncEngine(
+        source_url=_postgres_url(),
+        source_schema=warehouse._schema,
+        dest_schema=warehouse._schema,
+        adapters=[by_name["screen_capture"], by_name["photo"]],
+    )
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    SearchChunkBuilder(warehouse).run()
+
+    for adapter_name in ("screen_capture", "photo"):
+        ev = warehouse._query_dicts(
+            "SELECT title, snippet, metadata, search_text FROM @timeline_events WHERE adapter = %s",
+            (adapter_name,),
+        )
+        assert len(ev) == 1
+        combined = f"{ev[0]['title']} {ev[0]['snippet']} {ev[0]['search_text']}"
+        assert fake_secret not in combined, f"{adapter_name} leaked token in timeline.events"
+        assert fake_card not in combined, f"{adapter_name} leaked card in timeline.events"
+        assert "[REDACTED:pdw_token:" in combined
+        assert "[card ****1111]" in combined
+        if adapter_name == "photo":
+            meta = ev[0]["metadata"]
+            assert isinstance(meta["lat"], (int, float))
+            assert meta["lat"] == pytest.approx(luhn_lat)
+
+        chunks = warehouse._query_dicts(
+            "SELECT text FROM @search_chunks WHERE adapter = %s",
+            (adapter_name,),
+        )
+        assert chunks, f"{adapter_name} produced no search chunks"
+        chunk_text = " ".join(c["text"] for c in chunks)
+        assert fake_secret not in chunk_text
+        assert fake_card not in chunk_text

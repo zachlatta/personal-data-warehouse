@@ -4118,6 +4118,12 @@ SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS = (
     "is_reused",
     "agent_run_id",
     "raw_result_json",
+    # <= 1568 px JPEG preview for MCP inline viewing (HEIC/AVIF frames cannot
+    # be decoded in distroless Go; active frames write one content-addressed
+    # JPEG so Claude/MCP renders them directly).
+    "preview_storage_backend",
+    "preview_storage_key",
+    "preview_storage_file_id",
     "created_at",
     "sync_version",
 )

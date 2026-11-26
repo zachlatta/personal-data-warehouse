@@ -1,16 +1,25 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"hash/crc32"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
 	"net/url"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
 // fakeObjectStore implements objectstore.ObjectStore for the get_object tool
@@ -360,5 +369,185 @@ func TestGetObjectToolBlocksExternalSlackFileAndDoesNotMintDownloadURL(t *testin
 	}
 	if fake.downloadCalls != 0 {
 		t.Fatalf("downloadCalls = %d, want 0", fake.downloadCalls)
+	}
+}
+
+func invokeGetObjectMCP(t *testing.T, store objectstore.ObjectStore, in getObjectInput) getObjectOutput {
+	t.Helper()
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+	tl := getObjectTool(store, nil, objectsTestSigner(), objectsTestBaseURL, time.Hour, func() time.Time { return objectsTestNow })
+	out, isErr, err := tl.Invoke(tool.WithMCPContext(context.Background()), raw)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	result, ok := out.(getObjectOutput)
+	if !ok {
+		t.Fatalf("unexpected output type %T", out)
+	}
+	if result.Error != "" && !isErr {
+		t.Fatalf("error output not flagged as error: %+v", result)
+	}
+	return result
+}
+
+func makeTestPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		for x := range w {
+			img.SetRGBA(x, y, color.RGBA{R: uint8(x % 256), G: uint8(y % 256), B: 128, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestGetObjectToolInlineReturnsMCPImageContentForPNG(t *testing.T) {
+	pngBytes := makeTestPNG(t, 64, 48)
+	store := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "google_drive", StorageFileID: "fid-png", ContentType: "image/png",
+			SizeBytes: int64(len(pngBytes)), ContentSHA256: "sha-png", Filename: "shot.png",
+		},
+		content: pngBytes,
+	}
+	out := invokeGetObjectMCP(t, store, getObjectInput{StorageFileID: "fid-png", Inline: true})
+	if out.Error != "" || !store.getCalled {
+		t.Fatalf("expected inline fetch, got out=%+v getCalled=%v", out, store.getCalled)
+	}
+	res := out.MCPCallToolResult(false)
+	if len(res.Content) != 2 {
+		t.Fatalf("expected 2 MCP content blocks (text + image), got %d", len(res.Content))
+	}
+	img, ok := res.Content[1].(*mcp.ImageContent)
+	if !ok {
+		t.Fatalf("second block is %T, want *mcp.ImageContent", res.Content[1])
+	}
+	if img.MIMEType != "image/png" || !bytes.Equal(img.Data, pngBytes) {
+		t.Fatalf("unexpected image content: mime=%q len=%d", img.MIMEType, len(img.Data))
+	}
+}
+
+func TestGetObjectToolInlineDownscalesLargePNGToJPEG(t *testing.T) {
+	pngBytes := makeTestPNG(t, 2400, 1200)
+	store := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "google_drive", StorageFileID: "fid-big-png", ContentType: "image/png",
+			SizeBytes: int64(len(pngBytes)), ContentSHA256: "sha-big", Filename: "retina.png",
+		},
+		content: pngBytes,
+	}
+	out := invokeGetObjectMCP(t, store, getObjectInput{StorageFileID: "fid-big-png", Inline: true})
+	if out.Error != "" || !store.getCalled {
+		t.Fatalf("expected inline fetch, got out=%+v", out)
+	}
+	res := out.MCPCallToolResult(false)
+	if len(res.Content) != 2 {
+		t.Fatalf("expected 2 MCP content blocks, got %d", len(res.Content))
+	}
+	imgBlock, ok := res.Content[1].(*mcp.ImageContent)
+	if !ok {
+		t.Fatalf("second block is %T, want *mcp.ImageContent", res.Content[1])
+	}
+	if imgBlock.MIMEType != "image/jpeg" {
+		t.Fatalf("expected resized image/jpeg, got %q", imgBlock.MIMEType)
+	}
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(imgBlock.Data))
+	if err != nil {
+		t.Fatalf("decode resized jpeg: %v", err)
+	}
+	if cfg.Width != maxInlineImageEdge || cfg.Height != maxInlineImageEdge/2 {
+		t.Fatalf("expected %dx%d, got %dx%d", maxInlineImageEdge, maxInlineImageEdge/2, cfg.Width, cfg.Height)
+	}
+}
+
+func TestGetObjectToolInlineIgnoredOverHTTPCLI(t *testing.T) {
+	pngBytes := makeTestPNG(t, 32, 32)
+	store := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "google_drive", StorageFileID: "fid-http", ContentType: "image/png",
+			SizeBytes: int64(len(pngBytes)), ContentSHA256: "sha-http", Filename: "shot.png",
+		},
+		content: pngBytes,
+	}
+	out := invokeGetObject(t, store, getObjectInput{StorageFileID: "fid-http", Inline: true})
+	if store.getCalled {
+		t.Fatal("HTTP/CLI invocation must not fetch object bytes when inline=true")
+	}
+	if !strings.Contains(out.Hint, "--save") {
+		t.Fatalf("expected --save hint on HTTP/CLI inline, got %q", out.Hint)
+	}
+}
+
+func TestGetObjectToolInlineHEICReturnsPreviewHintNotImageContent(t *testing.T) {
+	store := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "google_drive", StorageFileID: "fid-heic", ContentType: "image/heic",
+			SizeBytes: 500000, ContentSHA256: "sha-heic", Filename: "frame.heic",
+		},
+		content: []byte("heic"),
+	}
+	out := invokeGetObjectMCP(t, store, getObjectInput{StorageFileID: "fid-heic", Inline: true})
+	if out.Error != "" || store.getCalled {
+		t.Fatalf("HEIC inline should not fetch bytes, got out=%+v getCalled=%v", out, store.getCalled)
+	}
+	if !strings.Contains(out.Hint, "preview_storage_file_id") || !strings.Contains(out.Hint, "--save") {
+		t.Fatalf("expected preview_storage_file_id and --save hint for HEIC, got %q", out.Hint)
+	}
+	res := out.MCPCallToolResult(false)
+	if len(res.Content) != 1 {
+		t.Fatalf("expected 1 MCP content block for HEIC, got %d", len(res.Content))
+	}
+}
+
+// makePNGHeaderOnly constructs a valid PNG signature + IHDR chunk with the
+// given dimensions (~33 bytes) so image.DecodeConfig reads the dimensions
+// without allocating a huge image in the test.
+func makePNGHeaderOnly(w, h uint32) []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	var ihdr [13]byte
+	binary.BigEndian.PutUint32(ihdr[0:4], w)
+	binary.BigEndian.PutUint32(ihdr[4:8], h)
+	ihdr[8] = 8 // bit depth
+	ihdr[9] = 2 // RGB
+	var chunk bytes.Buffer
+	chunk.WriteString("IHDR")
+	chunk.Write(ihdr[:])
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(ihdr)))
+	buf.Write(lenBuf[:])
+	buf.Write(chunk.Bytes())
+	var crcBuf [4]byte
+	binary.BigEndian.PutUint32(crcBuf[:], crc32.ChecksumIEEE(chunk.Bytes()))
+	buf.Write(crcBuf[:])
+	return buf.Bytes()
+}
+
+func TestGetObjectToolInlineRefusesImageAbovePixelBudget(t *testing.T) {
+	bombPNG := makePNGHeaderOnly(10_000, 6_000) // 60 MP > 50 MP cap, only 33 bytes
+	store := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "google_drive", StorageFileID: "fid-bomb", ContentType: "image/png",
+			SizeBytes: int64(len(bombPNG)), ContentSHA256: "sha-bomb", Filename: "huge.png",
+		},
+		content: bombPNG,
+	}
+	out := invokeGetObjectMCP(t, store, getObjectInput{StorageFileID: "fid-bomb", Inline: true})
+	if out.Error != "" {
+		t.Fatalf("expected soft hint rather than hard error, got %+v", out)
+	}
+	if !strings.Contains(out.Hint, "50 MP") || !strings.Contains(out.Hint, "preview_storage_file_id") || !strings.Contains(out.Hint, "thumbnail_storage_file_id") {
+		t.Fatalf("expected 50 MP + preview/thumbnail hint, got %q", out.Hint)
+	}
+	res := out.MCPCallToolResult(false)
+	if len(res.Content) != 1 {
+		t.Fatalf("expected 1 MCP content block (refused decode), got %d", len(res.Content))
 	}
 }

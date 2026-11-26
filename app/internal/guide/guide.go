@@ -62,7 +62,7 @@ var topics = []Topic{
 	{Name: "connections", Summary: "remote MCP tools, web authentication, sharing, and upstream write permissions"},
 	{Name: "search", Summary: "query shape, modes, scoping, conversation context, and what a miss means"},
 	{Name: "sql", Summary: "columns-first SQL, the layers, type traps, the epoch sentinel, and the timeout budget"},
-	{Name: "sources", Summary: "where each domain lives: the starting relation for mail, chat, calendar, files, notes, photos, voice, health, finance"},
+	{Name: "sources", Summary: "where each domain lives: mail, chat, calendar, files, notes, photos, screens/screenshots, voice, health, finance"},
 	{Name: "agent-sessions", Summary: "every prior agent session across providers and machines: finding one, reading it, pairing tool calls"},
 	{Name: "finance", Summary: "the ledger, net worth, commitments, securities and tax lots, and the guards that withhold a number"},
 	{Name: "health", Summary: "WHOOP's two sources, the unit traps, cycles, sleep, strain and the private-API documents"},

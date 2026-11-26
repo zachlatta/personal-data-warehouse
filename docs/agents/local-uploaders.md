@@ -658,5 +658,6 @@ SQL starting points: `marts_screen_timelapse.active_screens` (one row per frame 
 in use, with `storage_file_id` for `get_object` and `accessibility_tree_storage_file_id`),
 `base_screen_timelapse.screenshots` and `base_screen_timelapse.accessibility_trees` (join on
 `device, captured_at`); timeline `source = 'screen_timelapse'`, kind `screen_capture`, one
-`noise` event per moment (display 1) with no search text yet: the descriptions do not reach the
-timeline.
+`noise` event per moment (display 1) whose `title`, `snippet`, and `search_text` fold in the
+newest completed `active` descriptions across the moment's displays (undescribed, `locked`,
+and `off` frames keep empty `search_text`).
