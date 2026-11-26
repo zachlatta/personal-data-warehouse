@@ -14,8 +14,11 @@ import { requestFeedJump, reviewDoorPreview, type ReviewDoorPreview } from './re
 
 type Props = {
   config: AppConfig;
-  // Incremented on each Review screen paint (focus, app resume, live refresh, pull)
-  // so the door refetches and logs one shown event per paint.
+  // Incremented on each new screen paint (initial mount, later focus,
+  // foreground resume, pull): refetches and allows one new `shown` event.
+  paintKey?: number;
+  // Incremented on silent background refreshes (e.g. 60s periodic tick):
+  // refetches to keep count and card current without logging another `shown`.
   refreshKey?: number;
   onOpenFeed: () => void;
 };
@@ -23,29 +26,29 @@ type Props = {
 // Compact door to the Feed tab shown under "All caught up." in Review.
 // Fetches asynchronously so it never delays the Review list, hides itself on
 // error or 0 unseen, and never records a feed impression for the previewed card.
-export function ReviewToFeedDoor({ config, refreshKey = 0, onOpenFeed }: Props) {
+export function ReviewToFeedDoor({ config, paintKey = 0, refreshKey = 0, onOpenFeed }: Props) {
   const theme = useTheme();
-  const [paint, setPaint] = useState<{ key: number; preview: ReviewDoorPreview | null }>({ key: -1, preview: null });
-  const loggedKey = useRef(-1);
+  const [paint, setPaint] = useState<{ paintKey: number; preview: ReviewDoorPreview | null }>({ paintKey: -1, preview: null });
+  const loggedPaintKey = useRef(-1);
 
   useEffect(() => {
     if (!FEED_ENABLED) return;
     let cancelled = false;
     fetchFeed(config)
       .then((page) => {
-        if (!cancelled) setPaint({ key: refreshKey, preview: reviewDoorPreview(page) });
+        if (!cancelled) setPaint({ paintKey, preview: reviewDoorPreview(page) });
       })
       .catch(() => {
-        if (!cancelled) setPaint({ key: refreshKey, preview: null });
+        if (!cancelled) setPaint({ paintKey, preview: null });
       });
     return () => {
       cancelled = true;
     };
-  }, [config, refreshKey]);
+  }, [config, paintKey, refreshKey]);
 
   useEffect(() => {
-    if (!paint.preview || loggedKey.current === paint.key) return;
-    loggedKey.current = paint.key;
+    if (!paint.preview || loggedPaintKey.current === paint.paintKey) return;
+    loggedPaintKey.current = paint.paintKey;
     recordUi('review_to_feed', {
       metadata: { event: 'shown', item_id: paint.preview.itemId, unseen: paint.preview.unseen },
     });

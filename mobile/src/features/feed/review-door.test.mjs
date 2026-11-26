@@ -118,11 +118,11 @@ function doorHarness({ page = null, pages = null, failure = null, feedEnabled = 
 
   const config = { baseUrl: 'https://x.test', token: 't', clientName: 'c' };
   const onOpenFeed = () => { openedFeed++; };
-  const render = (refreshKey = 0) => {
+  const render = (paintKey = 0, refreshKey = 0) => {
     stateCursor = 0;
     refCursor = 0;
     effectCursor = 0;
-    return exports.ReviewToFeedDoor({ config, refreshKey, onOpenFeed });
+    return exports.ReviewToFeedDoor({ config, paintKey, refreshKey, onOpenFeed });
   };
   const flushEffects = async () => {
     for (const fn of pendingEffects.splice(0)) fn();
@@ -195,54 +195,70 @@ test('ReviewToFeedDoor renders nothing and logs nothing when 0 unseen or request
   }
 });
 
-test('ReviewToFeedDoor refetches and logs one new shown event on a second paint without duplicating on rerender', async () => {
+test('ReviewToFeedDoor periodic refresh updates count without logging shown; focus/resume logs exactly one', async () => {
   const page1 = {
     items: [item('picks:first', { title: 'First pick', source: 'picks' })],
     unseen_count: 4,
     generated_at: '2026-11-26T00:00:00Z',
   };
   const page2 = {
+    items: [item('picks:periodic', { title: 'Periodic pick', source: 'hn' })],
+    unseen_count: 5,
+    generated_at: '2026-11-26T00:01:00Z',
+  };
+  const page3 = {
     items: [item('picks:second', { title: 'Second pick', source: 'hn' })],
     unseen_count: 2,
     generated_at: '2026-11-26T00:05:00Z',
   };
-  const h = doorHarness({ pages: [page1, page2] });
-  h.render(0);
+  const h = doorHarness({ pages: [page1, page2, page3] });
+  // Initial mount: paintKey=0, refreshKey=0 -> 1 fetch, 1 shown.
+  h.render(0, 0);
   await h.flushEffects();
-  let tree = h.render(0);
+  let tree = h.render(0, 0);
   await h.flushEffects();
   assert.match(collectText(tree).join(' | '), /4 new in Feed/);
   assert.equal(h.fetchCount(), 1);
   assert.equal(h.uiEvents.length, 1);
 
-  // Plain rerender at the same refreshKey does not refetch or log again.
-  h.render(0);
+  // Plain rerender at the same keys does not refetch or log again.
+  h.render(0, 0);
   await h.flushEffects();
   assert.equal(h.fetchCount(), 1);
   assert.equal(h.uiEvents.length, 1);
 
-  // Second screen paint (focus, resume, or live refresh) bumps refreshKey:
-  // refetches and logs one new shown event.
-  h.render(1);
+  // Periodic refresh bumps refreshKey only: refetches and updates count/card,
+  // but must NOT log another shown event.
+  h.render(0, 1);
   await h.flushEffects();
-  tree = h.render(1);
+  tree = h.render(0, 1);
+  await h.flushEffects();
+  assert.match(collectText(tree).join(' | '), /5 new in Feed/);
+  assert.match(collectText(tree).join(' | '), /Periodic pick/);
+  assert.equal(h.fetchCount(), 2);
+  assert.equal(h.uiEvents.length, 1);
+
+  // Focus / foreground resume / pull bumps paintKey: refetches and logs one new shown.
+  h.render(1, 1);
+  await h.flushEffects();
+  tree = h.render(1, 1);
   await h.flushEffects();
   assert.match(collectText(tree).join(' | '), /2 new in Feed/);
   assert.match(collectText(tree).join(' | '), /Second pick/);
-  assert.equal(h.fetchCount(), 2);
+  assert.equal(h.fetchCount(), 3);
   assert.equal(h.uiEvents.length, 2);
   assert.deepEqual(JSON.parse(JSON.stringify(h.uiEvents[1])), {
     action: 'review_to_feed',
     metadata: { event: 'shown', item_id: 'picks:second', unseen: 2 },
   });
 
-  // Rerender at refreshKey=1 does not duplicate.
-  h.render(1);
+  // Rerender at paintKey=1 does not duplicate.
+  h.render(1, 1);
   await h.flushEffects();
   assert.equal(h.uiEvents.length, 2);
 });
 
-test('FeedJumpController scrolls immediately on an already-mounted list, waits for stale loads, applies held arrivals, and retries on scrollToIndexFailed', () => {
+test('FeedJumpController scrolls immediately on an already-mounted list, waits for stale loads, retries on scrollToIndexFailed, and clears on empty settle or blur', () => {
   const calls = [];
   const timers = [];
   const scroller = {
@@ -255,11 +271,11 @@ test('FeedJumpController scrolls immediately on an already-mounted list, waits f
   // 1. Already-mounted list, target at index 2: jumps immediately and clears pending.
   ctrl.arm('picks:2');
   assert.equal(ctrl.hasPending(), true);
-  ctrl.tryJump(['picks:0', 'picks:1', 'picks:2'], { filtered: false, loading: false }, scroller);
+  ctrl.tryJump(['picks:0', 'picks:1', 'picks:2'], { filtered: false, loading: false, settled: true }, scroller);
   assert.deepEqual(calls, [['index', 2]]);
   assert.equal(ctrl.hasPending(), false);
   // Later render does not surprise-scroll.
-  ctrl.tryJump(['picks:0', 'picks:1', 'picks:2'], { filtered: false, loading: false }, scroller);
+  ctrl.tryJump(['picks:0', 'picks:1', 'picks:2'], { filtered: false, loading: false, settled: true }, scroller);
   assert.deepEqual(calls, [['index', 2]]);
 
   // 2. scrollToIndexFailed scrolls to estimated offset and retries scrollToIndex once.
@@ -275,10 +291,28 @@ test('FeedJumpController scrolls immediately on an already-mounted list, waits f
   // 3. Stale reload in flight: waits until loading finishes, then lands on the new item.
   calls.length = 0;
   ctrl.arm('picks:new');
-  ctrl.tryJump(['picks:old'], { filtered: false, loading: true }, scroller);
+  ctrl.tryJump(['picks:old'], { filtered: false, loading: true, settled: true }, scroller);
   assert.deepEqual(calls, []);
   assert.equal(ctrl.hasPending(), true);
-  ctrl.tryJump(['picks:new', 'picks:old'], { filtered: false, loading: false }, scroller);
+  ctrl.tryJump(['picks:new', 'picks:old'], { filtered: false, loading: false, settled: true }, scroller);
   assert.deepEqual(calls, [['offset', 0]]);
   assert.equal(ctrl.hasPending(), false);
+
+  // 4. Settled with an empty list (or failed load): scrolls to top and clears armed target
+  // so it cannot stay armed and fire as a surprise scroll later.
+  calls.length = 0;
+  ctrl.arm('picks:missing');
+  ctrl.tryJump([], { filtered: false, loading: false, settled: true }, scroller);
+  assert.deepEqual(calls, [['offset', 0]]);
+  assert.equal(ctrl.hasPending(), false);
+
+  // 5. Leaving the Feed tab before a load finishes clears the armed target.
+  calls.length = 0;
+  ctrl.arm('picks:abandoned');
+  ctrl.tryJump([], { filtered: false, loading: true, settled: false }, scroller);
+  assert.equal(ctrl.hasPending(), true);
+  ctrl.clear();
+  assert.equal(ctrl.hasPending(), false);
+  ctrl.tryJump(['picks:abandoned'], { filtered: false, loading: false, settled: true }, scroller);
+  assert.deepEqual(calls, []);
 });

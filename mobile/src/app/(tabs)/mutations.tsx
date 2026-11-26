@@ -72,8 +72,10 @@ export default function MutationsScreen() {
   // Until a list is known (a cold start with an empty cache) the read shows
   // the spinner, so the tab is not two bare headers while it waits.
   const [doorPaint, setDoorPaint] = useState(0);
+  const [doorRefresh, setDoorRefresh] = useState(0);
   const focusedRef = useRef(false);
   const hasFocused = useRef(false);
+  const lastAppState = useRef(AppState.currentState);
 
   useFocusEffect(
     useCallback(() => {
@@ -88,13 +90,15 @@ export default function MutationsScreen() {
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active' && focusedRef.current) setDoorPaint((n) => n + 1);
+      const wasActive = lastAppState.current === 'active';
+      lastAppState.current = state;
+      if (state === 'active' && !wasActive && focusedRef.current) setDoorPaint((n) => n + 1);
     });
     return () => sub.remove();
   }, []);
 
   const live = useLiveRefresh((why) => {
-    if (why === 'periodic') setDoorPaint((n) => n + 1);
+    if (why === 'periodic') setDoorRefresh((n) => n + 1);
     void load(known);
   });
   const pull = useCallback(() => {
@@ -159,7 +163,7 @@ export default function MutationsScreen() {
                 {section.empty}
               </ThemedText>
               {section.key === 'pending' ? (
-                <ReviewToFeedDoor config={config} refreshKey={doorPaint} onOpenFeed={() => router.navigate('/feed')} />
+                <ReviewToFeedDoor config={config} paintKey={doorPaint} refreshKey={doorRefresh} onOpenFeed={() => router.navigate('/feed')} />
               ) : null}
             </ThemedView>
           ) : null

@@ -85,8 +85,15 @@ export class FeedJumpController {
     return this.pending !== null;
   }
 
-  tryJump(ids: string[], state: { filtered: boolean; loading: boolean }, scroller: FeedJumpScroller | null): boolean {
-    if (!this.pending || state.filtered || state.loading || ids.length === 0 || !scroller) return false;
+  tryJump(ids: string[], state: { filtered: boolean; loading: boolean; settled: boolean }, scroller: FeedJumpScroller | null): boolean {
+    if (!this.pending || state.filtered || state.loading || !scroller) return false;
+    if (ids.length === 0) {
+      if (!state.settled) return false;
+      this.pending = null;
+      this.active = null;
+      scroller.scrollToOffset({ offset: 0, animated: false });
+      return true;
+    }
     const idx = ids.indexOf(this.pending);
     this.pending = null;
     if (idx <= 0) {

@@ -342,10 +342,10 @@ export default function FeedScreen() {
   useEffect(() => {
     jumpController.current.tryJump(
       shown.map((i) => i.item_id),
-      { filtered: only !== null || searching, loading: loading.current },
+      { filtered: only !== null || searching, loading: loading.current, settled: loaded },
       list.current,
     );
-  }, [jumpSeq, shown, only, searching]);
+  }, [jumpSeq, shown, only, searching, loaded]);
 
   useEffect(() => {
     const ctrl = jumpController.current;
@@ -375,6 +375,7 @@ export default function FeedScreen() {
       else measure();
       return () => {
         focused.current = false;
+        jumpController.current.clear();
         gate.current.leave(pause, () => {
           if (lifecycle.blur()) endFeedSession('blur');
         });
