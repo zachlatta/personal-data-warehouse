@@ -140,7 +140,7 @@ order (`metadata.item_ids`) and how fast; `scroll` is one gesture (`from_y`, `to
 `direction`, `release_velocity`, `from_card`, `to_card`, `metadata.in` = `detail` inside
 a card); `ui` is any other tap, named by `metadata.action` (`filter`, `refresh`,
 `menu_open`, `menu_pick`, `undo`, `swipe_start`, `scroll_to_top`, `end_reached`,
-`share_failed`). Impressions carry `metadata.view` (`all`, `saved`, `source:<s>`) and the
+`share_failed`; `review_to_feed` logs `metadata.event` `shown` with `item_id`/`unseen` or `tapped` with `item_id` when the empty Review tab shows or opens the Feed door). Impressions carry `metadata.view` (`all`, `saved`, `source:<s>`) and the
 card's `height`.
 
 Zach's curated picks are source `picks`, refreshed daily by the "Feed picks daily" Paseo

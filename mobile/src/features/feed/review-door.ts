@@ -46,3 +46,88 @@ export function consumeFeedJump(): string | null {
   pendingJumpItemId = null;
   return id;
 }
+
+export type FeedJumpScroller = {
+  scrollToOffset: (params: { offset: number; animated?: boolean }) => void;
+  scrollToIndex: (params: { index: number; animated?: boolean }) => void;
+};
+
+export type ScrollToIndexFailedInfo = {
+  index: number;
+  averageItemLength: number;
+};
+
+// Coordinates landing on a target card when navigating from Review to Feed:
+// waits for filters to clear and any stale reload to settle, scrolls to the
+// card (or top if first/absent), retries once from the estimated offset if
+// FlatList has not measured the target yet, and always clears state afterward.
+export class FeedJumpController {
+  private pending: string | null = null;
+  private active: { index: number; retried: boolean } | null = null;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private schedule: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  private cancel: (id: ReturnType<typeof setTimeout>) => void;
+
+  constructor(
+    schedule: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = setTimeout,
+    cancel: (id: ReturnType<typeof setTimeout>) => void = clearTimeout,
+  ) {
+    this.schedule = schedule;
+    this.cancel = cancel;
+  }
+
+  arm(itemId: string): void {
+    this.clear();
+    this.pending = itemId;
+  }
+
+  hasPending(): boolean {
+    return this.pending !== null;
+  }
+
+  tryJump(ids: string[], state: { filtered: boolean; loading: boolean }, scroller: FeedJumpScroller | null): boolean {
+    if (!this.pending || state.filtered || state.loading || ids.length === 0 || !scroller) return false;
+    const idx = ids.indexOf(this.pending);
+    this.pending = null;
+    if (idx <= 0) {
+      this.active = null;
+      scroller.scrollToOffset({ offset: 0, animated: false });
+      return true;
+    }
+    this.active = { index: idx, retried: false };
+    scroller.scrollToIndex({ index: idx, animated: false });
+    return true;
+  }
+
+  onScrollToIndexFailed(info: ScrollToIndexFailedInfo, scroller: FeedJumpScroller | null): void {
+    const offset = info.averageItemLength > 0 ? info.averageItemLength * info.index : 0;
+    this.pending = null;
+    if (!scroller) {
+      this.active = null;
+      return;
+    }
+    if (this.active && !this.active.retried && this.active.index === info.index) {
+      this.active.retried = true;
+      scroller.scrollToOffset({ offset, animated: false });
+      const idx = info.index;
+      this.timer = this.schedule(() => {
+        this.timer = null;
+        const cur = this.active;
+        this.active = null;
+        if (cur && cur.index === idx) scroller.scrollToIndex({ index: idx, animated: false });
+      }, 50);
+      return;
+    }
+    this.active = null;
+    scroller.scrollToOffset({ offset, animated: false });
+  }
+
+  clear(): void {
+    if (this.timer !== null) {
+      this.cancel(this.timer);
+      this.timer = null;
+    }
+    this.pending = null;
+    this.active = null;
+  }
+}

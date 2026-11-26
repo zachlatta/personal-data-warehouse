@@ -187,7 +187,8 @@ func stockEntry(name string, liveUnseen, seen, opened int64, windowDays int) Sto
 }
 
 // attachPushStock fills Stock on every created card in results using the
-// committed live unseen counts and recent open shares for its source.
+// live unseen counts and recent open shares already waiting before this push
+// (excluding every card created by this push batch).
 func (s *Store) attachPushStock(ctx context.Context, items []normalized, results []PushResult) error {
 	type sourceNeed struct {
 		tastes map[string]bool
@@ -210,10 +211,12 @@ func (s *Store) attachPushStock(ctx context.Context, items []normalized, results
 		tags         []string
 	}
 	refs := []itemRef{}
+	createdIDs := []string{}
 	for i, r := range results {
 		if r.Status != "created" {
 			continue
 		}
+		createdIDs = append(createdIDs, r.ItemID)
 		item := items[i]
 		var tasteRaw string
 		if v, ok := item.Metadata["taste"].(string); ok {
@@ -250,6 +253,7 @@ func (s *Store) attachPushStock(ctx context.Context, items []normalized, results
 	now := s.now()
 	sectionSince := now.Add(-stockSectionWindowDays * 24 * time.Hour)
 	tagSince := now.Add(-stockTagWindowDays * 24 * time.Hour)
+	excluded := tagsLiteral(createdIDs)
 
 	sectionsBySource := map[string]map[string]StockEntry{}
 	tagsBySource := map[string]map[string]StockEntry{}
@@ -265,7 +269,7 @@ func (s *Store) attachPushStock(ctx context.Context, items []normalized, results
 					       e.first_seen_at, e.opens,
 					       (e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3)) AS live_unseen
 					FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
-					WHERE i.source = $2
+					WHERE i.source = $2 AND NOT (i.item_id = ANY($5::text[]))
 				)
 				SELECT lower(label) AS key,
 				       mode() WITHIN GROUP (ORDER BY label) AS taste,
@@ -274,7 +278,7 @@ func (s *Store) attachPushStock(ctx context.Context, items []normalized, results
 				       count(*) FILTER (WHERE live_unseen) AS live_unseen
 				FROM cards
 				WHERE lower(label) = ANY($4::text[])
-				GROUP BY lower(label)`), sectionSince, source, now, tagsLiteral(keys))
+				GROUP BY lower(label)`), sectionSince, source, now, tagsLiteral(keys), excluded)
 			if err != nil {
 				return err
 			}
@@ -308,7 +312,7 @@ func (s *Store) attachPushStock(ctx context.Context, items []normalized, results
 					FROM @feed_items i
 					JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
 					CROSS JOIN LATERAL unnest(i.tags) AS raw_tag
-					WHERE i.source = $2
+					WHERE i.source = $2 AND NOT (i.item_id = ANY($5::text[]))
 				)
 				SELECT tag,
 				       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
@@ -316,7 +320,7 @@ func (s *Store) attachPushStock(ctx context.Context, items []normalized, results
 				       count(*) FILTER (WHERE live_unseen) AS live_unseen
 				FROM cards
 				WHERE tag = ANY($4::text[])
-				GROUP BY tag`), tagSince, source, now, tagsLiteral(keys))
+				GROUP BY tag`), tagSince, source, now, tagsLiteral(keys), excluded)
 			if err != nil {
 				return err
 			}

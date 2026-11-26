@@ -1045,16 +1045,18 @@ func TestPostgresFeedStatsByTag(t *testing.T) {
 
 // Creating a card attaches its subject stock (metadata.taste section 14d open
 // share + each normalized tag's 21d open share and live unseen count in the
-// same source) and flags >=5 unseen with <5% opened; updates return no stock.
+// same source, excluding the cards created by this push) and flags >=5 unseen
+// with <5% opened; updates return no stock.
 func TestPostgresFeedPushStockNote(t *testing.T) {
 	store, now := postgresStore(t)
 	tools := Tools(store)
 	seed := []map[string]any{
-		// 4 existing live unseen cards tagged games in stock-test.
+		// 5 existing live unseen cards tagged games in stock-test (2 also in the section).
 		{"key": "u1", "title": "u1", "tags": []string{"games"}, "metadata": map[string]any{"taste": "Internet and creator culture"}},
 		{"key": "u2", "title": "u2", "tags": []string{"Games"}, "metadata": map[string]any{"taste": "Internet and creator culture:"}},
 		{"key": "u3", "title": "u3", "tags": []string{"games"}},
 		{"key": "u4", "title": "u4", "tags": []string{"games"}},
+		{"key": "u5", "title": "u5", "tags": []string{"games"}},
 		// Removed card must not count toward live unseen.
 		{"key": "u-rem", "title": "u-rem", "tags": []string{"games"}},
 		// 2 seen cards in 14d for the section (1 opened -> 50%), and 25 seen
@@ -1063,7 +1065,11 @@ func TestPostgresFeedPushStockNote(t *testing.T) {
 		{"key": "sec-s2", "title": "sec-s2", "metadata": map[string]any{"taste": "Internet and creator culture"}},
 	}
 	for i := range 25 {
-		seed = append(seed, map[string]any{"key": fmt.Sprintf("gs-%d", i), "title": fmt.Sprintf("gs-%d", i), "tags": []string{"games"}})
+		seed = append(seed,
+			map[string]any{"key": fmt.Sprintf("gs-%d", i), "title": fmt.Sprintf("gs-%d", i), "tags": []string{"games"}},
+			// 25 seen / 0 opened for batch-tag (0% open share, 0 live unseen waiting).
+			map[string]any{"key": fmt.Sprintf("bt-%d", i), "title": fmt.Sprintf("bt-%d", i), "tags": []string{"batch-tag"}},
+		)
 	}
 	call(t, tools, "feed_push", map[string]any{"source": "stock-test", "items": seed})
 	// Cards in another source must not pollute stock-test counts.
@@ -1080,10 +1086,16 @@ func TestPostgresFeedPushStockNote(t *testing.T) {
 		{"event_id": "st-sec2", "type": "impression", "item_id": "stock-test:sec-s2", "occurred_at": at(-2 * 24 * time.Hour), "dwell_ms": 400},
 	}
 	for i := range 25 {
-		events = append(events, map[string]any{
-			"event_id": fmt.Sprintf("st-gs-%d", i), "type": "impression",
-			"item_id": fmt.Sprintf("stock-test:gs-%d", i), "occurred_at": at(-10 * 24 * time.Hour), "dwell_ms": 400,
-		})
+		events = append(events,
+			map[string]any{
+				"event_id": fmt.Sprintf("st-gs-%d", i), "type": "impression",
+				"item_id": fmt.Sprintf("stock-test:gs-%d", i), "occurred_at": at(-10 * 24 * time.Hour), "dwell_ms": 400,
+			},
+			map[string]any{
+				"event_id": fmt.Sprintf("st-bt-%d", i), "type": "impression",
+				"item_id": fmt.Sprintf("stock-test:bt-%d", i), "occurred_at": at(-10 * 24 * time.Hour), "dwell_ms": 400,
+			},
+		)
 	}
 	events = append(events, map[string]any{
 		"event_id": "st-gs-0-o", "type": "open", "item_id": "stock-test:gs-0", "occurred_at": at(-10 * 24 * time.Hour),
@@ -1097,7 +1109,8 @@ func TestPostgresFeedPushStockNote(t *testing.T) {
 		t.Fatalf("POST events: %d %s", rec.Code, rec.Body.String())
 	}
 
-	// Push the 5th live unseen card tagged games (+ steam, + section).
+	// Push a 6th card tagged games while 5 live unseen cards already wait: must
+	// report games=5 (not 6), section=2 (not 3), and steam=0 (not 1).
 	var created pushOutput
 	rawOut, _ := json.Marshal(call(t, tools, "feed_push", map[string]any{"source": "stock-test", "items": []map[string]any{{
 		"key":      "new-1",
@@ -1113,7 +1126,7 @@ func TestPostgresFeedPushStockNote(t *testing.T) {
 	}
 	stock := created.Items[0].Stock
 	if stock.Section == nil || stock.Section.Name != "Internet and creator culture" ||
-		stock.Section.LiveUnseen != 3 || stock.Section.WindowDays != 14 ||
+		stock.Section.LiveUnseen != 2 || stock.Section.WindowDays != 14 ||
 		stock.Section.OpenShare == nil || *stock.Section.OpenShare != 0.5 || stock.Section.Warning {
 		t.Fatalf("section stock: %+v", stock.Section)
 	}
@@ -1124,9 +1137,37 @@ func TestPostgresFeedPushStockNote(t *testing.T) {
 		g.OpenShare == nil || *g.OpenShare != 0.04 || !g.Warning {
 		t.Fatalf("games stock: %+v", g)
 	}
-	if st := stock.Tags[1]; st.Name != "steam" || st.LiveUnseen != 1 || st.WindowDays != 21 ||
+	if st := stock.Tags[1]; st.Name != "steam" || st.LiveUnseen != 0 || st.WindowDays != 21 ||
 		st.OpenShare != nil || st.Warning {
 		t.Fatalf("steam stock: %+v", st)
+	}
+
+	// A batch of 5 new cards pushed into an empty subject (0 waiting, 0% open
+	// share) must not count itself or reach '!' on its own.
+	batchItems := make([]map[string]any, 5)
+	for i := range 5 {
+		batchItems[i] = map[string]any{
+			"key":   fmt.Sprintf("batch-%d", i),
+			"title": fmt.Sprintf("Batch card %d", i),
+			"tags":  []string{"batch-tag"},
+		}
+	}
+	var batchOut pushOutput
+	rawBatch, _ := json.Marshal(call(t, tools, "feed_push", map[string]any{"source": "stock-test", "items": batchItems}))
+	if err := json.Unmarshal(rawBatch, &batchOut); err != nil {
+		t.Fatal(err)
+	}
+	if len(batchOut.Items) != 5 {
+		t.Fatalf("batch items: %s", rawBatch)
+	}
+	for i, item := range batchOut.Items {
+		if item.Status != "created" || item.Stock == nil || len(item.Stock.Tags) != 1 {
+			t.Fatalf("batch[%d]: %+v", i, item)
+		}
+		bt := item.Stock.Tags[0]
+		if bt.Name != "batch-tag" || bt.LiveUnseen != 0 || bt.OpenShare == nil || *bt.OpenShare != 0 || bt.Warning {
+			t.Fatalf("batch[%d] tag stock must exclude the batch itself and not warn: %+v", i, bt)
+		}
 	}
 
 	// Updating an existing card returns no stock.

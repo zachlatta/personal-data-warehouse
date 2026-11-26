@@ -5,7 +5,7 @@ import ts from 'typescript';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { consumeFeedJump, requestFeedJump, reviewDoorPreview } from './review-door.ts';
+import { FeedJumpController, consumeFeedJump, requestFeedJump, reviewDoorPreview } from './review-door.ts';
 
 function item(id, overrides = {}) {
   return {
@@ -54,15 +54,18 @@ test('requestFeedJump / consumeFeedJump is one-shot', () => {
 
 const require = createRequire(import.meta.url);
 
-function doorHarness({ page = null, failure = null, feedEnabled = true } = {}) {
+function doorHarness({ page = null, pages = null, failure = null, feedEnabled = true } = {}) {
   const state = [];
   const refs = [];
+  const effectDeps = [];
   let stateCursor = 0;
   let refCursor = 0;
-  const effects = [];
+  let effectCursor = 0;
+  const pendingEffects = [];
   const uiEvents = [];
   const otherEvents = [];
   let openedFeed = 0;
+  let fetchCount = 0;
 
   const react = {
     useState(initial) {
@@ -75,8 +78,14 @@ function doorHarness({ page = null, failure = null, feedEnabled = true } = {}) {
       if (!(i in refs)) refs[i] = { current: initial };
       return refs[i];
     },
-    useEffect(fn) {
-      effects.push(fn);
+    useEffect(fn, deps) {
+      const i = effectCursor++;
+      const prev = effectDeps[i];
+      const changed = !prev || !deps || deps.length !== prev.length || deps.some((d, idx) => !Object.is(d, prev[idx]));
+      if (changed) {
+        effectDeps[i] = deps;
+        pendingEffects.push(fn);
+      }
     },
   };
   const modules = {
@@ -88,7 +97,9 @@ function doorHarness({ page = null, failure = null, feedEnabled = true } = {}) {
     '@/hooks/use-theme': { useTheme: () => ({ surface: '#fff', surfaceBorder: '#ddd', textSecondary: '#777', text: '#111' }) },
     './api': {
       fetchFeed: async () => {
+        const idx = fetchCount++;
         if (failure) throw failure;
+        if (pages) return pages[Math.min(idx, pages.length - 1)];
         return page;
       },
     },
@@ -105,17 +116,19 @@ function doorHarness({ page = null, failure = null, feedEnabled = true } = {}) {
   const exports = {};
   runInNewContext(source, { exports, require: (id) => modules[id] ?? require(id) });
 
-  const render = () => {
+  const config = { baseUrl: 'https://x.test', token: 't', clientName: 'c' };
+  const onOpenFeed = () => { openedFeed++; };
+  const render = (refreshKey = 0) => {
     stateCursor = 0;
     refCursor = 0;
-    effects.length = 0;
-    return exports.ReviewToFeedDoor({ config: { baseUrl: 'https://x.test', token: 't', clientName: 'c' }, onOpenFeed: () => { openedFeed++; } });
+    effectCursor = 0;
+    return exports.ReviewToFeedDoor({ config, refreshKey, onOpenFeed });
   };
   const flushEffects = async () => {
-    for (const fn of effects.splice(0)) fn();
+    for (const fn of pendingEffects.splice(0)) fn();
     await new Promise((resolve) => setImmediate(resolve));
   };
-  return { render, flushEffects, uiEvents, otherEvents, openedFeed: () => openedFeed };
+  return { render, flushEffects, uiEvents, otherEvents, openedFeed: () => openedFeed, fetchCount: () => fetchCount };
 }
 
 function collectText(node) {
@@ -180,4 +193,92 @@ test('ReviewToFeedDoor renders nothing and logs nothing when 0 unseen or request
     await h.flushEffects();
     assert.equal(h.uiEvents.length, 0);
   }
+});
+
+test('ReviewToFeedDoor refetches and logs one new shown event on a second paint without duplicating on rerender', async () => {
+  const page1 = {
+    items: [item('picks:first', { title: 'First pick', source: 'picks' })],
+    unseen_count: 4,
+    generated_at: '2026-11-26T00:00:00Z',
+  };
+  const page2 = {
+    items: [item('picks:second', { title: 'Second pick', source: 'hn' })],
+    unseen_count: 2,
+    generated_at: '2026-11-26T00:05:00Z',
+  };
+  const h = doorHarness({ pages: [page1, page2] });
+  h.render(0);
+  await h.flushEffects();
+  let tree = h.render(0);
+  await h.flushEffects();
+  assert.match(collectText(tree).join(' | '), /4 new in Feed/);
+  assert.equal(h.fetchCount(), 1);
+  assert.equal(h.uiEvents.length, 1);
+
+  // Plain rerender at the same refreshKey does not refetch or log again.
+  h.render(0);
+  await h.flushEffects();
+  assert.equal(h.fetchCount(), 1);
+  assert.equal(h.uiEvents.length, 1);
+
+  // Second screen paint (focus, resume, or live refresh) bumps refreshKey:
+  // refetches and logs one new shown event.
+  h.render(1);
+  await h.flushEffects();
+  tree = h.render(1);
+  await h.flushEffects();
+  assert.match(collectText(tree).join(' | '), /2 new in Feed/);
+  assert.match(collectText(tree).join(' | '), /Second pick/);
+  assert.equal(h.fetchCount(), 2);
+  assert.equal(h.uiEvents.length, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.uiEvents[1])), {
+    action: 'review_to_feed',
+    metadata: { event: 'shown', item_id: 'picks:second', unseen: 2 },
+  });
+
+  // Rerender at refreshKey=1 does not duplicate.
+  h.render(1);
+  await h.flushEffects();
+  assert.equal(h.uiEvents.length, 2);
+});
+
+test('FeedJumpController scrolls immediately on an already-mounted list, waits for stale loads, applies held arrivals, and retries on scrollToIndexFailed', () => {
+  const calls = [];
+  const timers = [];
+  const scroller = {
+    scrollToOffset: (opts) => calls.push(['offset', opts.offset]),
+    scrollToIndex: (opts) => calls.push(['index', opts.index]),
+  };
+  const schedule = (fn) => { timers.push(fn); return timers.length; };
+  const ctrl = new FeedJumpController(schedule);
+
+  // 1. Already-mounted list, target at index 2: jumps immediately and clears pending.
+  ctrl.arm('picks:2');
+  assert.equal(ctrl.hasPending(), true);
+  ctrl.tryJump(['picks:0', 'picks:1', 'picks:2'], { filtered: false, loading: false }, scroller);
+  assert.deepEqual(calls, [['index', 2]]);
+  assert.equal(ctrl.hasPending(), false);
+  // Later render does not surprise-scroll.
+  ctrl.tryJump(['picks:0', 'picks:1', 'picks:2'], { filtered: false, loading: false }, scroller);
+  assert.deepEqual(calls, [['index', 2]]);
+
+  // 2. scrollToIndexFailed scrolls to estimated offset and retries scrollToIndex once.
+  ctrl.onScrollToIndexFailed({ index: 2, averageItemLength: 320 }, scroller);
+  assert.deepEqual(calls, [['index', 2], ['offset', 640]]);
+  assert.equal(timers.length, 1);
+  timers.shift()();
+  assert.deepEqual(calls, [['index', 2], ['offset', 640], ['index', 2]]);
+  // A second failure clears state and does not loop.
+  ctrl.onScrollToIndexFailed({ index: 2, averageItemLength: 320 }, scroller);
+  assert.equal(timers.length, 0);
+
+  // 3. Stale reload in flight: waits until loading finishes, then lands on the new item.
+  calls.length = 0;
+  ctrl.arm('picks:new');
+  ctrl.tryJump(['picks:old'], { filtered: false, loading: true }, scroller);
+  assert.deepEqual(calls, []);
+  assert.equal(ctrl.hasPending(), true);
+  ctrl.tryJump(['picks:new', 'picks:old'], { filtered: false, loading: false }, scroller);
+  assert.deepEqual(calls, [['offset', 0]]);
+  assert.equal(ctrl.hasPending(), false);
 });

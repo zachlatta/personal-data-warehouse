@@ -1,6 +1,6 @@
-import { useRouter } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
-import { Pressable, RefreshControl, SectionList, StyleSheet } from 'react-native';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState, Pressable, RefreshControl, SectionList, StyleSheet } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -71,9 +71,35 @@ export default function MutationsScreen() {
   // which an Android app resumed from the background never fires.
   // Until a list is known (a cold start with an empty cache) the read shows
   // the spinner, so the tab is not two bare headers while it waits.
-  const live = useLiveRefresh(() => void load(known));
+  const [doorPaint, setDoorPaint] = useState(0);
+  const focusedRef = useRef(false);
+  const hasFocused = useRef(false);
+
+  useFocusEffect(
+    useCallback(() => {
+      focusedRef.current = true;
+      if (hasFocused.current) setDoorPaint((n) => n + 1);
+      else hasFocused.current = true;
+      return () => {
+        focusedRef.current = false;
+      };
+    }, []),
+  );
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active' && focusedRef.current) setDoorPaint((n) => n + 1);
+    });
+    return () => sub.remove();
+  }, []);
+
+  const live = useLiveRefresh((why) => {
+    if (why === 'periodic') setDoorPaint((n) => n + 1);
+    void load(known);
+  });
   const pull = useCallback(() => {
     live.loaded();
+    setDoorPaint((n) => n + 1);
     void load();
   }, [live, load]);
 
@@ -133,7 +159,7 @@ export default function MutationsScreen() {
                 {section.empty}
               </ThemedText>
               {section.key === 'pending' ? (
-                <ReviewToFeedDoor config={config} onOpenFeed={() => router.navigate('/feed')} />
+                <ReviewToFeedDoor config={config} refreshKey={doorPaint} onOpenFeed={() => router.navigate('/feed')} />
               ) : null}
             </ThemedView>
           ) : null

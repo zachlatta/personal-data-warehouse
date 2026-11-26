@@ -14,40 +14,44 @@ import { requestFeedJump, reviewDoorPreview, type ReviewDoorPreview } from './re
 
 type Props = {
   config: AppConfig;
+  // Incremented on each Review screen paint (focus, app resume, live refresh, pull)
+  // so the door refetches and logs one shown event per paint.
+  refreshKey?: number;
   onOpenFeed: () => void;
 };
 
 // Compact door to the Feed tab shown under "All caught up." in Review.
 // Fetches asynchronously so it never delays the Review list, hides itself on
 // error or 0 unseen, and never records a feed impression for the previewed card.
-export function ReviewToFeedDoor({ config, onOpenFeed }: Props) {
+export function ReviewToFeedDoor({ config, refreshKey = 0, onOpenFeed }: Props) {
   const theme = useTheme();
-  const [preview, setPreview] = useState<ReviewDoorPreview | null>(null);
-  const shownLogged = useRef(false);
+  const [paint, setPaint] = useState<{ key: number; preview: ReviewDoorPreview | null }>({ key: -1, preview: null });
+  const loggedKey = useRef(-1);
 
   useEffect(() => {
     if (!FEED_ENABLED) return;
     let cancelled = false;
     fetchFeed(config)
       .then((page) => {
-        if (!cancelled) setPreview(reviewDoorPreview(page));
+        if (!cancelled) setPaint({ key: refreshKey, preview: reviewDoorPreview(page) });
       })
       .catch(() => {
-        if (!cancelled) setPreview(null);
+        if (!cancelled) setPaint({ key: refreshKey, preview: null });
       });
     return () => {
       cancelled = true;
     };
-  }, [config]);
+  }, [config, refreshKey]);
 
   useEffect(() => {
-    if (!preview || shownLogged.current) return;
-    shownLogged.current = true;
+    if (!paint.preview || loggedKey.current === paint.key) return;
+    loggedKey.current = paint.key;
     recordUi('review_to_feed', {
-      metadata: { event: 'shown', item_id: preview.itemId, unseen: preview.unseen },
+      metadata: { event: 'shown', item_id: paint.preview.itemId, unseen: paint.preview.unseen },
     });
-  }, [preview]);
+  }, [paint]);
 
+  const preview = paint.preview;
   if (!FEED_ENABLED || !preview) return null;
 
   const onPress = () => {

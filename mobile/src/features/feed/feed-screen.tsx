@@ -63,7 +63,7 @@ import { openTrackedBrowser } from './tracked-browser';
 import { autoplayKey } from './video';
 import { autoplayVideo, playingVideo, VideoWarmup } from './video-player';
 import { PILL_GONE_Y, ReplacedListGate, type HeldImpression } from './replaced-list';
-import { consumeFeedJump } from './review-door';
+import { FeedJumpController, consumeFeedJump } from './review-door';
 import { layoutsFromHeights, ViewabilityTracker, visibleFraction } from './viewability';
 import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 import { isSideways, usePortraitWindow } from '@/hooks/use-portrait-window';
@@ -184,7 +184,8 @@ export default function FeedScreen() {
   const videoKeys = useRef(new Map<string, string>());
   const videoFocus = useRef<string | null>(null);
   const focused = useRef(false);
-  const pendingJump = useRef<string | null>(null);
+  const jumpController = useRef(new FeedJumpController());
+  const [jumpSeq, setJumpSeq] = useState(0);
   const [lifecycle] = useState(() => new FeedSessionLifecycle(feedSessionCoordinator));
   const loadedAt = useRef(0);
   // The error banner sits above the first card when it is showing.
@@ -275,7 +276,7 @@ export default function FeedScreen() {
       loadSaved(page.saved ?? []);
       pageItems.current = [...page.items, ...(page.saved ?? [])];
       loadLiked(pageItems.current);
-      const preserve = trigger !== 'pull' && loadedIds.current.length > 0 && viewport.current.top > PILL_GONE_Y;
+      const preserve = !jumpController.current.hasPending() && trigger !== 'pull' && loadedIds.current.length > 0 && viewport.current.top > PILL_GONE_Y;
       const fresh = preserve ? newArrivals(loadedIds.current, page.items) : [];
       pendingItems.current = preserve ? page.items : null;
       setArrivals(fresh);
@@ -316,6 +317,7 @@ export default function FeedScreen() {
       setRefreshing(false);
       setLoaded(true);
       if (gate.current.isOpen()) setLoadSettled((n) => n + 1);
+      if (jumpController.current.hasPending()) setJumpSeq((n) => n + 1);
     }
   }, [config, pause]);
 
@@ -336,18 +338,19 @@ export default function FeedScreen() {
   }, [shown, measure]);
 
   // Honor a one-shot jump from the Review tab's Feed door once the full list
-  // is showing.
+  // is showing and any stale reload has settled.
   useEffect(() => {
-    const target = pendingJump.current;
-    if (!target || only !== null || searching || shown.length === 0) return;
-    const idx = shown.findIndex((i) => i.item_id === target);
-    pendingJump.current = null;
-    if (idx <= 0) {
-      list.current?.scrollToOffset({ offset: 0, animated: false });
-    } else {
-      list.current?.scrollToIndex({ index: idx, animated: false });
-    }
-  }, [shown, only, searching]);
+    jumpController.current.tryJump(
+      shown.map((i) => i.item_id),
+      { filtered: only !== null || searching, loading: loading.current },
+      list.current,
+    );
+  }, [jumpSeq, shown, only, searching]);
+
+  useEffect(() => {
+    const ctrl = jumpController.current;
+    return () => ctrl.clear();
+  }, []);
 
   host.useFocusEffect(
     useCallback(() => {
@@ -355,10 +358,17 @@ export default function FeedScreen() {
       lifecycle.focus();
       const jump = consumeFeedJump();
       if (jump) {
-        pendingJump.current = jump;
+        jumpController.current.arm(jump);
+        if (pendingItems.current) {
+          const held = pendingItems.current;
+          pendingItems.current = null;
+          loadedIds.current = held.map((i) => i.item_id);
+          setItems(held);
+        }
         setOnly(null);
         setSearching(false);
         setArrivals([]);
+        setJumpSeq((n) => n + 1);
       }
       if (AppState.currentState === 'active') startFeedSession(ids.current.length, 'focus');
       if (Date.now() - loadedAt.current > STALE_MS) void load(loadedAt.current ? 'stale' : 'first');
@@ -807,7 +817,7 @@ export default function FeedScreen() {
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="on-drag"
           onScrollToTop={() => recordUi('scroll_to_top', { metadata: { view: view.current } })}
-          onScrollToIndexFailed={() => list.current?.scrollToOffset({ offset: 0, animated: false })}
+          onScrollToIndexFailed={(info) => jumpController.current.onScrollToIndexFailed(info, list.current)}
           onEndReachedThreshold={0.2}
           onEndReached={() => {
             if (endLogged.current || !shown.length) return;
