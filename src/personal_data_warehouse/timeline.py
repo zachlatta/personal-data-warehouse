@@ -219,6 +219,12 @@ class TimelineAdapter:
     # absent from ``adapter_definition_signature``: adding the lower bound must
     # not reset a 47M-row adapter backfill.
     refresh_sql: str = ""
+    # Name of an adapter whose rows this one's classification reads (the
+    # agent turn copies its session row's tier). While that adapter walks
+    # history, this one's history walk waits and then restarts after it, so
+    # no row is classified against a stale parent. Execution order only, not
+    # part of `adapter_signature`.
+    backfill_after: str = ""
     # How far BEHIND the stored watermark each incremental pass restarts.
     #
     # The engine walks (ingest_ts, event_id) strictly ascending, so a row whose
@@ -3365,6 +3371,9 @@ _AGENT_AUTOMATED_PROMPT_PREFIX = (
     "\\[subagent context\\]|this session is being continued from a previous conversation"
     "|factory (stage handoff\\M|note:)"
     "|pick the repository this task belongs in\\."
+    # An orchestrator relaying a worker's result into a lead's user channel
+    # labels itself; Zach's own words never carry this disclaimer.
+    "|\\[[[:alnum:] _-]{1,40}\\] \\(from the system, not the human\\)"
     # A formal harness header carrying a sender agent identity, not a topic.
     "|this is a [[:alpha:] -]+ review: agent [0-9a-f-]{36}"
 )
@@ -3376,6 +3385,11 @@ _AGENT_DISPATCH_PROMPT_PREFIX = (
     "\\(round [0-9]+ of [0-9]+\\)"
     "|plan approved by (the|a) plan reviewer\\."
     "|code review passed \\([[:alpha:] -]+ tier\\)\\."
+    # The workflow app hands one reviewer question to a fresh agent.
+    "|answer the reviewer.s question [0-9]+ about workflow proposal [0-9a-f-]{36}\\M"
+    # Zach does not write about himself in the third person; an agent
+    # handing work on does ("Zach requested the agent follow-up in ...").
+    "|zach (requested|asked|approved)\\M"
 )
 _AGENT_HARNESS_ENVELOPE_PATTERN = "'^\\s*(" + _AGENT_AUTOMATED_PROMPT_PREFIX + ")'"
 # A schedule's role declaration can follow a job title, and applies to a
@@ -3447,13 +3461,18 @@ def _agent_delegated_prompt(alias: str) -> str:
             AND {opening} ~* '(as explicitly requested by|user explicitly requests)')
         OR {opening} ~* '{probe}'
         OR ({opening} ~* '^\\s*(call|list)\\M' AND {opening} ~* '\\mMCP\\M'
-            AND {opening} ~* '([0-9])\\1{{7}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-\\1{{12}}')
+            AND ({opening} ~* '([0-9])\\1{{7}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-\\1{{12}}'
+                 OR {opening} ~* '\\mreply with (only|exactly)\\M'))
         OR ({alias}.source IN ('muse','muse_code')
             AND {alias}.text ~* '^carry out this assignment end to end[,.]')
         OR ({alias}.text ~* '^\\s*\\[request interrupted'
             AND {alias}.cwd ~ '/\\.paseo/worktrees/[^/]+/(email|voice)-')
         OR {opening} ~* '^from the [[:alpha:] /-]+ agent \\(worktree\\M'
         ) END)"""
+
+
+def _agent_opening(alias: str) -> str:
+    return f"left({alias}.text,2048)"
 
 
 def _agent_harness_metadata(alias: str) -> str:
@@ -3472,7 +3491,10 @@ def _agent_harness_metadata(alias: str) -> str:
         f"OR {alias}.text ~* {_AGENT_SCHEDULE_ENVELOPE_PATTERN} "
         # Workflow dispatcher envelope with a run identity; no task vocabulary.
         f"OR {alias}.text ~* 'this is run [0-9a-f-]{{36}} of the workflow' "
-        f"OR {alias}.text ~* 'this is an unattended agent session\\M' "
+        f"OR {alias}.text ~* 'this is an unattended (agent )?(session|run)\\M' "
+        # A one-shot follow-up another agent scheduled; it may follow a
+        # boilerplate first line, so it is not anchored.
+        f"OR {_agent_opening(alias)} ~* '\\myou are an? (scheduled|one-shot|recurring)( [[:alpha:]-]+){{0,3}} agent\\M' "
         f"OR {raw} "
         "@> '{\"isMeta\":true}'::jsonb "
         f"OR {raw} "
@@ -3567,7 +3589,9 @@ def _agent_environment_preamble(alias: str) -> str:
         f" OR {alias}.text LIKE '<environment_context>%%' "
         f" OR {alias}.text LIKE '<codex_internal_context%%' "
         f" OR {alias}.text LIKE '<local-command-caveat>%%' "
-        f" OR {alias}.text LIKE '# AGENTS.md instructions for %%')"
+        # `for <path>` for a project file; codex writes the global block
+        # as `# AGENTS.md instructions <INSTRUCTIONS>` (2026-11-26).
+        f" OR {alias}.text LIKE '# AGENTS.md instructions%%')"
     )
 
 
@@ -3608,6 +3632,11 @@ def _muse_loop_session_title_sql() -> str:
     )
 
 
+# How far back the agent adapters re-walk their own `self` rows (see the
+# refresh query in _agent_session_adapter).
+AGENT_PRIORITY_REFRESH_HOURS = 24 * 15
+
+
 def _agent_session_adapter() -> TimelineAdapter:
     """Session-level roll-up over marts_ai_conversations.events.
 
@@ -3644,6 +3673,11 @@ def _agent_session_adapter() -> TimelineAdapter:
         {{changed_join}}
         GROUP BY e.source, e.session_id
     """
+    # `fp.cwd` under `.factory-scratch` is a probe an agent launched from its
+    # worktree's scratch folder. Only the opening prompt's cwd is the launch
+    # directory: later lines record wherever the agent has since cd'd to, so
+    # this is a session rule, never a per-turn one (measured 2026-11-26: as a
+    # turn rule it demoted Zach's own messages in sessions that cd'd there).
     priority_sql = f"""CASE
         WHEN s.source IN ('chatgpt', 'claude_desktop') THEN {TIMELINE_PRIORITY_SELF}
         WHEN s.source = 'claude_code' AND s.session_id LIKE 'agent-%%'
@@ -3656,6 +3690,7 @@ def _agent_session_adapter() -> TimelineAdapter:
           OR st.session_title ~* {_AGENT_HARNESS_ENVELOPE_PATTERN}
           THEN {TIMELINE_PRIORITY_BACKGROUND}
         WHEN {_agent_harness_metadata('fp')} THEN {TIMELINE_PRIORITY_BACKGROUND}
+        WHEN fp.cwd ~ '/\\.factory-scratch(/|$)' THEN {TIMELINE_PRIORITY_BACKGROUND}
         WHEN {_agent_scheduled_prompt('fp')} THEN {TIMELINE_PRIORITY_BACKGROUND}
         WHEN {_agent_repeated_opener('fp')} THEN {TIMELINE_PRIORITY_BACKGROUND}
         ELSE {TIMELINE_PRIORITY_SELF} END"""
@@ -3760,6 +3795,38 @@ def _agent_session_adapter() -> TimelineAdapter:
         {rollup}
         ORDER BY 13 ASC, 1 ASC
     """
+    # Recurrence is evidence from LATER runs: the first runs of a new hourly
+    # job, or the first two weeks of a weekly one, look exactly like a request
+    # Zach typed when they land. Measured 2026-11-23, the first 4 of one hourly
+    # job's 72 sessions stayed `self` because nothing revisited them. Only a
+    # `self` row can be demoted by such evidence, so the refresh pages that set
+    # from the timeline itself (its (priority, occurred_at) index) and
+    # regroups only those sessions' transcript lines.
+    refreshable_join = """
+        JOIN (
+            SELECT tl.source_pk->>'source' AS source,
+                   tl.source_pk->>'session_id' AS session_id
+            FROM @timeline_events tl
+            WHERE tl.adapter = 'agent_session' AND tl.priority = 'self'
+              AND tl.occurred_at >= %(cutoff_ts)s
+              AND tl.occurred_at <= %(cursor_ts)s
+              AND (tl.occurred_at, tl.event_id) < (%(cursor_ts)s, %(cursor_id)s)
+            ORDER BY tl.occurred_at DESC, tl.event_id DESC
+            LIMIT %(limit)s
+        ) refreshable ON refreshable.source = e.source AND refreshable.session_id = e.session_id
+    """
+    refresh_sql = f"""
+        WITH agent_session_page AS MATERIALIZED (
+            SELECT * FROM ({aggregate.replace('{changed_join}', refreshable_join)}) candidate
+            WHERE candidate.event_ts >= %(cutoff_ts)s
+              AND (candidate.event_ts, concat_ws('|', candidate.source, candidate.session_id))
+                  < (%(cursor_ts)s, %(cursor_id)s)
+            ORDER BY candidate.event_ts DESC, concat_ws('|', candidate.source, candidate.session_id) DESC
+            LIMIT %(limit)s
+        )
+        {rollup}
+        ORDER BY 4 DESC, 1 DESC
+    """
     return TimelineAdapter(
         name="agent_session",
         source_table="ai_conversation_events",
@@ -3772,6 +3839,10 @@ def _agent_session_adapter() -> TimelineAdapter:
         # Enrichment does several indexed probes per session after pagination.
         # Keep historical pages small enough for the fast lane to stay responsive.
         batch_size=1000,
+        # The weekly rule needs a job's third week, so a 15-day window lets a
+        # new weekly schedule's first run converge as well.
+        refresh_hours=AGENT_PRIORITY_REFRESH_HOURS,
+        refresh_sql=refresh_sql,
         mask_credentials=True,
     )
 
@@ -3919,6 +3990,33 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
         {select}
         ORDER BY 13 ASC, 1 ASC
     """
+    # A user turn's tier follows its session's, which the session refresh can
+    # demote after the turn landed. Page the turn rows still `self` from the
+    # timeline and re-read exactly those transcript lines.
+    refresh_sql = f"""
+        WITH agent_turn_refreshable AS MATERIALIZED (
+            SELECT tl.source_pk->>'source' AS source,
+                   tl.source_pk->>'session_id' AS session_id,
+                   (tl.metadata->>'seq')::bigint AS seq
+            FROM @timeline_events tl
+            WHERE tl.adapter = 'agent_session_turn' AND tl.priority = 'self'
+              AND tl.occurred_at >= %(cutoff_ts)s
+              AND tl.occurred_at <= %(cursor_ts)s
+              AND (tl.occurred_at, tl.event_id) < (%(cursor_ts)s, %(cursor_id)s)
+            ORDER BY tl.occurred_at DESC, tl.event_id DESC
+            LIMIT %(limit)s
+        ), agent_turn_page AS MATERIALIZED (
+        {page_rows}
+          AND EXISTS (
+              SELECT 1 FROM agent_turn_refreshable r
+              WHERE r.source = e.source AND r.session_id = e.session_id AND r.seq = e.seq
+          )
+          AND e.session_id IN (SELECT r.session_id FROM agent_turn_refreshable r)
+          AND e.occurred_at >= %(cutoff_ts)s
+        ), {context_and_deliveries}
+        {select}
+        ORDER BY 4 DESC, 1 DESC
+    """
     return TimelineAdapter(
         name="agent_session_turn",
         source_table="ai_conversation_events",
@@ -3932,6 +4030,9 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
         ),
         priority_expression=_AGENT_TURN_PRIORITY,
         batch_size=5000,
+        backfill_after="agent_session",
+        refresh_hours=AGENT_PRIORITY_REFRESH_HOURS,
+        refresh_sql=refresh_sql,
         mask_credentials=True,
     )
 
@@ -5073,6 +5174,32 @@ class TimelineSyncEngine:
         self._save_state(adapter, state)
         return state
 
+    def _restart_after_parent(
+        self,
+        adapter: TimelineAdapter,
+        state: _AdapterState,
+        states: dict[str, _AdapterState],
+    ) -> None:
+        """Re-walk a dependent adapter's history whenever its parent re-walks.
+
+        A parent re-walks when its definition changed. Rows of the dependent
+        that were classified against the old parent rows are stale even when
+        the dependent's own SQL did not change, so its finished backfill
+        restarts; the backfill loop then holds it until the parent is done.
+        """
+        parent = states.get(adapter.backfill_after) if adapter.backfill_after else None
+        if parent is None or parent.backfill_done or not state.backfill_done:
+            return
+        logger.info(
+            "timeline adapter %s re-walks after %s, whose history is re-walking",
+            adapter.name,
+            adapter.backfill_after,
+        )
+        state.backfill_cursor_ts = BACKFILL_CURSOR_START
+        state.backfill_cursor_id = ""
+        state.backfill_done = False
+        self._save_state(adapter, state)
+
     def _source_highwater(self, adapter: TimelineAdapter) -> datetime | None:
         cache = getattr(self, "_source_highwaters", None)
         if cache is None:
@@ -5746,6 +5873,7 @@ class TimelineSyncEngine:
             try:
                 state = self._load_state(adapter)
                 states[adapter.name] = state
+                self._restart_after_parent(adapter, state, states)
                 self._measure_source(adapter)
                 if locked:
                     stats[adapter.name].incremental_rows = self._run_incremental(adapter, state, deadline)
@@ -5806,6 +5934,10 @@ class TimelineSyncEngine:
             backfill_deadline = capped if deadline is None else min(deadline, capped)
         while active and not _past(backfill_deadline):
             for adapter in list(active):
+                if adapter.backfill_after and any(
+                    parent.name == adapter.backfill_after for parent in active
+                ):
+                    continue
                 state = states[adapter.name]
                 try:
                     stats[adapter.name].backfill_rows += self._run_backfill_batch(adapter, state)
