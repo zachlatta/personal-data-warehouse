@@ -385,6 +385,10 @@ SEARCH_TEXT_POOL_PART_LOW_VOLUME = 1
 # number than the same row scored against the global index's.
 SEARCH_TEXT_POOL_PART_ATTENTION_HIGH_VOLUME = 2
 SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME = 3
+# And once more for the AGENT-WORK indexes (`self,background`): two more BM25
+# corpora, so two more part numbers.
+SEARCH_TEXT_POOL_PART_AGENT_WORK_HIGH_VOLUME = 4
+SEARCH_TEXT_POOL_PART_AGENT_WORK_LOW_VOLUME = 5
 # The tiers the partial "attention" BM25 indexes contain.
 #
 # `priorities => ARRAY['self']` is the single most important query an agent
@@ -412,6 +416,28 @@ SEARCH_TEXT_ATTENTION_PRIORITIES: tuple[str, ...] = (
 )
 SEARCH_TEXT_ATTENTION_PRIORITIES_SQL = ", ".join(
     f"'{priority}'" for priority in SEARCH_TEXT_ATTENTION_PRIORITIES
+)
+# The OTHER scope every surface recommends: `self,background` for prior agent
+# conclusions (the catalog's selection guide, which the guidance, the CLI and
+# start-here all repeat). The attention pair cannot hold it -- `background` is
+# not an attention tier -- so until 2026-11-26 it was served by the global
+# index, the exact shape the attention comment above warns about. `self` +
+# `background` are ~2.5M of 66.6M rows (3.7%), so the pool's 5,000 candidates
+# cost ~53,000 score-ordered heap visits, one at a time, in one backend.
+# Measured on production 2026-11-26, cold: 14.1 s for that partition (13.5 s
+# of it read wait, 27,487 blocks at 0.49 ms, on an otherwise idle 28-vCPU
+# host), against 0.27 s warm and 0.49 s cold for an attention-scoped pool from
+# its partial index. Searches whose slowest leg was the scoped lexical one
+# were the largest class of slow searches on an idle host
+# (marts_ops.search_request_latency, contract C6). Same rule as
+# above: the index the advice points at has to be the index the advice is fast on.
+SEARCH_TEXT_AGENT_WORK_PRIORITIES: tuple[str, ...] = next(
+    selection.priorities
+    for selection in CATALOG.timeline_priorities.selection_guide
+    if selection.intent == "prior agent conclusions"
+)
+SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL = ", ".join(
+    f"'{priority}'" for priority in SEARCH_TEXT_AGENT_WORK_PRIORITIES
 )
 # Sources whose documents dominate the corpus, and therefore the global BM25
 # ordering. Everything else is scanned as the second pool partition.
@@ -2809,6 +2835,32 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         requires_pg_textsearch=True,
         # Same reason as the low-volume index above: a stale adapter predicate
         # means the planner picks another index and vchord-bm25 RAISES.
+        rebuild_on_definition_change=True,
+    ),
+    # The AGENT-WORK partitions: the same pair again, over the tiers the
+    # `self,background` scope asks for (see SEARCH_TEXT_AGENT_WORK_PRIORITIES
+    # for the production measurement). Sampled on production 2026-11-26:
+    # ~2.5M rows and ~1.5 GB of text, against ~2.1 GB for the attention pair,
+    # so roughly a 1.5 GB index. Same rules as the attention pair: the big one
+    # carries the tier alone and builds CONCURRENTLY; the low-volume one
+    # carries the adapter list and rebuilds when it moves.
+    IndexSpec(
+        "timeline_events_search_text_bm25_agent_work_idx",
+        "timeline_events",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS timeline_events_search_text_bm25_agent_work_idx "
+        "ON @timeline_events USING bm25 (search_text) WITH (text_config='english') "
+        f"WHERE priority IN ({SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL})",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "timeline_events_search_text_bm25_agent_work_lowvol_idx",
+        "timeline_events",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "timeline_events_search_text_bm25_agent_work_lowvol_idx "
+        "ON @timeline_events USING bm25 (search_text) WITH (text_config='english') "
+        f"WHERE priority IN ({SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL}) "
+        f"AND adapter IN ({SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL})",
+        requires_pg_textsearch=True,
         rebuild_on_definition_change=True,
     ),
     IndexSpec(
@@ -18080,6 +18132,17 @@ class PostgresWarehouse:
             SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME,
             f" AND t.priority IN ({SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})",
         )
+        # The AGENT-WORK pool: the same shape again over the partial indexes
+        # that hold only `self` and `background`, for the prior-agent-work
+        # scope the attention pair cannot serve. Same literal-predicate rule,
+        # same subset rule (chosen in search_text_pool, after attention).
+        agent_work_pool_parts = two_partition_pool(
+            "timeline_events_search_text_bm25_agent_work_idx",
+            "timeline_events_search_text_bm25_agent_work_lowvol_idx",
+            SEARCH_TEXT_POOL_PART_AGENT_WORK_HIGH_VOLUME,
+            SEARCH_TEXT_POOL_PART_AGENT_WORK_LOW_VOLUME,
+            f" AND t.priority IN ({SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL})",
+        )
         # The pool's partitions run side by side, one per worker. Each is an
         # index-ordered BM25 scan that fetches its heap rows one at a time,
         # so in one backend the pool cost the SUM of its partitions (prod,
@@ -18091,7 +18154,7 @@ class PostgresWarehouse:
         # Append through RETURN QUERY EXECUTE. Rows are the partitions' rows.
         pool_partition_whens = "\n                        ".join(
             f"WHEN {part} THEN $part${one_shot_pool(sql)}$part$"
-            for part, sql in broad_pool_parts + attention_pool_parts
+            for part, sql in broad_pool_parts + attention_pool_parts + agent_work_pool_parts
         )
 
         def pool_union(parts: list[tuple[int, str]]) -> str:
@@ -18150,6 +18213,28 @@ class PostgresWarehouse:
                     RETURN QUERY EXECUTE $q$"""
             + pool_union(attention_pool_parts)
             + r"""$q$ USING query, priorities, since;
+                -- Agent work: only when every requested tier is in the
+                -- agent-work indexes (anything else would come back silently
+                -- empty), and only once both are built and valid. They are
+                -- CONCURRENTLY builds that a deploy may not have finished,
+                -- and to_bm25query() raises on an index that is not there:
+                -- until then this scope keeps the slower general pool rather
+                -- than failing every search that asks for it.
+                ELSIF priorities IS NOT NULL
+                      AND priorities <@ ARRAY["""
+            + SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL
+            + r"""]
+                      AND (
+                          SELECT count(*) FROM pg_catalog.pg_index i
+                          WHERE i.indisvalid AND i.indisready
+                            AND i.indexrelid IN (
+                                to_regclass('timeline_events_search_text_bm25_agent_work_idx'),
+                                to_regclass('timeline_events_search_text_bm25_agent_work_lowvol_idx')
+                            )
+                      ) = 2 THEN
+                    RETURN QUERY EXECUTE $q$"""
+            + pool_union(agent_work_pool_parts)
+            + r"""$q$ USING query, priorities, since;
                 ELSE
                     RETURN QUERY EXECUTE $q$"""
             + pool_union(broad_pool_parts)
@@ -18187,6 +18272,21 @@ class PostgresWarehouse:
             f"THEN ({broad_candidate_scored_text_sql} <@> "
             "to_bm25query(query, "
             "'timeline_events_search_text_bm25_attention_lowvol_idx'))::real "
+            # The agent-work index names are scalar sub-SELECTs, not literals.
+            # to_bm25query() is IMMUTABLE, so with both arguments constant the
+            # planner folds it while planning -- in every arm, reached or not
+            # -- and it raises when the index is missing. search_text_pool
+            # only uses this pair once it is built, but the fold would still
+            # fail every broad search during the deploy that builds it. An
+            # InitPlan is evaluated only when its arm is reached.
+            f"WHEN c.part = {SEARCH_TEXT_POOL_PART_AGENT_WORK_HIGH_VOLUME} "
+            f"THEN ({broad_candidate_scored_text_sql} <@> "
+            "to_bm25query(query, "
+            "(SELECT 'timeline_events_search_text_bm25_agent_work_idx'::text)))::real "
+            f"WHEN c.part = {SEARCH_TEXT_POOL_PART_AGENT_WORK_LOW_VOLUME} "
+            f"THEN ({broad_candidate_scored_text_sql} <@> "
+            "to_bm25query(query, "
+            "(SELECT 'timeline_events_search_text_bm25_agent_work_lowvol_idx'::text)))::real "
             # Deliberately no ELSE: every partition names itself. A catch-all
             # would score a future partition's rows against whichever corpus
             # happened to be last, which is a WRONG number rather than a

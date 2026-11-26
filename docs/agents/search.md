@@ -202,6 +202,22 @@ timeline writes and global searches for the whole fourteen minutes, and the depl
 follows (a changed index fingerprint) runs its own 26 GB prewarm at startup — the first
 searches after it read 16s / 45s, which is the prewarm's I/O, not the rebuild.
 
+**The prior-agent-work scope (`self,background`) has its own pair since 2026-11-26**, for
+the same reason. It is the other scope every surface recommends (the catalog's selection
+guide), and the attention pair cannot hold it, so it walked the global index: about 2.5M
+of 66.6M rows, so a 5,000-row pool paid ~53,000 one-at-a-time heap visits. Measured on
+production 2026-11-26, cold: **14.1 s** for that partition, 13.5 s of it read wait (27,487
+blocks at 0.49 ms) on an otherwise idle 28-vCPU host — against 0.27 s warm, and 0.49 s cold
+for an attention-scoped pool from its partial index. Slow searches whose
+slowest leg was the scoped lexical one were the largest group of C6's idle-host slow
+searches. `..._bm25_agent_work_idx` / `..._bm25_agent_work_lowvol_idx` follow the attention
+pair's rules (literal tier predicate, subset test, no adapter list on the big one).
+`search_text_pool` tries attention first. It takes this pair only when both indexes are
+valid, because the deploy that adds them builds them `CONCURRENTLY`. Until then the scope
+keeps the general pair. Their scoring arms name the index through a scalar sub-SELECT: the
+`IMMUTABLE` `to_bm25query()` is folded at plan time even in a CASE arm no row reaches, and
+it raises on a missing index.
+
 Repeated 2026-09-19 14:27–14:49Z after the 09-14..16 index-definition flap had doubled
 every BM25 index again: plain `REINDEX` of the global index in 15m50s (**12 GB → 6.36 GB**),
 the attention index in 4m41s (1.9 GB → 968 MB), the low-volume pair in 47s + 30s
