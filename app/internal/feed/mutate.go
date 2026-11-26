@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"regexp"
 	"strconv"
@@ -146,8 +147,13 @@ func (s *Store) Push(ctx context.Context, items []normalized, m Mutation) ([]Pus
 	if err != nil {
 		return results, err
 	}
+	// The stock note is read after the commit: the cards are stored, so a
+	// failed read drops the note instead of failing a push an agent would retry.
 	if err := s.attachPushStock(ctx, items, results); err != nil {
-		return results, err
+		slog.WarnContext(ctx, "feed push stock note failed", "error", err)
+		for i := range results {
+			results[i].Stock = nil
+		}
 	}
 	return results, nil
 }

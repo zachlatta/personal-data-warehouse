@@ -1186,6 +1186,31 @@ func TestPostgresFeedPushStockNote(t *testing.T) {
 	}
 }
 
+// The stock note is read after the push commits, so a failed stock read must
+// not turn a stored push into an error the agent would retry: the cards are
+// returned as created, without stock.
+func TestPostgresFeedPushSucceedsWhenTheStockReadFails(t *testing.T) {
+	store, _ := postgresStore(t)
+	expand := store.Expand
+	store.Expand = func(q string) string {
+		return expand(strings.ReplaceAll(q, "@marts_feed_item_engagement", "pg_catalog.no_such_relation"))
+	}
+	defer store.DB.Exec(expand("DELETE FROM @feed_items WHERE source = 'stock-fail'"))
+	results, err := store.Push(context.Background(), []normalized{{
+		ItemID: "stock-fail:a", Source: "stock-fail", Key: "a", Title: "a", Tags: []string{"games"},
+	}}, Mutation{})
+	if err != nil {
+		t.Fatalf("push must succeed when only the stock note fails: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != "created" || results[0].Stock != nil {
+		t.Fatalf("results: %+v", results)
+	}
+	var n int
+	if err := store.DB.QueryRow(expand("SELECT count(*) FROM @feed_items WHERE item_id = 'stock-fail:a'")).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("stored cards = %d, err = %v", n, err)
+	}
+}
+
 // GET /api/feed returns unseen_count, the true total of live unseen items
 // independent of the page limit.
 func TestPostgresFeedAPIUnseenCount(t *testing.T) {
