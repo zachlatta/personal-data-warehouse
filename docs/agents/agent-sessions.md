@@ -503,7 +503,7 @@ an orchestrator or schedule envelope, a provider subagent flag, a harness preamb
 dispatch from an app, or an opening prompt that recurs on a clock (daily or weekly rules,
 or the same long opener in four sessions). A user turn is `self` only inside a `self`
 session and only when it is not harness-injected or delivered by another agent. The rules
-are in `_agent_session_adapter` / `_AGENT_TURN_PRIORITY` in `timeline.py`, tested in
+are in `_agent_session_adapter` / `_AGENT_TURN_PRIORITY` in the timeline module, tested in
 `tests/test_timeline_priority_automation.py`.
 
 Two properties keep them from going stale:

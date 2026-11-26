@@ -171,7 +171,18 @@ def c2_priority_tiers() -> Verdict:
         return Verdict("C2", title, RED, "labeled priority correctness is unmeasured")
     if any(r["status"] != "ok" for r in quality):
         return Verdict("C2", title, RED, "labeled priority correctness below 90% (missing counts as error)")
-    return Verdict("C2", title, GREEN, f"{len(rows)} (source, tier) cells over 7 days; tiers seen {tiers}")
+    # The screen timelapse as an independent witness of `self`: a channel whose
+    # on-screen acts stop reaching `self` (or whose `self` sends had no screen in
+    # use) is a classification or sync gap the labeled sample cannot see.
+    screen = pdw_sql(
+        "screen self audit",
+        "SELECT channel, status FROM marts_ops.screen_self_audit WHERE is_latest",
+    )
+    flagged = sorted(r["channel"] for r in screen or [] if r["status"] in ("failing", "attention"))
+    if flagged:
+        return Verdict("C2", title, YELLOW, f"screenshot-vs-self audit flags {flagged}")
+    witness = "screen audit ok" if screen else "screen audit not yet recorded"
+    return Verdict("C2", title, GREEN, f"{len(rows)} (source, tier) cells over 7 days; tiers seen {tiers}; {witness}")
 
 
 def c3_agents_start_at_timeline() -> Verdict:

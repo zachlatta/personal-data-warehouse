@@ -12,19 +12,27 @@ from personal_data_warehouse.search_benchmark import SearchResult
 from scripts import contract_audit
 
 
-@pytest.mark.parametrize("missing_tier,quality,expected", [
-    (False, "ok", "green"),
-    (True, "ok", "yellow"),
-    (False, "failing", "red"),
-    (False, None, "red"),
+@pytest.mark.parametrize("missing_tier,quality,screen,expected", [
+    (False, "ok", "ok", "green"),
+    (False, "ok", None, "green"),
+    (False, "ok", "unknown", "green"),
+    (False, "ok", "attention", "yellow"),
+    (False, "ok", "failing", "yellow"),
+    (True, "ok", "ok", "yellow"),
+    (False, "failing", "ok", "red"),
+    (False, None, "ok", "red"),
 ])
-def test_c2_requires_five_tiers_and_passing_labeled_correctness(monkeypatch, missing_tier, quality, expected):
+def test_c2_requires_five_tiers_and_passing_labeled_correctness(monkeypatch, missing_tier, quality, screen, expected):
     tiers = ["self", "direct", "cc", "noise", "background"]
     if missing_tier:
         tiers.pop()
     def query(question, sql):
         if question == "priority mix":
             return [dict(source="example", priority=t, status="ok", events_7d=1) for t in tiers]
+        if question == "screen self audit":
+            return None if screen is None else [
+                dict(channel="email", status="ok"), dict(channel="slack", status=screen)
+            ]
         if quality is None:
             return None
         return [dict(adapter=a, status=quality, accuracy=1, missing=0)

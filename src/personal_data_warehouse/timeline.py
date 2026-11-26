@@ -4894,6 +4894,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "script_runs": _state("script execution telemetry, not real-world activity; daily summary in marts_ops.script_runs"),
     "search_request_timing_state": _state("the search-timing writer's ten-minute heartbeat"),
     "timeline_priority_mix": _state("per-source priority-tier counts over the last seven days (collector snapshot)"),
+    "screen_self_audit": _state("daily screenshot-vs-self audit runs per channel (collector measurement)"),
     "priority_benchmark_labels": _state("private priority benchmark labels and required sample sizes"),
     "priority_benchmark_results": _state("aggregate priority benchmark measurements for marts_ops"),
     "agent_usage": _state("how agents use PDW over a trailing window (daily collector snapshot)"),

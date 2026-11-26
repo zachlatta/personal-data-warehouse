@@ -253,8 +253,12 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// 2026-11-23: marts_ops.mcp_connection_health, one row per proxied MCP
 	// connection with its status and redacted cause, added one relation line
 	// ("MCP connections."): 10719. 10719 is that line and no more.
-	if guidance > 10719 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10719)", guidance)
+	//
+	// 2026-11-26: contract C2's marts_ops.screen_self_audit, the screen
+	// timelapse checked against the self tier per channel, added one relation
+	// line ("Screen vs self."): 10741. 10741 is that line and no more.
+	if guidance > 10741 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10741)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

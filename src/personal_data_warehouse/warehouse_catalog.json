@@ -2676,6 +2676,17 @@
       "secret": false
     },
     {
+      "id": "screen_self_audit",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "screen_self_audit",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "timeline_priority_mix",
       "kind": "table",
       "layer": "ops",
@@ -2860,6 +2871,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "Failure shapes. Failed agent calls to PDW per ISO week by shape (a SQLSTATE and message, or a pdw command that does not exist), ranked by sessions; a top-three shape also top three the week before reads failing (contract C17)."
+    },
+    {
+      "id": "marts_screen_self_audit",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "screen_self_audit",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Screen vs self. Per channel per daily run (last 30 days; is_latest marks the newest run). follow_through: share of active frames showing Zach composing, replying, sending or posting in a messaging app followed by a self event from that channel within 30 minutes (drafts can be abandoned, so a lower bound on recall); sent_recall is the same over frames that show a finished send. screen_coverage: share of the channel's self events with an active screen within 6 minutes. Counts only, no screen text."
     },
     {
       "id": "marts_timeline_priority_mix",

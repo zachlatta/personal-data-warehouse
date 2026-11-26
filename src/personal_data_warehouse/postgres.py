@@ -153,6 +153,7 @@ from personal_data_warehouse.schema import (
     SOURCE_UPSTREAM_OBSERVATION_COLUMNS,
     SEARCH_REQUEST_TIMING_COLUMNS,
     SEARCH_REQUEST_TIMING_STATE_COLUMNS,
+    SCREEN_SELF_AUDIT_COLUMNS,
     TIMELINE_PRIORITY_MIX_COLUMNS,
     AGENT_USAGE_COLUMNS,
     AGENT_FAILURE_SHAPE_COLUMNS,
@@ -230,6 +231,15 @@ from personal_data_warehouse.upstream_mutation_policy import (
     policy_recheck_failure,
 )
 from personal_data_warehouse.config import normalize_postgres_url
+from personal_data_warehouse.screen_self_audit import (
+    SCREEN_SELF_AUDIT_FAILING_COVERAGE,
+    SCREEN_SELF_AUDIT_HISTORY_DAYS,
+    SCREEN_SELF_AUDIT_MIN_COVERAGE,
+    SCREEN_SELF_AUDIT_MIN_EVENTS,
+    SCREEN_SELF_AUDIT_MIN_FOLLOW_THROUGH,
+    SCREEN_SELF_AUDIT_MIN_FRAMES,
+    SCREEN_SELF_AUDIT_STALE_SECONDS,
+)
 from personal_data_warehouse.pipeline_health import (
     ACCOUNT_BASELINE_GAPS,
     ACCOUNT_BASELINE_MAX_DAYS,
@@ -1525,6 +1535,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         SEARCH_REQUEST_TIMING_STATE_COLUMNS, ("writer",), "updated_at"
     ),
     "timeline_priority_mix": TableSpec(TIMELINE_PRIORITY_MIX_COLUMNS, ("source", "priority"), "collected_at"),
+    "screen_self_audit": TableSpec(SCREEN_SELF_AUDIT_COLUMNS, ("measured_at", "channel"), "collected_at"),
     "agent_usage": TableSpec(AGENT_USAGE_COLUMNS, ("source",), "collected_at"),
     "agent_failure_shapes": TableSpec(AGENT_FAILURE_SHAPE_COLUMNS, ("week_start", "shape"), "collected_at"),
     "search_benchmark_runs": TableSpec(SEARCH_BENCHMARK_RUN_COLUMNS, ("mode",), "collected_at"),
@@ -3483,6 +3494,8 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # ops.screen_self_audit
+    "window_start_at", "window_end_at",
     "status_changed_at",
     "newest_finished_at",
     "measured_at", "received_at",
@@ -3674,6 +3687,9 @@ _APPLE_MESSAGE_OPTIONAL_TIMESTAMPS = frozenset(
 )
 
 INTEGER_COLUMNS = {
+    # ops.screen_self_audit
+    "sent_frames", "sent_frames_matched", "draft_frames", "draft_frames_matched",
+    "self_events", "self_events_with_screen",
     # comma.ai
     "segment_number",
     "offset_seconds",
@@ -6840,6 +6856,7 @@ class PostgresWarehouse:
         self._ensure_table_group(
             [
                 *PIPELINE_HEALTH_SNAPSHOT_TABLES,
+                "screen_self_audit",
                 "search_benchmark_history",
                 "search_request_timings",
                 "script_runs",
@@ -7642,6 +7659,65 @@ class PostgresWarehouse:
                 collected_at,
                 (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds
             FROM measured
+            """,
+        )
+
+        # C2 against an independent witness: what the screen timelapse shows Zach
+        # doing versus his `self` tier, one row per channel per daily run
+        # (screen_self_audit.py). Rates and the verdict are derived here, so a
+        # run that stops arriving reads `unknown` rather than yesterday's green.
+        self._ensure_view(
+            "marts_screen_self_audit",
+            f"""
+            CREATE OR REPLACE VIEW @marts_screen_self_audit AS
+            WITH runs AS (
+                SELECT a.*,
+                       a.sent_frames + a.draft_frames AS act_frames,
+                       a.sent_frames_matched + a.draft_frames_matched AS act_frames_matched,
+                       rank() OVER (ORDER BY a.measured_at DESC) AS run_rank
+                FROM @screen_self_audit a
+                WHERE a.measured_at >= now() - interval '{SCREEN_SELF_AUDIT_HISTORY_DAYS} days'
+            ), rated AS (
+                SELECT runs.*,
+                       CASE WHEN sent_frames > 0
+                            THEN round(sent_frames_matched::numeric / sent_frames, 4) END AS sent_recall,
+                       CASE WHEN act_frames > 0
+                            THEN round(act_frames_matched::numeric / act_frames, 4) END AS follow_through,
+                       CASE WHEN self_events > 0
+                            THEN round(self_events_with_screen::numeric / self_events, 4) END AS screen_coverage
+                FROM runs
+            )
+            SELECT
+                measured_at,
+                run_rank = 1 AS is_latest,
+                channel,
+                CASE
+                    WHEN now() - measured_at > make_interval(secs => {SCREEN_SELF_AUDIT_STALE_SECONDS})
+                        THEN 'unknown'
+                    WHEN act_frames = 0 AND self_events = 0 THEN 'unknown'
+                    WHEN act_frames >= {SCREEN_SELF_AUDIT_MIN_FRAMES} AND act_frames_matched = 0
+                        THEN 'failing'
+                    WHEN self_events >= {SCREEN_SELF_AUDIT_MIN_EVENTS}
+                     AND self_events_with_screen::numeric / self_events < {SCREEN_SELF_AUDIT_FAILING_COVERAGE}
+                        THEN 'failing'
+                    WHEN act_frames >= {SCREEN_SELF_AUDIT_MIN_FRAMES}
+                     AND act_frames_matched::numeric / act_frames < {SCREEN_SELF_AUDIT_MIN_FOLLOW_THROUGH}
+                        THEN 'attention'
+                    WHEN self_events >= {SCREEN_SELF_AUDIT_MIN_EVENTS}
+                     AND self_events_with_screen::numeric / self_events < {SCREEN_SELF_AUDIT_MIN_COVERAGE}
+                        THEN 'attention'
+                    ELSE 'ok'
+                END AS status,
+                sent_recall,
+                follow_through,
+                screen_coverage,
+                sent_frames, sent_frames_matched,
+                draft_frames, draft_frames_matched,
+                self_events, self_events_with_screen,
+                string_to_array(adapters, ',') AS adapters,
+                window_start_at, window_end_at,
+                (EXTRACT(EPOCH FROM now() - measured_at))::bigint AS run_age_seconds
+            FROM rated
             """,
         )
 
@@ -8515,6 +8591,14 @@ class PostgresWarehouse:
             "agent_failure_shapes",
             [_pipeline_health_row(shape, collected_at=collected_at) for shape in rows],
             AGENT_FAILURE_SHAPE_COLUMNS,
+        )
+
+    def write_screen_self_audit(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Append one screenshot-vs-self audit run (one row per channel)."""
+        self._insert_rows("screen_self_audit", [dict(row) for row in rows], SCREEN_SELF_AUDIT_COLUMNS)
+        self._command(
+            "DELETE FROM @screen_self_audit WHERE measured_at < now() - make_interval(days => %s)",
+            (SCREEN_SELF_AUDIT_HISTORY_DAYS * 3,),
         )
 
     def write_timeline_priority_mix(

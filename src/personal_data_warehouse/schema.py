@@ -2959,6 +2959,23 @@ AGENT_FAILURE_SHAPE_COLUMNS = (
 # shows the classification actually happening, per source, so a tier that
 # silently swallows a source (or an `unclassified` row) is a red row rather
 # than a search that comes back full of newsletters.
+# One screenshot-vs-self audit run, per channel (screen_self_audit.py). Facts
+# only: marts_ops.screen_self_audit derives the rates and the verdict.
+SCREEN_SELF_AUDIT_COLUMNS = (
+    "measured_at",
+    "channel",
+    "adapters",
+    "window_start_at",
+    "window_end_at",
+    "sent_frames",
+    "sent_frames_matched",
+    "draft_frames",
+    "draft_frames_matched",
+    "self_events",
+    "self_events_with_screen",
+    "collected_at",
+)
+
 TIMELINE_PRIORITY_MIX_COLUMNS = (
     "source",
     "priority",

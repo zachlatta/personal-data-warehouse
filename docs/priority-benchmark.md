@@ -159,3 +159,30 @@ the correctness mart independently fails measurements older than seven days.
 Measurements describe stored classifications. After adapter rules change, measure
 once history catch-up covers the labeled window and its parent sessions. The daily
 schedule refreshes the measurement against the same independently labeled set.
+
+## Screenshots as a second witness
+
+The labels above grade a fixed sample. `marts_ops.screen_self_audit` checks `self`
+against what the screen timelapse saw, with no labels, once a day per channel (email,
+Slack, phone messages, WhatsApp). The pipeline-health collector runs it (the
+`screen_self_audit` module) over the seven days that ended two hours ago and stores each
+run in `ops.screen_self_audit`. The mart keeps 30 days of runs; `is_latest` marks the
+newest one.
+
+- **follow_through**: the share of active frames in a messaging app
+  (`marts_screen_timelapse.active_screens`) whose reading says Zach is composing,
+  replying, sending or posting, and that are followed within 30 minutes (or preceded
+  by up to 10) by a `self` event from that channel's adapters. A draft on screen is
+  not a send, and an abandoned draft has no event to find, so this is a lower bound.
+  `sent_recall` is the same share over frames that show a finished send.
+- **screen_coverage**: the share of the channel's `self` events with an active frame
+  on any device within 6 minutes. A `self` send while no screen was in use is what an
+  automated send filed as Zach's looks like.
+
+A channel reads `failing` when three or more act frames reach no `self` event, or
+when fewer than half of ten or more `self` events had a screen in use. It reads
+`attention` below 50% follow-through or 80% coverage, and `unknown` with no evidence
+or a run older than two days. `scripts/contract_audit.py` reads a flagged channel as
+C2 yellow. Frame selection uses the describing agent's own words (app plus summary).
+It is a measured baseline, not a judgment of its own. The thresholds were set from
+the first prod measurement (2026-11-26), whose numbers stay in the warehouse.

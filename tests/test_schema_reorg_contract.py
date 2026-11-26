@@ -270,7 +270,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # as a Pixel memo started.
             # +1 marts: marts_ops.mcp_connection_health, one row per proxied MCP
             # connection with its status and redacted last error.
-            "marts": 80,  # daily script pilot usage
+            # +1 marts: marts_ops.screen_self_audit, the screen timelapse
+            # checked against the self tier per channel (C2).
+            "marts": 81,  # daily script pilot usage
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -304,7 +306,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +4 ops: mutation auto-approval policies, their grants, every policy
         # decision, and the kill switch (app/internal/mutations/policy_store.go).
         # +1 ops: ops.notification_mutes, per-source alert mutes with an end.
-        "ops": 56,  # outgoing feed projection and script-run telemetry
+        # +1 ops: ops.screen_self_audit, one row per channel per daily run.
+        "ops": 57,  # outgoing feed projection and script-run telemetry
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).
