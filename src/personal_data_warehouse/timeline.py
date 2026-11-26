@@ -3433,11 +3433,16 @@ def _agent_broadcast_prompt(alias: str) -> str:
         LIMIT 16) delivery LIMIT 4) fanout) >= 4)"""
 
 
+def _agent_opening(alias: str) -> str:
+    # The opening of a prompt: where an envelope, role or probe declares itself.
+    return f"left({alias}.text,2048)"
+
+
 def _agent_delegated_prompt(alias: str) -> str:
     # Provider transcripts do not retain Paseo's parent-agent labels. Restrict
     # text evidence to opening role/ownership declarations and probe envelopes;
     # asking an agent to *start* a subagent or consult a reviewer is human input.
-    opening = f"left({alias}.text,2048)"
+    opening = _agent_opening(alias)
     role = (
         r"\myou are (an? |the |that )?([[:alpha:]-]+[[:space:]]){0,5}"
         r"(subagent|runner|reviewer)\M"
@@ -3472,10 +3477,6 @@ def _agent_delegated_prompt(alias: str) -> str:
             AND {alias}.cwd ~ '/\\.paseo/worktrees/[^/]+/(email|voice)-')
         OR {opening} ~* '^from the [[:alpha:] /-]+ agent \\(worktree\\M'
         ) END)"""
-
-
-def _agent_opening(alias: str) -> str:
-    return f"left({alias}.text,2048)"
 
 
 def _agent_harness_metadata(alias: str) -> str:

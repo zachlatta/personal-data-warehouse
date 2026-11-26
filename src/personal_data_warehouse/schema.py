@@ -2953,12 +2953,6 @@ AGENT_FAILURE_SHAPE_COLUMNS = (
     "collected_at",
 )
 
-# One row per (source, priority tier) over the last seven days of
-# timeline.events, taken by the pipeline_health collector. Contract C2 says
-# every row is classified into one of five tiers; this is the surface that
-# shows the classification actually happening, per source, so a tier that
-# silently swallows a source (or an `unclassified` row) is a red row rather
-# than a search that comes back full of newsletters.
 # One screenshot-vs-self audit run, per channel (screen_self_audit.py). Facts
 # only: marts_ops.screen_self_audit derives the rates and the verdict.
 SCREEN_SELF_AUDIT_COLUMNS = (
@@ -2976,6 +2970,12 @@ SCREEN_SELF_AUDIT_COLUMNS = (
     "collected_at",
 )
 
+# One row per (source, priority tier) over the last seven days of
+# timeline.events, taken by the pipeline_health collector. Contract C2 says
+# every row is classified into one of five tiers; this is the surface that
+# shows the classification actually happening, per source, so a tier that
+# silently swallows a source (or an `unclassified` row) is a red row rather
+# than a search that comes back full of newsletters.
 TIMELINE_PRIORITY_MIX_COLUMNS = (
     "source",
     "priority",
