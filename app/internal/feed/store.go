@@ -158,6 +158,11 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
 // when the unseen cards run out, the rest of the page is cards he saw without
 // engaging (no open, share, save or 5 s on screen), least seen and longest
 // ago first, marked Resurfaced. Cards he engaged with or saved never come back.
+// freshCardsWhere is the Feed's unseen part (and UnseenCount's total): live,
+// unexpired ($1 is now), undismissed and never shown.
+const freshCardsWhere = `i.removed_at = 'epoch' AND (i.expires_at = 'epoch' OR i.expires_at > $1)
+		  AND COALESCE(e.dismissed, 0) = 0 AND COALESCE(e.impressions, 0) = 0`
+
 func (s *Store) Feed(ctx context.Context, limit int) ([]Item, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
@@ -165,8 +170,7 @@ func (s *Store) Feed(ctx context.Context, limit int) ([]Item, error) {
 	// Read a wider pool than is shown so ranking has room to work.
 	items, err := s.query(ctx, `SELECT `+itemColumns+`
 		FROM @feed_items i LEFT JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
-		WHERE i.removed_at = 'epoch' AND (i.expires_at = 'epoch' OR i.expires_at > $1)
-		  AND COALESCE(e.dismissed, 0) = 0 AND COALESCE(e.impressions, 0) = 0
+		WHERE `+freshCardsWhere+`
 		ORDER BY i.score DESC, i.created_at DESC LIMIT $2`, s.now(), limit*3)
 	if err != nil {
 		return nil, err
@@ -197,8 +201,7 @@ func (s *Store) UnseenCount(ctx context.Context) (int64, error) {
 	var n int64
 	err := s.DB.QueryRowContext(ctx, s.q(`SELECT count(*)
 		FROM @feed_items i LEFT JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
-		WHERE i.removed_at = 'epoch' AND (i.expires_at = 'epoch' OR i.expires_at > $1)
-		  AND COALESCE(e.dismissed, 0) = 0 AND COALESCE(e.impressions, 0) = 0`), s.now()).Scan(&n)
+		WHERE `+freshCardsWhere+``), s.now()).Scan(&n)
 	return n, err
 }
 
