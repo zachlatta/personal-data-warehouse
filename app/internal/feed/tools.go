@@ -131,8 +131,8 @@ type saveOutput struct {
 
 type statsInput struct {
 	Source string `json:"source,omitempty"`
-	Since  string `json:"since,omitempty" jsonschema:"window for the per-source window_* fields (cards first seen since then), events_by_type, sitting starts (sessions), shares and by_taste: RFC3339, YYYY-MM-DD, or a duration back from now (7d, 24h); default 7d"`
-	By     string `json:"by,omitempty" jsonschema:"taste: also return by_taste, one row per curation section (metadata.taste) with cards first seen in the window, how many were opened, open_share, average engagement_score and live_unseen cards still waiting; labels differing only by case, spaces or a trailing colon are merged"`
+	Since  string `json:"since,omitempty" jsonschema:"window for the per-source window_* fields (cards first seen since then), events_by_type, sitting starts (sessions), shares, by_taste and by_tag: RFC3339, YYYY-MM-DD, or a duration back from now (7d, 24h); default 7d"`
+	By     string `json:"by,omitempty" jsonschema:"taste or tag: taste adds by_taste (one row per metadata.taste section); tag adds by_tag (one row per normalized tag with at least 3 seen in the window or 3 live unseen), each with items_seen, items_opened, open_share, avg_engagement_score and live_unseen"`
 }
 
 type eventsInput struct {
@@ -175,7 +175,7 @@ func Tools(store *Store) []tool.Tool {
 				"https image_url, author, site, tags, score (higher shows first), published_at, expires_at (RFC3339 or 48h/7d). " +
 				"An x.com post url is embedded: the post's text, author, photos, video and quoted post show inside the card, not as a link. " +
 				"Every impression, dwell, open (per link), read time, like and dismissal is recorded; interest is mostly " +
-				"measured (engagement_score, with his likes weighted most): read it back with feed_stats. CLI: pdw feed push (alias add). Every create and change is kept as a version (feed_history).",
+				"measured (engagement_score, with his likes weighted most): read it back with feed_stats. Each created card's result also carries stock (its metadata.taste section's live unseen count and 14d open share, and each tag's live unseen count and 21d open share in that source). CLI: pdw feed push (alias add). Every create and change is kept as a version (feed_history).",
 			Handle: func(ctx context.Context, in pushInput) (pushOutput, error) {
 				if len(in.Items) == 0 {
 					return pushOutput{}, &tool.InvalidInputError{Message: "items is empty: pass at least one card"}
@@ -383,8 +383,8 @@ func Tools(store *Store) []tool.Tool {
 				"avg_engagement_score, dwell and read time, from marts_feed.source_engagement), event counts by type and sittings starting since a window (sessions; default 7d), the most engaged cards, " +
 				"and cards seen twice or more without any engagement. shares lists each share in the window with what Zach wrote when he sent it " +
 				"(message: the first self email or Slack message within 5 minutes after it whose text holds the card title's first 30 characters, or null). " +
-				"by: taste adds per-section results (by_taste). Sittings exclude emulators and always cover all sources; " +
-				"source filters apply to cards, event counts, shares and sections. Use it before writing the next batch. CLI: pdw feed stats.",
+				"by: taste adds per-section results (by_taste); by: tag adds per-tag results (by_tag). Sittings exclude emulators and always cover all sources; " +
+				"source filters apply to cards, event counts, shares, sections and tags. Use it before writing the next batch. CLI: pdw feed stats.",
 			Handle: func(ctx context.Context, in statsInput) (Stats, error) {
 				since, err := sinceTime(in.Since, store.now(), 7*24*time.Hour)
 				if err != nil {

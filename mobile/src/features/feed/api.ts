@@ -33,7 +33,8 @@ export type FeedItem = {
 };
 
 // saved is his read-later queue, newest saved first (absent on an older server).
-export type FeedPage = { items: FeedItem[]; saved?: FeedItem[]; generated_at: string };
+// unseen_count is the true count of live unseen cards (absent on an older server).
+export type FeedPage = { items: FeedItem[]; saved?: FeedItem[]; unseen_count?: number; generated_at: string };
 
 async function feedRequest<T>(config: AppConfig, path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);

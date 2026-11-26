@@ -268,8 +268,22 @@ phone, web ── POST /api/feed/events ──▶ base_feed.events ──▶ mar
   characters (case-insensitive), or `null`: a share's count said nothing about why he sent it.
   `--by taste` adds `by_taste`, one row per `metadata.taste` section (labels that differ only by
   case, surrounding spaces or a trailing colon merged; most common spelling shown): cards first
-  seen in the window, opened, `open_share`, average score and live unseen cards. Both are computed
-  in the Go query from existing relations, so no view change is needed.
+  seen in the window, opened, `open_share`, average score and live unseen cards. `--by tag` adds
+  `by_tag`, the same shape per normalized tag (lowercased, runs of spaces and hyphens collapsed to
+  `-`, no stemming, listing tags with at least 3 seen in the window or 3 live unseen). On push,
+  each newly created card (not updates) returns `stock` with its `metadata.taste` section's live
+  unseen count and 14-day open share plus each tag's live unseen count and 21-day open share in
+  that source, and `pdw feed push` prints a `stock:` line flagging (`!`) any section or tag with
+  5+ unseen and under 5% opened. All are computed in Go from existing relations, so no view change
+  is needed.
+- **Review-to-Feed door** (added 2026-11-26): when the phone's Review tab (`mobile/src/app/(tabs)/mutations.tsx`)
+  has no pending requests ("All caught up. Nothing is waiting on you."), `ReviewToFeedDoor`
+  (`mobile/src/features/feed/review-door-card.tsx`, logic in `review-door.ts`) asynchronously reads
+  `GET /api/feed` (which also returns `unseen_count`, the true total of live unseen cards) and,
+  when `unseen_count > 0`, renders one compact card under that line with the top unseen card's
+  title, picture (if any), source and "N new in Feed". A tap opens the Feed tab scrolled to that
+  card. It logs `ui` events with `action: 'review_to_feed'` (`metadata.event`: `'shown'` once per
+  paint with `item_id` and `unseen`, `'tapped'` on tap) and never logs a feed `impression`.
   The marts count only Zach's devices (his phones and the web page): events from a build under test (client `android-emulator`,
   device `sdk_gphone*`, or a `*simulator*` client) are kept in `base_feed.events` but left out
   (`TEST_CLIENT_SQL` in `feed.py`). On 2026-10-24 an agent checking video autoplay on the emulator
@@ -408,6 +422,7 @@ Then remove one registration in each of these places:
 | `app/internal/guide/guide.go` | the `feed` topic; `brief.md` the two Feed tab rows |
 | `app/internal/webapp/` | `/feed` in `Routes` (`webapp.go`) and its route test; the `feed` route and import in `static/app.js`; the nav link and three `modulepreload` lines in `static/index.html`; the `feed` block in `static/api.js`; the `feed` rules in `static/app.css`; the `/feed` mentions in `README.md` and `docs/agents/mutations-and-app.md` |
 | `mobile/src/app/(tabs)/_layout.tsx` | `<Tabs.Screen name="feed" ... />` and its import |
+| `mobile/src/app/(tabs)/mutations.tsx` | `ReviewToFeedDoor` and its `connectFeedLogger` / `review-door-card` imports |
 | `mobile/src/app/_layout.tsx` | `<Stack.Screen name="feed/[id]" ... />` |
 | `mobile/package.json` | `src/features/*/*.test.mjs` in the test script (harmless if left) |
 | `src/personal_data_warehouse/postgres.py` | `ensure_feed_tables(self)` in `ensure_timeline_tables`, the `feed` entry in `SEARCH_SOURCE_DEFS` |

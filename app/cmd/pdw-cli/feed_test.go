@@ -298,3 +298,45 @@ func TestFeedStatsPrintsEachShareWithWhatHeWrote(t *testing.T) {
 		}
 	}
 }
+
+func TestFeedStatsByTagAsksForAndPrintsEachTag(t *testing.T) {
+	srv := feedStub(t, `{"since":"2026-11-05T00:00:00Z","sessions":1,"events_by_type":{},"sources":[],`+
+		`"by_tag":[{"tag":"games","items_seen":40,"items_opened":1,"open_share":0.03,"avg_engagement_score":0.5,"live_unseen":12},`+
+		`{"tag":"video-games","items_seen":0,"items_opened":0,"open_share":null,"avg_engagement_score":null,"live_unseen":3}]}`)
+	out, stderr, code := runCLI(t, srv.URL, "", "feed", "stats", "--source", "picks", "--since", "21d", "--by", "tag")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(string(srv.lastBody), `"by":"tag"`) {
+		t.Fatalf("body: %s", srv.lastBody)
+	}
+	for _, want := range []string{
+		"per tag (since 2026-11-05):",
+		"  games                                     seen=40 opened=1 open_share=0.03 avg_engagement=0.5 live_unseen=12\n",
+		"  video-games                               seen=0 opened=0 open_share=- avg_engagement=- live_unseen=3\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestFeedPushPrintsStockNoteForCreatedCardsOnly(t *testing.T) {
+	srv := feedStub(t, `{"created":1,"updated":1,"items":[`+
+		`{"item_id":"picks:https://x.test/1","status":"created","stock":{`+
+		`"section":{"name":"Internet and creator culture","live_unseen":9,"items_seen":20,"items_opened":4,"open_share":0.2,"window_days":14},`+
+		`"tags":[{"name":"games","live_unseen":12,"items_seen":40,"items_opened":1,"open_share":0.03,"window_days":21,"warning":true},`+
+		`{"name":"steam","live_unseen":3,"items_seen":0,"items_opened":0,"open_share":null,"window_days":21}]}},`+
+		`{"item_id":"picks:https://x.test/2","status":"updated"}]}`)
+	out, stderr, code := runCLI(t, srv.URL, `[{"title":"a"},{"title":"b"}]`, "feed", "push", "--source", "picks")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	want := "    stock: section 'Internet and creator culture' 9 unseen (20% opened 14d); tags games 12 unseen (3% opened 21d)!, steam 3\n"
+	if !strings.Contains(out, want) {
+		t.Fatalf("missing %q in:\n%s", want, out)
+	}
+	if strings.Count(out, "stock:") != 1 {
+		t.Fatalf("updated card must not print stock:\n%s", out)
+	}
+}

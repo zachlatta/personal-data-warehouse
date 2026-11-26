@@ -189,6 +189,19 @@ func (s *Store) Feed(ctx context.Context, limit int) ([]Item, error) {
 	return append(ranked, again...), nil
 }
 
+// UnseenCount is the true number of live, unexpired, undismissed cards Zach
+// has not seen yet, independent of Feed's page limit.
+func (s *Store) UnseenCount(ctx context.Context) (int64, error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	var n int64
+	err := s.DB.QueryRowContext(ctx, s.q(`SELECT count(*)
+		FROM @feed_items i LEFT JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		WHERE i.removed_at = 'epoch' AND (i.expires_at = 'epoch' OR i.expires_at > $1)
+		  AND COALESCE(e.dismissed, 0) = 0 AND COALESCE(e.impressions, 0) = 0`), s.now()).Scan(&n)
+	return n, err
+}
+
 // Saved is his read-later queue, most recently saved first. A saved card
 // stays in it after it expires or an agent removes it from the feed: only he
 // takes it out (unsave), or a dismissal.
@@ -523,11 +536,23 @@ type TasteStats struct {
 	LiveUnseen  int64    `json:"live_unseen"` // Not removed, not expired, never seen: what is still waiting.
 }
 
+// TagStats is one normalized tag for the window. Tags are lowercased with
+// runs of spaces and hyphens collapsed to a single hyphen (no stemming);
+// only tags with at least 3 seen in the window or 3 live unseen are listed.
+type TagStats struct {
+	Tag         string   `json:"tag"`
+	ItemsSeen   int64    `json:"items_seen"`   // Cards first seen in the window.
+	ItemsOpened int64    `json:"items_opened"` // Of those, opened at least once.
+	OpenShare   *float64 `json:"open_share"`   // items_opened / items_seen, 2 places; null when none seen.
+	AvgScore    *float64 `json:"avg_engagement_score"`
+	LiveUnseen  int64    `json:"live_unseen"` // Not removed, not expired, never seen: what is still waiting.
+}
+
 // StatsQuery selects the window and the optional breakdown.
 type StatsQuery struct {
 	Source string
 	Since  time.Time
-	By     string // "" or "taste".
+	By     string // "", "taste" or "tag".
 }
 
 // Stats is the agent's read of how the feed is landing.
@@ -538,12 +563,13 @@ type Stats struct {
 	Sessions     int64            `json:"sessions"` // Sittings starting in the window; all sources, emulator excluded.
 	Shares       []Share          `json:"shares"`
 	ByTaste      []TasteStats     `json:"by_taste,omitempty"`
+	ByTag        []TagStats       `json:"by_tag,omitempty"`
 	TopItems     []Item           `json:"top_items"`
 	Ignored      []Item           `json:"ignored"`
 }
 
 // StatsBreakdowns are the values --by accepts.
-var StatsBreakdowns = []string{"taste"}
+var StatsBreakdowns = []string{"taste", "tag"}
 
 func (s *Store) Stats(ctx context.Context, query StatsQuery) (Stats, error) {
 	source, since := query.Source, query.Since
@@ -626,8 +652,13 @@ func (s *Store) Stats(ctx context.Context, query StatsQuery) (Stats, error) {
 	if out.Shares, err = s.shares(qctx, source, since); err != nil {
 		return out, err
 	}
-	if query.By == "taste" {
+	switch query.By {
+	case "taste":
 		if out.ByTaste, err = s.tasteStats(qctx, source, since); err != nil {
+			return out, err
+		}
+	case "tag":
+		if out.ByTag, err = s.tagStats(qctx, source, since); err != nil {
 			return out, err
 		}
 	}
@@ -714,6 +745,49 @@ func (s *Store) tasteStats(ctx context.Context, source string, since time.Time) 
 	for rows.Next() {
 		var row TasteStats
 		if err := rows.Scan(&row.Taste, &row.ItemsSeen, &row.ItemsOpened, &row.AvgScore, &row.LiveUnseen); err != nil {
+			return nil, err
+		}
+		if row.ItemsSeen > 0 {
+			share := math.Round(float64(row.ItemsOpened)/float64(row.ItemsSeen)*100) / 100
+			row.OpenShare = &share
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+const tagNormExpr = `btrim(lower(regexp_replace(btrim(raw_tag), '[\s-]+', '-', 'g')), '-')`
+
+func (s *Store) tagStats(ctx context.Context, source string, since time.Time) ([]TagStats, error) {
+	rows, err := s.DB.QueryContext(ctx, s.q(`
+		WITH cards AS (
+			SELECT DISTINCT i.item_id,
+			       `+tagNormExpr+` AS tag,
+			       e.first_seen_at, e.opens, e.engagement_score,
+			       (e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3)) AS live_unseen
+			FROM @feed_items i
+			JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+			CROSS JOIN LATERAL unnest(i.tags) AS raw_tag
+			WHERE ($2 = '' OR i.source = $2)
+		)
+		SELECT tag,
+		       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
+		       count(*) FILTER (WHERE first_seen_at >= $1 AND opens > 0) AS opened,
+		       round(avg(engagement_score) FILTER (WHERE first_seen_at >= $1)::numeric, 2)::float8 AS avg_score,
+		       count(*) FILTER (WHERE live_unseen) AS live_unseen
+		FROM cards
+		WHERE tag <> ''
+		GROUP BY tag
+		HAVING count(*) FILTER (WHERE first_seen_at >= $1) >= 3 OR count(*) FILTER (WHERE live_unseen) >= 3
+		ORDER BY seen DESC, live_unseen DESC, tag`), since, source, s.now())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TagStats{}
+	for rows.Next() {
+		var row TagStats
+		if err := rows.Scan(&row.Tag, &row.ItemsSeen, &row.ItemsOpened, &row.AvgScore, &row.LiveUnseen); err != nil {
 			return nil, err
 		}
 		if row.ItemsSeen > 0 {

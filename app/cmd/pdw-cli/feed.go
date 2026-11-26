@@ -42,9 +42,9 @@ USAGE
   pdw feed save ITEM_ID...              Put cards in Zach's read-later queue (the phone's
                                         Saved view), only when he asks; unsave takes them out.
   pdw feed list [flags]                 Cards with their engagement and version.
-  pdw feed stats [--source S] [--since 7d] [--by taste]
+  pdw feed stats [--source S] [--since 7d] [--by taste|tag]
                                         Per source, each share with what he wrote, and
-                                        with --by taste each section's results.
+                                        with --by taste or --by tag each section's or tag's results.
   pdw feed events [--item ID] [--type open,dismiss] [--since 7d] [-n 100]
 
 An order list puts those cards above every card you did not list, best first; use --score to place cards at exact weights.
@@ -500,7 +500,7 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		var source, since, by string
 		fs.StringVar(&source, "source", "", "source")
 		fs.StringVar(&since, "since", "", "window")
-		fs.StringVar(&by, "by", "", "taste")
+		fs.StringVar(&by, "by", "", "taste or tag")
 		if err := parse(); err != nil {
 			return fail(err)
 		}
@@ -588,6 +588,11 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 		fmt.Fprintf(w, "created %d, updated %d\n", int(num(out, "created")), int(num(out, "updated")))
 		for _, it := range asList(out["items"]) {
 			fmt.Fprintf(w, "  %-8s %s\n", str(it, "status"), str(it, "item_id"))
+			if stock, ok := it["stock"].(map[string]any); ok {
+				if line := formatPushStock(stock); line != "" {
+					fmt.Fprintf(w, "    stock: %s\n", line)
+				}
+			}
 		}
 	case "list":
 		items := asList(out["items"])
@@ -645,6 +650,14 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 					label = "(no taste)"
 				}
 				fmt.Fprintf(w, "  %-40s  seen=%d opened=%d open_share=%s avg_engagement=%s live_unseen=%d\n", label,
+					int(num(t, "items_seen")), int(num(t, "items_opened")), averageOrDash(t, "open_share"),
+					averageOrDash(t, "avg_engagement_score"), int(num(t, "live_unseen")))
+			}
+		}
+		if tags := asList(out["by_tag"]); len(tags) > 0 {
+			fmt.Fprintf(w, "per tag (since %s):\n", strings.SplitN(str(out, "since"), "T", 2)[0])
+			for _, t := range tags {
+				fmt.Fprintf(w, "  %-40s  seen=%d opened=%d open_share=%s avg_engagement=%s live_unseen=%d\n", str(t, "tag"),
 					int(num(t, "items_seen")), int(num(t, "items_opened")), averageOrDash(t, "open_share"),
 					averageOrDash(t, "avg_engagement_score"), int(num(t, "live_unseen")))
 			}
@@ -780,6 +793,49 @@ func averageOrDash(m map[string]any, key string) string {
 		return fmt.Sprintf("%g", v)
 	}
 	return "-"
+}
+
+// formatPushStock renders a created card's subject stock on one line, marking
+// any section or tag with >=5 unseen and <5% opened with "!".
+func formatPushStock(stock map[string]any) string {
+	num := func(m map[string]any, k string) float64 { v, _ := m[k].(float64); return v }
+	str := func(m map[string]any, k string) string { v, _ := m[k].(string); return v }
+	formatRate := func(m map[string]any) string {
+		share, ok := m["open_share"].(float64)
+		if !ok {
+			return ""
+		}
+		pct := int(share*100 + 0.5)
+		days := int(num(m, "window_days"))
+		mark := ""
+		if warn, _ := m["warning"].(bool); warn {
+			mark = "!"
+		}
+		return fmt.Sprintf(" (%d%% opened %dd)%s", pct, days, mark)
+	}
+	parts := []string{}
+	if sec, ok := stock["section"].(map[string]any); ok && str(sec, "name") != "" {
+		parts = append(parts, fmt.Sprintf("section '%s' %d unseen%s", str(sec, "name"), int(num(sec, "live_unseen")), formatRate(sec)))
+	}
+	if tags := asList(stock["tags"]); len(tags) > 0 {
+		rendered := make([]string, 0, len(tags))
+		for _, t := range tags {
+			name := str(t, "name")
+			if name == "" {
+				continue
+			}
+			unseen := int(num(t, "live_unseen"))
+			if rate := formatRate(t); rate != "" {
+				rendered = append(rendered, fmt.Sprintf("%s %d unseen%s", name, unseen, rate))
+			} else {
+				rendered = append(rendered, fmt.Sprintf("%s %d", name, unseen))
+			}
+		}
+		if len(rendered) > 0 {
+			parts = append(parts, "tags "+strings.Join(rendered, ", "))
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 func printCardFields(w io.Writer, card map[string]any) {

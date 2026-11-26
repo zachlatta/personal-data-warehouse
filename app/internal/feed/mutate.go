@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -53,10 +55,29 @@ func setProvenance(ctx context.Context, tx *sql.Tx, m Mutation) error {
 	return err
 }
 
+// StockEntry is the live unseen count and recent open share for one section
+// or normalized tag in the pushed card's source.
+type StockEntry struct {
+	Name        string   `json:"name"`
+	LiveUnseen  int64    `json:"live_unseen"`
+	ItemsSeen   int64    `json:"items_seen"`
+	ItemsOpened int64    `json:"items_opened"`
+	OpenShare   *float64 `json:"open_share"`
+	WindowDays  int      `json:"window_days"`
+	Warning     bool     `json:"warning,omitempty"` // true when live_unseen >= 5 and open_share < 0.05
+}
+
+// PushStock is the subject-stock note attached to a newly created card.
+type PushStock struct {
+	Section *StockEntry  `json:"section,omitempty"`
+	Tags    []StockEntry `json:"tags,omitempty"`
+}
+
 // PushResult is one card's outcome.
 type PushResult struct {
-	ItemID string `json:"item_id"`
-	Status string `json:"status"` // created | updated | unchanged
+	ItemID string     `json:"item_id"`
+	Status string     `json:"status"` // created | updated | unchanged
+	Stock  *PushStock `json:"stock,omitempty"`
 }
 
 // Push upserts cards by (source, key). Re-pushing a removed card restores
@@ -122,7 +143,225 @@ func (s *Store) Push(ctx context.Context, items []normalized, m Mutation) ([]Pus
 		}
 		return nil
 	})
-	return results, err
+	if err != nil {
+		return results, err
+	}
+	if err := s.attachPushStock(ctx, items, results); err != nil {
+		return results, err
+	}
+	return results, nil
+}
+
+const (
+	stockSectionWindowDays = 14
+	stockTagWindowDays     = 21
+	stockWarnMinUnseen     = 5
+	stockWarnMaxOpenShare  = 0.05
+)
+
+var tagSepRe = regexp.MustCompile(`[\s-]+`)
+
+func normalizeTagKey(raw string) string {
+	return strings.Trim(strings.ToLower(tagSepRe.ReplaceAllString(strings.TrimSpace(raw), "-")), "-")
+}
+
+func normalizeTasteLabel(raw string) (display, key string) {
+	display = strings.TrimSpace(strings.TrimRight(strings.TrimSpace(raw), ":"))
+	return display, strings.ToLower(display)
+}
+
+func stockEntry(name string, liveUnseen, seen, opened int64, windowDays int) StockEntry {
+	entry := StockEntry{
+		Name:        name,
+		LiveUnseen:  liveUnseen,
+		ItemsSeen:   seen,
+		ItemsOpened: opened,
+		WindowDays:  windowDays,
+	}
+	if seen > 0 {
+		share := math.Round(float64(opened)/float64(seen)*100) / 100
+		entry.OpenShare = &share
+		entry.Warning = liveUnseen >= stockWarnMinUnseen && share < stockWarnMaxOpenShare
+	}
+	return entry
+}
+
+// attachPushStock fills Stock on every created card in results using the
+// committed live unseen counts and recent open shares for its source.
+func (s *Store) attachPushStock(ctx context.Context, items []normalized, results []PushResult) error {
+	type sourceNeed struct {
+		tastes map[string]bool
+		tags   map[string]bool
+	}
+	needs := map[string]*sourceNeed{}
+	ensure := func(source string) *sourceNeed {
+		n := needs[source]
+		if n == nil {
+			n = &sourceNeed{tastes: map[string]bool{}, tags: map[string]bool{}}
+			needs[source] = n
+		}
+		return n
+	}
+	type itemRef struct {
+		idx          int
+		source       string
+		tasteDisplay string
+		tasteKey     string
+		tags         []string
+	}
+	refs := []itemRef{}
+	for i, r := range results {
+		if r.Status != "created" {
+			continue
+		}
+		item := items[i]
+		var tasteRaw string
+		if v, ok := item.Metadata["taste"].(string); ok {
+			tasteRaw = v
+		}
+		tasteDisplay, tasteKey := normalizeTasteLabel(tasteRaw)
+		tagKeys := []string{}
+		seenTag := map[string]bool{}
+		for _, raw := range item.Tags {
+			k := normalizeTagKey(raw)
+			if k == "" || seenTag[k] {
+				continue
+			}
+			seenTag[k] = true
+			tagKeys = append(tagKeys, k)
+		}
+		if tasteKey == "" && len(tagKeys) == 0 {
+			continue
+		}
+		need := ensure(item.Source)
+		if tasteKey != "" {
+			need.tastes[tasteKey] = true
+		}
+		for _, k := range tagKeys {
+			need.tags[k] = true
+		}
+		refs = append(refs, itemRef{idx: i, source: item.Source, tasteDisplay: tasteDisplay, tasteKey: tasteKey, tags: tagKeys})
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	qctx, cancel := s.ctx(ctx)
+	defer cancel()
+	now := s.now()
+	sectionSince := now.Add(-stockSectionWindowDays * 24 * time.Hour)
+	tagSince := now.Add(-stockTagWindowDays * 24 * time.Hour)
+
+	sectionsBySource := map[string]map[string]StockEntry{}
+	tagsBySource := map[string]map[string]StockEntry{}
+	for source, need := range needs {
+		if len(need.tastes) > 0 {
+			keys := make([]string, 0, len(need.tastes))
+			for k := range need.tastes {
+				keys = append(keys, k)
+			}
+			rows, err := s.DB.QueryContext(qctx, s.q(`
+				WITH cards AS (
+					SELECT btrim(regexp_replace(btrim(COALESCE(i.metadata->>'taste', '')), ':+$', '')) AS label,
+					       e.first_seen_at, e.opens,
+					       (e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3)) AS live_unseen
+					FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+					WHERE i.source = $2
+				)
+				SELECT lower(label) AS key,
+				       mode() WITHIN GROUP (ORDER BY label) AS taste,
+				       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
+				       count(*) FILTER (WHERE first_seen_at >= $1 AND opens > 0) AS opened,
+				       count(*) FILTER (WHERE live_unseen) AS live_unseen
+				FROM cards
+				WHERE lower(label) = ANY($4::text[])
+				GROUP BY lower(label)`), sectionSince, source, now, tagsLiteral(keys))
+			if err != nil {
+				return err
+			}
+			byKey := map[string]StockEntry{}
+			for rows.Next() {
+				var key, label string
+				var seen, opened, unseen int64
+				if err := rows.Scan(&key, &label, &seen, &opened, &unseen); err != nil {
+					rows.Close()
+					return err
+				}
+				byKey[key] = stockEntry(label, unseen, seen, opened, stockSectionWindowDays)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			sectionsBySource[source] = byKey
+		}
+		if len(need.tags) > 0 {
+			keys := make([]string, 0, len(need.tags))
+			for k := range need.tags {
+				keys = append(keys, k)
+			}
+			rows, err := s.DB.QueryContext(qctx, s.q(`
+				WITH cards AS (
+					SELECT DISTINCT i.item_id,
+					       `+tagNormExpr+` AS tag,
+					       e.first_seen_at, e.opens,
+					       (e.first_seen_at IS NULL AND e.removed_at IS NULL AND (e.expires_at IS NULL OR e.expires_at > $3)) AS live_unseen
+					FROM @feed_items i
+					JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+					CROSS JOIN LATERAL unnest(i.tags) AS raw_tag
+					WHERE i.source = $2
+				)
+				SELECT tag,
+				       count(*) FILTER (WHERE first_seen_at >= $1) AS seen,
+				       count(*) FILTER (WHERE first_seen_at >= $1 AND opens > 0) AS opened,
+				       count(*) FILTER (WHERE live_unseen) AS live_unseen
+				FROM cards
+				WHERE tag = ANY($4::text[])
+				GROUP BY tag`), tagSince, source, now, tagsLiteral(keys))
+			if err != nil {
+				return err
+			}
+			byKey := map[string]StockEntry{}
+			for rows.Next() {
+				var tag string
+				var seen, opened, unseen int64
+				if err := rows.Scan(&tag, &seen, &opened, &unseen); err != nil {
+					rows.Close()
+					return err
+				}
+				byKey[tag] = stockEntry(tag, unseen, seen, opened, stockTagWindowDays)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			tagsBySource[source] = byKey
+		}
+	}
+
+	for _, ref := range refs {
+		stock := &PushStock{}
+		if ref.tasteKey != "" {
+			if entry, ok := sectionsBySource[ref.source][ref.tasteKey]; ok {
+				copyEntry := entry
+				stock.Section = &copyEntry
+			} else {
+				entry := stockEntry(ref.tasteDisplay, 0, 0, 0, stockSectionWindowDays)
+				stock.Section = &entry
+			}
+		}
+		if len(ref.tags) > 0 {
+			stock.Tags = make([]StockEntry, 0, len(ref.tags))
+			for _, k := range ref.tags {
+				if entry, ok := tagsBySource[ref.source][k]; ok {
+					stock.Tags = append(stock.Tags, entry)
+				} else {
+					stock.Tags = append(stock.Tags, stockEntry(k, 0, 0, 0, stockTagWindowDays))
+				}
+			}
+		}
+		results[ref.idx].Stock = stock
+	}
+	return nil
 }
 
 // Update edits cards: one (item_id), several (item_ids) or every live card

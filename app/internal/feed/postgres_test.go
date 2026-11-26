@@ -946,3 +946,247 @@ func TestPostgresFeedStatsByTaste(t *testing.T) {
 		t.Fatalf("an unknown --by is a ValidationError, got %T: %v", err, err)
 	}
 }
+
+// --by tag breaks down performance and live unseen stock per normalized tag
+// (lowercased, spaces and hyphens treated alike, no stemming), keeping tags
+// with at least 3 seen in the window or at least 3 live unseen.
+func TestPostgresFeedStatsByTag(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	card := func(key string, tags []string, extra ...func(map[string]any)) map[string]any {
+		m := map[string]any{"key": key, "title": key, "tags": tags}
+		for _, fn := range extra {
+			fn(m)
+		}
+		return m
+	}
+	expired := func(m map[string]any) { m["expires_at"] = now.Add(-time.Hour).Format(time.RFC3339) }
+	call(t, tools, "feed_push", map[string]any{"source": "tag-stats", "items": []map[string]any{
+		// Three seen cards under Games / games (one carries both spellings and must count once).
+		card("g1", []string{"Games", "games"}),
+		card("g2", []string{"games"}),
+		card("g3", []string{"  Games  "}),
+		// Live unseen, removed, and expired cards for games.
+		card("g-unseen", []string{"GAMES"}),
+		card("g-removed", []string{"games"}),
+		card("g-expired", []string{"games"}, expired),
+		// Seen before the window: not counted in this window.
+		card("g-old", []string{"games"}),
+		// Spaces and hyphens normalize to the same tag (3 live unseen, 0 seen).
+		card("vg1", []string{"Video games"}),
+		card("vg2", []string{"video-games"}),
+		card("vg3", []string{"video  - games"}),
+		// Below threshold: 2 seen and 2 live unseen must be excluded.
+		card("rare1", []string{"rare"}),
+		card("rare2", []string{"rare"}),
+		card("rare3", []string{"rare"}),
+		card("rare4", []string{"rare"}),
+	}})
+	call(t, tools, "feed_push", map[string]any{"source": "tag-stats-other", "items": []map[string]any{
+		card("o1", []string{"games"}),
+		card("o2", []string{"games"}),
+		card("o3", []string{"games"}),
+	}})
+	defer store.DB.Exec(store.q("DELETE FROM @feed_items WHERE source LIKE 'tag-stats%'"))
+	call(t, tools, "feed_remove", map[string]any{"item_ids": []string{"tag-stats:g-removed"}})
+
+	at := func(d time.Duration) string { return now.Add(d).Format(time.RFC3339Nano) }
+	events := []map[string]any{}
+	for i, key := range []string{"g1", "g2", "g3", "rare1", "rare2"} {
+		events = append(events, map[string]any{"event_id": fmt.Sprintf("tg-i%d", i), "type": "impression", "item_id": "tag-stats:" + key, "occurred_at": at(-time.Hour), "dwell_ms": 400})
+	}
+	events = append(events,
+		map[string]any{"event_id": "tg-o1", "type": "open", "item_id": "tag-stats:g1", "occurred_at": at(-time.Hour)},
+		map[string]any{"event_id": "tg-old", "type": "impression", "item_id": "tag-stats:g-old", "occurred_at": at(-48 * time.Hour), "dwell_ms": 400},
+		map[string]any{"event_id": "tg-old-o", "type": "open", "item_id": "tag-stats:g-old", "occurred_at": at(-48 * time.Hour)},
+	)
+	mux := http.NewServeMux()
+	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
+	raw, _ := json.Marshal(map[string]any{"events": events})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(raw)))
+	if rec.Code != 200 {
+		t.Fatalf("POST events: %d %s", rec.Code, rec.Body.String())
+	}
+
+	var gamesAvg float64
+	if err := store.DB.QueryRow(store.q(`SELECT round(avg(engagement_score)::numeric, 2)::float8 FROM @marts_feed_item_engagement
+		WHERE item_id IN ('tag-stats:g1', 'tag-stats:g2', 'tag-stats:g3')`)).Scan(&gamesAvg); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := store.Stats(context.Background(), StatsQuery{Source: "tag-stats", Since: now.Add(-24 * time.Hour), By: "tag"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.ByTag) != 2 {
+		t.Fatalf("want games and video-games only, got %+v", stats.ByTag)
+	}
+	got := map[string]TagStats{}
+	for _, row := range stats.ByTag {
+		got[row.Tag] = row
+	}
+	games, ok := got["games"]
+	if !ok || games.ItemsSeen != 3 || games.ItemsOpened != 1 || games.LiveUnseen != 1 ||
+		games.AvgScore == nil || *games.AvgScore != gamesAvg || games.OpenShare == nil || *games.OpenShare != 0.33 {
+		t.Fatalf("games: %+v (avg want %v)", games, gamesAvg)
+	}
+	vg, ok := got["video-games"]
+	if !ok || vg.ItemsSeen != 0 || vg.ItemsOpened != 0 || vg.LiveUnseen != 3 || vg.OpenShare != nil || vg.AvgScore != nil {
+		t.Fatalf("video-games: %+v", vg)
+	}
+
+	// Without --by the tag breakdown is not computed.
+	plain, err := store.Stats(context.Background(), StatsQuery{Source: "tag-stats", Since: now.Add(-24 * time.Hour)})
+	if err != nil || plain.ByTag != nil {
+		t.Fatalf("by_tag without asking: %+v %v", plain.ByTag, err)
+	}
+}
+
+// Creating a card attaches its subject stock (metadata.taste section 14d open
+// share + each normalized tag's 21d open share and live unseen count in the
+// same source) and flags >=5 unseen with <5% opened; updates return no stock.
+func TestPostgresFeedPushStockNote(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	seed := []map[string]any{
+		// 4 existing live unseen cards tagged games in stock-test.
+		{"key": "u1", "title": "u1", "tags": []string{"games"}, "metadata": map[string]any{"taste": "Internet and creator culture"}},
+		{"key": "u2", "title": "u2", "tags": []string{"Games"}, "metadata": map[string]any{"taste": "Internet and creator culture:"}},
+		{"key": "u3", "title": "u3", "tags": []string{"games"}},
+		{"key": "u4", "title": "u4", "tags": []string{"games"}},
+		// Removed card must not count toward live unseen.
+		{"key": "u-rem", "title": "u-rem", "tags": []string{"games"}},
+		// 2 seen cards in 14d for the section (1 opened -> 50%), and 25 seen
+		// cards in 21d for games (1 opened -> 4%, below 5%).
+		{"key": "sec-s1", "title": "sec-s1", "metadata": map[string]any{"taste": "Internet and creator culture"}},
+		{"key": "sec-s2", "title": "sec-s2", "metadata": map[string]any{"taste": "Internet and creator culture"}},
+	}
+	for i := range 25 {
+		seed = append(seed, map[string]any{"key": fmt.Sprintf("gs-%d", i), "title": fmt.Sprintf("gs-%d", i), "tags": []string{"games"}})
+	}
+	call(t, tools, "feed_push", map[string]any{"source": "stock-test", "items": seed})
+	// Cards in another source must not pollute stock-test counts.
+	call(t, tools, "feed_push", map[string]any{"source": "stock-other", "items": []map[string]any{
+		{"key": "o1", "title": "o1", "tags": []string{"games"}},
+	}})
+	defer store.DB.Exec(store.q("DELETE FROM @feed_items WHERE source LIKE 'stock-%'"))
+	call(t, tools, "feed_remove", map[string]any{"item_ids": []string{"stock-test:u-rem"}})
+
+	at := func(d time.Duration) string { return now.Add(d).Format(time.RFC3339Nano) }
+	events := []map[string]any{
+		{"event_id": "st-sec1", "type": "impression", "item_id": "stock-test:sec-s1", "occurred_at": at(-2 * 24 * time.Hour), "dwell_ms": 400},
+		{"event_id": "st-sec1-o", "type": "open", "item_id": "stock-test:sec-s1", "occurred_at": at(-2 * 24 * time.Hour)},
+		{"event_id": "st-sec2", "type": "impression", "item_id": "stock-test:sec-s2", "occurred_at": at(-2 * 24 * time.Hour), "dwell_ms": 400},
+	}
+	for i := range 25 {
+		events = append(events, map[string]any{
+			"event_id": fmt.Sprintf("st-gs-%d", i), "type": "impression",
+			"item_id": fmt.Sprintf("stock-test:gs-%d", i), "occurred_at": at(-10 * 24 * time.Hour), "dwell_ms": 400,
+		})
+	}
+	events = append(events, map[string]any{
+		"event_id": "st-gs-0-o", "type": "open", "item_id": "stock-test:gs-0", "occurred_at": at(-10 * 24 * time.Hour),
+	})
+	mux := http.NewServeMux()
+	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
+	raw, _ := json.Marshal(map[string]any{"events": events})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(raw)))
+	if rec.Code != 200 {
+		t.Fatalf("POST events: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Push the 5th live unseen card tagged games (+ steam, + section).
+	var created pushOutput
+	rawOut, _ := json.Marshal(call(t, tools, "feed_push", map[string]any{"source": "stock-test", "items": []map[string]any{{
+		"key":      "new-1",
+		"title":    "New game pick",
+		"tags":     []string{"Games", "steam"},
+		"metadata": map[string]any{"taste": "internet and creator culture"},
+	}}}))
+	if err := json.Unmarshal(rawOut, &created); err != nil {
+		t.Fatal(err)
+	}
+	if len(created.Items) != 1 || created.Items[0].Status != "created" || created.Items[0].Stock == nil {
+		t.Fatalf("created push result: %s", rawOut)
+	}
+	stock := created.Items[0].Stock
+	if stock.Section == nil || stock.Section.Name != "Internet and creator culture" ||
+		stock.Section.LiveUnseen != 3 || stock.Section.WindowDays != 14 ||
+		stock.Section.OpenShare == nil || *stock.Section.OpenShare != 0.5 || stock.Section.Warning {
+		t.Fatalf("section stock: %+v", stock.Section)
+	}
+	if len(stock.Tags) != 2 {
+		t.Fatalf("tag stock: %+v", stock.Tags)
+	}
+	if g := stock.Tags[0]; g.Name != "games" || g.LiveUnseen != 5 || g.WindowDays != 21 ||
+		g.OpenShare == nil || *g.OpenShare != 0.04 || !g.Warning {
+		t.Fatalf("games stock: %+v", g)
+	}
+	if st := stock.Tags[1]; st.Name != "steam" || st.LiveUnseen != 1 || st.WindowDays != 21 ||
+		st.OpenShare != nil || st.Warning {
+		t.Fatalf("steam stock: %+v", st)
+	}
+
+	// Updating an existing card returns no stock.
+	var updated pushOutput
+	rawUpd, _ := json.Marshal(call(t, tools, "feed_push", map[string]any{"source": "stock-test", "items": []map[string]any{{
+		"key":      "new-1",
+		"title":    "Updated game pick",
+		"tags":     []string{"Games", "steam"},
+		"metadata": map[string]any{"taste": "internet and creator culture"},
+	}}}))
+	if err := json.Unmarshal(rawUpd, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Items) != 1 || updated.Items[0].Status != "updated" || updated.Items[0].Stock != nil {
+		t.Fatalf("updated push must return no stock: %s", rawUpd)
+	}
+}
+
+// GET /api/feed returns unseen_count, the true total of live unseen items
+// independent of the page limit.
+func TestPostgresFeedAPIUnseenCount(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	call(t, tools, "feed_push", map[string]any{"source": "unseen-count", "items": []map[string]any{
+		{"key": "a", "title": "a"},
+		{"key": "b", "title": "b"},
+		{"key": "c", "title": "c"},
+		{"key": "rem", "title": "rem"},
+		{"key": "exp", "title": "exp", "expires_at": now.Add(-time.Hour).Format(time.RFC3339)},
+		{"key": "seen", "title": "seen"},
+	}})
+	defer store.DB.Exec(store.q("DELETE FROM @feed_items WHERE source = 'unseen-count'"))
+	call(t, tools, "feed_remove", map[string]any{"item_ids": []string{"unseen-count:rem"}})
+
+	mux := http.NewServeMux()
+	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
+	evBody, _ := json.Marshal(map[string]any{"events": []map[string]any{
+		{"event_id": "uc-seen", "type": "impression", "item_id": "unseen-count:seen", "occurred_at": now.Add(-time.Minute).Format(time.RFC3339Nano), "dwell_ms": 500},
+	}})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(evBody)))
+	if rec.Code != 200 {
+		t.Fatalf("POST events: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Count baseline unseen in the DB (other tests clean up, so expect >=3), then check limit=1 matches Store.UnseenCount.
+	want, err := store.UnseenCount(context.Background())
+	if err != nil || want < 3 {
+		t.Fatalf("UnseenCount = %d, err = %v", want, err)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", APIPath+"?limit=1", nil))
+	if rec.Code != 200 {
+		t.Fatalf("GET /api/feed: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp feedResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Items) != 1 || resp.UnseenCount != want {
+		t.Fatalf("items=%d unseen_count=%d, want 1 and %d", len(resp.Items), resp.UnseenCount, want)
+	}
+}

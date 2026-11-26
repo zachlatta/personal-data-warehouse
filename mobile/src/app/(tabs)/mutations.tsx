@@ -9,6 +9,8 @@ import { PolicySwitches } from '@/components/policy-switches';
 import { STATUS_COLORS } from '@/components/status-pill';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { Spacing } from '@/constants/theme';
+import { connectFeedLogger } from '@/features/feed/engagement';
+import { ReviewToFeedDoor } from '@/features/feed/review-door-card';
 import { useLiveRefresh } from '@/hooks/use-live-refresh';
 import { useTheme } from '@/hooks/use-theme';
 import { getMutationRequest, listMutationRequests, type MutationRequest } from '@/lib/api';
@@ -93,11 +95,15 @@ export default function MutationsScreen() {
       unsubscribeDecisions();
     };
   }, []);
+  useEffect(() => {
+    connectFeedLogger(config);
+  }, [config]);
+
   const pending = requests.filter((r) => r.status === 'pending_review' && !decided.includes(r.id));
   const past = requests.filter((r) => r.status !== 'pending_review');
   const sections = [
-    { title: pending.length ? `Needs review (${pending.length})` : 'Needs review', data: pending, empty: 'All caught up. Nothing is waiting on you.' },
-    { title: 'Past requests', data: past, empty: 'No approved or denied requests yet.' },
+    { key: 'pending', title: pending.length ? `Needs review (${pending.length})` : 'Needs review', data: pending, empty: 'All caught up. Nothing is waiting on you.' },
+    { key: 'past', title: 'Past requests', data: past, empty: 'No approved or denied requests yet.' },
   ];
 
   return (
@@ -122,9 +128,14 @@ export default function MutationsScreen() {
         )}
         renderSectionFooter={({ section }) =>
           section.data.length === 0 && known && !refreshing && !error ? (
-            <ThemedText type="small" themeColor="textSecondary" style={styles.empty}>
-              {section.empty}
-            </ThemedText>
+            <ThemedView>
+              <ThemedText type="small" themeColor="textSecondary" style={styles.empty}>
+                {section.empty}
+              </ThemedText>
+              {section.key === 'pending' ? (
+                <ReviewToFeedDoor config={config} onOpenFeed={() => router.navigate('/feed')} />
+              ) : null}
+            </ThemedView>
           ) : null
         }
         renderItem={({ item }) => (

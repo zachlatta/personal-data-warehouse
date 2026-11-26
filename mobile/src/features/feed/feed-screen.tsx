@@ -63,6 +63,7 @@ import { openTrackedBrowser } from './tracked-browser';
 import { autoplayKey } from './video';
 import { autoplayVideo, playingVideo, VideoWarmup } from './video-player';
 import { PILL_GONE_Y, ReplacedListGate, type HeldImpression } from './replaced-list';
+import { consumeFeedJump } from './review-door';
 import { layoutsFromHeights, ViewabilityTracker, visibleFraction } from './viewability';
 import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 import { isSideways, usePortraitWindow } from '@/hooks/use-portrait-window';
@@ -183,6 +184,7 @@ export default function FeedScreen() {
   const videoKeys = useRef(new Map<string, string>());
   const videoFocus = useRef<string | null>(null);
   const focused = useRef(false);
+  const pendingJump = useRef<string | null>(null);
   const [lifecycle] = useState(() => new FeedSessionLifecycle(feedSessionCoordinator));
   const loadedAt = useRef(0);
   // The error banner sits above the first card when it is showing.
@@ -333,10 +335,31 @@ export default function FeedScreen() {
     return () => clearTimeout(t);
   }, [shown, measure]);
 
+  // Honor a one-shot jump from the Review tab's Feed door once the full list
+  // is showing.
+  useEffect(() => {
+    const target = pendingJump.current;
+    if (!target || only !== null || searching || shown.length === 0) return;
+    const idx = shown.findIndex((i) => i.item_id === target);
+    pendingJump.current = null;
+    if (idx <= 0) {
+      list.current?.scrollToOffset({ offset: 0, animated: false });
+    } else {
+      list.current?.scrollToIndex({ index: idx, animated: false });
+    }
+  }, [shown, only, searching]);
+
   host.useFocusEffect(
     useCallback(() => {
       focused.current = true;
       lifecycle.focus();
+      const jump = consumeFeedJump();
+      if (jump) {
+        pendingJump.current = jump;
+        setOnly(null);
+        setSearching(false);
+        setArrivals([]);
+      }
       if (AppState.currentState === 'active') startFeedSession(ids.current.length, 'focus');
       if (Date.now() - loadedAt.current > STALE_MS) void load(loadedAt.current ? 'stale' : 'first');
       else measure();
@@ -784,6 +807,7 @@ export default function FeedScreen() {
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="on-drag"
           onScrollToTop={() => recordUi('scroll_to_top', { metadata: { view: view.current } })}
+          onScrollToIndexFailed={() => list.current?.scrollToOffset({ offset: 0, animated: false })}
           onEndReachedThreshold={0.2}
           onEndReached={() => {
             if (endLogged.current || !shown.length) return;

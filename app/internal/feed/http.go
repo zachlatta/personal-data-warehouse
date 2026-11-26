@@ -60,6 +60,7 @@ type feedResponse struct {
 	// Saved is his read-later queue, newest saved first; its cards can also
 	// be in Items, and stay here after they leave the feed.
 	Saved       []Item    `json:"saved"`
+	UnseenCount int64     `json:"unseen_count"`
 	GeneratedAt time.Time `json:"generated_at"`
 }
 
@@ -83,8 +84,13 @@ func (h *handler) feed(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	unseen, err := h.store.UnseenCount(r.Context())
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
 	forCards(items, saved)
-	writeJSON(w, http.StatusOK, feedResponse{Items: items, Saved: saved, GeneratedAt: h.store.now()})
+	writeJSON(w, http.StatusOK, feedResponse{Items: items, Saved: saved, UnseenCount: unseen, GeneratedAt: h.store.now()})
 }
 
 // forCards keeps the payload to what a card needs.
