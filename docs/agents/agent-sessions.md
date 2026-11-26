@@ -523,6 +523,15 @@ Only the opening prompt's `cwd` is the launch directory. Claude Code records the
 `cwd` on every line, so a `cwd` rule (a probe launched from `.factory-scratch`) is a
 session rule, never a turn rule.
 
+A one-shot schedule never recurs, so only its prompt can show it is one. Nothing in the
+transcript marks a Paseo schedule launch (a schedule run and a session Zach types into
+both arrive as `sdk-cli` with the same metadata rows). The rules therefore read the run
+prompts the `recurring-agent-tasks` skill writes: the standard "Recurring desk task …
+You are one run of Paseo schedule …" line (even when hard-wrapped), or a titled header
+("One dated follow-up:", "Recurring desk watch:") together with the desk work item's
+`state.json`. A schedule prompt in none of these shapes stays `self`, so new schedule
+prompts should keep the standard line.
+
 ## Payment data and credentials in conversations
 
 The conversation batch HTTP endpoint redacts payment card data before object

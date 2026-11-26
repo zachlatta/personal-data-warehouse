@@ -33,6 +33,16 @@ from tests.test_timeline import _NOW, _engine, _ensure_all_source_tables, wareho
         # A connectivity probe with a fixed reply format.
         "Call the fictional MCP tool get_item with uuid 0a1b2c3d-1111-2222-3333-444455556666. "
         "Reply with exactly: TEXT=<text>, or ERROR=<error>.",
+        # The schedule declaration hard-wrapped across a line break.
+        "One-off follow-up check for a fictional fix. You are the single run of a bounded\n"
+        "Paseo schedule, in a fresh worktree. Read the note first.",
+        # Run prompts a schedule from the recurring-agent-tasks skill starts: a
+        # titled header plus the desk work item that is the run's memory.
+        "One dated follow-up: 2026-01-02 fictional rollout audit and retry.\n"
+        "Read the desk work item work/2026-01-02-fictional-followup/README.md and state.json.\n"
+        "Authority: retry the fictional host only.",
+        "Recurring desk watch: fictional continuity on real traffic. This is one bounded check. "
+        "Read work/2026-01-03-fictional-watch/README.md and state.json; they hold the stop rules.",
     ],
 )
 def test_dispatch_and_schedule_envelopes_keep_the_whole_session_background(
@@ -472,6 +482,18 @@ def test_daily_schedule_normalizes_worktree_slugs_and_daylight_saving(warehouse)
         (
             "claude_code",
             "/fictional/project",
+            "This is an authorized shell smoke check only. Run exactly echo ok and report the output.",
+            "background",
+        ),
+        (
+            "claude_code",
+            "/fictional/project",
+            "is the fictional deploy a smoke test only, or does it ship?",
+            "self",
+        ),
+        (
+            "claude_code",
+            "/fictional/project",
             "Call the fictional MCP once with uuid 11111111-1111-4111-8111-111111111111. Run nothing else.",
             "background",
         ),
@@ -530,6 +552,27 @@ def test_daily_schedule_normalizes_worktree_slugs_and_daylight_saving(warehouse)
             "claude_code",
             "/fictional/project",
             "how do scheduled agents work? are you a scheduled agent?",
+            "self",
+        ),
+        # Asking for a follow-up or a recurring task is Zach's request, and so
+        # is resuming a work item by hand: only header AND work-item memory
+        # together are a schedule's run prompt.
+        (
+            "claude_code",
+            "/fictional/project",
+            "one dated follow-up: remind me to call the fictional plumber tomorrow",
+            "self",
+        ),
+        (
+            "claude_code",
+            "/fictional/project",
+            "set up a recurring watch: check my fictional flight every two hours and keep me posted",
+            "self",
+        ),
+        (
+            "claude_code",
+            "/fictional/project",
+            "read work/2026-01-02-fictional-followup/README.md and state.json and tell me where we are",
             "self",
         ),
     ],

@@ -3393,10 +3393,12 @@ _AGENT_DISPATCH_PROMPT_PREFIX = (
 )
 _AGENT_HARNESS_ENVELOPE_PATTERN = "'^\\s*(" + _AGENT_AUTOMATED_PROMPT_PREFIX + ")'"
 # A schedule's role declaration can follow a job title, and applies to a
-# one-shot run too. Mentioning a schedule alone is not this declaration.
+# one-shot run too. Mentioning a schedule alone is not this declaration. It
+# stays inside one sentence but may cross a hard line wrap (2026-11-12: "the
+# single run of a bounded\nPaseo schedule" stayed self).
 _AGENT_SCHEDULE_ENVELOPE_PATTERN = (
-    "'\\myou( are|''re| represent)\\M[^.\\n]{0,80}\\mrun\\M"
-    "[^.\\n]{0,80}\\mpaseo schedule\\M'"
+    "'\\myou( are|''re| represent)\\M[^.]{0,80}\\mrun\\M"
+    "[^.]{0,80}\\mpaseo\\s+schedule\\M'"
 )
 
 
@@ -3450,6 +3452,7 @@ def _agent_delegated_prompt(alias: str) -> str:
     )
     probe = (
         r"^\s*(perform|run) only (a )?read-only [^.\n]{0,60}(compatibility|smoke) (check|test)\M"
+        r"|^\s*this is an? (authorized )?[[:alpha:] -]{0,30}(compatibility|smoke) (check|test) only\M"
         r"|^\s*(one-time|one bounded) read-only (check|verification)\M"
         r"|^\s*report the (current )?(date|time) and stop\M"
     )
@@ -3492,6 +3495,14 @@ def _agent_harness_metadata(alias: str) -> str:
         # Workflow dispatcher envelope with a run identity; no task vocabulary.
         f"OR {alias}.text ~* 'this is run [0-9a-f-]{{36}} of the workflow' "
         f"OR {alias}.text ~* 'this is an unattended (agent )?(session|run)\\M' "
+        # A run prompt a schedule from the recurring-agent-tasks skill starts
+        # when it is not the standard "Recurring desk task" template: a titled
+        # header ("One dated follow-up:", "Recurring desk watch:") AND the desk
+        # work item whose state.json is the run's memory. Either alone is
+        # something Zach types (asking for a follow-up, resuming a work item).
+        f"OR ({_agent_opening(alias)} ~* '^\\s*((one|a) [[:alpha:] -]{{0,20}}follow-up|recurring [[:alpha:] -]{{1,40}})\\s*:' "
+        f"    AND {_agent_opening(alias)} ~* '\\mwork/[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}-[^/[:space:]]+/'"
+        f"    AND {_agent_opening(alias)} ~* '\\mstate\\.json\\M') "
         # A one-shot follow-up another agent scheduled; it may follow a
         # boilerplate first line, so it is not anchored.
         f"OR {_agent_opening(alias)} ~* '\\myou are an? (scheduled|one-shot|recurring)( [[:alpha:]-]+){{0,3}} agent\\M' "
