@@ -218,6 +218,19 @@ keeps the general pair. Their scoring arms name the index through a scalar sub-S
 `IMMUTABLE` `to_bm25query()` is folded at plan time even in a CASE arm no row reaches, and
 it raises on a missing index.
 
+**No index build runs under the search-schema lock (since the 2026-11-27 deploy).** The
+first deploy of this pair built it inside `_ensure_search_views_if_possible`, which held
+`SEARCH_SCHEMA_REFRESH_LOCK_ID` while every other ensure call queued in a blocking
+`pg_advisory_lock`. A concurrent build waits for every older snapshot, and each queued
+statement is one, so Postgres killed the build as a deadlock four times in 15 minutes and
+the queue filled `max_connections`. The deploy was reverted. Now the timeline index pass
+runs before that lock is taken, under `_ensure_indexes`' own try-lock. Waiters poll
+`pg_try_advisory_lock` between statements, so they hold no snapshot. After
+`_SEARCH_SCHEMA_LOCK_WAIT_SECONDS` they skip, because the holder runs the same DDL. A
+leftover invalid index from an interrupted build is dropped `CONCURRENTLY` and rebuilt by
+the next index pass. The earlier attention pair never met this, because it was built by
+hand on production before its code deployed.
+
 Repeated 2026-09-19 14:27–14:49Z after the 09-14..16 index-definition flap had doubled
 every BM25 index again: plain `REINDEX` of the global index in 15m50s (**12 GB → 6.36 GB**),
 the attention index in 4m41s (1.9 GB → 968 MB), the low-volume pair in 47s + 30s

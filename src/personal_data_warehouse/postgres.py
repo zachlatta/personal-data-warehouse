@@ -17521,24 +17521,69 @@ class PostgresWarehouse:
         tier.name for tier in CATALOG.timeline_priorities.tiers
     ) + (CATALOG.timeline_priorities.sentinel.name,)
 
+    # How long an ensure_* call waits for another session's search-schema
+    # refresh before it skips its own. The holder runs the same idempotent
+    # DDL, so skipping loses nothing; waiting longer only holds a connection.
+    _SEARCH_SCHEMA_LOCK_WAIT_SECONDS = 120.0
+
     def _ensure_search_views_if_possible(self) -> None:
         # Several Dagster assets can call ensure_* concurrently on deploy. The
-        # shared search_text() function/index refresh mutates global Postgres
+        # shared search_text() function refresh mutates global Postgres
         # catalog rows, so serialize it to avoid "tuple concurrently updated"
         # races between otherwise-idempotent DDL statements.
-        self._command("SELECT pg_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+        #
+        # That lock must never be one a CREATE INDEX CONCURRENTLY has to
+        # outlast. A concurrent build waits for every older snapshot, and a
+        # session blocked inside pg_advisory_lock holds one; on 2026-11-27 a
+        # new timeline index built under this lock was killed as a deadlock
+        # four times in 15 minutes, while the queued sessions filled
+        # max_connections and searches were refused. So:
+        # - the timeline indexes search_text() references are built first,
+        #   under _ensure_indexes' own try-lock and outside this one, so the
+        #   function can still never point at a not-yet-built index but no
+        #   one waits on this lock while a build runs; and
+        # - waiters poll for the lock between statements, holding no
+        #   transaction or snapshot, and give up after a deadline instead of
+        #   collecting connections behind a slow holder.
+        if not all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
+            return
+        self._ensure_indexes(self._SEARCHABLE_TEXT_TABLES)
+        if not self._acquire_advisory_lock_without_snapshot(
+            SEARCH_SCHEMA_REFRESH_LOCK_ID, wait_seconds=self._SEARCH_SCHEMA_LOCK_WAIT_SECONDS
+        ):
+            logger.warning(
+                "skipping the search schema refresh: another session held its lock for %.0f s",
+                self._SEARCH_SCHEMA_LOCK_WAIT_SECONDS,
+            )
+            return
         try:
             self._ensure_search_views_if_possible_locked()
         finally:
             self._command("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
 
+    def _acquire_advisory_lock_without_snapshot(self, key: int, *, wait_seconds: float) -> bool:
+        """Take session advisory lock ``key``, waiting at most ``wait_seconds``.
+
+        Polls pg_try_advisory_lock rather than blocking in pg_advisory_lock.
+        The connection is autocommit, so between polls this session has no
+        transaction and no snapshot, and no concurrent index build anywhere
+        in the database ever waits for it.
+        """
+        deadline = time.monotonic() + wait_seconds
+        delay = 0.01
+        while True:
+            rows = self._query("SELECT pg_try_advisory_lock(%s)", (key,))
+            if rows and bool(rows[0][0]):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.5)
+
     def _ensure_search_views_if_possible_locked(self) -> None:
         if not all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
             return
-        # Build the timeline BM25 index search_text() references BEFORE
-        # (re)creating the function, so it can never point at a not-yet-built
-        # index. The gate above guarantees the referenced timeline table exists.
-        self._ensure_indexes(self._SEARCHABLE_TEXT_TABLES)
         signature = self._search_schema_signature()
         if (
             signature

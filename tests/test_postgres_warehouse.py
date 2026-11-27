@@ -130,20 +130,237 @@ def _message_row(*, message_id: str, subject: str, labels: list[str], sync_versi
     }
 
 
-def test_search_view_refresh_takes_advisory_lock(monkeypatch) -> None:
+def test_search_view_refresh_builds_indexes_before_taking_its_lock_and_never_blocks(monkeypatch) -> None:
     warehouse = object.__new__(PostgresWarehouse)
     warehouse._schema = "public"
-    commands: list[tuple[str, tuple | None]] = []
+    steps: list[tuple[str, tuple | None]] = []
 
-    monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append((sql, params)))
-    monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: False)
-    monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: [])
-    monkeypatch.setattr(warehouse, "_raw_command", lambda sql, params=None: commands.append((sql, params)))
+    monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: True)
+    monkeypatch.setattr(warehouse, "_ensure_indexes", lambda tables: steps.append(("indexes", tuple(tables))))
+    monkeypatch.setattr(
+        warehouse,
+        "_query",
+        lambda sql, params=None: steps.append((sql, params)) or [(True,)],
+    )
+    monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: steps.append((sql, params)))
+    monkeypatch.setattr(
+        warehouse, "_ensure_search_views_if_possible_locked", lambda: steps.append(("locked", None))
+    )
 
     warehouse._ensure_search_views_if_possible()
 
-    assert commands[0] == ("SELECT pg_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
-    assert commands[-1] == ("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+    # The index pass (which may run CREATE INDEX CONCURRENTLY) comes first,
+    # outside the lock; the lock is only ever tried, never waited on inside
+    # a blocking pg_advisory_lock statement.
+    assert steps == [
+        ("indexes", ("timeline_events",)),
+        ("SELECT pg_try_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,)),
+        ("locked", None),
+        ("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,)),
+    ]
+
+
+def test_search_view_refresh_skips_without_lock_when_the_timeline_is_absent(monkeypatch) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    warehouse._schema = "public"
+    monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: False)
+    monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: pytest.fail(sql))
+    monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: pytest.fail(sql))
+    monkeypatch.setattr(warehouse, "_ensure_indexes", lambda tables: pytest.fail("no timeline, no index pass"))
+
+    warehouse._ensure_search_views_if_possible()
+
+
+def _second_connection(warehouse: PostgresWarehouse) -> PostgresWarehouse:
+    return PostgresWarehouse(warehouse._database_url, schema=warehouse._schema, initialize=False)
+
+
+def _advisory_lock_waiters(observer: PostgresWarehouse, pids: list[int]) -> list[int]:
+    rows = observer._query(
+        "SELECT pid FROM pg_stat_activity WHERE pid = ANY(%s) "
+        "AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+        (pids,),
+    )
+    return [int(row[0]) for row in rows]
+
+
+def test_ensure_call_during_a_concurrent_index_build_under_the_search_lock_does_not_deadlock(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # The 2026-11-27 deploy: one session held the search-schema lock while it
+    # ran CREATE INDEX CONCURRENTLY; every other ensure_* call queued inside a
+    # blocking pg_advisory_lock statement, and that statement's snapshot is
+    # one the concurrent build must outlast. Postgres killed the build as a
+    # deadlock four times in 15 minutes while the queue filled max_connections.
+    # Whatever a holder does, a waiter must not be such a snapshot.
+    import threading
+
+    warehouse.ensure_timeline_tables()
+    schema = _physical_relation(warehouse, "timeline_events").schema
+    probe = f"{_identifier(schema)}.cic_probe"
+    holder = _second_connection(warehouse)
+    waiter = _second_connection(warehouse)
+    try:
+        holder._raw_command(f"CREATE TABLE {probe} AS SELECT g AS n FROM generate_series(1, 2000) AS g")
+        waiter_pid = int(waiter._query("SELECT pg_backend_pid()")[0][0])
+        holder._raw_command("SELECT pg_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+        waiter_errors: list[BaseException] = []
+
+        def refresh() -> None:
+            try:
+                waiter._ensure_search_views_if_possible()
+            except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
+                waiter_errors.append(exc)
+
+        thread = threading.Thread(target=refresh, daemon=True)
+        thread.start()
+        # Let the waiter reach the lock (its own index pass comes first).
+        settle = time.monotonic() + 3
+        while time.monotonic() < settle and not _advisory_lock_waiters(warehouse, [waiter_pid]):
+            time.sleep(0.05)
+        time.sleep(0.5)
+
+        build_error: BaseException | None = None
+        try:
+            holder._raw_command(f"CREATE INDEX CONCURRENTLY cic_probe_idx ON {probe} (n)")
+        except psycopg2.Error as exc:
+            build_error = exc
+        finally:
+            holder._raw_command("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+        thread.join(timeout=120)
+
+        assert build_error is None, f"the concurrent index build failed: {build_error}"
+        assert not thread.is_alive()
+        assert waiter_errors == []
+        valid = warehouse._query(
+            "SELECT i.indisvalid AND i.indisready FROM pg_index AS i "
+            "WHERE i.indexrelid = to_regclass(%s)",
+            (f"{schema}.cic_probe_idx",),
+        )
+        assert valid == [(True,)]
+    finally:
+        holder.close()
+        waiter.close()
+
+
+def test_search_view_refresh_runs_its_index_pass_without_holding_the_search_lock(
+    warehouse: PostgresWarehouse, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warehouse.ensure_timeline_tables()
+    fresh = _second_connection(warehouse)
+    try:
+        held_during_index_pass: list[bool] = []
+        index_pass = fresh._ensure_indexes
+
+        def spy(tables):
+            rows = fresh._query(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted "
+                "AND pid = pg_backend_pid() AND classid = %s AND objid = %s AND objsubid = 1",
+                (SEARCH_SCHEMA_REFRESH_LOCK_ID >> 32, SEARCH_SCHEMA_REFRESH_LOCK_ID & 0xFFFFFFFF),
+            )
+            held_during_index_pass.append(int(rows[0][0]) > 0)
+            return index_pass(tables)
+
+        monkeypatch.setattr(fresh, "_ensure_indexes", spy)
+
+        fresh._ensure_search_views_if_possible()
+
+        assert held_during_index_pass and not any(held_during_index_pass)
+    finally:
+        fresh.close()
+
+
+def test_search_view_refresh_waiters_give_up_promptly_instead_of_piling_up(
+    warehouse: PostgresWarehouse, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A long holder (an index build, a cold prewarm) must not collect every
+    # ensure_* caller's connection behind it: on 2026-11-27 the queue reached
+    # max_connections=60 and searches were refused. Waiters poll without a
+    # snapshot and skip after a deadline; the holder is doing the same work.
+    import threading
+
+    warehouse.ensure_timeline_tables()
+    monkeypatch.setattr(PostgresWarehouse, "_SEARCH_SCHEMA_LOCK_WAIT_SECONDS", 1.0, raising=False)
+    holder = _second_connection(warehouse)
+    waiters = [_second_connection(warehouse) for _ in range(4)]
+    try:
+        pids = [int(w._query("SELECT pg_backend_pid()")[0][0]) for w in waiters]
+        holder._raw_command("SELECT pg_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+        errors: list[BaseException] = []
+
+        def refresh(target: PostgresWarehouse) -> None:
+            try:
+                target._ensure_search_views_if_possible()
+            except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
+                errors.append(exc)
+
+        caplog.set_level(logging.WARNING, logger="personal_data_warehouse.postgres")
+        started = time.monotonic()
+        threads = [threading.Thread(target=refresh, args=(w,), daemon=True) for w in waiters]
+        for thread in threads:
+            thread.start()
+        blocked_samples = 0
+        while any(thread.is_alive() for thread in threads) and time.monotonic() - started < 15:
+            blocked_samples += len(_advisory_lock_waiters(warehouse, pids))
+            time.sleep(0.05)
+        elapsed = time.monotonic() - started
+        alive = [thread for thread in threads if thread.is_alive()]
+        holder._raw_command("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+        for thread in threads:
+            thread.join(timeout=120)
+
+        assert not alive, "waiters were still queued behind the holder after 15 s"
+        assert elapsed < 10
+        assert blocked_samples == 0, "a waiter blocked inside pg_advisory_lock"
+        assert errors == []
+        assert sum("search schema refresh" in record.getMessage() for record in caplog.records) == len(waiters)
+    finally:
+        holder.close()
+        for w in waiters:
+            w.close()
+
+
+def test_index_pass_drops_a_leftover_invalid_bm25_index_and_rebuilds_it(warehouse: PostgresWarehouse) -> None:
+    # An interrupted CREATE INDEX CONCURRENTLY leaves the name taken by an
+    # invalid index (production after the 2026-11-27 deploy: the agent-work
+    # index not ready, its low-volume partner ready but not valid). The next
+    # index pass must drop and rebuild both rather than skip on "exists".
+    warehouse.ensure_timeline_tables()
+    schema = _physical_relation(warehouse, "timeline_events").schema
+    names = (
+        "timeline_events_search_text_bm25_agent_work_idx",
+        "timeline_events_search_text_bm25_agent_work_lowvol_idx",
+    )
+
+    def state(name: str):
+        return warehouse._query(
+            "SELECT i.indexrelid::bigint, i.indisvalid, i.indisready FROM pg_index AS i "
+            "WHERE i.indexrelid = to_regclass(%s)",
+            (f"{schema}.{name}",),
+        )
+
+    if not all(state(name) for name in names):
+        pytest.skip("this Postgres has no pg_textsearch, so the BM25 indexes are absent")
+    before = {name: state(name)[0][0] for name in names}
+    warehouse._raw_command(
+        "UPDATE pg_index SET indisvalid = false, indisready = false WHERE indexrelid = to_regclass(%s)",
+        (f"{schema}.{names[0]}",),
+    )
+    warehouse._raw_command(
+        "UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass(%s)",
+        (f"{schema}.{names[1]}",),
+    )
+
+    deploy = _second_connection(warehouse)
+    try:
+        deploy.ensure_timeline_tables()
+    finally:
+        deploy.close()
+
+    for name in names:
+        rebuilt = state(name)
+        assert rebuilt and rebuilt[0][1:] == (True, True), name
+        assert rebuilt[0][0] != before[name], f"{name} was not rebuilt"
 
 
 def test_index_refresh_takes_nonblocking_advisory_lock(monkeypatch) -> None:
@@ -269,15 +486,14 @@ def test_search_view_refresh_releases_advisory_lock_on_error(monkeypatch) -> Non
     warehouse = object.__new__(PostgresWarehouse)
     commands: list[tuple[str, tuple | None]] = []
 
-    def command(sql, params=None):
-        commands.append((sql, params))
-        if "pg_advisory_lock" in sql:
-            return
+    def locked():
         raise RuntimeError("ddl failed")
 
-    monkeypatch.setattr(warehouse, "_command", command)
+    monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append((sql, params)))
+    monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: [(True,)])
     monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: True)
     monkeypatch.setattr(warehouse, "_ensure_indexes", lambda tables: None)
+    monkeypatch.setattr(warehouse, "_ensure_search_views_if_possible_locked", locked)
 
     with pytest.raises(RuntimeError, match="ddl failed"):
         warehouse._ensure_search_views_if_possible()
