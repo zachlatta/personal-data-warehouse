@@ -18111,7 +18111,8 @@ class PostgresWarehouse:
         )
 
         # The ATTENTION pool: the identical two-partition shape, taken from the
-        # partial indexes that contain only `self` and `direct`. Used only when
+        # partial indexes that contain only the attention tiers
+        # (SEARCH_TEXT_ATTENTION_PRIORITIES). Used only when
         # the requested tiers are a SUBSET of those -- a call for `noise` or an
         # unscoped call cannot be answered from an index that does not hold
         # those rows, and answering it from there would return silently empty
@@ -18600,14 +18601,17 @@ class PostgresWarehouse:
                 -- immediately so the hint cannot leak into the caller's query.
                 IF sources IS NULL THEN
                     PERFORM set_config('enable_sort', 'off', true);
-                    -- Two pools, one shape. The ATTENTION pool reads the
+                    -- Three pools, one shape. The ATTENTION pool reads the
                     -- partial indexes that contain only """ + SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + r""",
                     -- so it is usable ONLY when every requested tier is one of
                     -- them; anything else (including no filter at all) has to
                     -- read the general indexes or it returns silently empty.
                     -- `priorities` is NULL-normalized to "all tiers" above, so
                     -- an unscoped call correctly fails this test.
-                    -- search_text_pool runs both partitions on parallel
+                    -- search_text_pool applies the same subset rule to the
+                    -- AGENT-WORK pool (""" + SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL + r""") when this
+                    -- test fails, and uses the general pool otherwise.
+                    -- search_text_pool runs a pool's two partitions on parallel
                     -- workers, each as one-shot dynamic SQL: a cached plan for
                     -- this scan re-scores every returned document (14-28s when
                     -- a few are multi-megabyte), so the query text reaches the
