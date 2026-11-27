@@ -486,6 +486,80 @@ launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.browser-hist
 SQL starting points: `base_browser_history.visits`; timeline `source = 'browser_history'`
 (`kind` `visit` or `search`); search scope `sources => ARRAY['browser_history']`.
 
+## Local X Upload Scheduler
+
+The Mac whose Chrome is signed in to x.com (porygon) reads Zach's own X account through a user
+LaunchAgent:
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.x-upload`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.x-upload.plist`
+- Wrapper script: `bin/x-upload-launchd`; status helper `bin/x-upload-status`
+- Run cadence: every 1,800 seconds with `RunAtLoad`
+- Command: `pdw ingest x --mode incremental` (native Go, `app/internal/uploaders/x`)
+- Logs: `~/Library/Logs/personal-data-warehouse/x-upload.run.log` and `.heartbeat`; the run
+  heartbeat posts as pipeline `x`
+- Settings: `X_ACCOUNT=<handle>` in the device runtime's `.env` (required);
+  `X_REQUEST_DELAY_MS` (default 2000) and `X_USER_AGENT` are optional
+
+**Why it runs on the Mac and spends the browser's own login.** X offers no API for a person's
+own likes, bookmarks and mentions short of a paid developer plan, but the x.com web client
+reads all of them from its GraphQL API with the browser's cookie. The uploader reads that
+cookie (`auth_token`, `ct0`, `twid` on `.x.com`) out of Chrome with the same Chromium cookie
+code the session publishers use, so it needs the "Chrome Safe Storage" keychain item with
+Always Allow for `/usr/bin/security`, exactly like `chatgpt-auth`. The cookie never leaves the
+Mac: every request comes from the network and the session X already sees Zach use, and only
+what was read goes to the warehouse. Over SSH the login keychain is locked (`security` exits
+36), so test it under launchd (`launchctl kickstart`), not from an SSH shell.
+
+**What a run reads.** Four streams, each a read-only GraphQL query: `posts`
+(`UserTweetsAndReplies`: his posts, replies and reposts), `likes` (`Likes`), `bookmarks`
+(`Bookmarks`) and `mentions` (`NotificationsTimeline` with `timeline_type: Mentions`). Every
+run reads each stream newest-first until a page holds nothing it has shipped before (at most
+`--pages`, 3), then walks `--backfill-pages` (5) further into history from the cursor the last
+run stopped at (kept in `~/Library/Application Support/personal-data-warehouse/x-upload-state.sqlite`).
+So the first sync of years of likes takes many runs rather than one burst. `--mode full`
+restarts every history walk. X's profile timelines stop at roughly the newest few thousand
+posts, so older history needs the X data archive, which this does not read.
+
+**The live client's bundles are read on every run.** The GraphQL query ids rotate and the
+feature switches change; `Discover` loads `x.com/home` with the session, then the
+`main.*.js` bundle it names on `abs.twimg.com`, for the web client's public bearer token and
+the current query ids. Operations the page did not name fall back to the ids read on
+2026-11-27 (`fallbackOperations` in `client.go`). If x.com stops naming a bundle with the
+token, the run fails with "X changed its web client".
+
+**Failure modes.** A 401/403 is a rejected session and stops the run (exit 1, `/pipelines`
+reads failing through the heartbeat): sign in to x.com in Chrome on porygon as the
+`X_ACCOUNT` handle, then kickstart the job. A 429 stops that stream until the next run and the
+run still exits 0; `x-rate-limit-remaining: 0` ends the run after the page it came with. Any
+other failure of one stream fails the run after the others ran. The run refuses a browser
+signed in to a different account than `X_ACCOUNT`.
+
+**Account risk.** Slack signed Zach out of every device when a Go client spent his desktop
+session ([slack.md](slack.md#publishing-the-slack-session-a-paste-never-a-capture)), and X
+locks accounts it reads as automation. This uploader keeps to a person's volume (a few
+requests per stream every 30 minutes, two seconds apart) and never writes to X. If x.com ever
+signs him out, asks him to verify the account, or locks it, unload the LaunchAgent and tell
+him rather than making the requests look more like a browser.
+
+**Not covered:** DMs (X moved them to its encrypted chat; this uploader does not attempt
+them), likes or bookmarks taken back (the row stays), and his home timeline, which is never
+read.
+
+Install or reinstall (after a `pdw` release with `ingest x` is on porygon and
+`bin/sync-mac-device-runtime porygon` has copied the wrapper):
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.x-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.x-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.x-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.x-upload
+```
+
+SQL starting points: `base_x.posts` joined to `base_x.user_posts` on `(account, post_id)`;
+timeline `source = 'x'` (kind `post`, `metadata->>'post_kind'` `post`/`reply`/`repost`/`quote`);
+search scope `sources => ARRAY['x']`.
+
 ## Local Screen Timelapse Upload Scheduler
 
 The screen timelapse is a periodic image of a device's whole screen, about once a minute while

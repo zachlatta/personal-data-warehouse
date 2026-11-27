@@ -142,6 +142,20 @@ a whole thread; `body_text` is the decoded body, `text` the raw HTML. Timeline s
 `hacker_news`, search scope `hacker_news`: his items and anything he acted on are `self`,
 replies to him `direct`, the rest of a thread `noise`; `timeline.context()` returns the thread.
 
+## X (Twitter)
+
+`base_x.posts` is one row per post archived for his account (`account` is his handle,
+lowercased): `author_screen_name`, `created_at`, `text` (a repost carries `RT @handle: ` and
+the whole reposted text), `conversation_id` (the thread), `in_reply_to_*`, `quoted_post_id`,
+`retweeted_post_id`, `is_retweet`/`is_quote`/`mentions_account` (0/1) and the counts as last
+read. `base_x.user_posts` says WHY (`relation` in `authored`, `liked`, `bookmarked`,
+`mentioned`); X stamps no time on a like or bookmark, so `discovered_at` is when the uploader
+first saw it and `sort_index` is X's own order (larger is newer). A post with no relation rode
+along as context: the post he replied to, quoted or reposted. Timeline source `x`, search
+scope `x`: his posts, reposts, likes and bookmarks are `self`, a reply to him or a mention
+`direct`, context `noise`; `timeline.context()` returns the thread. No DMs. Likes or
+bookmarks he took back stay.
+
 ## GitHub
 
 `base_github.issues` is one row per issue or PR (`is_pull_request = 1`) Zach is involved in

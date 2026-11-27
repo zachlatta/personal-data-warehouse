@@ -494,6 +494,18 @@ into `base_browser_history.visits`. Two timeline adapters (`browser_visit`, `bro
 `browser_history`, tier `self`) carry page views and web searches only; see
 [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md#local-browser-history-upload-scheduler).
 
+## X (Twitter) Sync
+
+`pdw ingest x` (LaunchAgent `com.zachlatta.personal-data-warehouse.x-upload`, every 30 minutes)
+reads Zach's own X account on the Mac whose Chrome is signed in to x.com: his posts and
+replies, likes, bookmarks and mentions, through the same read-only GraphQL queries the x.com
+web client uses, with that browser's login. It posts them to `/ingest/x/batch`, and Dagster's
+`x_drive_inbox_sensor` promotes them into `base_x.posts` (one row per post) and
+`base_x.user_posts` (why each is archived). One timeline adapter (`x_post`, source `x`) files
+his posts, reposts, likes and bookmarks as `self`, replies to him and mentions as `direct`, and
+the posts that ride along as context as `noise`; see
+[docs/agents/local-uploaders.md](docs/agents/local-uploaders.md#local-x-upload-scheduler).
+
 ## Android Message Sync
 
 Every SMS, MMS and RCS message on the Android phone (`pichu`) since it took over Zach's line

@@ -18,6 +18,7 @@ uploader's exec chain).
 | `android-screen-time` | an Android device's usage events and daily usage totals (screen time), read through the PDW usage exporter app; run as root ON each Android device by a Magisk service every 5 minutes; not a Mac command |
 | `scanner` | documents scanned from the network scanner's own panel: a long-running service on a computer on its LAN (mew) that puts PDW names on the panel's Scan to PC button and sends each scan as a PDF; not a Mac command |
 | `browser-history` | this Mac's Chrome, Brave and Safari history (every profile); LaunchAgent every 15 minutes; Safari needs Full Disk Access |
+| `x` | his X account (posts and replies, likes, bookmarks, mentions) through the x.com web client's read-only queries with this Mac's Chrome login; needs `X_ACCOUNT`; LaunchAgent every 30 minutes |
 | `screen-timelapse` | the periodic whole-screen captures (and accessibility trees) of this Mac and of the phone it images, one file per request; `SCREEN_TIMELAPSE_SOURCES` says which folder is which device; LaunchAgent every 5 minutes |
 | `agent-sessions` | Claude Code, Codex, pi, Muse Code, Argon and OpenClaw transcripts from this machine |
 | `muse` | run ON a Muse VM (Meta's hosted agent) by a Muse hook: its transcripts plus its workspace files (memory, goals, feed, podcasts, uploads) |
