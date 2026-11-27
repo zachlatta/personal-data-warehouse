@@ -476,6 +476,13 @@ func (c *Client) UploadScreenTimelapseFile(content []byte, f ScreenTimelapseFile
 	return ScreenTimelapseStored{StoredObject: storedObjectFromPayload(payload), Skipped: skipped}, nil
 }
 
+// --- x ---------------------------------------------------------------------
+
+// UploadXBatch posts a gzipped JSONL batch of X posts and relations.
+func (c *Client) UploadXBatch(gzipBytes []byte, exportedAt string) (StoredObject, error) {
+	return c.post("/ingest/x/batch", gzipBytes, "application/gzip", map[string]string{"exported_at": exportedAt})
+}
+
 // --- voice memos ------------------------------------------------------------
 
 // UploadVoiceMemoAudio lives in resumable.go: a recording streams to a Drive

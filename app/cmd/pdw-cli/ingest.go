@@ -26,6 +26,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/scanner"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/screentimelapse"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/voicememos"
+	xuploader "github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/x"
 )
 
 // localCommand is the shared entry point of every local (non-/api/tools)
@@ -65,6 +66,7 @@ var ingestSources = map[string]localCommand{
 	"scanner":                 scanner.Run,
 	"screen-timelapse":        screentimelapse.Run,
 	"voice-memos":             voicememos.Run,
+	"x":                       xuploader.Run,
 }
 
 // resolveIngestSource returns the uploader for a source, or ok=false when the
@@ -112,6 +114,7 @@ SOURCES
   agent-sessions   Upload AI agent CLI session transcripts
   apple-photos     Upload local Apple Photos originals + metadata
   browser-history  Upload Chrome, Brave and Safari history (every profile)
+  x                Upload his X account: posts, likes, bookmarks, mentions (browser's x.com login)
   claude-desktop   Push the Claude Desktop (claude.ai) session credential
   plaid            Link, repair, list and unlink Plaid Items (sync runs in Dagster)
   manual-finance   Upload finance documents (statements, valuations, exports)

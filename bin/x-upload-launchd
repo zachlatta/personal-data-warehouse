@@ -1,0 +1,54 @@
+#!/bin/zsh
+set -u
+
+# The wrapper's own install dir. On a Mac that is the device runtime
+# ~/.local/share/personal-data-warehouse (bin/ and .env only, no checkout),
+# installed by bin/sync-mac-device-runtime from a mew-dev checkout.
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# `pdw ingest x` reads the x.com login from this Mac's Chrome, reads Zach's own
+# X account through the web client's read-only GraphQL queries, and posts it to
+# the app's /ingest/x/batch endpoint (native Go, app/internal/uploaders/x). It
+# needs no Full Disk Access, but it reads the "Chrome Safe Storage" keychain
+# item, so that item's ACL must say Always Allow for /usr/bin/security (the
+# same grant the chatgpt-auth job uses). X_ACCOUNT in the runtime .env names
+# the handle; the run refuses a browser signed in to any other account.
+# Sourced up here, not just before the heartbeat: pdw_export_app_credentials
+# has to run BEFORE the uploader so an operator-less environment still carries
+# the URL/token pdw would otherwise read from its config file.
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+# `.env` for the uploader's own settings (accounts, Tailscale-direct origin)
+# is read from PDW_INGEST_PROJECT_DIR; pin it so launchd's cwd does not matter.
+export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+LOG_FILE="$LOG_DIR/x-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/x-upload.heartbeat"
+
+mkdir -p "$LOG_DIR"
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+
+echo "[$started_at_iso] starting x upload" >> "$LOG_FILE"
+
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (install a release to ~/.local/bin/pdw or set PDW_BIN)" >> "$LOG_FILE"
+elif ! cd "$REPO_DIR"; then
+  exit_code=1
+  echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
+else
+    "$PDW" ingest x --mode incremental >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+pdw_post_heartbeat "x" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
+echo "[$finished_at_iso] finished x upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

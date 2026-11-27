@@ -340,7 +340,7 @@
       "domain": "x",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Faithful X (Twitter) source data for Zach's account: his posts, likes, bookmarks and mentions."
+      "comment": "X (Twitter). Zach's own account: his posts, likes, bookmarks and mentions."
     },
     {
       "name": "base_comma",
@@ -4217,7 +4217,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "START HERE for X (Twitter). One row per post keyed by post_id; account is Zach's handle; user_posts says why a post is here."
+      "comment": "START HERE for X. One row per post keyed by post_id; account is Zach's handle; user_posts says why a post is here."
     },
     {
       "id": "x_user_posts",
@@ -4229,7 +4229,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Why a post is archived: authored, liked, bookmarked or mentioned."
+      "comment": "Why a post is here. One row per authored / liked / bookmarked / mentioned relation."
     },
     {
       "id": "plaid_item_tokens",

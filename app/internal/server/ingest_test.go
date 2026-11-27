@@ -248,6 +248,29 @@ func TestIngestBrowserHistoryBatchStoresExpectedObject(t *testing.T) {
 	}
 }
 
+func TestIngestXBatchStoresExpectedObject(t *testing.T) {
+	svc, stores := ingestTestService()
+	body := []byte("gzipped-x-batch")
+	exportedAt := "2026-11-27T12:34:56+00:00"
+	target := signedIngestTarget("/ingest/x/batch", body, url.Values{"exported_at": {exportedAt}})
+
+	rec := postIngest(t, svc, target, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	put := stores["x"].lastFile
+	if put == nil {
+		t.Fatal("expected PutFile to be called")
+	}
+	wantKey := "x/inbox/batches/2026/11/20261127T123456Z-" + sha256Hex(body) + ".jsonl.gz"
+	if put.ObjectKey != wantKey {
+		t.Fatalf("object key = %q, want %q", put.ObjectKey, wantKey)
+	}
+	if put.Kind != "x_export_batch" {
+		t.Fatalf("kind = %q", put.Kind)
+	}
+}
+
 func TestIngestAndroidNotificationsBatchStoresExpectedObject(t *testing.T) {
 	svc, stores := ingestTestService()
 	body := []byte("gzipped-notification-batch")

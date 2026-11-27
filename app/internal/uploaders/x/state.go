@@ -1,0 +1,99 @@
+package x
+
+import (
+	"time"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/common"
+)
+
+// State is the uploader's memory between runs: which (stream, post) relations
+// it has already shipped, and when it first saw each (X stamps no time on a
+// like or a bookmark, so that first sighting is the time the warehouse keeps),
+// and how far each stream's history backfill has walked.
+type State struct {
+	db *common.StateDB
+}
+
+// DefaultStateFile is the state path.
+func DefaultStateFile() string {
+	return common.DefaultStateFile("x-upload-state.sqlite")
+}
+
+// OpenState opens the state for the account.
+func OpenState(path, account string) (*State, error) {
+	db, err := common.OpenStateDB(path, []string{
+		`CREATE TABLE IF NOT EXISTS seen (
+			stream TEXT NOT NULL,
+			post_id TEXT NOT NULL,
+			discovered_at TEXT NOT NULL,
+			PRIMARY KEY (stream, post_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS backfill (
+			stream TEXT PRIMARY KEY,
+			cursor TEXT NOT NULL DEFAULT '',
+			done INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL DEFAULT ''
+		)`,
+	}, map[string]string{"schema_version": "1", "account": account}, []string{"seen", "backfill"})
+	if err != nil {
+		return nil, err
+	}
+	return &State{db: db}, nil
+}
+
+// Close releases the database.
+func (s *State) Close() error { return s.db.Close() }
+
+// Discovered is when the uploader first shipped (stream, post), if it has.
+func (s *State) Discovered(stream, postID string) (time.Time, bool, error) {
+	rows, err := common.Query(s.db.DB, "SELECT discovered_at FROM seen WHERE stream = ? AND post_id = ?", stream, postID)
+	if err != nil || len(rows) == 0 {
+		return time.Time{}, false, err
+	}
+	at, err := time.Parse(time.RFC3339Nano, rows[0].String("discovered_at"))
+	if err != nil {
+		return time.Time{}, false, nil
+	}
+	return at.UTC(), true, nil
+}
+
+// MarkDiscovered records a shipped relation (first sighting wins).
+func (s *State) MarkDiscovered(stream, postID string, at time.Time) error {
+	_, err := s.db.DB.Exec(`INSERT INTO seen (stream, post_id, discovered_at) VALUES (?, ?, ?)
+		ON CONFLICT(stream, post_id) DO NOTHING`, stream, postID, at.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+// BackfillState is one stream's walk into its history.
+type BackfillState struct {
+	Started bool
+	Cursor  string
+	Done    bool
+}
+
+// Backfill reads one stream's backfill position.
+func (s *State) Backfill(stream string) (BackfillState, error) {
+	rows, err := common.Query(s.db.DB, "SELECT cursor, done FROM backfill WHERE stream = ?", stream)
+	if err != nil || len(rows) == 0 {
+		return BackfillState{}, err
+	}
+	return BackfillState{Started: true, Cursor: rows[0].String("cursor"), Done: rows[0].Int("done") != 0}, nil
+}
+
+// SetBackfill records where a stream's backfill stands.
+func (s *State) SetBackfill(stream, cursor string, done bool, now time.Time) error {
+	doneFlag := 0
+	if done {
+		doneFlag = 1
+	}
+	_, err := s.db.DB.Exec(`INSERT INTO backfill (stream, cursor, done, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, done = excluded.done, updated_at = excluded.updated_at`,
+		stream, cursor, doneFlag, common.ISOFormat(now))
+	return err
+}
+
+// ResetBackfill starts a stream's history walk over (`--mode full`).
+func (s *State) ResetBackfill(stream string) error {
+	_, err := s.db.DB.Exec("DELETE FROM backfill WHERE stream = ?", stream)
+	return err
+}

@@ -64,7 +64,7 @@ func isolatedEnv(t *testing.T, extra map[string]string) func(string) string {
 func TestIngestSourceTableIsExactlyTheNativeUploaders(t *testing.T) {
 	want := []string{
 		"agent-sessions", "android-call-recordings", "android-location", "android-messages", "android-notifications", "android-photos", "android-screen-time", "apple-contacts", "apple-messages", "apple-notes",
-		"apple-photos", "browser-history", "google-recorder", "manual-finance", "muse", "plaid", "scanner", "screen-timelapse", "voice-memos",
+		"apple-photos", "browser-history", "google-recorder", "manual-finance", "muse", "plaid", "scanner", "screen-timelapse", "voice-memos", "x",
 	}
 	var got []string
 	for name, run := range ingestSources {
@@ -84,7 +84,7 @@ func TestIngestSourceTableIsExactlyTheNativeUploaders(t *testing.T) {
 		t.Fatal("claude-desktop is dispatched before the table, not through it")
 	}
 	names := ingestSourceNames()
-	if !sort.StringsAreSorted(names) || names[len(names)-1] != "voice-memos" || names[0] != "agent-sessions" {
+	if !sort.StringsAreSorted(names) || names[len(names)-1] != "x" || names[0] != "agent-sessions" {
 		t.Fatalf("ingestSourceNames = %v", names)
 	}
 	found := false
@@ -138,7 +138,7 @@ func TestIngestUnknownSourceErrors(t *testing.T) {
 	if !strings.Contains(errOut.String(), "bogus") {
 		t.Fatalf("stderr should name the bad source: %s", errOut.String())
 	}
-	for _, s := range []string{"voice-memos", "apple-notes", "apple-messages", "agent-sessions", "claude-desktop", "plaid", "apple-photos", "manual-finance", "apple-contacts", "browser-history", "screen-timelapse", "google-recorder", "android-notifications", "android-messages", "android-screen-time", "android-location", "android-photos"} {
+	for _, s := range []string{"voice-memos", "apple-notes", "apple-messages", "agent-sessions", "claude-desktop", "plaid", "apple-photos", "manual-finance", "apple-contacts", "browser-history", "screen-timelapse", "google-recorder", "android-notifications", "android-messages", "android-screen-time", "android-location", "android-photos", "x"} {
 		if !strings.Contains(errOut.String(), s) {
 			t.Fatalf("stderr should list valid source %q: %s", s, errOut.String())
 		}

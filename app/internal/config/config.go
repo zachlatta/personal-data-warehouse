@@ -161,6 +161,7 @@ var ingestSourceEnvInfix = map[string]string{
 	"google_recorder":         "GOOGLE_RECORDER",
 	"android_call_recordings": "ANDROID_CALL_RECORDINGS",
 	"browser_history":         "BROWSER_HISTORY",
+	"x":                       "X",
 	"android_notifications":   "ANDROID_NOTIFICATIONS",
 	"android_messages":        "ANDROID_MESSAGES",
 	"android_screen_time":     "ANDROID_SCREEN_TIME",

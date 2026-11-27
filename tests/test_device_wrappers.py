@@ -47,6 +47,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "apple-contacts-upload-launchd": ('"$PDW" ingest apple-contacts --mode incremental', "apple_contacts"),
     "apple-messages-upload-launchd": ('"$PDW" ingest apple-messages --mode incremental', "apple_messages"),
     "browser-history-upload-launchd": ('"$PDW" ingest browser-history --mode incremental', "browser_history"),
+    "x-upload-launchd": ('"$PDW" ingest x --mode incremental', "x"),
     "screen-timelapse-upload-launchd": ('"$PDW" ingest screen-timelapse', "screen_timelapse"),
     "screen-timelapse-upload-android": ('"$PDW" ingest screen-timelapse', "screen_timelapse"),
     "apple-notes-upload-launchd": ('"$PDW" ingest apple-notes --mode incremental', "apple_notes"),
@@ -71,6 +72,7 @@ LAUNCH_AGENTS: dict[str, tuple[str, bool]] = {
     "apple-contacts-upload": ("apple-contacts-upload-launchd", False),
     "apple-messages-upload": ("apple-messages-upload-launchd", False),
     "browser-history-upload": ("browser-history-upload-launchd", False),
+    "x-upload": ("x-upload-launchd", False),
     "screen-timelapse-upload": ("screen-timelapse-upload-launchd", False),
     "apple-notes-upload": ("apple-notes-upload-launchd", False),
     "voice-memos-upload": ("voice-memos-upload-launchd", False),
@@ -157,6 +159,10 @@ def test_uploaders_run_every_five_minutes_and_photos_every_thirty() -> None:
     # History lands in the browser's own database continuously; fifteen
     # minutes keeps the copy of a large History file off the hot path.
     assert interval("browser-history-upload") == 900
+    # X spends the browser's own session; every thirty minutes keeps its
+    # request volume near a person's, which is the line between a reader and
+    # the automation X locks accounts for.
+    assert interval("x-upload") == 1800
     for label in ("chatgpt-auth", "claude-desktop-auth"):
         assert interval(label) == 3600, label
 

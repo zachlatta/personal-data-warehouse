@@ -257,8 +257,12 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// 2026-11-26: contract C2's marts_ops.screen_self_audit, the screen
 	// timelapse checked against the self tier per channel, added one relation
 	// line ("Screen vs self."): 10741. 10741 is that line and no more.
-	if guidance > 10741 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10741)", guidance)
+	//
+	// 2026-11-27: the X source added the base_x schema line ("X (Twitter).")
+	// and its two tables ("START HERE for X.", "Why a post is here."): 10791.
+	// 10791 is those three lines and no more.
+	if guidance > 10791 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10791)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)
