@@ -2633,14 +2633,13 @@ def test_search_text_casts_branch_rows_to_the_physical_hit_type() -> None:
 
 def test_only_timeline_bm25_indexes_are_registered() -> None:
     # BM25 indexes are expensive enough that per-source sprawl once left ~25GB
-    # of dead text indexes behind. Exactly six are justified, and every one
-    # after the first has to index a small slice rather than a second copy of
-    # the corpus: the global timeline index; the PARTIAL index over the
-    # low-volume adapters the broad pool's second partition scans (2.6% of
-    # rows); the two ATTENTION partitions over the attention tiers (2.72% of
-    # rows and 7.9% of document bytes when added); and the two AGENT-WORK
-    # partitions over `self,background` (~3.7% of rows, ~1.5 GB of text on
-    # 2026-11-26). Any further bm25 index needs the same argument made
+    # of dead text indexes behind. Exactly four are justified, and every one
+    # after the first has to indexes a small DISJOINT slice rather than a
+    # second copy of the corpus: the global timeline index; the PARTIAL index
+    # over the low-volume adapters the broad pool's second partition scans
+    # (2.6% of rows); and the two ATTENTION partitions over
+    # priority IN ('self','direct'), which is 2.72% of rows and 7.9% of
+    # document bytes. Any further bm25 index needs the same argument made
     # explicitly.
     import personal_data_warehouse.postgres as postgres_module
 
@@ -2654,8 +2653,6 @@ def test_only_timeline_bm25_indexes_are_registered() -> None:
         "timeline_events_search_text_bm25_lowvol_idx",
         "timeline_events_search_text_bm25_attention_idx",
         "timeline_events_search_text_bm25_attention_lowvol_idx",
-        "timeline_events_search_text_bm25_agent_work_idx",
-        "timeline_events_search_text_bm25_agent_work_lowvol_idx",
     }
     lowvol = bm25_indexes["timeline_events_search_text_bm25_lowvol_idx"].sql
     assert "WHERE adapter IN (" in lowvol, (
@@ -2693,21 +2690,6 @@ def test_only_timeline_bm25_indexes_are_registered() -> None:
     assert "CREATE INDEX CONCURRENTLY" in big.sql, (
         "a multi-minute build on the 45 GB timeline heap must not hold a write lock"
     )
-    # The AGENT-WORK pair (`self,background`, ~3.7% of rows) is argued in
-    # SEARCH_TEXT_AGENT_WORK_PRIORITIES: the recommended prior-agent-work scope
-    # otherwise walks the global index with a heap visit per candidate (14 s
-    # cold on production, 2026-11-26). Same shape rules as the attention pair.
-    agent_big = bm25_indexes["timeline_events_search_text_bm25_agent_work_idx"]
-    agent_small = bm25_indexes["timeline_events_search_text_bm25_agent_work_lowvol_idx"]
-    for spec in (agent_big, agent_small):
-        assert (
-            f"WHERE priority IN ({postgres_module.SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL})"
-            in spec.sql
-        ), f"{spec.name} must be PARTIAL on the agent-work tiers"
-        assert "CREATE INDEX CONCURRENTLY" in spec.sql
-    assert "adapter" not in agent_big.sql and not agent_big.rebuild_on_definition_change
-    assert "adapter IN (" in agent_small.sql and agent_small.rebuild_on_definition_change
-    assert "'noise'" not in postgres_module.SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL
 
 
 def test_search_text_only_references_defined_bm25_indexes() -> None:
@@ -4178,111 +4160,6 @@ def test_search_text_runs_its_pool_partitions_on_parallel_workers(
         "slack_message:pp1",
         "apple_note_revision:pp2",
     }
-
-
-def test_search_text_serves_agent_work_scopes_from_the_agent_work_indexes(
-    warehouse: PostgresWarehouse,
-) -> None:
-    """Contract C6: `self,background` reads the agent-work pair on parallel
-    workers, returns exactly the requested tiers, and falls back to the general
-    pool -- still correct -- while that pair is not built."""
-    if not _pg_textsearch_usable(warehouse):
-        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
-
-    _ensure_all_table_groups(warehouse)
-    warehouse._command(
-        """
-        INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table,
-                                     search_text, priority, actor, title, snippet, context)
-        VALUES ('slack_message', 'aw1', 'slack', 'message', now(), 'slack_messages',
-                'wombat agent work probe', 'self', 'a', 't', 's', 'c'),
-               ('agent_session_turn', 'aw2', 'claude_code', 'turn', now(), 'agent_sessions',
-                'wombat agent work answer', 'background', 'a', 't', 's', 'c'),
-               ('apple_note_revision', 'aw3', 'apple_notes', 'note_edit', now(),
-                'apple_note_revisions', 'wombat agent work note', 'background', 'a', 't', 's', 'c'),
-               ('slack_message', 'aw4', 'slack', 'message', now(), 'slack_messages',
-                'wombat direct message', 'direct', 'a', 't', 's', 'c'),
-               ('gmail_email', 'aw5', 'gmail', 'email', now(), 'gmail_messages',
-                'wombat newsletter', 'noise', 'a', 't', 's', 'c')
-        """
-    )
-    connection = warehouse._connection
-
-    def search(priorities: list[str]) -> tuple[set[str], str]:
-        warehouse._command("LOAD 'auto_explain'")
-        warehouse._command("SET auto_explain.log_min_duration = 0")
-        warehouse._command("SET auto_explain.log_nested_statements = on")
-        warehouse._command("SET client_min_messages = log")
-        del connection.notices[:]
-        try:
-            rows = warehouse._query(
-                "SELECT ref FROM @search_text('wombat', 10, NULL, NULL, %s::text[])",
-                (priorities,),
-            )
-            plans = "".join(connection.notices)
-        finally:
-            warehouse._command("RESET client_min_messages")
-            warehouse._command("RESET auto_explain.log_min_duration")
-        return {ref for (ref,) in rows}, plans
-
-    import personal_data_warehouse.postgres as postgres_module
-
-    def pool_parts(plans: str) -> set[int]:
-        # The partitions the pool statement unioned. Read off the pool's own
-        # logged statement, not the partitions' plans: a partition that runs
-        # on a parallel worker does not log its nested plan to this client.
-        return {
-            int(part)
-            for part in re.findall(r'search_text_pool_partition"?\(\$1, (\d+),', plans)
-        }
-
-    agent_parts = {
-        postgres_module.SEARCH_TEXT_POOL_PART_AGENT_WORK_HIGH_VOLUME,
-        postgres_module.SEARCH_TEXT_POOL_PART_AGENT_WORK_LOW_VOLUME,
-    }
-    general_parts = {
-        postgres_module.SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
-        postgres_module.SEARCH_TEXT_POOL_PART_LOW_VOLUME,
-    }
-
-    refs, plans = search(["self", "background"])
-    assert refs == {
-        "slack_message:aw1",
-        "agent_session_turn:aw2",
-        "apple_note_revision:aw3",
-    }
-    assert pool_parts(plans) == agent_parts, plans
-    assert "Parallel Append" in plans, plans
-
-    refs, plans = search(["background"])
-    assert refs == {"agent_session_turn:aw2", "apple_note_revision:aw3"}
-    assert pool_parts(plans) == agent_parts, plans
-
-    # Not a subset: the general pool, never a partial index.
-    refs, plans = search(["self", "background", "noise"])
-    assert refs == {
-        "slack_message:aw1",
-        "agent_session_turn:aw2",
-        "apple_note_revision:aw3",
-        "gmail_email:aw5",
-    }
-    assert pool_parts(plans) == general_parts, plans
-
-    # A deploy that has not finished the CONCURRENTLY build: same answer from
-    # the general pool rather than an error naming a missing index.
-    warehouse._set_search_path()
-    warehouse._command("DROP INDEX IF EXISTS timeline_events_search_text_bm25_agent_work_idx")
-    try:
-        refs, plans = search(["self", "background"])
-    finally:
-        warehouse._ensured_index_names.discard("timeline_events_search_text_bm25_agent_work_idx")
-        warehouse._ensure_indexes(["timeline_events"])
-    assert refs == {
-        "slack_message:aw1",
-        "agent_session_turn:aw2",
-        "apple_note_revision:aw3",
-    }
-    assert pool_parts(plans) == general_parts, plans
 
 
 def test_search_text_preview_strips_tracking_urls_and_table_scaffolding(warehouse: PostgresWarehouse) -> None:
@@ -7642,8 +7519,6 @@ def test_search_text_broad_candidates_are_scored_through_their_own_partition_ind
         postgres_module.SEARCH_TEXT_POOL_PART_LOW_VOLUME,
         postgres_module.SEARCH_TEXT_POOL_PART_ATTENTION_HIGH_VOLUME,
         postgres_module.SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME,
-        postgres_module.SEARCH_TEXT_POOL_PART_AGENT_WORK_HIGH_VOLUME,
-        postgres_module.SEARCH_TEXT_POOL_PART_AGENT_WORK_LOW_VOLUME,
     ):
         assert f"c.part = {part}" in ranking, (
             f"pool partition {part} has no scoring branch, so its rows are scored "
@@ -8182,7 +8057,7 @@ def test_search_text_pool_is_one_shot_dynamic_sql_with_the_query_inlined() -> No
         "the pool must inline the query as a literal (%1$L), never reference "
         "the plpgsql variable, which makes it a cached parameterized plan"
     )
-    assert pool.count("to_bm25query(%1$L,") == 6, "all six partitions inline the query"
+    assert pool.count("to_bm25query(%1$L,") == 4, "all four partitions inline the query"
     assert "RETURN QUERY EXECUTE format(partition_sql, query) USING priorities, since;" in sql
     assert "($1 IS NULL OR t.priority::text = ANY ($1))" in pool
     assert "($2 IS NULL OR t.occurred_at >= $2)" in pool
@@ -8657,59 +8532,6 @@ def test_the_attention_pool_repeats_the_index_predicate_as_a_literal() -> None:
         assert (
             f"priority IN ({postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})" in spec.sql
         )
-
-
-def test_the_agent_work_scope_is_served_from_the_agent_work_indexes() -> None:
-    """`self,background` (prior agent work) must scan the PARTIAL agent-work pair.
-
-    Contract C6. That scope is ~3.7% of the timeline, so a 5,000-row pool from
-    the global index cost ~53,000 one-at-a-time heap visits: 14.1 s cold on
-    production 2026-11-26 (13.5 s read wait) on an otherwise idle host. The
-    pool chooses the pair only for a SUBSET of its tiers (anything else would
-    come back silently empty), only after the attention pair has had its turn,
-    and only once both indexes are valid (a CONCURRENTLY build a deploy has not
-    finished must not take this scope's searches down).
-    """
-    import personal_data_warehouse.postgres as postgres_module
-
-    assert postgres_module.SEARCH_TEXT_AGENT_WORK_PRIORITIES == ("self", "background")
-    sql = _search_text_function_sql()
-    pool_fn = sql[sql.index("CREATE OR REPLACE FUNCTION @search_text_pool(") :]
-    pool_fn = pool_fn[: pool_fn.index("$pool$;")]
-    attention_at = pool_fn.index("IF attention THEN")
-    agent_at = pool_fn.index(
-        "priorities <@ ARRAY[" + postgres_module.SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL + "]"
-    )
-    general_at = pool_fn.index("ELSE\n")
-    assert attention_at < agent_at < general_at
-    agent_branch = pool_fn[agent_at:general_at]
-    assert "priorities IS NOT NULL" in pool_fn[attention_at:agent_at]
-    for name in (
-        "timeline_events_search_text_bm25_agent_work_idx",
-        "timeline_events_search_text_bm25_agent_work_lowvol_idx",
-    ):
-        assert f"to_regclass('{name}')" in agent_branch, (
-            f"the agent-work pool must check {name} is built before naming it"
-        )
-    assert "indisvalid" in agent_branch and "indisready" in agent_branch
-    agent_parts = {
-        int(part)
-        for part in re.findall(r"@search_text_pool_partition\(\$1, (\d+),", agent_branch)
-    }
-    assert agent_parts == {
-        postgres_module.SEARCH_TEXT_POOL_PART_AGENT_WORK_HIGH_VOLUME,
-        postgres_module.SEARCH_TEXT_POOL_PART_AGENT_WORK_LOW_VOLUME,
-    }
-    partitions = _search_text_pool_partitions_sql()
-    literal = f"t.priority IN ({postgres_module.SEARCH_TEXT_AGENT_WORK_PRIORITIES_SQL})"
-    assert partitions.count(literal) == 2, (
-        "both agent-work partitions must carry the index predicate as a literal"
-    )
-    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_agent_work_idx')" in partitions
-    assert (
-        "to_bm25query(%1$L, 'timeline_events_search_text_bm25_agent_work_lowvol_idx')"
-        in partitions
-    )
 
 
 def test_a_non_subset_priority_call_keeps_the_general_indexes() -> None:
