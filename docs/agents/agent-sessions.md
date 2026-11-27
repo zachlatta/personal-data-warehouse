@@ -496,6 +496,42 @@ is reachable only through the agent's own read-only `muse.db` tool, not from a s
 its phone data (contacts, calendar, health, media library) was empty for this account on
 2026-09-28. Its connectors read other systems PDW already syncs.
 
+## How a session and its turns get a tier
+
+The `agent_session` row is `self` when Zach opened it and `background` when a program did:
+an orchestrator or schedule envelope, a provider subagent flag, a harness preamble, a
+dispatch from an app, or an opening prompt that recurs on a clock (daily or weekly rules,
+or the same long opener in four sessions). A user turn is `self` only inside a `self`
+session and only when it is not harness-injected or delivered by another agent. The rules
+are in `_agent_session_adapter` / `_AGENT_TURN_PRIORITY` in the timeline module, tested in
+`tests/test_timeline_priority_automation.py`.
+
+Two properties keep them from going stale:
+
+- **Late evidence.** Recurrence and agent-to-agent delivery are proven by rows that land
+  *after* the session (the next runs of a new hourly job, a delivery tool call uploaded
+  from another host). Both adapters re-walk their own `self` rows of the last 15 days on
+  every pass (`AGENT_PRIORITY_REFRESH_HOURS`), so a new job's first runs converge to
+  `background`. Measured on prod 2026-11-26, the two refresh queries took about 1 s and
+  2 s per pass.
+- **Re-walk order.** A turn copies its session row's tier, so `agent_session_turn`
+  declares `backfill_after="agent_session"`: when the session adapter re-walks history,
+  the turn adapter's history walk restarts and waits for it, even if only the session
+  rules changed.
+
+Only the opening prompt's `cwd` is the launch directory. Claude Code records the current
+`cwd` on every line, so a `cwd` rule (a probe launched from `.factory-scratch`) is a
+session rule, never a turn rule.
+
+A one-shot schedule never recurs, so only its prompt can show it is one. Nothing in the
+transcript marks a Paseo schedule launch (a schedule run and a session Zach types into
+both arrive as `sdk-cli` with the same metadata rows). The rules therefore read the run
+prompts the `recurring-agent-tasks` skill writes: the standard "Recurring desk task …
+You are one run of Paseo schedule …" line (even when hard-wrapped), or a titled header
+("One dated follow-up:", "Recurring desk watch:") together with the desk work item's
+`state.json`. A schedule prompt in none of these shapes stays `self`, so new schedule
+prompts should keep the standard line.
+
 ## Payment data and credentials in conversations
 
 The conversation batch HTTP endpoint redacts payment card data before object

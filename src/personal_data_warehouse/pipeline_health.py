@@ -64,6 +64,7 @@ from personal_data_warehouse.relations import (
     relation as canonical_relation,
 )
 from personal_data_warehouse.source_sla import SOURCE_UPSTREAM_HEALTH_VIEW
+from personal_data_warehouse.screen_self_audit import run_screen_self_audit
 
 logger = logging.getLogger(__name__)
 
@@ -2386,6 +2387,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "script_runs": _support("agent_usage", "occurred_at", "occurred_at", note="traffic-dependent script telemetry; no calls is not a collector outage"),
     "search_request_timing_state": _state("search_requests", "ticked_at"),
     "timeline_priority_mix": _support("pipeline_health", "collected_at", note="per-source tier mix, last 7 days"),
+    "screen_self_audit": _support("pipeline_health", "collected_at", note="daily screenshot-vs-self audit runs"),
     "priority_benchmark_labels": _support("priority_benchmark", "updated_at", note="private label file mirror"),
     "priority_benchmark_results": _data("priority_benchmark", "collected_at"),
     "agent_usage": _data("agent_usage", "collected_at", "newest_session_at"),
@@ -2687,7 +2689,20 @@ class PipelineHealthCollector:
         self._warehouse.write_mart_view_health(marts, collected_at=collected_at)
         if mix is not None:
             self._warehouse.write_timeline_priority_mix(mix, collected_at=collected_at)
+        self.collect_screen_self_audit(collected_at)
         return pipelines, tables, marts
+
+    def collect_screen_self_audit(self, now: datetime) -> None:
+        """Record the daily screenshot-vs-self audit when one is due.
+
+        A failure keeps the previous runs: the mart reads ``unknown`` once the
+        newest run is stale, which is what a missing measurement means.
+        """
+        try:
+            with self._probe_budget(PRIORITY_MIX_STATEMENT_TIMEOUT_MS):
+                run_screen_self_audit(self._warehouse, now=now)
+        except psycopg2.Error as error:
+            logger.warning("screen self audit failed: %s", error)
 
     def run(self) -> tuple[list[PipelineSnapshot], list[TableSnapshot]]:
         """Collect and persist, returning the pipeline and table snapshots."""

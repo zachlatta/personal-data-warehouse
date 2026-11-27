@@ -2953,6 +2953,23 @@ AGENT_FAILURE_SHAPE_COLUMNS = (
     "collected_at",
 )
 
+# One screenshot-vs-self audit run, per channel (screen_self_audit.py). Facts
+# only: marts_ops.screen_self_audit derives the rates and the verdict.
+SCREEN_SELF_AUDIT_COLUMNS = (
+    "measured_at",
+    "channel",
+    "adapters",
+    "window_start_at",
+    "window_end_at",
+    "sent_frames",
+    "sent_frames_matched",
+    "draft_frames",
+    "draft_frames_matched",
+    "self_events",
+    "self_events_with_screen",
+    "collected_at",
+)
+
 # One row per (source, priority tier) over the last seven days of
 # timeline.events, taken by the pipeline_health collector. Contract C2 says
 # every row is classified into one of five tiers; this is the surface that
