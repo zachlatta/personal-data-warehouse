@@ -17539,9 +17539,11 @@ class PostgresWarehouse:
         # four times in 15 minutes, while the queued sessions filled
         # max_connections and searches were refused. So:
         # - the timeline indexes search_text() references are built first,
-        #   under _ensure_indexes' own try-lock and outside this one, so the
-        #   function can still never point at a not-yet-built index but no
-        #   one waits on this lock while a build runs; and
+        #   under _ensure_indexes' own try-lock and outside this one, so no
+        #   one waits on this lock while a build runs. When another session
+        #   holds that try-lock this pass skips and the function may be
+        #   created before a new index is valid; the agent-work arm checks
+        #   its pair at run time for exactly that case; and
         # - waiters poll for the lock between statements, holding no
         #   transaction or snapshot, and give up after a deadline instead of
         #   collecting connections behind a slow holder.
@@ -17582,8 +17584,7 @@ class PostgresWarehouse:
             delay = min(delay * 2, 0.5)
 
     def _ensure_search_views_if_possible_locked(self) -> None:
-        if not all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
-            return
+        # The caller has already checked that the searched tables exist.
         signature = self._search_schema_signature()
         if (
             signature

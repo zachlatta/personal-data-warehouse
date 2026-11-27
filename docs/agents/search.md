@@ -218,7 +218,7 @@ keeps the general pair. Their scoring arms name the index through a scalar sub-S
 `IMMUTABLE` `to_bm25query()` is folded at plan time even in a CASE arm no row reaches, and
 it raises on a missing index.
 
-**No index build runs under the search-schema lock (since the 2026-11-27 deploy).** The
+**No index build runs under the search-schema lock (since 2026-11-27).** The
 first deploy of this pair built it inside `_ensure_search_views_if_possible`, which held
 `SEARCH_SCHEMA_REFRESH_LOCK_ID` while every other ensure call queued in a blocking
 `pg_advisory_lock`. A concurrent build waits for every older snapshot, and each queued

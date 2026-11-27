@@ -280,7 +280,7 @@ def test_search_view_refresh_waiters_give_up_promptly_instead_of_piling_up(
     import threading
 
     warehouse.ensure_timeline_tables()
-    monkeypatch.setattr(PostgresWarehouse, "_SEARCH_SCHEMA_LOCK_WAIT_SECONDS", 1.0, raising=False)
+    monkeypatch.setattr(PostgresWarehouse, "_SEARCH_SCHEMA_LOCK_WAIT_SECONDS", 1.0)
     holder = _second_connection(warehouse)
     waiters = [_second_connection(warehouse) for _ in range(4)]
     try:
