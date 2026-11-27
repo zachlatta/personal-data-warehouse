@@ -87,6 +87,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_hacker_news_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
+    wh.ensure_x_tables()
     wh.ensure_android_notifications_tables()
     wh.ensure_android_messages_tables()
     wh.ensure_android_location_tables()
@@ -197,7 +198,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # Android device's screen time.
         # +1 base: base_scans.documents, documents scanned from the scanner's panel.
         # +1 base: base_android_photos.files, the Pixel's gallery.
-        "base": 103,
+        # +2 base: base_x.posts/.user_posts, Zach's X posts, likes, bookmarks
+        # and mentions from the Mac uploader.
+        "base": 105,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter

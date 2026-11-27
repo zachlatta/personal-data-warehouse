@@ -2760,6 +2760,73 @@ _HACKER_NEWS_ITEM = _simple_adapter(
     ),
 )
 
+# --- X (Twitter) ----------------------------------------------------------------
+# `account` is Zach's handle, lowercased by the reader; handles are
+# case-insensitive on X, so the author comparison lowers it too.
+_X_SELF = "lower(t.author_screen_name) = t.account"
+_X_RELATION = (
+    "EXISTS (SELECT 1 FROM @x_user_posts u WHERE u.account = t.account "
+    "AND u.post_id = t.post_id AND u.relation IN ({relations}))"
+)
+_X_MENTIONED = _X_RELATION.format(relations="'mentioned'")
+_X_ACTED_ON = _X_RELATION.format(relations="'liked', 'bookmarked'")
+
+_X_POST = _simple_adapter(
+    name="x_post",
+    source_table="x_posts",
+    source="x",
+    kind="post",
+    from_sql="@x_posts t",
+    event_id="concat_ws('|', t.account, t.post_id)",
+    event_ts="t.created_at",
+    ingest_ts="t.synced_at",
+    actor="concat('@', t.author_screen_name)",
+    title=(
+        "CASE WHEN t.is_retweet <> 0 THEN concat('X: @', t.author_screen_name, ' reposted') "
+        "WHEN t.in_reply_to_post_id <> '' "
+        "THEN concat('X: @', t.author_screen_name, ' replied to @', t.in_reply_to_screen_name) "
+        "ELSE concat('X: @', t.author_screen_name) END"
+    ),
+    snippet=_snippet("t.text"),
+    # The thread is one conversation: keying context by the root post makes
+    # the generic (source, context) walk return the thread around a hit.
+    context="t.conversation_id",
+    source_pk="jsonb_build_object('account', t.account, 'post_id', t.post_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'post_kind', CASE WHEN t.is_retweet <> 0 THEN 'repost' "
+        "WHEN t.in_reply_to_post_id <> '' THEN 'reply' "
+        "WHEN t.is_quote <> 0 THEN 'quote' ELSE 'post' END, "
+        "'url', t.url, "
+        "'author_name', t.author_name, "
+        "'in_reply_to_post_id', t.in_reply_to_post_id, "
+        "'quoted_post_id', t.quoted_post_id, "
+        "'retweeted_post_id', t.retweeted_post_id, "
+        "'like_count', t.like_count, "
+        "'retweet_count', t.retweet_count, "
+        "'reply_count', t.reply_count, "
+        "'view_count', t.view_count, "
+        "'relations', COALESCE((SELECT array_agg(u.relation ORDER BY u.relation) "
+        "FROM @x_user_posts u WHERE u.account = t.account AND u.post_id = t.post_id), "
+        "ARRAY[]::text[]))"
+    ),
+    search_text=_search_concat("t.text", "t.author_screen_name", "t.author_name"),
+    # self: Zach wrote it (a post, reply or repost). direct: someone else
+    # addressed him -- a reply to him, an @-mention, or a post X filed under
+    # his Mentions. self again: he liked or bookmarked someone else's post
+    # (an action he took, the rule that keeps an HN upvote at self). noise:
+    # the context that rode along (the post he replied to, quoted or
+    # reposted); nobody in it is talking to him.
+    priority=(
+        "CASE "
+        f"WHEN {_X_SELF} THEN 'self' "
+        "WHEN lower(t.in_reply_to_screen_name) = t.account OR t.mentions_account <> 0 "
+        f"OR {_X_MENTIONED} THEN 'direct' "
+        f"WHEN {_X_ACTED_ON} THEN 'self' "
+        "ELSE 'noise' END"
+    ),
+)
+
 # --- GitHub ---------------------------------------------------------------------
 # `account` is Zach's GitHub login. Logins are case-insensitive on GitHub, so
 # every comparison lowers both sides.
@@ -4076,6 +4143,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _WHOOP_PRIVATE_HEALTHSPAN,
     _WHOOP_PRIVATE_COACH,
     _HACKER_NEWS_ITEM,
+    _X_POST,
     _GITHUB_COMMIT,
     _GITHUB_ISSUE,
     _GITHUB_COMMENT,
@@ -4319,6 +4387,8 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         # context is the conversation id, so (source, context) IS the conversation.
         "whoop_private_coach",
         "hacker_news_item",
+        # context is the conversation id: (source, context) IS the thread.
+        "x_post",
         # context is repo#number: (source, context) IS the issue's conversation.
         "github_commit",
         "github_issue",
@@ -4758,6 +4828,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "hacker_news_items": _events(),
     "hacker_news_user_items": _detail(
         "hacker_news_items", "why an item is archived (submitted / favorited / upvoted / hidden)"
+    ),
+    "x_posts": _events(),
+    "x_user_posts": _detail(
+        "x_posts", "why a post is archived (authored / liked / bookmarked / mentioned)"
     ),
     "hacker_news_profile": _entity("the HN account's current karma and about text"),
     "hacker_news_sync_state": _state("per-list Hacker News walk state"),

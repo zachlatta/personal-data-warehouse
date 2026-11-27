@@ -2446,6 +2446,7 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_hacker_news_tables()
     warehouse.ensure_github_tables()
     warehouse.ensure_browser_history_tables()
+    warehouse.ensure_x_tables()
     warehouse.ensure_android_notifications_tables()
     warehouse.ensure_android_messages_tables()
     warehouse.ensure_android_location_tables()

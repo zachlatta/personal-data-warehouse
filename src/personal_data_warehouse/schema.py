@@ -3719,6 +3719,73 @@ BROWSER_HISTORY_VISIT_COLUMNS = (
 )
 
 
+# --- X (Twitter) ------------------------------------------------------------
+#
+# Zach's own X account, read by `pdw ingest x` on the Mac whose Chrome is
+# signed in to x.com (the web client's GraphQL API, with that browser's
+# session) and promoted from the Drive inbox. `account` is his handle,
+# lowercased; every row is keyed by it so the timeline's self/direct decision
+# is a column comparison. A post is archived because he wrote it, liked it,
+# bookmarked it or was mentioned in it (x_user_posts says which), or because
+# it rode along as the context of one of those (the post he replied to, quoted
+# or reposted), which carries no relation.
+X_POST_COLUMNS = (
+    "account",
+    # X's numeric id (a snowflake), stored as text like every provider id here.
+    "post_id",
+    "author_user_id",
+    # The author's handle and display name when the post was read.
+    "author_screen_name",
+    "author_name",
+    "created_at",
+    # The full text: a long post's note text when it has one, else full_text.
+    # A repost carries "RT @handle: " and the reposted post's whole text.
+    "text",
+    "lang",
+    # The thread's root post id; keys the timeline's context stream.
+    "conversation_id",
+    "in_reply_to_post_id",
+    "in_reply_to_user_id",
+    "in_reply_to_screen_name",
+    "quoted_post_id",
+    "retweeted_post_id",
+    # 1 for a repost (retweet) and for a quote post.
+    "is_retweet",
+    "is_quote",
+    # 1 when the post @-mentions the account.
+    "mentions_account",
+    # Engagement counts as X reported them when the post was last read.
+    "reply_count",
+    "retweet_count",
+    "like_count",
+    "quote_count",
+    "bookmark_count",
+    "view_count",
+    "url",
+    # The tweet result exactly as the GraphQL API returned it.
+    "raw_json",
+    "exported_at",
+    "synced_at",
+    "sync_version",
+)
+
+#: Why a post is in the archive. One row per (post, relation): authored /
+#: liked / bookmarked / mentioned. X stamps no time on a like or a bookmark,
+#: so `discovered_at` is when the uploader first saw the relation and
+#: `sort_index` is X's own ordering of the list (newest first, larger is
+#: newer). A like or bookmark taken back is not detected: the row stays.
+X_USER_POST_COLUMNS = (
+    "account",
+    "post_id",
+    "relation",
+    "discovered_at",
+    "sort_index",
+    "exported_at",
+    "synced_at",
+    "sync_version",
+)
+
+
 # --- Android notifications -------------------------------------------------
 #
 # One row per notification event on an Android phone, written by the PDW

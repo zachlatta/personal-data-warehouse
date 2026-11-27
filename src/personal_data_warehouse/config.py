@@ -328,6 +328,14 @@ class AppleContactsConfig:
 
 
 @dataclass(frozen=True)
+class XConfig:
+    """Where the Mac X uploader's batches land (via the app)."""
+
+    google_drive_account: str
+    google_drive_folder_id: str
+
+
+@dataclass(frozen=True)
 class AndroidNotificationsConfig:
     """Where the phone's notification uploader's batches land (via the app)."""
 
@@ -720,6 +728,7 @@ class Settings:
     apple_messages: AppleMessagesConfig | None = None
     apple_contacts: AppleContactsConfig | None = None
     browser_history: BrowserHistoryConfig | None = None
+    x: XConfig | None = None
     android_notifications: AndroidNotificationsConfig | None = None
     android_messages: AndroidMessagesConfig | None = None
     android_location: AndroidLocationConfig | None = None
@@ -802,6 +811,8 @@ class Settings:
             configured_domains.add(email_domain(self.apple_contacts.google_drive_account))
         if self.browser_history is not None:
             configured_domains.add(email_domain(self.browser_history.google_drive_account))
+        if self.x is not None:
+            configured_domains.add(email_domain(self.x.google_drive_account))
         if self.android_notifications is not None:
             configured_domains.add(email_domain(self.android_notifications.google_drive_account))
         if self.android_messages is not None:
@@ -887,6 +898,7 @@ def load_settings(
     require_apple_messages: bool = False,
     require_apple_contacts: bool = False,
     require_browser_history: bool = False,
+    require_x: bool = False,
     require_android_notifications: bool = False,
     require_android_messages: bool = False,
     require_android_location: bool = False,
@@ -1358,6 +1370,33 @@ def load_settings(
             account=browser_history_account,
             google_drive_account=browser_history_google_drive_account,
             google_drive_folder_id=browser_history_google_drive_folder_id,
+        )
+
+    # X: the same shared ingest folder and account as browser history; the
+    # app files the Mac uploader's batches there. The account rows are keyed
+    # by is the X handle each batch carries, not a configured one.
+    x_google_drive_account = (
+        os.getenv("X_GOOGLE_DRIVE_ACCOUNT") or browser_history_google_drive_account
+    ).strip()
+    x_google_drive_folder_id = (
+        os.getenv("X_GOOGLE_DRIVE_FOLDER_ID") or browser_history_google_drive_folder_id
+    ).strip()
+    x: XConfig | None = None
+    if require_x or os.getenv("X_GOOGLE_DRIVE_FOLDER_ID"):
+        if not x_google_drive_account:
+            raise ValueError(
+                "X_GOOGLE_DRIVE_ACCOUNT, BROWSER_HISTORY_GOOGLE_DRIVE_ACCOUNT "
+                "or GMAIL_ACCOUNTS must be set for X sync"
+            )
+        if not x_google_drive_folder_id:
+            raise ValueError(
+                "X_GOOGLE_DRIVE_FOLDER_ID, BROWSER_HISTORY_GOOGLE_DRIVE_FOLDER_ID, "
+                "APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID, "
+                "or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        x = XConfig(
+            google_drive_account=x_google_drive_account,
+            google_drive_folder_id=x_google_drive_folder_id,
         )
 
     # Android notifications: the same shared ingest folder and account as
@@ -2427,6 +2466,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if browser_history:
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if x:
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if android_notifications:
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if android_messages:
@@ -2493,6 +2534,7 @@ def load_settings(
         apple_messages=apple_messages,
         apple_contacts=apple_contacts,
         browser_history=browser_history,
+        x=x,
         android_notifications=android_notifications,
         android_messages=android_messages,
         android_location=android_location,

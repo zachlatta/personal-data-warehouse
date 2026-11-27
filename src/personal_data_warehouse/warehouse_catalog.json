@@ -335,6 +335,14 @@
       "comment": "Faithful hacker news source data: Zach's items and lists plus the full discussion under every story he touched; not a mirror of HN."
     },
     {
+      "name": "base_x",
+      "layer": "base",
+      "domain": "x",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Faithful X (Twitter) source data for Zach's account: his posts, likes, bookmarks and mentions."
+    },
+    {
       "name": "base_comma",
       "layer": "base",
       "domain": "comma",
@@ -4198,6 +4206,30 @@
       "discoverable": false,
       "query_access": "denied",
       "secret": true
+    },
+    {
+      "id": "x_posts",
+      "kind": "table",
+      "layer": "base",
+      "domain": "x",
+      "schema": "base_x",
+      "name": "posts",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "START HERE for X (Twitter). One row per post keyed by post_id; account is Zach's handle; user_posts says why a post is here."
+    },
+    {
+      "id": "x_user_posts",
+      "kind": "table",
+      "layer": "base",
+      "domain": "x",
+      "schema": "base_x",
+      "name": "user_posts",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Why a post is archived: authored, liked, bookmarked or mentioned."
     },
     {
       "id": "plaid_item_tokens",

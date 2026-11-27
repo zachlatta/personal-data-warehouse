@@ -738,6 +738,23 @@ PIPELINES: tuple[Pipeline, ...] = (
         detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
+        "x",
+        "X (Twitter)",
+        cadence="uploader every 30 min",
+        transport="Mac LaunchAgent (x.com GraphQL with Chrome's session) → /ingest/x/batch → Drive inbox → Dagster",
+        data=2 * DAY,
+        basis=(
+            "every run re-reads the newest page of his posts, likes, bookmarks and"
+            " mentions and rewrites those rows, so a write older than 2 days (late at 4)"
+            " means the uploader stopped landing anything. The run heartbeat in"
+            " ops.uploader_heartbeats is what catches x.com rejecting the session"
+        ),
+        note="run heartbeat posted by bin/x-upload-launchd",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("x"),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
+    ),
+    _source(
         "screen_timelapse",
         "Screen timelapse",
         cadence="capture every minute while in use; uploader every 5 min",
@@ -2216,6 +2233,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "github_sync_state": _state("github", "updated_at"),
     "hacker_news_items": _data("hacker_news", "synced_at", "posted_at"),
     "hacker_news_user_items": _data("hacker_news", "synced_at"),
+    "x_posts": _data("x", "synced_at", "created_at"),
+    "x_user_posts": _data("x", "synced_at"),
     "hacker_news_profile": _support("hacker_news", "synced_at", note="profile snapshot"),
     "hacker_news_sync_state": _state("hacker_news", "updated_at"),
     "hacker_news_sessions": _state(

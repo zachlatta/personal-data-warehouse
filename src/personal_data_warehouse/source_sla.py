@@ -281,6 +281,21 @@ SOURCE_UPSTREAM_CHECKS: tuple[UpstreamCheck, ...] = (
         observation_interval=2 * HOUR,
     ),
     UpstreamCheck(
+        pipeline="x",
+        scope="account",
+        evidence=(
+            "x.com's own UserTweetsAndReplies timeline: the newest post Zach wrote on its"
+            " first page, read with the browser's session every uploader run"
+        ),
+        # The exact post by its id: present means it landed, and then the
+        # observation's own time stands in for PDW's.
+        pdw_newest_sql="""(SELECT o.upstream_newest_at FROM @x_posts p
+            WHERE p.account = o.scope AND p.post_id = o.upstream_newest_id LIMIT 1)""",
+        # Uploaded every 30 minutes, then the Drive reader.
+        tolerance=2 * HOUR,
+        observation_interval=4 * HOUR,
+    ),
+    UpstreamCheck(
         pipeline="android_photos",
         scope="account",
         evidence=(
@@ -358,6 +373,7 @@ SOURCE_UPSTREAM_INPUT_TABLES: tuple[str, ...] = (
     "apple_contact_cards",
     "apple_notes",
     "browser_history_visits",
+    "x_posts",
     "android_photos_files",
     "android_messages",
     "android_screen_time_events",

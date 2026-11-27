@@ -2273,6 +2273,7 @@ def _seed_health(wh: PostgresWarehouse) -> None:
     wh.ensure_hacker_news_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
+    wh.ensure_x_tables()
     wh.ensure_android_notifications_tables()
     wh.ensure_android_messages_tables()
     wh.ensure_android_location_tables()

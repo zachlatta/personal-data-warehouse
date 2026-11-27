@@ -113,6 +113,14 @@ func timelineDeepLinkFor(row map[string]any, env timelineLinkEnv) *timelineDeepL
 			return nil
 		}
 		return &timelineDeepLink{URL: page, Label: "Open page"}
+	case sourceTable == "x_posts":
+		// The post on x.com, built from its id rather than trusted from the
+		// stored URL, so a hit never links anywhere but x.com.
+		postID := linkString(pk, "post_id")
+		if postID == "" || strings.Trim(postID, "0123456789") != "" {
+			return nil
+		}
+		return &timelineDeepLink{URL: "https://x.com/i/status/" + postID, Label: "Open on X"}
 	case sourceTable == "contact_cards" || sourceTable == "apple_contact_cards":
 		return contactDeepLink(pk)
 	case sourceTable == "ai_conversation_events":

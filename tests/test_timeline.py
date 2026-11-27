@@ -89,6 +89,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_comma_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
+    wh.ensure_x_tables()
     wh.ensure_android_notifications_tables()
     wh.ensure_android_messages_tables()
     wh.ensure_android_location_tables()
@@ -1211,8 +1212,45 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         ]
     )
     wh.upsert_hacker_news_user_items(account="zachlatta", relation="upvoted", item_ids=["100"], now=_NOW)
+    _seed_x(wh)
     _seed_github(wh)
     _seed_feed(wh)
+
+
+def _seed_x(wh: PostgresWarehouse) -> None:
+    """X: one post per classification branch (self / direct / self / direct /
+    noise / self), oldest first: his post, a reply to him (his handle in a
+    different case), a post he liked, a post X filed under his mentions, the
+    post he quoted, and his repost."""
+
+    def post(post_id: str, hours: int, author: str, text: str, **extra) -> dict:
+        return {
+            "account": "zachlatta", "post_id": post_id, "author_user_id": f"u-{author}",
+            "author_screen_name": author, "author_name": author.title(), "created_at": _NOW - timedelta(hours=hours),
+            "text": text, "lang": "en", "conversation_id": extra.pop("conversation_id", post_id),
+            "url": f"https://x.com/{author}/status/{post_id}", "raw_json": {"rest_id": post_id},
+            "synced_at": _NOW, "exported_at": _NOW, **extra,
+        }
+
+    wh.insert_x_posts(
+        [
+            post("x1", 9, "zachlatta", "Shipping a new warehouse source"),
+            post(
+                "x2", 8, "replier", "Congrats on the launch", conversation_id="x1",
+                in_reply_to_post_id="x1", in_reply_to_user_id="u-zachlatta", in_reply_to_screen_name="ZachLatta",
+            ),
+            post("x3", 7, "writer", "A thread about databases"),
+            post("x4", 6, "fan", "Look at what the team built"),
+            post("x5", 5, "quoted", "The post that got quoted"),
+            post("x6", 4, "zachlatta", "RT @writer: A thread about databases", is_retweet=1, retweeted_post_id="x3"),
+        ]
+    )
+    wh.insert_x_user_posts(
+        [
+            {"account": "zachlatta", "post_id": post_id, "relation": relation, "discovered_at": _NOW, "synced_at": _NOW}
+            for post_id, relation in (("x1", "authored"), ("x3", "liked"), ("x4", "mentioned"), ("x6", "authored"))
+        ]
+    )
 
 
 def _gh_ts(hours: int) -> str:
@@ -1507,6 +1545,8 @@ EXPECTED_SEEDED_PRIORITIES = {
     # test_backfill_normalizes_every_source; this dict is built newest-first
     # and keeps the LAST row per adapter, which is the upvoted story (self).
     "hacker_news_item": "self",
+    # Oldest seeded post: Zach's own.
+    "x_post": "self",
     # Oldest row per adapter: his commit, the old docs issue (noise), his own
     # comment on it (self) and the star (self).
     "github_commit": "self",
@@ -1565,6 +1605,7 @@ EXPECTED_SEEDED_EVENTS = {
     # The hidden tool turn is machinery, not conversation.
     "whoop_private_coach": 2,
     "hacker_news_item": 4,
+    "x_post": 6,
     "github_commit": 1,
     "github_issue": 3,
     # The empty COMMENTED review envelope is not an event.
@@ -1757,6 +1798,27 @@ def test_backfill_normalizes_every_source(warehouse):
     assert hn["100"]["metadata"]["relations"] == ["upvoted"]
     assert hn["100"]["source_table"] == "hacker_news_items"
     assert hn["102"]["actor"] == "replier"
+
+    # X: one row per classification branch; a reply shares its thread's context.
+    x_posts = {r["source_pk"]["post_id"]: r for r in rows if r["adapter"] == "x_post"}
+    assert {k: v["priority"] for k, v in x_posts.items()} == {
+        "x1": "self",  # his post
+        "x2": "direct",  # a reply to him
+        "x3": "self",  # a post he liked
+        "x4": "direct",  # filed under his mentions
+        "x5": "noise",  # context that rode along
+        "x6": "self",  # his repost
+    }
+    assert x_posts["x2"]["context"] == x_posts["x1"]["context"] == "x1"
+    assert x_posts["x1"]["title"] == "X: @zachlatta"
+    assert x_posts["x2"]["title"] == "X: @replier replied to @ZachLatta"
+    assert x_posts["x6"]["title"] == "X: @zachlatta reposted"
+    assert x_posts["x2"]["actor"] == "@replier"
+    assert x_posts["x2"]["metadata"]["post_kind"] == "reply"
+    assert x_posts["x6"]["metadata"]["post_kind"] == "repost"
+    assert x_posts["x3"]["metadata"]["relations"] == ["liked"]
+    assert x_posts["x1"]["snippet"] == "Shipping a new warehouse source"
+    assert x_posts["x1"]["source_table"] == "x_posts"
 
     # GitHub: one row per classification branch.
     gh = {r["event_id"].split("|", 1)[1]: r for r in rows if r["source"] == "github"}

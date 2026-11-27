@@ -98,7 +98,7 @@ def test_pollers_and_device_uploaders_compare_with_the_source_not_their_own_hear
         "google_contacts", "whoop", "whoop_private", "github", "chatgpt",
         "claude_desktop", "comma", "alice_voice_recordings",
         "claude_code", "codex", "openclaw", "pi", "muse_code", "argon", "muse",
-        "apple_contacts", "apple_notes", "browser_history",
+        "apple_contacts", "apple_notes", "browser_history", "x",
         "android_photos", "android_messages", "android_screen_time",
     ):
         assert PIPELINES_BY_ID[pipeline].detector == SOURCE_UPSTREAM_HEALTH_VIEW, pipeline

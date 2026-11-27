@@ -117,6 +117,8 @@ from personal_data_warehouse.schema import (
     GITHUB_SYNC_STATE_COLUMNS,
     HACKER_NEWS_ITEM_COLUMNS,
     BROWSER_HISTORY_VISIT_COLUMNS,
+    X_POST_COLUMNS,
+    X_USER_POST_COLUMNS,
     ANDROID_NOTIFICATION_EVENT_COLUMNS,
     ANDROID_MESSAGE_COLUMNS,
     ANDROID_MESSAGE_ATTACHMENT_COLUMNS,
@@ -528,6 +530,9 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         ("browser_visit", "browser_search"),
         "COALESCE(t.metadata->>'browser', t.kind)",
     ),
+    # Zach's X account: his posts, likes, bookmarks and mentions; the
+    # subsource is the post's kind (post / reply / repost / quote).
+    ("x", ("x_post",), "COALESCE(t.metadata->>'post_kind', t.kind)"),
     # Texts on the Android phone since the switch; the subsource is the
     # protocol (sms, mms, rcs).
     (
@@ -1395,6 +1400,9 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         BROWSER_HISTORY_VISIT_COLUMNS,
         ("account", "device", "browser", "profile", "visit_id"),
     ),
+    # X: one row per post, and one per (post, relation) for why it is here.
+    "x_posts": TableSpec(X_POST_COLUMNS, ("account", "post_id")),
+    "x_user_posts": TableSpec(X_USER_POST_COLUMNS, ("account", "post_id", "relation")),
     # Android messages: one row per SMS/MMS/RCS message since the switch.
     "android_messages": TableSpec(
         ANDROID_MESSAGE_COLUMNS,
@@ -2288,6 +2296,24 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "browser_history_visits_visited_idx",
         "browser_history_visits",
         "CREATE INDEX IF NOT EXISTS browser_history_visits_visited_idx ON @browser_history_visits (visited_at DESC)",
+    ),
+    # X. synced_at leads for the freshness probe and the adapter's incremental
+    # pass; created_at serves its backfill; the priority's relation lookup
+    # reads x_user_posts by its primary key.
+    IndexSpec(
+        "x_posts_synced_idx",
+        "x_posts",
+        "CREATE INDEX IF NOT EXISTS x_posts_synced_idx ON @x_posts (synced_at)",
+    ),
+    IndexSpec(
+        "x_posts_created_idx",
+        "x_posts",
+        "CREATE INDEX IF NOT EXISTS x_posts_created_idx ON @x_posts (created_at DESC)",
+    ),
+    IndexSpec(
+        "x_user_posts_synced_idx",
+        "x_user_posts",
+        "CREATE INDEX IF NOT EXISTS x_user_posts_synced_idx ON @x_user_posts (synced_at)",
     ),
     # Android messages. synced_at leads for the freshness probe and the
     # timeline adapter's incremental pass; message_at serves its backfill and
@@ -3383,6 +3409,7 @@ JSONB_COLUMNS_BY_TABLE = {
     "github_comments": {"raw_json"},
     "github_events": {"payload_json"},
     "browser_history_visits": {"raw_json"},
+    "x_posts": {"raw_json"},
     "android_notification_events": {"raw_json", "text_lines", "messages", "people", "actions"},
     "android_messages": {"raw_json", "participants", "parts"},
     "android_message_attachments": {"raw_json"},
@@ -3838,6 +3865,17 @@ INTEGER_COLUMNS = {
     "exposure_ms",
     "notification_rank",
     "action_index",
+    # x
+    "is_retweet",
+    "is_quote",
+    "mentions_account",
+    "sort_index",
+    "reply_count",
+    "retweet_count",
+    "like_count",
+    "quote_count",
+    "bookmark_count",
+    "view_count",
     # browser_history
     "transition_raw",
     "is_redirect",
@@ -4282,6 +4320,8 @@ _WHOOP_PRIVATE_TABLES = (
 )
 
 _BROWSER_HISTORY_TABLES = ("browser_history_visits",)
+
+_X_TABLES = ("x_posts", "x_user_posts")
 
 _ANDROID_NOTIFICATIONS_TABLES = ("android_notification_events",)
 
@@ -12707,6 +12747,32 @@ class PostgresWarehouse:
                 for row in rows
             ],
             BROWSER_HISTORY_VISIT_COLUMNS,
+        )
+
+    def ensure_x_tables(self) -> None:
+        """Provision base_x.posts and base_x.user_posts."""
+        self._ensure_table_group(list(_X_TABLES))
+
+    def insert_x_posts(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert posts by (account, post_id); a re-read refreshes the counts."""
+        self._insert_full_rows("x_posts", X_POST_COLUMNS, rows)
+
+    def insert_x_user_posts(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert relations by (account, post_id, relation)."""
+        self._insert_full_rows("x_user_posts", X_USER_POST_COLUMNS, rows)
+
+    def _insert_full_rows(
+        self, table: str, columns: Sequence[str], rows: Sequence[Mapping[str, Any]]
+    ) -> None:
+        if not rows:
+            return
+        self._insert_rows(
+            table,
+            [
+                {column: row.get(column, _default_python_value(column, table=table)) for column in columns}
+                for row in rows
+            ],
+            tuple(columns),
         )
 
     def ensure_android_notifications_tables(self) -> None:

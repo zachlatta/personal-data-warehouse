@@ -409,6 +409,18 @@ func TestTimelineItemDetailIncludesConversationContext(t *testing.T) {
 	}
 }
 
+func TestTimelineDeepLinkXPostOpensThePostOnX(t *testing.T) {
+	link := linkFor(t, "x_post", "x_posts", `{"account":"zachlatta","post_id":"1900000000000000001"}`, `{}`)
+	if link == nil || link.URL != "https://x.com/i/status/1900000000000000001" || link.Label != "Open on X" {
+		t.Fatalf("link = %#v", link)
+	}
+	for _, postID := range []string{"", "12/../evil", "abc"} {
+		if link := linkFor(t, "x_post", "x_posts", `{"post_id":"`+postID+`"}`, `{}`); link != nil {
+			t.Fatalf("%q: got %#v", postID, link)
+		}
+	}
+}
+
 func TestTimelineDeepLinkBrowserVisitOpensOnlyWebPages(t *testing.T) {
 	link := linkFor(t, "browser_visit", "browser_history_visits", `{}`, `{"url":"https://example.com/page?a=1"}`)
 	if link == nil || link.URL != "https://example.com/page?a=1" || link.Label != "Open page" {
