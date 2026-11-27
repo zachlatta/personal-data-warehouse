@@ -2792,6 +2792,9 @@ _X_POST = _simple_adapter(
     # the generic (source, context) walk return the thread around a hit.
     context="t.conversation_id",
     source_pk="jsonb_build_object('account', t.account, 'post_id', t.post_id)",
+    # No engagement counts: metadata is part of the content guard, and a view
+    # count moves on every read, so carrying it would rewrite the row (and
+    # bump seq) every run. The counts stay in base_x.posts.
     metadata=(
         "jsonb_build_object("
         "'post_kind', CASE WHEN t.is_retweet <> 0 THEN 'repost' "
@@ -2802,10 +2805,6 @@ _X_POST = _simple_adapter(
         "'in_reply_to_post_id', t.in_reply_to_post_id, "
         "'quoted_post_id', t.quoted_post_id, "
         "'retweeted_post_id', t.retweeted_post_id, "
-        "'like_count', t.like_count, "
-        "'retweet_count', t.retweet_count, "
-        "'reply_count', t.reply_count, "
-        "'view_count', t.view_count, "
         "'relations', COALESCE((SELECT array_agg(u.relation ORDER BY u.relation) "
         "FROM @x_user_posts u WHERE u.account = t.account AND u.post_id = t.post_id), "
         "ARRAY[]::text[]))"
