@@ -693,7 +693,7 @@ func TestAnOutageLongerThanThePageBudgetIsCaughtUpOverLaterRuns(t *testing.T) {
 	state := openState(t)
 	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
 	// The history walk is finished and posts 1..2 were shipped long ago.
-	if err := state.SetBackfill("likes", "", true, now); err != nil {
+	if err := state.SetBackfill("likes", "", "Likes", true, now); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"1", "2"} {
@@ -738,7 +738,7 @@ func TestARateLimitMidCatchUpResumesWhereItStopped(t *testing.T) {
 	likes, _ := x.StreamByName("likes")
 	state := openState(t)
 	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
-	if err := state.SetBackfill("likes", "", true, now); err != nil {
+	if err := state.SetBackfill("likes", "", "Likes", true, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := state.MarkDiscovered("likes", "1", now); err != nil {

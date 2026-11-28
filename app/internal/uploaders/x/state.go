@@ -32,12 +32,14 @@ func OpenState(path, account string) (*State, error) {
 			stream TEXT PRIMARY KEY,
 			cursor TEXT NOT NULL DEFAULT '',
 			done INTEGER NOT NULL DEFAULT 0,
-			updated_at TEXT NOT NULL DEFAULT ''
+			updated_at TEXT NOT NULL DEFAULT '',
+			operation TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE TABLE IF NOT EXISTS catchup (
 			stream TEXT NOT NULL,
 			cursor TEXT NOT NULL,
 			created_at TEXT NOT NULL,
+			operation TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (stream, cursor)
 		)`,
 		`CREATE TABLE IF NOT EXISTS cooldown (
@@ -49,7 +51,36 @@ func OpenState(path, account string) (*State, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &State{db: db}, nil
+	s := &State{db: db}
+	if err := s.ensureOperationColumns(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// ensureOperationColumns adds the operation column to backfill and catchup in
+// existing state databases created before per-operation cursor tracking.
+func (s *State) ensureOperationColumns() error {
+	for _, table := range []string{"backfill", "catchup"} {
+		rows, err := common.Query(s.db.DB, "PRAGMA table_info("+table+")")
+		if err != nil {
+			return err
+		}
+		hasOp := false
+		for _, row := range rows {
+			if row.String("name") == "operation" {
+				hasOp = true
+				break
+			}
+		}
+		if !hasOp {
+			if _, err := s.db.DB.Exec("ALTER TABLE " + table + " ADD COLUMN operation TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Close releases the database.
@@ -77,49 +108,62 @@ func (s *State) MarkDiscovered(stream, postID string, at time.Time) error {
 
 // BackfillState is one stream's walk into its history.
 type BackfillState struct {
-	Started bool
-	Cursor  string
-	Done    bool
+	Started   bool
+	Cursor    string
+	Done      bool
+	Operation string
 }
 
 // Backfill reads one stream's backfill position.
 func (s *State) Backfill(stream string) (BackfillState, error) {
-	rows, err := common.Query(s.db.DB, "SELECT cursor, done FROM backfill WHERE stream = ?", stream)
+	rows, err := common.Query(s.db.DB, "SELECT cursor, done, operation FROM backfill WHERE stream = ?", stream)
 	if err != nil || len(rows) == 0 {
 		return BackfillState{}, err
 	}
-	return BackfillState{Started: true, Cursor: rows[0].String("cursor"), Done: rows[0].Int("done") != 0}, nil
+	return BackfillState{
+		Started:   true,
+		Cursor:    rows[0].String("cursor"),
+		Done:      rows[0].Int("done") != 0,
+		Operation: rows[0].String("operation"),
+	}, nil
 }
 
-// SetBackfill records where a stream's backfill stands.
-func (s *State) SetBackfill(stream, cursor string, done bool, now time.Time) error {
+// SetBackfill records where a stream's backfill stands, tagged with the GraphQL
+// operation that produced the cursor.
+func (s *State) SetBackfill(stream, cursor, operation string, done bool, now time.Time) error {
 	doneFlag := 0
 	if done {
 		doneFlag = 1
 	}
-	_, err := s.db.DB.Exec(`INSERT INTO backfill (stream, cursor, done, updated_at) VALUES (?, ?, ?, ?)
-		ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, done = excluded.done, updated_at = excluded.updated_at`,
-		stream, cursor, doneFlag, common.ISOFormat(now))
+	_, err := s.db.DB.Exec(`INSERT INTO backfill (stream, cursor, done, updated_at, operation) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, done = excluded.done, updated_at = excluded.updated_at, operation = excluded.operation`,
+		stream, cursor, doneFlag, common.ISOFormat(now), operation)
 	return err
+}
+
+// CatchupGap is an open catch-up cursor and the operation that produced it.
+type CatchupGap struct {
+	Cursor    string
+	Operation string
 }
 
 // Catchups are a stream's open gaps, oldest first: cursors a run stopped at
 // while its pages still held items it had never shipped.
-func (s *State) Catchups(stream string) ([]string, error) {
-	rows, err := common.Query(s.db.DB, "SELECT cursor FROM catchup WHERE stream = ? ORDER BY created_at, cursor", stream)
+func (s *State) Catchups(stream string) ([]CatchupGap, error) {
+	rows, err := common.Query(s.db.DB, "SELECT cursor, operation FROM catchup WHERE stream = ? ORDER BY created_at, cursor", stream)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(rows))
+	out := make([]CatchupGap, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, row.String("cursor"))
+		out = append(out, CatchupGap{Cursor: row.String("cursor"), Operation: row.String("operation")})
 	}
 	return out, nil
 }
 
 // ReplaceCatchup moves a gap's position (old "" opens a new gap), keeping
 // when it opened so the oldest gap is resumed first.
-func (s *State) ReplaceCatchup(stream, old, next string, now time.Time) error {
+func (s *State) ReplaceCatchup(stream, old, next, operation string, now time.Time) error {
 	created := common.ISOFormat(now)
 	if old != "" {
 		rows, err := common.Query(s.db.DB, "SELECT created_at FROM catchup WHERE stream = ? AND cursor = ?", stream, old)
@@ -133,14 +177,22 @@ func (s *State) ReplaceCatchup(stream, old, next string, now time.Time) error {
 			return err
 		}
 	}
-	_, err := s.db.DB.Exec(`INSERT INTO catchup (stream, cursor, created_at) VALUES (?, ?, ?)
-		ON CONFLICT(stream, cursor) DO NOTHING`, stream, next, created)
+	_, err := s.db.DB.Exec(`INSERT INTO catchup (stream, cursor, created_at, operation) VALUES (?, ?, ?, ?)
+		ON CONFLICT(stream, cursor) DO UPDATE SET operation = excluded.operation`, stream, next, created, operation)
 	return err
 }
 
 // RemoveCatchup closes a gap: its walk reached items already shipped.
 func (s *State) RemoveCatchup(stream, cursor string) error {
 	_, err := s.db.DB.Exec("DELETE FROM catchup WHERE stream = ? AND cursor = ?", stream, cursor)
+	return err
+}
+
+// ClearCatchupsOtherThan removes open gaps written by another operation (or
+// untagged legacy rows) so cursors are never passed across incompatible
+// GraphQL endpoints.
+func (s *State) ClearCatchupsOtherThan(stream, operation string) error {
+	_, err := s.db.DB.Exec("DELETE FROM catchup WHERE stream = ? AND operation != ?", stream, operation)
 	return err
 }
 

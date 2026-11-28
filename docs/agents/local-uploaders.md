@@ -521,7 +521,11 @@ the web client's per-request `x-client-transaction-id` header (otherwise x.com a
 `loading-x-anim-0..3` SVG animation paths, and `ondemand.s.*.js` bundle to generate it
 (`txid.go`) on every GraphQL request. If X ever changes that scheme and
 `UserTweetsAndReplies` answers 404 again, the run falls back to `UserTweets` (posts,
-reposts and quotes) for the rest of that run so non-reply posts keep landing. Every
+reposts and quotes) for the rest of that run so non-reply posts keep landing. Backfill
+and catch-up cursors record which GraphQL operation wrote them, so switching from
+`UserTweets` (or an untagged pre-migration state row) to `UserTweetsAndReplies`
+automatically resets and re-backfills `posts` history from the start, while a transient
+`UserTweets` fallback never overwrites or completes a `UserTweetsAndReplies` backfill. Every
 run reads each stream newest-first until a page holds nothing it has shipped before (at most
 `--pages`, 3), then walks `--backfill-pages` (5) further into history from the cursor the last
 run stopped at (kept in `~/Library/Application Support/personal-data-warehouse/x-upload-state.sqlite`).

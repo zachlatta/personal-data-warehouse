@@ -279,10 +279,17 @@ func (r *Runner) pages(n int) int {
 	return r.Pace.Pages(n)
 }
 
+func (r *Runner) activeOperation(stream Stream) string {
+	if r.fellBack[stream.Name] && stream.Fallback != nil {
+		return stream.Fallback.Operation
+	}
+	return stream.Operation
+}
+
 func (r *Runner) syncStream(stream Stream) error {
 	// Gaps an earlier run left open: it stopped (page budget, rate limit,
 	// error) while its pages still held items it had never shipped.
-	var pending []string
+	var pending []CatchupGap
 	if r.State != nil {
 		var err error
 		if pending, err = r.State.Catchups(stream.Name); err != nil {
@@ -297,9 +304,30 @@ func (r *Runner) syncStream(stream Stream) error {
 	if r.State == nil {
 		return nil
 	}
+	activeOp := r.activeOperation(stream)
 	backfill, err := r.State.Backfill(stream.Name)
 	if err != nil {
 		return err
+	}
+	if stream.Fallback != nil && !r.fellBack[stream.Name] {
+		// When the primary operation (e.g. UserTweetsAndReplies) is active and
+		// stored backfill state came from a fallback or untagged legacy run,
+		// reset so history is cleanly walked via the primary operation rather
+		// than reusing a fallback cursor or skipping history as done.
+		if backfill.Started && backfill.Operation != stream.Operation {
+			prev := backfill.Operation
+			if prev == "" {
+				prev = "untagged/legacy"
+			}
+			r.Logger.Infof("X %s: resetting history backfill (was %s) to walk via %s", stream.Name, prev, stream.Operation)
+			if err := r.State.ResetBackfill(stream.Name); err != nil {
+				return err
+			}
+			if err := r.State.ClearCatchupsOtherThan(stream.Name, stream.Operation); err != nil {
+				return err
+			}
+			backfill = BackfillState{}
+		}
 	}
 	if !backfill.Started && top.open != "" {
 		// A first run's open gap is simply the history: the backfill below
@@ -308,11 +336,23 @@ func (r *Runner) syncStream(stream Stream) error {
 			return err
 		}
 	}
-	// Then each earlier gap, from where it stopped, until it meets seen items.
-	for _, cursor := range pending {
-		if _, err := r.catchUp(stream, cursor); err != nil || r.summary.Deferred || r.exhausted {
+	// Then each earlier gap from this same operation, from where it stopped,
+	// until it meets seen items. Never pass a cursor from another endpoint.
+	for _, gap := range pending {
+		compatible := gap.Operation == activeOp || (gap.Operation == "" && stream.Fallback == nil)
+		if !compatible {
+			continue
+		}
+		if _, err := r.catchUp(stream, gap.Cursor); err != nil || r.summary.Deferred || r.exhausted {
 			return err
 		}
+	}
+	if stream.Fallback != nil && r.fellBack[stream.Name] && backfill.Started && backfill.Operation == stream.Operation {
+		// A transient fallback run must not overwrite or mark done a primary
+		// operation's backfill state.
+		r.Logger.Infof("X %s: skipping history backfill while on fallback %s to preserve %s backfill state",
+			stream.Name, activeOp, stream.Operation)
+		return nil
 	}
 	if r.BackfillPages == 0 || backfill.Done {
 		return nil
@@ -322,7 +362,7 @@ func (r *Runner) syncStream(stream Stream) error {
 		// The first backfill starts where this run's catch-up stopped, so it
 		// never re-reads the newest pages.
 		if top.reachedEnd {
-			return r.State.SetBackfill(stream.Name, "", true, r.Now())
+			return r.State.SetBackfill(stream.Name, "", activeOp, true, r.Now())
 		}
 		backfill.Cursor = top.next
 	}
@@ -332,9 +372,15 @@ func (r *Runner) syncStream(stream Stream) error {
 		if err != nil || r.summary.Deferred {
 			return err
 		}
+		activeOp = r.activeOperation(stream)
+		if stream.Fallback != nil && r.fellBack[stream.Name] && backfill.Started && backfill.Operation == stream.Operation {
+			r.Logger.Infof("X %s: fell back to %s mid-backfill; preserving %s backfill state",
+				stream.Name, activeOp, stream.Operation)
+			return nil
+		}
 		next := read.next
 		done := read.items == 0 || next == "" || next == cursor
-		if err := r.State.SetBackfill(stream.Name, next, done, r.Now()); err != nil {
+		if err := r.State.SetBackfill(stream.Name, next, activeOp, done, r.Now()); err != nil {
 			return err
 		}
 		if done {
@@ -405,7 +451,7 @@ func (r *Runner) moveGap(stream Stream, w *walk, next string) error {
 	if r.State == nil {
 		return nil
 	}
-	if err := r.State.ReplaceCatchup(stream.Name, w.open, next, r.Now()); err != nil {
+	if err := r.State.ReplaceCatchup(stream.Name, w.open, next, r.activeOperation(stream), r.Now()); err != nil {
 		return err
 	}
 	w.open = next
