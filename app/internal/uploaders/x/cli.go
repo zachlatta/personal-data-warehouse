@@ -273,6 +273,9 @@ func RunWith(args []string, stdout, stderr io.Writer, getenv func(string) string
 		fmt.Fprintf(stderr, "pdw ingest x: %v\n", err)
 		return refused(err)
 	}
+	if check, ok := api.(interface{ HasTransactionID() bool }); ok && !check.HasTransactionID() {
+		logger.Warningf("X: could not initialize x-client-transaction-id from x.com/home; UserTweetsAndReplies may answer 404")
+	}
 	if setter, ok := api.(interface{ SetReferer(string) }); ok {
 		setter.SetReferer("/" + account)
 	}

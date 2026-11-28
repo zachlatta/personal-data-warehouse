@@ -513,13 +513,15 @@ what was read goes to the warehouse. Over SSH the login keychain is locked (`sec
 36), so test it under launchd (`launchctl kickstart`), not from an SSH shell.
 
 **What a run reads.** Four streams, each a read-only GraphQL query: `posts`
-(`UserTweetsAndReplies`: his posts, replies and reposts), `likes` (`Likes`), `bookmarks`
-(`Bookmarks`) and `mentions` (`NotificationsTimeline` with `timeline_type: Mentions`). On
-2026-11-28 x.com answered `UserTweetsAndReplies` with 404 for this client while the other
-three answered 200 (it likely wants the web client's `x-client-transaction-id`, which this
-does not send), so on a 404 a run reads `UserTweets` (his profile's posts tab: posts, reposts
-and quotes) instead, and his replies to other people are not archived until that is solved;
-replies to him still arrive through mentions. Every
+(`UserTweetsAndReplies`: his posts, replies and reposts, plus the posts he replied to as
+context), `likes` (`Likes`), `bookmarks` (`Bookmarks`) and `mentions`
+(`NotificationsTimeline` with `timeline_type: Mentions`). `UserTweetsAndReplies` requires
+the web client's per-request `x-client-transaction-id` header (otherwise x.com answers
+404): `Discover` parses `x.com/home`'s `twitter-site-verification` meta tag,
+`loading-x-anim-0..3` SVG animation paths, and `ondemand.s.*.js` bundle to generate it
+(`txid.go`) on every GraphQL request. If X ever changes that scheme and
+`UserTweetsAndReplies` answers 404 again, the run falls back to `UserTweets` (posts,
+reposts and quotes) for the rest of that run so non-reply posts keep landing. Every
 run reads each stream newest-first until a page holds nothing it has shipped before (at most
 `--pages`, 3), then walks `--backfill-pages` (5) further into history from the cursor the last
 run stopped at (kept in `~/Library/Application Support/personal-data-warehouse/x-upload-state.sqlite`).

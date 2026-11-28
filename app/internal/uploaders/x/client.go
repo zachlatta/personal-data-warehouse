@@ -75,6 +75,7 @@ type Client struct {
 
 	bearer     string
 	operations map[string]Operation
+	tx         *TransactionGenerator
 	// referer is the x.com page the next query is made from ("" = /home).
 	referer string
 	// lastPath is where the last request ended up after redirects.
@@ -189,6 +190,7 @@ func (c *Client) Discover() error {
 	}
 	sort.Strings(scripts)
 	operations := map[string]Operation{}
+	ondemandURL := ParseOndemandScriptURL(string(page), c.BaseURL)
 	for _, script := range scripts {
 		body, err := c.get(script, map[string]string{
 			"Accept":         "*/*",
@@ -207,6 +209,9 @@ func (c *Client) Discover() error {
 				}
 			}
 		}
+		if ondemandURL == "" {
+			ondemandURL = ParseOndemandScriptURL(string(body), c.BaseURL)
+		}
 		for name, op := range ParseOperations(string(body)) {
 			operations[name] = op
 		}
@@ -220,6 +225,23 @@ func (c *Client) Discover() error {
 		}
 	}
 	c.operations = operations
+	c.tx = nil
+	if ondemandURL != "" {
+		trusted := strings.HasPrefix(ondemandURL, "https://abs.twimg.com/") || strings.HasPrefix(ondemandURL, c.BaseURL+"/")
+		if trusted {
+			if body, err := c.get(ondemandURL, map[string]string{
+				"Accept":         "*/*",
+				"Referer":        c.BaseURL + "/",
+				"sec-fetch-dest": "script",
+				"sec-fetch-mode": "cors",
+				"sec-fetch-site": "cross-site",
+			}, false); err == nil {
+				if tx, err := NewTransactionGenerator(string(page), string(body)); err == nil {
+					c.tx = tx
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -266,8 +288,9 @@ func (c *Client) Query(operation string, variables map[string]any) (map[string]a
 		encoded, _ := json.Marshal(toggles)
 		params.Set("fieldToggles", string(encoded))
 	}
-	target := c.BaseURL + "/i/api/graphql/" + url.PathEscape(op.QueryID) + "/" + operation + "?" + params.Encode()
-	body, err := c.get(target, map[string]string{
+	path := "/i/api/graphql/" + url.PathEscape(op.QueryID) + "/" + operation
+	target := c.BaseURL + path + "?" + params.Encode()
+	headers := map[string]string{
 		"Authorization":             "Bearer " + c.bearer,
 		"x-csrf-token":              c.Session.CSRFToken(),
 		"x-twitter-auth-type":       "OAuth2Session",
@@ -279,7 +302,11 @@ func (c *Client) Query(operation string, variables map[string]any) (map[string]a
 		"sec-fetch-dest":            "empty",
 		"sec-fetch-mode":            "cors",
 		"sec-fetch-site":            "same-origin",
-	}, true)
+	}
+	if c.tx != nil {
+		headers["x-client-transaction-id"] = c.tx.Generate(http.MethodGet, path)
+	}
+	body, err := c.get(target, headers, true)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", operation, err)
 	}
@@ -312,6 +339,11 @@ func (c *Client) refererPath() string {
 
 // RemainingRequests is the last response's x-rate-limit-remaining, or -1.
 func (c *Client) RemainingRequests() int { return c.lastRemaining }
+
+// HasTransactionID reports whether Discover initialized the
+// x-client-transaction-id generator from the page's verification key, SVG
+// animation frames, and ondemand.s bundle.
+func (c *Client) HasTransactionID() bool { return c.tx != nil }
 
 func (c *Client) get(target string, headers map[string]string, api bool) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, target, nil)

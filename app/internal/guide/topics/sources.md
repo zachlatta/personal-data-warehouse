@@ -152,10 +152,9 @@ read. `base_x.user_posts` says WHY (`relation` in `authored`, `liked`, `bookmark
 `mentioned`); X stamps no time on a like or bookmark, so `discovered_at` is when the uploader
 first saw it and `sort_index` is X's own order (larger is newer). A post with no relation rode
 along as context: the post he replied to, quoted or reposted. Timeline source `x`, search
-scope `x`: his posts, reposts, likes and bookmarks are `self`, a reply to him or a mention
-`direct`, context `noise`; `timeline.context()` returns the thread. No DMs. Likes or
-bookmarks he took back stay. His own replies to other people are missing while x.com
-refuses the replies timeline to the uploader (2026-11-28).
+scope `x`: his posts, replies, reposts, likes and bookmarks are `self`, a reply to him or a
+mention `direct`, context `noise`; `timeline.context()` returns the thread. No DMs. Likes or
+bookmarks he took back stay.
 
 ## GitHub
 

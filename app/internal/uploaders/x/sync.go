@@ -46,9 +46,11 @@ var Streams = []Stream{
 				"withCommunity": true, "withVoice": true,
 			}, cursor)
 		},
-		// On 2026-11-28 x.com answered UserTweetsAndReplies with 404 for this
-		// client (Likes, Bookmarks and mentions answered 200): his profile's
-		// posts tab still reads his posts, reposts and quotes, not his replies.
+		// UserTweetsAndReplies requires x-client-transaction-id (generated
+		// from /home's verification key, SVG frames and ondemand.s bundle); if
+		// X changes that scheme and answers 404, fall back to UserTweets (his
+		// posts, reposts and quotes) for the rest of the run so non-reply posts
+		// keep landing.
 		Fallback: &Stream{
 			Name: "posts", Relation: "authored", Operation: "UserTweets",
 			Page: func(h string) string { return "/" + h },
