@@ -203,6 +203,10 @@ func RunWith(args []string, stdout, stderr io.Writer, getenv func(string) string
 			fmt.Fprintf(stderr, "pdw ingest x: %v\n", err)
 			return common.ExitFailure
 		}
+		if until.After(deps.Now()) && reason == "rate_limit" {
+			logger.Infof("X: cooling down after a rate limit until %s; not calling x.com", until.Format(time.RFC3339))
+			return 0
+		}
 		if until.After(deps.Now()) {
 			fmt.Fprintf(stderr, "pdw ingest x: not calling x.com until %s (cooling down after: %s); sign in to x.com in Chrome if it signed out, then run once with --clear-cooldown\n",
 				until.Format(time.RFC3339), reason)
@@ -228,9 +232,32 @@ func RunWith(args []string, stdout, stderr io.Writer, getenv func(string) string
 	}
 	logger.Infof("Using the x.com session from %s (login %s)", session.Browser, session.Fingerprint())
 	api := deps.NewAPI(session, env)
+	// A refusal before the streams run (the page load or the account lookup,
+	// the first calls every run makes) cools the run down like one during them.
+	refused := func(err error) int {
+		var auth *AuthError
+		var limit *RateLimitError
+		switch {
+		case state != nil && errors.As(err, &auth):
+			until := pacer.ChallengeCooldown(deps.Now())
+			if cerr := state.SetCooldown(RunScope, until, "session"); cerr != nil {
+				fmt.Fprintf(stderr, "pdw ingest x: %v\n", cerr)
+			}
+			fmt.Fprintf(stderr, "pdw ingest x: no request to x.com until %s\n", until.Format(time.RFC3339))
+		case state != nil && errors.As(err, &limit):
+			until := pacer.RateLimitCooldown(limit.Reset, deps.Now())
+			if cerr := state.SetCooldown(RunScope, until, "rate_limit"); cerr != nil {
+				fmt.Fprintf(stderr, "pdw ingest x: %v\n", cerr)
+				return common.ExitFailure
+			}
+			logger.Warningf("X: rate limited before the streams; next request no sooner than %s", until.Format(time.RFC3339))
+			return 0
+		}
+		return common.ExitFailure
+	}
 	if err := api.Discover(); err != nil {
 		fmt.Fprintf(stderr, "pdw ingest x: %v\n", err)
-		return common.ExitFailure
+		return refused(err)
 	}
 	if setter, ok := api.(interface{ SetReferer(string) }); ok {
 		setter.SetReferer("/" + account)
@@ -238,7 +265,7 @@ func RunWith(args []string, stdout, stderr io.Writer, getenv func(string) string
 	user, err := api.Query("UserByScreenName", map[string]any{"screen_name": account})
 	if err != nil {
 		fmt.Fprintf(stderr, "pdw ingest x: could not look up @%s: %v\n", account, err)
-		return common.ExitFailure
+		return refused(err)
 	}
 	userID := UserID(user)
 	if userID == "" {

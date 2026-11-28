@@ -560,6 +560,9 @@ so every run (`pace.go`, all of it seeded and injected so the tests are determin
 - after a 429 or `x-rate-limit-remaining: 0`, keeps that stream off x.com past X's own reset
   and for at least 35-75 minutes (state table `cooldown`); after a 401/403 (signed out or
   challenged), keeps every run off x.com for 2-6 hours, exiting 1 so `/pipelines` shows it.
+  The same holds for the two calls every run makes before the streams: a `/home` load that is
+  refused or bounced to a login or account-check page, and the account lookup (a 429 there
+  cools the whole run down and exits 0, as a rate-limited stream does).
   After signing back in, `pdw ingest x --clear-cooldown` lifts that.
 
 It still runs on Go's TLS, so this is camouflage of the request pattern, not a browser. If

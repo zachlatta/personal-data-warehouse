@@ -76,6 +76,8 @@ type Client struct {
 	operations map[string]Operation
 	// referer is the x.com page the next query is made from ("" = /home).
 	referer string
+	// lastPath is where the last request ended up after redirects.
+	lastPath string
 	// lastRemaining is the x-rate-limit-remaining of the last response, or -1.
 	lastRemaining int
 }
@@ -159,7 +161,19 @@ func (c *Client) Discover() error {
 		"upgrade-insecure-requests": "1",
 	}, false)
 	if err != nil {
+		var auth *AuthError
+		var limit *RateLimitError
+		if errors.As(err, &auth) || errors.As(err, &limit) {
+			return err
+		}
 		return fmt.Errorf("could not load x.com: %w", err)
+	}
+	// A signed-out or challenged session is bounced to a login or account
+	// check page rather than refused outright.
+	for _, prefix := range []string{"/login", "/i/flow/login", "/account/access", "/i/flow/", "/logout"} {
+		if strings.HasPrefix(c.lastPath, prefix) {
+			return &AuthError{Status: http.StatusFound, Detail: ": x.com sent /home to " + c.lastPath}
+		}
 	}
 	seen := map[string]bool{}
 	var scripts []string
@@ -320,6 +334,8 @@ func (c *Client) get(target string, headers map[string]string, api bool) ([]byte
 		return nil, err
 	}
 	defer resp.Body.Close()
+	c.lastPath = resp.Request.URL.Path
+	session := api || target == c.BaseURL+"/home"
 	if api {
 		c.lastRemaining = -1
 		if v := resp.Header.Get("x-rate-limit-remaining"); v != "" {
@@ -339,7 +355,7 @@ func (c *Client) get(target string, headers map[string]string, api bool) ([]byte
 			limit.Reset = time.Unix(v, 0)
 		}
 		return nil, limit
-	case api && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden):
+	case session && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden):
 		return nil, &AuthError{Status: resp.StatusCode, Detail: apiErrorDetail(body)}
 	case resp.StatusCode != http.StatusOK:
 		return nil, fmt.Errorf("HTTP %d%s", resp.StatusCode, apiErrorDetail(body))

@@ -274,6 +274,9 @@ type fakeX struct {
 	// pages maps "<operation>|<cursor>" to a response's data.
 	pages  map[string]map[string]any
 	status map[string]int
+	// homeStatus / homeRedirect make /home refuse or bounce to a login page.
+	homeStatus   int
+	homeRedirect string
 }
 
 func newFakeX(t *testing.T) *fakeX {
@@ -286,6 +289,12 @@ func newFakeX(t *testing.T) *fakeX {
 func (f *fakeX) serve(w http.ResponseWriter, r *http.Request) {
 	f.requests = append(f.requests, r)
 	switch {
+	case r.URL.Path == "/home" && f.homeStatus != 0:
+		w.WriteHeader(f.homeStatus)
+	case r.URL.Path == "/home" && f.homeRedirect != "":
+		http.Redirect(w, r, f.homeRedirect, http.StatusFound)
+	case r.URL.Path == "/i/flow/login":
+		fmt.Fprint(w, `<html>Sign in to X</html>`)
 	case r.URL.Path == "/home":
 		fmt.Fprintf(w, `<html><script src="%s/responsive-web/client-web/main.abc123.js"></script>`+
 			`<script src="https://evil.example/responsive-web/client-web/main.evil.js"></script></html>`, f.server.URL)
@@ -1082,5 +1091,73 @@ func TestClearCooldownLiftsTheSessionCooldown(t *testing.T) {
 		&stdout, &stderr, func(k string) string { return env[k] }, ingestclient.Config{}, deps)
 	if !captured {
 		t.Fatalf("the cleared cooldown still blocked the run: %s", stderr.String())
+	}
+}
+
+// refusedRun runs once against a fake x.com, then again, and reports whether
+// the second run reached x.com at all.
+func refusedRun(t *testing.T, setup func(f *fakeX)) (first, second string, secondRequests int, code2 int, state *x.State) {
+	t.Helper()
+	f := newFakeX(t)
+	f.pages["UserByScreenName|"] = map[string]any{"user": user(myID, myHandle)}
+	setup(f)
+	stateDir := t.TempDir()
+	statePath := filepath.Join(stateDir, "s.sqlite")
+	env := map[string]string{"X_ACCOUNT": myHandle, "PDW_INGEST_PROJECT_DIR": t.TempDir(), "X_REQUEST_DELAY_MS": "0"}
+	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	deps := x.Deps{
+		Capture: func(string) (x.Session, error) { return testSession(), nil },
+		NewAPI:  func(s x.Session, _ common.Getenv) x.API { return x.NewClient(s, f.server.URL, "") },
+		Pacer:   func(base time.Duration) *x.Pacer { return seededPacer(7, base) },
+		Sleep:   func(time.Duration) {},
+		Now:     func() time.Time { return now },
+	}
+	args := []string{"--start-jitter", "0", "--state-file", statePath, "--lock-file", filepath.Join(stateDir, "lock")}
+	var out1, err1, out2, err2 bytes.Buffer
+	x.RunWith(args, &out1, &err1, func(k string) string { return env[k] }, ingestclient.Config{}, deps)
+	before := len(f.requests)
+	code2 = x.RunWith(args, &out2, &err2, func(k string) string { return env[k] }, ingestclient.Config{}, deps)
+	st, err := x.OpenState(statePath, myHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return err1.String(), err2.String(), len(f.requests) - before, code2, st
+}
+
+func TestARefusedAccountLookupCoolsTheSessionDown(t *testing.T) {
+	first, second, requests, code, state := refusedRun(t, func(f *fakeX) { f.status["UserByScreenName|"] = http.StatusForbidden })
+	if !strings.Contains(first, "HTTP 403") {
+		t.Fatalf("first run: %q", first)
+	}
+	until, reason, _ := state.Cooldown(x.RunScope)
+	if reason != "session" || until.Before(time.Date(2026, 11, 27, 16, 0, 0, 0, time.UTC)) {
+		t.Fatalf("cooldown %s %q", until, reason)
+	}
+	if requests != 0 || code != 1 || !strings.Contains(second, "not calling x.com until") {
+		t.Fatalf("second run reached x.com (%d requests, code %d): %q", requests, code, second)
+	}
+}
+
+func TestARateLimitedAccountLookupCoolsTheRunDownWithoutFailing(t *testing.T) {
+	_, second, requests, code, state := refusedRun(t, func(f *fakeX) { f.status["UserByScreenName|"] = http.StatusTooManyRequests })
+	_, reason, _ := state.Cooldown(x.RunScope)
+	if reason != "rate_limit" || requests != 0 || code != 0 {
+		t.Fatalf("reason %q requests %d code %d: %q", reason, requests, code, second)
+	}
+}
+
+func TestARefusedOrRedirectedHomePageCoolsTheSessionDown(t *testing.T) {
+	for name, setup := range map[string]func(f *fakeX){
+		"403":      func(f *fakeX) { f.homeStatus = http.StatusForbidden },
+		"to login": func(f *fakeX) { f.homeRedirect = "/i/flow/login" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, requests, code, state := refusedRun(t, setup)
+			_, reason, _ := state.Cooldown(x.RunScope)
+			if reason != "session" || requests != 0 || code != 1 {
+				t.Fatalf("reason %q requests %d code %d", reason, requests, code)
+			}
+		})
 	}
 }
