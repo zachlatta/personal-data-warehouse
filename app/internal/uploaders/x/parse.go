@@ -71,7 +71,10 @@ type Entry struct {
 
 // Page is one timeline response.
 type Page struct {
-	Entries      []Entry
+	Entries []Entry
+	// Items counts every non-cursor entry, readable or not: a page of only
+	// deleted or withheld posts is still a page, not the end of the list.
+	Items        int
 	BottomCursor string
 }
 
@@ -120,6 +123,7 @@ func (p *Page) add(entry map[string]any) {
 		}
 		return
 	}
+	p.Items++
 	e := Entry{EntryID: str(entry["entryId"]), SortIndex: int64Of(entry["sortIndex"])}
 	var results []map[string]any
 	if item := asMap(content["itemContent"]); item != nil {

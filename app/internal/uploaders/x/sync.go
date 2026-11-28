@@ -198,47 +198,60 @@ func (r *Runner) Sync() (Summary, error) {
 }
 
 func (r *Runner) syncStream(stream Stream) error {
-	// Newest first, until a page holds nothing this stream has not seen.
-	cursor := ""
-	reachedEnd := false
-	for page := 0; page < r.Pages; page++ {
-		read, err := r.readPage(stream, cursor, page == 0)
-		if err != nil || r.summary.Deferred || r.exhausted {
+	// Gaps an earlier run left open: it stopped (page budget, rate limit,
+	// error) while its pages still held items it had never shipped.
+	var pending []string
+	if r.State != nil {
+		var err error
+		if pending, err = r.State.Catchups(stream.Name); err != nil {
 			return err
 		}
-		cursor = read.next
-		if read.posts == 0 || read.next == "" {
-			reachedEnd = true
-			break
-		}
-		if read.fresh == 0 {
-			break
+	}
+	// Newest first, until a page holds nothing this stream has not seen.
+	top, err := r.catchUp(stream, "")
+	if err != nil || r.summary.Deferred || r.exhausted {
+		return err
+	}
+	if r.State == nil {
+		return nil
+	}
+	backfill, err := r.State.Backfill(stream.Name)
+	if err != nil {
+		return err
+	}
+	if !backfill.Started && top.open != "" {
+		// A first run's open gap is simply the history: the backfill below
+		// starts there, so the catch-up does not walk it twice.
+		if err := r.State.RemoveCatchup(stream.Name, top.open); err != nil {
+			return err
 		}
 	}
-	if r.State == nil || r.BackfillPages == 0 {
+	// Then each earlier gap, from where it stopped, until it meets seen items.
+	for _, cursor := range pending {
+		if _, err := r.catchUp(stream, cursor); err != nil || r.summary.Deferred || r.exhausted {
+			return err
+		}
+	}
+	if r.BackfillPages == 0 || backfill.Done {
 		return nil
 	}
 	// Then a few pages further into history, from where the last run stopped.
-	backfill, err := r.State.Backfill(stream.Name)
-	if err != nil || backfill.Done {
-		return err
-	}
 	if !backfill.Started {
 		// The first backfill starts where this run's catch-up stopped, so it
 		// never re-reads the newest pages.
-		if reachedEnd {
+		if top.reachedEnd {
 			return r.State.SetBackfill(stream.Name, "", true, r.Now())
 		}
-		backfill.Cursor = cursor
+		backfill.Cursor = top.next
 	}
-	cursor = backfill.Cursor
+	cursor := backfill.Cursor
 	for page := 0; page < r.BackfillPages; page++ {
 		read, err := r.readPage(stream, cursor, false)
 		if err != nil || r.summary.Deferred {
 			return err
 		}
 		next := read.next
-		done := read.posts == 0 || next == "" || next == cursor
+		done := read.items == 0 || next == "" || next == cursor
 		if err := r.State.SetBackfill(stream.Name, next, done, r.Now()); err != nil {
 			return err
 		}
@@ -254,12 +267,68 @@ func (r *Runner) syncStream(stream Stream) error {
 	return nil
 }
 
-// pageRead is what one page held: its primary posts, how many of its
-// relations this stream had not seen before, and the cursor to the next.
+// pageRead is what one page held: its entries (readable or not), how many
+// of its relations this stream had not seen before, and the next cursor.
 type pageRead struct {
-	posts int
+	items int
 	fresh int
 	next  string
+}
+
+// walk is where a catch-up stopped: the next cursor, whether the list ended,
+// and the gap it left open (a cursor saved in state), if any.
+type walk struct {
+	next       string
+	reachedEnd bool
+	open       string
+}
+
+// catchUp reads newest-first from start ("" is the top) for up to r.Pages
+// pages, until a page holds nothing new. While pages keep holding new items
+// the position is saved as an open gap after every shipped page, so a run
+// that stops early (the page budget, a rate limit, an error, the warehouse
+// refusing the upload) is resumed by the next run instead of leaving the
+// items between here and what was already shipped unread for good.
+func (r *Runner) catchUp(stream Stream, start string) (walk, error) {
+	w := walk{next: start, open: start}
+	for page := 0; page < r.Pages; page++ {
+		read, err := r.readPage(stream, w.next, start == "" && page == 0)
+		if err != nil || r.summary.Deferred {
+			return w, err
+		}
+		w.next = read.next
+		if read.items == 0 || read.next == "" || read.fresh == 0 {
+			w.reachedEnd = read.items == 0 || read.next == ""
+			return w, r.closeGap(stream, &w)
+		}
+		if err := r.moveGap(stream, &w, read.next); err != nil {
+			return w, err
+		}
+		if r.exhausted {
+			return w, nil
+		}
+	}
+	return w, nil
+}
+
+func (r *Runner) moveGap(stream Stream, w *walk, next string) error {
+	if r.State == nil {
+		return nil
+	}
+	if err := r.State.ReplaceCatchup(stream.Name, w.open, next, r.Now()); err != nil {
+		return err
+	}
+	w.open = next
+	return nil
+}
+
+func (r *Runner) closeGap(stream Stream, w *walk) error {
+	if r.State == nil || w.open == "" {
+		return nil
+	}
+	err := r.State.RemoveCatchup(stream.Name, w.open)
+	w.open = ""
+	return err
 }
 
 // readPage fetches, uploads and records one page.
@@ -307,7 +376,9 @@ func (r *Runner) readPage(stream Stream, cursor string, first bool) (pageRead, e
 	if stream.Name == "posts" && first {
 		r.observeNewest(page)
 	}
-	read := pageRead{posts: page.PostCount(), next: page.BottomCursor}
+	read := pageRead{items: page.Items, next: page.BottomCursor}
+	r.Logger.Infof("X %s: read a page via %s: %d entries, %d posts, more=%t",
+		stream.Name, stream.Operation, page.Items, len(posts), page.BottomCursor != "")
 	if len(posts) == 0 {
 		return read, nil
 	}

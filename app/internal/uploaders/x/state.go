@@ -34,7 +34,13 @@ func OpenState(path, account string) (*State, error) {
 			done INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
-	}, map[string]string{"schema_version": "1", "account": account}, []string{"seen", "backfill"})
+		`CREATE TABLE IF NOT EXISTS catchup (
+			stream TEXT NOT NULL,
+			cursor TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (stream, cursor)
+		)`,
+	}, map[string]string{"schema_version": "1", "account": account}, []string{"seen", "backfill", "catchup"})
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +95,47 @@ func (s *State) SetBackfill(stream, cursor string, done bool, now time.Time) err
 	_, err := s.db.DB.Exec(`INSERT INTO backfill (stream, cursor, done, updated_at) VALUES (?, ?, ?, ?)
 		ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, done = excluded.done, updated_at = excluded.updated_at`,
 		stream, cursor, doneFlag, common.ISOFormat(now))
+	return err
+}
+
+// Catchups are a stream's open gaps, oldest first: cursors a run stopped at
+// while its pages still held items it had never shipped.
+func (s *State) Catchups(stream string) ([]string, error) {
+	rows, err := common.Query(s.db.DB, "SELECT cursor FROM catchup WHERE stream = ? ORDER BY created_at, cursor", stream)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.String("cursor"))
+	}
+	return out, nil
+}
+
+// ReplaceCatchup moves a gap's position (old "" opens a new gap), keeping
+// when it opened so the oldest gap is resumed first.
+func (s *State) ReplaceCatchup(stream, old, next string, now time.Time) error {
+	created := common.ISOFormat(now)
+	if old != "" {
+		rows, err := common.Query(s.db.DB, "SELECT created_at FROM catchup WHERE stream = ? AND cursor = ?", stream, old)
+		if err != nil {
+			return err
+		}
+		if len(rows) > 0 {
+			created = rows[0].String("created_at")
+		}
+		if _, err := s.db.DB.Exec("DELETE FROM catchup WHERE stream = ? AND cursor = ?", stream, old); err != nil {
+			return err
+		}
+	}
+	_, err := s.db.DB.Exec(`INSERT INTO catchup (stream, cursor, created_at) VALUES (?, ?, ?)
+		ON CONFLICT(stream, cursor) DO NOTHING`, stream, next, created)
+	return err
+}
+
+// RemoveCatchup closes a gap: its walk reached items already shipped.
+func (s *State) RemoveCatchup(stream, cursor string) error {
+	_, err := s.db.DB.Exec("DELETE FROM catchup WHERE stream = ? AND cursor = ?", stream, cursor)
 	return err
 }
 

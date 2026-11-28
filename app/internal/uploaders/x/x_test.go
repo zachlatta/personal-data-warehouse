@@ -654,3 +654,128 @@ func TestRunWithNeedsTheAccount(t *testing.T) {
 		t.Fatalf("code %d stderr %q", code, stderr.String())
 	}
 }
+
+// likesPages builds a Likes timeline of `pages` pages, newest first, ids
+// counting down from top, `per` posts a page; the last page has no cursor.
+func likesPages(t *testing.T, top, pages, per int) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	id := top
+	for p := 0; p < pages; p++ {
+		var entries []map[string]any
+		for i := 0; i < per; i++ {
+			entries = append(entries, itemEntry(fmt.Sprint(id), tweet(fmt.Sprint(id), "500", "writer", "post", nil)))
+			id--
+		}
+		if p < pages-1 {
+			entries = append(entries, cursorEntry("Bottom", fmt.Sprintf("c%d", p+1)))
+		}
+		key := "Likes|"
+		if p > 0 {
+			key = fmt.Sprintf("Likes|c%d", p)
+		}
+		out[key] = roundTrip(t, profileTimeline(entries...))
+	}
+	return out
+}
+
+func TestAnOutageLongerThanThePageBudgetIsCaughtUpOverLaterRuns(t *testing.T) {
+	likes, _ := x.StreamByName("likes")
+	state := openState(t)
+	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	// The history walk is finished and posts 1..2 were shipped long ago.
+	if err := state.SetBackfill("likes", "", true, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"1", "2"} {
+		if err := state.MarkDiscovered("likes", id, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Then an outage: 10 new likes land on top, 2 a page; the old ones follow.
+	pages := likesPages(t, 12, 6, 2)
+	api := &fakeAPI{remaining: -1, pages: pages}
+	uploader := &recordingUploader{}
+	run := func() {
+		t.Helper()
+		if _, err := (&x.Runner{
+			Account: myHandle, UserID: myID, API: api, Client: uploader, State: state, Streams: []x.Stream{likes},
+			Logger: common.NewWriterLogger(io.Discard), Now: func() time.Time { return now }, Pages: 2, BackfillPages: 5,
+		}).Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run()
+	if got := len(uploader.relations()); got != 4 {
+		t.Fatalf("first run ships the page budget: %d", got)
+	}
+	run()
+	run()
+	rels := uploader.relations()
+	for id := 3; id <= 12; id++ {
+		if _, ok := rels[fmt.Sprintf("liked|%d", id)]; !ok {
+			t.Fatalf("liked|%d was never shipped: %v", id, rels)
+		}
+	}
+	// Caught up: the next run reads the top page only.
+	api.calls = nil
+	run()
+	if strings.Join(api.calls, ",") != "Likes|" {
+		t.Fatalf("calls after catching up = %v", api.calls)
+	}
+}
+
+func TestARateLimitMidCatchUpResumesWhereItStopped(t *testing.T) {
+	likes, _ := x.StreamByName("likes")
+	state := openState(t)
+	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	if err := state.SetBackfill("likes", "", true, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MarkDiscovered("likes", "1", now); err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{remaining: -1, pages: likesPages(t, 7, 4, 2), errs: map[string]error{"Likes|c1": &x.RateLimitError{}}}
+	uploader := &recordingUploader{}
+	runner := func() *x.Runner {
+		return &x.Runner{
+			Account: myHandle, UserID: myID, API: api, Client: uploader, State: state, Streams: []x.Stream{likes},
+			Logger: common.NewWriterLogger(io.Discard), Now: func() time.Time { return now }, Pages: 3,
+		}
+	}
+	if _, err := runner().Sync(); err != nil {
+		t.Fatal(err)
+	}
+	delete(api.errs, "Likes|c1")
+	if _, err := runner().Sync(); err != nil {
+		t.Fatal(err)
+	}
+	rels := uploader.relations()
+	for id := 2; id <= 7; id++ {
+		if _, ok := rels[fmt.Sprintf("liked|%d", id)]; !ok {
+			t.Fatalf("liked|%d lost to the rate limit: %v", id, rels)
+		}
+	}
+}
+
+func TestAHistoryPageOfOnlyDeletedPostsDoesNotEndTheWalk(t *testing.T) {
+	likes, _ := x.StreamByName("likes")
+	tombstones := roundTrip(t, profileTimeline(
+		itemEntry("5", map[string]any{"__typename": "TweetTombstone", "rest_id": "5"}),
+		cursorEntry("Bottom", "c2"),
+	))
+	api := &fakeAPI{remaining: -1, pages: map[string]map[string]any{
+		"Likes|":   roundTrip(t, profileTimeline(itemEntry("9", tweet("9", "500", "w", "p", nil)), cursorEntry("Bottom", "c1"))),
+		"Likes|c1": tombstones,
+		"Likes|c2": roundTrip(t, profileTimeline(itemEntry("3", tweet("3", "500", "w", "older", nil)))),
+	}}
+	uploader := &recordingUploader{}
+	if _, err := (&x.Runner{
+		Account: myHandle, UserID: myID, API: api, Client: uploader, State: openState(t), Streams: []x.Stream{likes},
+		Logger: common.NewWriterLogger(io.Discard), Pages: 1, BackfillPages: 3,
+	}).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := uploader.relations()["liked|3"]; !ok {
+		t.Fatalf("the walk stopped at the deleted posts: calls %v", api.calls)
+	}
+}
