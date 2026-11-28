@@ -74,9 +74,42 @@ type Client struct {
 
 	bearer     string
 	operations map[string]Operation
+	// referer is the x.com page the next query is made from ("" = /home).
+	referer string
 	// lastRemaining is the x-rate-limit-remaining of the last response, or -1.
 	lastRemaining int
 }
+
+// ChromeUserAgent is the User-Agent a Chrome of this version on macOS sends.
+// Chrome freezes everything but the major version ("142.0.0.0").
+func ChromeUserAgent(version string) string {
+	major, _, _ := strings.Cut(strings.TrimSpace(version), ".")
+	if major == "" || strings.Trim(major, "0123456789") != "" {
+		return DefaultUserAgent
+	}
+	return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + major + ".0.0.0 Safari/537.36"
+}
+
+var chromeMajorRe = regexp.MustCompile(`Chrome/(\d+)\.`)
+
+// clientHints are the sec-ch-ua headers that Chrome sends with its UA; a
+// User-Agent that names a Chrome version without them is what a script
+// pretending to be Chrome looks like. Empty for a non-Chrome UA.
+func clientHints(userAgent string) map[string]string {
+	m := chromeMajorRe.FindStringSubmatch(userAgent)
+	if m == nil {
+		return nil
+	}
+	return map[string]string{
+		"sec-ch-ua":          `"Chromium";v="` + m[1] + `", "Google Chrome";v="` + m[1] + `", "Not_A Brand";v="24"`,
+		"sec-ch-ua-mobile":   "?0",
+		"sec-ch-ua-platform": `"macOS"`,
+	}
+}
+
+// SetReferer sets the x.com page (a path like "/i/bookmarks") the next
+// queries are made from, as the web client would send it.
+func (c *Client) SetReferer(path string) { c.referer = path }
 
 // NewClient targets x.com with the session.
 func NewClient(session Session, baseURL, userAgent string) *Client {
@@ -117,7 +150,14 @@ func wantedBundle(scriptURL string) bool {
 // public app token (it ships in every page), never Zach's credential; the
 // credential is the cookie.
 func (c *Client) Discover() error {
-	page, err := c.get(c.BaseURL+"/home", nil, false)
+	page, err := c.get(c.BaseURL+"/home", map[string]string{
+		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+		"sec-fetch-dest":            "document",
+		"sec-fetch-mode":            "navigate",
+		"sec-fetch-site":            "none",
+		"sec-fetch-user":            "?1",
+		"upgrade-insecure-requests": "1",
+	}, false)
 	if err != nil {
 		return fmt.Errorf("could not load x.com: %w", err)
 	}
@@ -135,7 +175,13 @@ func (c *Client) Discover() error {
 	sort.Strings(scripts)
 	operations := map[string]Operation{}
 	for _, script := range scripts {
-		body, err := c.get(script, nil, false)
+		body, err := c.get(script, map[string]string{
+			"Accept":         "*/*",
+			"Referer":        c.BaseURL + "/",
+			"sec-fetch-dest": "script",
+			"sec-fetch-mode": "cors",
+			"sec-fetch-site": "cross-site",
+		}, false)
 		if err != nil {
 			return fmt.Errorf("could not load the x.com client bundle %s: %w", script, err)
 		}
@@ -213,7 +259,11 @@ func (c *Client) Query(operation string, variables map[string]any) (map[string]a
 		"x-twitter-active-user":     "yes",
 		"x-twitter-client-language": "en",
 		"Content-Type":              "application/json",
-		"Referer":                   c.BaseURL + "/",
+		"Accept":                    "*/*",
+		"Referer":                   c.BaseURL + c.refererPath(),
+		"sec-fetch-dest":            "empty",
+		"sec-fetch-mode":            "cors",
+		"sec-fetch-site":            "same-origin",
 	}, true)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", operation, err)
@@ -238,6 +288,13 @@ func (c *Client) Query(operation string, variables map[string]any) (map[string]a
 	return decoded.Data, nil
 }
 
+func (c *Client) refererPath() string {
+	if c.referer == "" {
+		return "/home"
+	}
+	return c.referer
+}
+
 // RemainingRequests is the last response's x-rate-limit-remaining, or -1.
 func (c *Client) RemainingRequests() int { return c.lastRemaining }
 
@@ -248,6 +305,9 @@ func (c *Client) get(target string, headers map[string]string, api bool) ([]byte
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	for k, v := range clientHints(c.UserAgent) {
+		req.Header.Set(k, v)
+	}
 	if strings.HasPrefix(target, c.BaseURL) {
 		// The cookie goes to x.com only, never to the bundle CDN.
 		req.Header.Set("Cookie", c.Session.CookieHeader())

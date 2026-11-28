@@ -17,6 +17,8 @@ type Stream struct {
 	Relation  string
 	Operation string
 	Variables func(userID, cursor string) map[string]any
+	// Page is the x.com page whose client makes this call, sent as Referer.
+	Page func(handle string) string
 }
 
 // pageSize is the posts asked for per request, what the web client asks.
@@ -34,6 +36,7 @@ func withCursor(vars map[string]any, cursor string) map[string]any {
 var Streams = []Stream{
 	{
 		Name: "posts", Relation: "authored", Operation: "UserTweetsAndReplies",
+		Page: func(h string) string { return "/" + h + "/with_replies" },
 		Variables: func(userID, cursor string) map[string]any {
 			return withCursor(map[string]any{
 				"userId": userID, "count": pageSize, "includePromotedContent": false,
@@ -43,6 +46,7 @@ var Streams = []Stream{
 	},
 	{
 		Name: "likes", Relation: "liked", Operation: "Likes",
+		Page: func(h string) string { return "/" + h + "/likes" },
 		Variables: func(userID, cursor string) map[string]any {
 			return withCursor(map[string]any{
 				"userId": userID, "count": pageSize, "includePromotedContent": false,
@@ -52,12 +56,14 @@ var Streams = []Stream{
 	},
 	{
 		Name: "bookmarks", Relation: "bookmarked", Operation: "Bookmarks",
+		Page: func(string) string { return "/i/bookmarks" },
 		Variables: func(_ string, cursor string) map[string]any {
 			return withCursor(map[string]any{"count": pageSize, "includePromotedContent": false}, cursor)
 		},
 	},
 	{
 		Name: "mentions", Relation: "mentioned", Operation: "NotificationsTimeline",
+		Page: func(string) string { return "/notifications/mentions" },
 		Variables: func(_ string, cursor string) map[string]any {
 			return withCursor(map[string]any{"timeline_type": "Mentions", "count": pageSize}, cursor)
 		},
@@ -92,7 +98,7 @@ type Uploader interface {
 const (
 	DefaultIncrementalPages = 3
 	DefaultBackfillPages    = 5
-	DefaultRequestDelay     = 2 * time.Second
+	DefaultRequestDelay     = 3 * time.Second
 )
 
 // Summary is the run's counts.
@@ -104,6 +110,10 @@ type Summary struct {
 	RateLimited []string
 	Failed      []string
 	Deferred    bool
+	// Skipped sat this run out by chance; CoolingDown are still waiting out
+	// an earlier rate limit.
+	Skipped     []string
+	CoolingDown []string
 }
 
 // ErrStreamsFailed is returned (wrapped) when a stream failed; the others ran.
@@ -122,9 +132,12 @@ type Runner struct {
 	Mode    string
 	// Pages bounds the newest-first catch-up per stream; BackfillPages the
 	// walk into older history per stream.
-	Pages             int
-	BackfillPages     int
-	Delay             time.Duration
+	Pages         int
+	BackfillPages int
+	Delay         time.Duration
+	// Pace randomizes gaps, stream order, skips, page budgets and cooldowns;
+	// nil keeps every run identical (a fixed Delay, the listed order).
+	Pace              *Pacer
 	Sleep             func(time.Duration)
 	Now               func() time.Time
 	BeforeUploadCheck func() string
@@ -171,19 +184,50 @@ func (r *Runner) Sync() (Summary, error) {
 			}
 		}
 	}
+	skip := map[string]bool{}
+	if r.Pace != nil {
+		streams = r.Pace.Order(streams)
+		skip = r.Pace.Skip(streams)
+	}
 	for _, stream := range streams {
 		if r.summary.Deferred || r.exhausted {
 			break
 		}
+		if skip[stream.Name] {
+			r.Logger.Infof("X %s: sitting this run out", stream.Name)
+			r.summary.Skipped = append(r.summary.Skipped, stream.Name)
+			continue
+		}
+		if r.State != nil {
+			until, _, err := r.State.Cooldown(stream.Name)
+			if err != nil {
+				return r.summary, err
+			}
+			if until.After(r.Now()) {
+				r.Logger.Infof("X %s: cooling down after a rate limit until %s", stream.Name, until.Format(time.RFC3339))
+				r.summary.CoolingDown = append(r.summary.CoolingDown, stream.Name)
+				continue
+			}
+		}
 		err := r.syncStream(stream)
 		var auth *AuthError
 		if errors.As(err, &auth) {
+			if r.State != nil && r.Pace != nil {
+				until := r.Pace.ChallengeCooldown(r.Now())
+				if cerr := r.State.SetCooldown(RunScope, until, "session"); cerr != nil {
+					return r.summary, cerr
+				}
+				r.Logger.Warningf("X: no request to x.com until %s", until.Format(time.RFC3339))
+			}
 			return r.summary, err
 		}
 		var limit *RateLimitError
 		if errors.As(err, &limit) {
 			r.Logger.Warningf("X %s: %v; resuming next run", stream.Name, limit)
 			r.summary.RateLimited = append(r.summary.RateLimited, stream.Name)
+			if err := r.coolDown(stream.Name, limit.Reset); err != nil {
+				return r.summary, err
+			}
 			continue
 		}
 		if err != nil {
@@ -195,6 +239,24 @@ func (r *Runner) Sync() (Summary, error) {
 		return r.summary, fmt.Errorf("%w: %s", ErrStreamsFailed, strings.Join(r.summary.Failed, "; "))
 	}
 	return r.summary, nil
+}
+
+// coolDown holds a scope off x.com for a randomized while after a rate limit.
+func (r *Runner) coolDown(scope string, reset time.Time) error {
+	if r.State == nil || r.Pace == nil {
+		return nil
+	}
+	until := r.Pace.RateLimitCooldown(reset, r.Now())
+	r.Logger.Warningf("X %s: next request no sooner than %s", scope, until.Format(time.RFC3339))
+	return r.State.SetCooldown(scope, until, "rate_limit")
+}
+
+// pages is this run's page budget for one walk.
+func (r *Runner) pages(n int) int {
+	if r.Pace == nil {
+		return n
+	}
+	return r.Pace.Pages(n)
 }
 
 func (r *Runner) syncStream(stream Stream) error {
@@ -245,7 +307,7 @@ func (r *Runner) syncStream(stream Stream) error {
 		backfill.Cursor = top.next
 	}
 	cursor := backfill.Cursor
-	for page := 0; page < r.BackfillPages; page++ {
+	for page, budget := 0, r.pages(r.BackfillPages); page < budget; page++ {
 		read, err := r.readPage(stream, cursor, false)
 		if err != nil || r.summary.Deferred {
 			return err
@@ -291,7 +353,7 @@ type walk struct {
 // items between here and what was already shipped unread for good.
 func (r *Runner) catchUp(stream Stream, start string) (walk, error) {
 	w := walk{next: start, open: start}
-	for page := 0; page < r.Pages; page++ {
+	for page, budget := 0, r.pages(r.Pages); page < budget; page++ {
 		read, err := r.readPage(stream, w.next, start == "" && page == 0)
 		if err != nil || r.summary.Deferred {
 			return w, err
@@ -333,10 +395,20 @@ func (r *Runner) closeGap(stream Stream, w *walk) error {
 
 // readPage fetches, uploads and records one page.
 func (r *Runner) readPage(stream Stream, cursor string, first bool) (pageRead, error) {
-	if r.requests > 0 && r.Delay > 0 {
-		r.Sleep(r.Delay)
+	if r.requests > 0 {
+		gap := r.Delay
+		if r.Pace != nil {
+			gap = r.Pace.Gap()
+		}
+		if gap > 0 {
+			r.Sleep(gap)
+		}
 	}
 	r.requests++
+	if setter, ok := r.API.(interface{ SetReferer(string) }); ok && stream.Page != nil {
+		// The page a person would be on when the web client makes this call.
+		setter.SetReferer(stream.Page(r.Account))
+	}
 	data, err := r.API.Query(stream.Operation, stream.Variables(r.UserID, cursor))
 	if err != nil {
 		return pageRead{}, err
@@ -345,6 +417,9 @@ func (r *Runner) readPage(stream Stream, cursor string, first bool) (pageRead, e
 		r.Logger.Warningf("X %s: rate limit exhausted after this page; resuming next run", stream.Name)
 		r.summary.RateLimited = append(r.summary.RateLimited, stream.Name)
 		r.exhausted = true
+		if err := r.coolDown(stream.Name, time.Time{}); err != nil {
+			return pageRead{}, err
+		}
 	}
 	r.summary.Pages++
 	page := ParsePage(data)

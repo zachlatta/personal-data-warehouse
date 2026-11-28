@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -777,5 +778,309 @@ func TestAHistoryPageOfOnlyDeletedPostsDoesNotEndTheWalk(t *testing.T) {
 	}
 	if _, ok := uploader.relations()["liked|3"]; !ok {
 		t.Fatalf("the walk stopped at the deleted posts: calls %v", api.calls)
+	}
+}
+
+// --- pacing -----------------------------------------------------------------
+
+func seededPacer(seed uint64, base time.Duration) *x.Pacer {
+	return &x.Pacer{Rand: rand.New(rand.NewPCG(seed, seed)), Base: base, SkipChance: 0.1, PauseChance: 0.1}
+}
+
+func TestPacerGapsAreJitteredWithOccasionalReadingPauses(t *testing.T) {
+	p := seededPacer(1, 3*time.Second)
+	seen := map[time.Duration]bool{}
+	pauses := 0
+	for i := 0; i < 500; i++ {
+		gap := p.Gap()
+		if gap < 1500*time.Millisecond || gap > 45*time.Second {
+			t.Fatalf("gap %s out of range", gap)
+		}
+		if gap > 6*time.Second {
+			pauses++
+		}
+		seen[gap] = true
+	}
+	if len(seen) < 400 || pauses < 20 || pauses > 90 {
+		t.Fatalf("distinct gaps %d, reading pauses %d", len(seen), pauses)
+	}
+	if (&x.Pacer{Rand: p.Rand}).Gap() != 0 {
+		t.Fatal("a zero base means no wait")
+	}
+}
+
+func TestPacerOrdersSkipsAndBudgetsVaryButStayBounded(t *testing.T) {
+	p := seededPacer(2, time.Second)
+	orders := map[string]bool{}
+	skips := 0
+	for i := 0; i < 200; i++ {
+		var names []string
+		for _, s := range p.Order(x.Streams) {
+			names = append(names, s.Name)
+		}
+		if len(names) != 4 {
+			t.Fatalf("order lost a stream: %v", names)
+		}
+		orders[strings.Join(names, ",")] = true
+		skipped := p.Skip(x.Streams)
+		if len(skipped) == 4 {
+			t.Fatal("never skip every stream")
+		}
+		skips += len(skipped)
+		if n := p.Pages(5); n < 3 || n > 5 {
+			t.Fatalf("pages %d", n)
+		}
+		if d := p.StartDelay(10 * time.Minute); d < 0 || d >= 10*time.Minute {
+			t.Fatalf("start delay %s", d)
+		}
+	}
+	if len(orders) < 15 || skips < 40 || skips > 130 {
+		t.Fatalf("orders %d skips %d", len(orders), skips)
+	}
+	if p.Pages(1) != 1 {
+		t.Fatal("a one-page budget stays one page")
+	}
+}
+
+func TestPacerCooldownsOutlastTheResetAndVary(t *testing.T) {
+	p := seededPacer(3, time.Second)
+	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	reset := now.Add(2 * time.Hour)
+	for i := 0; i < 50; i++ {
+		if at := p.RateLimitCooldown(reset, now); at.Before(reset.Add(5*time.Minute)) || at.After(reset.Add(45*time.Minute)) {
+			t.Fatalf("after a named reset: %s", at)
+		}
+		if at := p.RateLimitCooldown(time.Time{}, now); at.Before(now.Add(35*time.Minute)) || at.After(now.Add(75*time.Minute)) {
+			t.Fatalf("without a reset: %s", at)
+		}
+		if at := p.ChallengeCooldown(now); at.Before(now.Add(2*time.Hour)) || at.After(now.Add(6*time.Hour)) {
+			t.Fatalf("challenge: %s", at)
+		}
+	}
+}
+
+func TestARunWithAPacerShufflesSleepsAndCoolsARateLimitedStreamDown(t *testing.T) {
+	api := &fakeAPI{remaining: -1, errs: map[string]error{"Likes|": &x.RateLimitError{}}}
+	state := openState(t)
+	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	var slept []time.Duration
+	pacer := seededPacer(4, 3*time.Second)
+	pacer.SkipChance = 0
+	runner := func() *x.Runner {
+		return &x.Runner{
+			Account: myHandle, UserID: myID, API: api, Client: &recordingUploader{}, State: state,
+			Logger: common.NewWriterLogger(io.Discard), Now: func() time.Time { return now },
+			Pace: pacer, Sleep: func(d time.Duration) { slept = append(slept, d) },
+		}
+	}
+	summary, err := runner().Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(slept) != len(api.calls)-1 {
+		t.Fatalf("one gap between requests: slept %v calls %v", slept, api.calls)
+	}
+	for _, d := range slept {
+		if d == 3*time.Second {
+			t.Fatalf("a fixed gap slipped through: %v", slept)
+		}
+	}
+	until, reason, err := state.Cooldown("likes")
+	if err != nil || reason != "rate_limit" || until.Before(now.Add(35*time.Minute)) {
+		t.Fatalf("cooldown %s %q %v", until, reason, err)
+	}
+	if strings.Join(summary.RateLimited, ",") != "likes" {
+		t.Fatalf("summary %+v", summary)
+	}
+	// The next run, within the cooldown, never asks for likes.
+	api.calls = nil
+	delete(api.errs, "Likes|")
+	summary, err = runner().Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range api.calls {
+		if strings.HasPrefix(call, "Likes") {
+			t.Fatalf("called likes while cooling down: %v", api.calls)
+		}
+	}
+	if strings.Join(summary.CoolingDown, ",") != "likes" {
+		t.Fatalf("summary %+v", summary)
+	}
+	// A different seed reads the streams in a different order.
+	var orders []string
+	for seed := uint64(10); seed < 14; seed++ {
+		api := &fakeAPI{remaining: -1}
+		p := seededPacer(seed, 0)
+		p.SkipChance = 0
+		(&x.Runner{Account: myHandle, UserID: myID, API: api, Client: &recordingUploader{},
+			Logger: common.NewWriterLogger(io.Discard), Pace: p}).Sync()
+		orders = append(orders, strings.Join(api.calls, ","))
+	}
+	if orders[0] == orders[1] && orders[1] == orders[2] && orders[2] == orders[3] {
+		t.Fatalf("stream order never varies: %v", orders)
+	}
+}
+
+func TestARejectedSessionKeepsEveryLaterRunOffXComForHours(t *testing.T) {
+	api := &fakeAPI{remaining: -1, errs: map[string]error{"UserTweetsAndReplies|": &x.AuthError{Status: 403}}}
+	state := openState(t)
+	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	pacer := seededPacer(5, 0)
+	pacer.SkipChance = 0
+	_, err := (&x.Runner{Account: myHandle, UserID: myID, API: api, Client: &recordingUploader{}, State: state,
+		Streams: []x.Stream{x.Streams[0]}, Logger: common.NewWriterLogger(io.Discard), Now: func() time.Time { return now }, Pace: pacer}).Sync()
+	var auth *x.AuthError
+	if !errors.As(err, &auth) {
+		t.Fatalf("err = %v", err)
+	}
+	until, reason, _ := state.Cooldown(x.RunScope)
+	if reason != "session" || until.Before(now.Add(2*time.Hour)) {
+		t.Fatalf("run cooldown %s %q", until, reason)
+	}
+}
+
+func TestTheClientSendsTheInstalledChromesHeadersAndTheStreamsPage(t *testing.T) {
+	if got := x.ChromeUserAgent("142.0.7444.60"); !strings.Contains(got, "Chrome/142.0.0.0 Safari") {
+		t.Fatalf("ua %q", got)
+	}
+	if x.ChromeUserAgent("") != x.DefaultUserAgent || x.ChromeUserAgent("garbage") != x.DefaultUserAgent {
+		t.Fatal("an unreadable version falls back")
+	}
+	f := newFakeX(t)
+	c := x.NewClient(testSession(), f.server.URL, x.ChromeUserAgent("143.0.1.2"))
+	if err := c.Discover(); err != nil {
+		t.Fatal(err)
+	}
+	home := f.requests[0]
+	if home.Header.Get("sec-fetch-mode") != "navigate" || home.Header.Get("sec-ch-ua-platform") != `"macOS"` {
+		t.Fatalf("home headers %v", home.Header)
+	}
+	c.SetReferer("/i/bookmarks")
+	if _, err := c.Query("Bookmarks", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	last := f.requests[len(f.requests)-1]
+	if last.Header.Get("Referer") != f.server.URL+"/i/bookmarks" ||
+		!strings.Contains(last.Header.Get("sec-ch-ua"), `"Google Chrome";v="143"`) ||
+		!strings.Contains(last.Header.Get("User-Agent"), "Chrome/143.0.0.0") ||
+		last.Header.Get("sec-fetch-site") != "same-origin" || last.Header.Get("Accept-Language") == "" {
+		t.Fatalf("api headers %v", last.Header)
+	}
+	// Each stream names the page its query comes from.
+	for _, s := range x.Streams {
+		if s.Page == nil || !strings.HasPrefix(s.Page(myHandle), "/") {
+			t.Fatalf("%s has no page", s.Name)
+		}
+	}
+}
+
+func TestRunWithWaitsARandomStartAndHonorsARunCooldown(t *testing.T) {
+	f := newFakeX(t)
+	f.pages["UserByScreenName|"] = map[string]any{"user": user(myID, myHandle)}
+	stateDir := t.TempDir()
+	statePath := filepath.Join(stateDir, "s.sqlite")
+	env := map[string]string{"X_ACCOUNT": myHandle, "PDW_INGEST_PROJECT_DIR": t.TempDir(), "X_REQUEST_DELAY_MS": "0", "X_START_JITTER_SECONDS": "600"}
+	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	var slept []time.Duration
+	captured := 0
+	deps := x.Deps{
+		Capture: func(string) (x.Session, error) { captured++; return testSession(), nil },
+		NewAPI:  func(s x.Session, _ common.Getenv) x.API { return x.NewClient(s, f.server.URL, "") },
+		Pacer:   func(base time.Duration) *x.Pacer { return seededPacer(6, base) },
+		Sleep:   func(d time.Duration) { slept = append(slept, d) },
+		Now:     func() time.Time { return now },
+	}
+	args := []string{"--dry-run", "--start-jitter", "10m", "--state-file", statePath, "--lock-file", filepath.Join(stateDir, "lock")}
+	var stdout, stderr bytes.Buffer
+	if code := x.RunWith(args, &stdout, &stderr, func(k string) string { return env[k] }, ingestclient.Config{}, deps); code != 0 {
+		t.Fatalf("code %d %s", code, stderr.String())
+	}
+	if len(slept) == 0 || slept[0] <= 0 || slept[0] >= 10*time.Minute {
+		t.Fatalf("start wait %v", slept)
+	}
+	// The dry run reads every stream: none sits out.
+	for _, s := range []string{"posts", "likes", "bookmarks", "mentions"} {
+		if !strings.Contains(stdout.String(), "X "+s+": read a page") {
+			t.Fatalf("dry run skipped %s: %s", s, stdout.String())
+		}
+	}
+	// A session cooldown in state stops a real run before it touches x.com.
+	state, err := x.OpenState(statePath, myHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetCooldown(x.RunScope, now.Add(3*time.Hour), "session"); err != nil {
+		t.Fatal(err)
+	}
+	state.Close()
+	captured = 0
+	requests := len(f.requests)
+	stderr.Reset()
+	code := x.RunWith([]string{"--state-file", statePath, "--lock-file", filepath.Join(stateDir, "lock")},
+		&stdout, &stderr, func(k string) string { return env[k] }, ingestclient.Config{}, deps)
+	if code != 1 || captured != 0 || len(f.requests) != requests || !strings.Contains(stderr.String(), "not calling x.com until") {
+		t.Fatalf("code %d captured %d stderr %q", code, captured, stderr.String())
+	}
+}
+
+func TestTheRunnerSendsEachStreamsOwnPageAsReferer(t *testing.T) {
+	f := newFakeX(t)
+	c := x.NewClient(testSession(), f.server.URL, "")
+	if err := c.Discover(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&x.Runner{Account: myHandle, UserID: myID, API: c, Client: &recordingUploader{},
+		Logger: common.NewWriterLogger(io.Discard)}).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"UserTweetsAndReplies":  "/zachlatta/with_replies",
+		"Likes":                 "/zachlatta/likes",
+		"Bookmarks":             "/i/bookmarks",
+		"NotificationsTimeline": "/notifications/mentions",
+	}
+	for _, r := range f.requests {
+		for op, page := range want {
+			if strings.HasSuffix(r.URL.Path, "/"+op) {
+				if got := r.Header.Get("Referer"); got != f.server.URL+page {
+					t.Fatalf("%s referer %q, want %q", op, got, page)
+				}
+				delete(want, op)
+			}
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("not called: %v", want)
+	}
+}
+
+func TestClearCooldownLiftsTheSessionCooldown(t *testing.T) {
+	f := newFakeX(t)
+	f.pages["UserByScreenName|"] = map[string]any{"user": user(myID, myHandle)}
+	stateDir := t.TempDir()
+	statePath := filepath.Join(stateDir, "s.sqlite")
+	now := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	state, err := x.OpenState(statePath, myHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.SetCooldown(x.RunScope, now.Add(3*time.Hour), "session")
+	state.Close()
+	env := map[string]string{"X_ACCOUNT": myHandle, "PDW_INGEST_PROJECT_DIR": t.TempDir(), "X_REQUEST_DELAY_MS": "0"}
+	captured := false
+	deps := x.Deps{
+		Capture: func(string) (x.Session, error) {
+			captured = true
+			return x.Session{}, errors.New("stop after the gate")
+		},
+		Now:   func() time.Time { return now },
+		Sleep: func(time.Duration) {},
+	}
+	var stdout, stderr bytes.Buffer
+	x.RunWith([]string{"--clear-cooldown", "--start-jitter", "0", "--state-file", statePath, "--lock-file", filepath.Join(stateDir, "lock")},
+		&stdout, &stderr, func(k string) string { return env[k] }, ingestclient.Config{}, deps)
+	if !captured {
+		t.Fatalf("the cleared cooldown still blocked the run: %s", stderr.String())
 	}
 }

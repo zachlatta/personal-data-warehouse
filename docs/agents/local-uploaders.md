@@ -499,7 +499,8 @@ LaunchAgent:
 - Logs: `~/Library/Logs/personal-data-warehouse/x-upload.run.log` and `.heartbeat`; the run
   heartbeat posts as pipeline `x`
 - Settings: `X_ACCOUNT=<handle>` in the device runtime's `.env` (required);
-  `X_REQUEST_DELAY_MS` (default 2000) and `X_USER_AGENT` are optional
+  `X_REQUEST_DELAY_MS` (median gap, default 3000), `X_START_JITTER_SECONDS` (default 600)
+  and `X_USER_AGENT` (default: built from the installed Chrome's version) are optional
 
 **Why it runs on the Mac and spends the browser's own login.** X offers no API for a person's
 own likes, bookmarks and mentions short of a paid developer plan, but the x.com web client
@@ -541,9 +542,29 @@ signed in to a different account than `X_ACCOUNT`.
 **Account risk.** Slack signed Zach out of every device when a Go client spent his desktop
 session ([slack.md](slack.md#publishing-the-slack-session-a-paste-never-a-capture)), and X
 locks accounts it reads as automation. This uploader keeps to a person's volume (a few
-requests per stream every 30 minutes, two seconds apart) and never writes to X. If x.com ever
-signs him out, asks him to verify the account, or locks it, unload the LaunchAgent and tell
-him rather than making the requests look more like a browser.
+requests per stream every 30 minutes) and never writes to X. Unlike the Slack rule, Zach
+asked on 2026-11-27 for the X traffic to read like his browser rather than a scheduled job,
+so every run (`pace.go`, all of it seeded and injected so the tests are deterministic):
+
+- waits a random 0-10 minutes before its first request, off launchd's exact 30-minute grid;
+- spaces requests a random half to twice 3 s apart, with a longer "reading" pause of 4-15x
+  about one gap in ten;
+- shuffles the order of the four streams, lets each sit out about one run in ten (never all
+  of them; a dry run skips none), and varies each walk's page budget between half and all of
+  `--pages` / `--backfill-pages`;
+- sends what the installed Chrome sends: a User-Agent with that Chrome's major version (read
+  from the app bundle with `defaults read`), the matching `sec-ch-ua` client hints,
+  `sec-fetch-*`, `Accept-Language`, and as Referer the x.com page the web client would make
+  that call from (`/<handle>/with_replies`, `/<handle>/likes`, `/i/bookmarks`,
+  `/notifications/mentions`);
+- after a 429 or `x-rate-limit-remaining: 0`, keeps that stream off x.com past X's own reset
+  and for at least 35-75 minutes (state table `cooldown`); after a 401/403 (signed out or
+  challenged), keeps every run off x.com for 2-6 hours, exiting 1 so `/pipelines` shows it.
+  After signing back in, `pdw ingest x --clear-cooldown` lifts that.
+
+It still runs on Go's TLS, so this is camouflage of the request pattern, not a browser. If
+x.com ever signs him out, asks him to verify the account, or locks it, unload the LaunchAgent
+and tell him.
 
 **Not covered:** DMs (X moved them to its encrypted chat; this uploader does not attempt
 them), likes or bookmarks taken back (the row stays), and his home timeline, which is never

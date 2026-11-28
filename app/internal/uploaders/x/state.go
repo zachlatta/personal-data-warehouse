@@ -40,7 +40,12 @@ func OpenState(path, account string) (*State, error) {
 			created_at TEXT NOT NULL,
 			PRIMARY KEY (stream, cursor)
 		)`,
-	}, map[string]string{"schema_version": "1", "account": account}, []string{"seen", "backfill", "catchup"})
+		`CREATE TABLE IF NOT EXISTS cooldown (
+			scope TEXT PRIMARY KEY,
+			until TEXT NOT NULL,
+			reason TEXT NOT NULL DEFAULT ''
+		)`,
+	}, map[string]string{"schema_version": "1", "account": account}, []string{"seen", "backfill", "catchup", "cooldown"})
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +141,36 @@ func (s *State) ReplaceCatchup(stream, old, next string, now time.Time) error {
 // RemoveCatchup closes a gap: its walk reached items already shipped.
 func (s *State) RemoveCatchup(stream, cursor string) error {
 	_, err := s.db.DB.Exec("DELETE FROM catchup WHERE stream = ? AND cursor = ?", stream, cursor)
+	return err
+}
+
+// RunScope is the cooldown scope that holds every request, not one stream's.
+const RunScope = "run"
+
+// Cooldown is when a scope (a stream, or RunScope) may next call x.com, and why.
+func (s *State) Cooldown(scope string) (time.Time, string, error) {
+	rows, err := common.Query(s.db.DB, "SELECT until, reason FROM cooldown WHERE scope = ?", scope)
+	if err != nil || len(rows) == 0 {
+		return time.Time{}, "", err
+	}
+	until, err := time.Parse(time.RFC3339Nano, rows[0].String("until"))
+	if err != nil {
+		return time.Time{}, "", nil
+	}
+	return until.UTC(), rows[0].String("reason"), nil
+}
+
+// SetCooldown holds a scope off x.com until a time.
+func (s *State) SetCooldown(scope string, until time.Time, reason string) error {
+	_, err := s.db.DB.Exec(`INSERT INTO cooldown (scope, until, reason) VALUES (?, ?, ?)
+		ON CONFLICT(scope) DO UPDATE SET until = excluded.until, reason = excluded.reason`,
+		scope, until.UTC().Format(time.RFC3339Nano), reason)
+	return err
+}
+
+// ClearCooldown lifts a scope's cooldown (after signing back in).
+func (s *State) ClearCooldown(scope string) error {
+	_, err := s.db.DB.Exec("DELETE FROM cooldown WHERE scope = ?", scope)
 	return err
 }
 
