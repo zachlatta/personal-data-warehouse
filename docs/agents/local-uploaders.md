@@ -517,7 +517,10 @@ what was read goes to the warehouse. Over SSH the login keychain is locked (`sec
 run reads each stream newest-first until a page holds nothing it has shipped before (at most
 `--pages`, 3), then walks `--backfill-pages` (5) further into history from the cursor the last
 run stopped at (kept in `~/Library/Application Support/personal-data-warehouse/x-upload-state.sqlite`).
-So the first sync of years of likes takes many runs rather than one burst. `--mode full`
+So the first sync of years of likes takes many runs rather than one burst. A catch-up cut short
+while its pages still held new items (the page budget after an outage, a rate limit, an
+error) saves its cursor as an open gap, and later runs resume each gap until it reaches items
+already shipped, so an outage delays items rather than losing them. `--mode full`
 restarts every history walk. X's profile timelines stop at roughly the newest few thousand
 posts, so older history needs the X data archive, which this does not read.
 
