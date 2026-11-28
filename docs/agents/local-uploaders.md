@@ -553,7 +553,8 @@ so every run (`pace.go`, all of it seeded and injected so the tests are determin
   of them; a dry run skips none), and varies each walk's page budget between half and all of
   `--pages` / `--backfill-pages`;
 - sends what the installed Chrome sends: a User-Agent with that Chrome's major version (read
-  from the app bundle with `defaults read`), the matching `sec-ch-ua` client hints,
+  from the app bundle with `defaults read`; a session from Arc, Vivaldi or another browser that
+  numbers its bundle its own way keeps the default User-Agent), the matching `sec-ch-ua` client hints,
   `sec-fetch-*`, `Accept-Language`, and as Referer the x.com page the web client would make
   that call from (`/<handle>/with_replies`, `/<handle>/likes`, `/i/bookmarks`,
   `/notifications/mentions`);

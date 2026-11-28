@@ -93,20 +93,34 @@ func defaultDeps() Deps {
 	}
 }
 
-// InstalledChromeVersion reads the version of the Chrome-family app the
-// session was captured from ("142.0.7444.60"), or "" when it cannot.
+// InstalledChromeVersion reads the version of the Chrome the session was
+// captured from ("142.0.7444.60"), or "" when it cannot.
 func InstalledChromeVersion(browserDisplayName string) string {
+	return BundleChromeVersion(browserDisplayName, func(bundle string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "/usr/bin/defaults", "read", bundle+"/Contents/Info", "CFBundleShortVersionString").Output()
+		return string(out), err
+	})
+}
+
+// BundleChromeVersion is the Chrome version of a session's browser, read
+// from its app bundle, or "" (the default User-Agent). Only Chrome and
+// Chromium number their bundles with the Chrome version: Arc ("1.79.1") and
+// Vivaldi ("7.1...") use their own, which would make "Chrome/1.0.0.0".
+func BundleChromeVersion(browserDisplayName string, readBundleVersion func(bundle string) (string, error)) string {
 	for _, profile := range chromium.Browsers {
 		if profile.DisplayName != browserDisplayName || profile.AppBundle == "" {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		out, err := exec.CommandContext(ctx, "/usr/bin/defaults", "read", profile.AppBundle+"/Contents/Info", "CFBundleShortVersionString").Output()
+		if profile.Key != "chrome" && profile.Key != "chromium" {
+			return ""
+		}
+		out, err := readBundleVersion(profile.AppBundle)
 		if err != nil {
 			return ""
 		}
-		return strings.TrimSpace(string(out))
+		return strings.TrimSpace(out)
 	}
 	return ""
 }

@@ -956,6 +956,22 @@ func TestTheClientSendsTheInstalledChromesHeadersAndTheStreamsPage(t *testing.T)
 	if x.ChromeUserAgent("") != x.DefaultUserAgent || x.ChromeUserAgent("garbage") != x.DefaultUserAgent {
 		t.Fatal("an unreadable version falls back")
 	}
+	// Arc ("1.79.1") and Vivaldi ("7.1.3570.39") number their bundles with
+	// their own version, not Chrome's: reading it would send "Chrome/1.0.0.0".
+	bundles := map[string]string{
+		"/Applications/Google Chrome.app": "142.0.7444.60",
+		"/Applications/Arc.app":           "1.79.1",
+		"/Applications/Vivaldi.app":       "7.1.3570.39",
+	}
+	read := func(bundle string) (string, error) { return bundles[bundle], nil }
+	if v := x.BundleChromeVersion("Google Chrome", read); v != "142.0.7444.60" {
+		t.Fatalf("chrome version %q", v)
+	}
+	for _, browser := range []string{"Arc", "Vivaldi"} {
+		if v := x.BundleChromeVersion(browser, read); v != "" {
+			t.Fatalf("%s bundle version %q used as a Chrome version", browser, v)
+		}
+	}
 	f := newFakeX(t)
 	c := x.NewClient(testSession(), f.server.URL, x.ChromeUserAgent("143.0.1.2"))
 	if err := c.Discover(); err != nil {
