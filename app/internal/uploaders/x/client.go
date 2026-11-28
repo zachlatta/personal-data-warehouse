@@ -39,6 +39,7 @@ type Operation struct {
 var fallbackOperations = map[string]Operation{
 	"UserByScreenName":      {QueryID: "AMIBMjtxEEATh4z8V9GtRg", Features: userFeatures, FieldToggles: userFieldToggles},
 	"UserTweetsAndReplies":  {QueryID: "FmuxExUC21Xn_C2NwtX5sQ", Features: timelineFeatures, FieldToggles: timelineFieldToggles},
+	"UserTweets":            {QueryID: "D6z-FJI2pKuwEeYYxVIGbg", Features: timelineFeatures, FieldToggles: timelineFieldToggles},
 	"Likes":                 {QueryID: "ZjyvI1V9gajq5eclHCObzA", Features: timelineFeatures, FieldToggles: timelineFieldToggles},
 	"Bookmarks":             {QueryID: "fjf5b5Lu82lYMSBRhppK2g", Features: timelineFeatures, FieldToggles: timelineFieldToggles},
 	"NotificationsTimeline": {QueryID: "XANkUc-HLIcCl8q85rGC2A", Features: timelineFeatures, FieldToggles: timelineFieldToggles},

@@ -1177,3 +1177,37 @@ func TestARefusedOrRedirectedHomePageCoolsTheSessionDown(t *testing.T) {
 		})
 	}
 }
+
+func TestPostsFallBackToUserTweetsWhenTheRepliesTimelineIs404(t *testing.T) {
+	mine := tweet("300", myID, myHandle, "a post of his", nil)
+	api := &fakeAPI{remaining: -1,
+		errs: map[string]error{"UserTweetsAndReplies|": errors.New("HTTP 404")},
+		pages: map[string]map[string]any{
+			"UserTweets|":   roundTrip(t, profileTimeline(itemEntry("90", mine), cursorEntry("Bottom", "c1"))),
+			"UserTweets|c1": roundTrip(t, profileTimeline(itemEntry("80", tweet("299", myID, myHandle, "older", nil)))),
+		}}
+	posts, _ := x.StreamByName("posts")
+	uploader := &recordingUploader{}
+	summary, err := (&x.Runner{Account: myHandle, UserID: myID, API: api, Client: uploader, State: openState(t),
+		Streams: []x.Stream{posts}, Logger: common.NewWriterLogger(io.Discard), Pages: 2}).Sync()
+	if err != nil || len(summary.Failed) != 0 {
+		t.Fatalf("err %v summary %+v", err, summary)
+	}
+	rels := uploader.relations()
+	if _, ok := rels["authored|300"]; !ok {
+		t.Fatalf("relations %v", rels)
+	}
+	if _, ok := rels["authored|299"]; !ok {
+		t.Fatalf("the next page must use the fallback too: %v calls %v", rels, api.calls)
+	}
+	// The replies timeline is tried once per run, not once per page.
+	n := 0
+	for _, c := range api.calls {
+		if strings.HasPrefix(c, "UserTweetsAndReplies") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("calls %v", api.calls)
+	}
+}

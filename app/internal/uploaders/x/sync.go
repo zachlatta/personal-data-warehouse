@@ -19,6 +19,9 @@ type Stream struct {
 	Variables func(userID, cursor string) map[string]any
 	// Page is the x.com page whose client makes this call, sent as Referer.
 	Page func(handle string) string
+	// Fallback is the query used for the rest of a run when Operation
+	// answers 404 (x.com gating it), with its own variables and page.
+	Fallback *Stream
 }
 
 // pageSize is the posts asked for per request, what the web client asks.
@@ -42,6 +45,19 @@ var Streams = []Stream{
 				"userId": userID, "count": pageSize, "includePromotedContent": false,
 				"withCommunity": true, "withVoice": true,
 			}, cursor)
+		},
+		// On 2026-11-28 x.com answered UserTweetsAndReplies with 404 for this
+		// client (Likes, Bookmarks and mentions answered 200): his profile's
+		// posts tab still reads his posts, reposts and quotes, not his replies.
+		Fallback: &Stream{
+			Name: "posts", Relation: "authored", Operation: "UserTweets",
+			Page: func(h string) string { return "/" + h },
+			Variables: func(userID, cursor string) map[string]any {
+				return withCursor(map[string]any{
+					"userId": userID, "count": pageSize, "includePromotedContent": false,
+					"withQuickPromoteEligibilityTweetFields": true, "withVoice": true,
+				}, cursor)
+			},
 		},
 	},
 	{
@@ -144,7 +160,9 @@ type Runner struct {
 	// Observe posts the newest post of his own x.com shows (contract C11).
 	Observe ingestclient.ObservationPoster
 
-	requests  int
+	requests int
+	// fellBack names the streams on their Fallback query for this run.
+	fellBack  map[string]bool
 	guarded   bool
 	summary   Summary
 	exhausted bool
@@ -329,6 +347,14 @@ func (r *Runner) syncStream(stream Stream) error {
 	return nil
 }
 
+func (r *Runner) query(stream Stream, cursor string) (map[string]any, error) {
+	if setter, ok := r.API.(interface{ SetReferer(string) }); ok && stream.Page != nil {
+		// The page a person would be on when the web client makes this call.
+		setter.SetReferer(stream.Page(r.Account))
+	}
+	return r.API.Query(stream.Operation, stream.Variables(r.UserID, cursor))
+}
+
 // pageRead is what one page held: its entries (readable or not), how many
 // of its relations this stream had not seen before, and the next cursor.
 type pageRead struct {
@@ -405,14 +431,29 @@ func (r *Runner) readPage(stream Stream, cursor string, first bool) (pageRead, e
 		}
 	}
 	r.requests++
-	if setter, ok := r.API.(interface{ SetReferer(string) }); ok && stream.Page != nil {
-		// The page a person would be on when the web client makes this call.
-		setter.SetReferer(stream.Page(r.Account))
+	query := stream
+	if r.fellBack[stream.Name] && stream.Fallback != nil {
+		query = *stream.Fallback
 	}
-	data, err := r.API.Query(stream.Operation, stream.Variables(r.UserID, cursor))
+	data, err := r.query(query, cursor)
+	if err != nil && stream.Fallback != nil && !r.fellBack[stream.Name] && strings.Contains(err.Error(), "HTTP 404") {
+		r.Logger.Warningf("X %s: %s answered 404; reading %s instead for this run", stream.Name, stream.Operation, stream.Fallback.Operation)
+		if r.fellBack == nil {
+			r.fellBack = map[string]bool{}
+		}
+		r.fellBack[stream.Name] = true
+		query = *stream.Fallback
+		if r.Pace != nil {
+			r.Sleep(r.Pace.Gap())
+		} else if r.Delay > 0 {
+			r.Sleep(r.Delay)
+		}
+		data, err = r.query(query, cursor)
+	}
 	if err != nil {
 		return pageRead{}, err
 	}
+	stream.Operation = query.Operation
 	if remaining := r.API.RemainingRequests(); remaining == 0 {
 		r.Logger.Warningf("X %s: rate limit exhausted after this page; resuming next run", stream.Name)
 		r.summary.RateLimited = append(r.summary.RateLimited, stream.Name)

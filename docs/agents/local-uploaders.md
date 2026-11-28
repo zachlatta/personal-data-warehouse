@@ -514,7 +514,12 @@ what was read goes to the warehouse. Over SSH the login keychain is locked (`sec
 
 **What a run reads.** Four streams, each a read-only GraphQL query: `posts`
 (`UserTweetsAndReplies`: his posts, replies and reposts), `likes` (`Likes`), `bookmarks`
-(`Bookmarks`) and `mentions` (`NotificationsTimeline` with `timeline_type: Mentions`). Every
+(`Bookmarks`) and `mentions` (`NotificationsTimeline` with `timeline_type: Mentions`). On
+2026-11-28 x.com answered `UserTweetsAndReplies` with 404 for this client while the other
+three answered 200 (it likely wants the web client's `x-client-transaction-id`, which this
+does not send), so on a 404 a run reads `UserTweets` (his profile's posts tab: posts, reposts
+and quotes) instead, and his replies to other people are not archived until that is solved;
+replies to him still arrive through mentions. Every
 run reads each stream newest-first until a page holds nothing it has shipped before (at most
 `--pages`, 3), then walks `--backfill-pages` (5) further into history from the cursor the last
 run stopped at (kept in `~/Library/Application Support/personal-data-warehouse/x-upload-state.sqlite`).
