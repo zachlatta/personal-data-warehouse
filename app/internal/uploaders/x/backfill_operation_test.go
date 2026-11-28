@@ -79,7 +79,7 @@ func TestLegacyBackfillStateMigratesAndResetsForUserTweetsAndReplies(t *testing.
 			replyNew := tweet("201", myID, myHandle, "@someone recent reply", map[string]any{"legacy.in_reply_to_status_id_str": "200"})
 			replyOld := tweet("150", myID, myHandle, "@someone older reply", map[string]any{"legacy.in_reply_to_status_id_str": "149"})
 			api := &fakeAPI{remaining: -1, pages: map[string]map[string]any{
-				"UserTweetsAndReplies|":      roundTrip(t, profileTimeline(itemEntry("201", replyNew), cursorEntry("Bottom", "utr-c1"))),
+				"UserTweetsAndReplies|":       roundTrip(t, profileTimeline(itemEntry("201", replyNew), cursorEntry("Bottom", "utr-c1"))),
 				"UserTweetsAndReplies|utr-c1": roundTrip(t, profileTimeline(itemEntry("150", replyOld), cursorEntry("Bottom", "utr-c2"))),
 			}}
 			uploader := &recordingUploader{}
@@ -128,7 +128,7 @@ func TestExplicitUserTweetsBackfillResetsWhenUserTweetsAndRepliesSucceeds(t *tes
 	reply := tweet("301", myID, myHandle, "@someone reply", map[string]any{"legacy.in_reply_to_status_id_str": "300"})
 	olderReply := tweet("250", myID, myHandle, "@someone older", map[string]any{"legacy.in_reply_to_status_id_str": "249"})
 	api := &fakeAPI{remaining: -1, pages: map[string]map[string]any{
-		"UserTweetsAndReplies|":      roundTrip(t, profileTimeline(itemEntry("301", reply), cursorEntry("Bottom", "utr-c1"))),
+		"UserTweetsAndReplies|":       roundTrip(t, profileTimeline(itemEntry("301", reply), cursorEntry("Bottom", "utr-c1"))),
 		"UserTweetsAndReplies|utr-c1": roundTrip(t, profileTimeline(itemEntry("250", olderReply))),
 	}}
 	uploader := &recordingUploader{}
@@ -231,9 +231,9 @@ func TestNormalUserTweetsAndRepliesRunsPreserveCursorWithoutResetting(t *testing
 	now := time.Date(2026, 11, 28, 8, 0, 0, 0, time.UTC)
 	postsStream, _ := x.StreamByName("posts")
 	api := &fakeAPI{remaining: -1, pages: map[string]map[string]any{
-		"UserTweetsAndReplies|":      roundTrip(t, profileTimeline(itemEntry("10", tweet("10", myID, myHandle, "p10", nil)), cursorEntry("Bottom", "c1"))),
-		"UserTweetsAndReplies|c1":    roundTrip(t, profileTimeline(itemEntry("9", tweet("9", myID, myHandle, "p9", nil)), cursorEntry("Bottom", "c2"))),
-		"UserTweetsAndReplies|c2":    roundTrip(t, profileTimeline(itemEntry("8", tweet("8", myID, myHandle, "p8", nil)), cursorEntry("Bottom", "c3"))),
+		"UserTweetsAndReplies|":   roundTrip(t, profileTimeline(itemEntry("10", tweet("10", myID, myHandle, "p10", nil)), cursorEntry("Bottom", "c1"))),
+		"UserTweetsAndReplies|c1": roundTrip(t, profileTimeline(itemEntry("9", tweet("9", myID, myHandle, "p9", nil)), cursorEntry("Bottom", "c2"))),
+		"UserTweetsAndReplies|c2": roundTrip(t, profileTimeline(itemEntry("8", tweet("8", myID, myHandle, "p8", nil)), cursorEntry("Bottom", "c3"))),
 	}}
 	uploader := &recordingUploader{}
 	run := func(at time.Time) {
@@ -258,5 +258,36 @@ func TestNormalUserTweetsAndRepliesRunsPreserveCursorWithoutResetting(t *testing
 	bf, err := state.Backfill("posts")
 	if err != nil || bf.Cursor != "c3" || bf.Operation != "UserTweetsAndReplies" {
 		t.Fatalf("backfill after run 2 = %+v err=%v", bf, err)
+	}
+}
+
+func TestFallbackMidwayThroughAFreshBackfillKeepsTheUserTweetsAndRepliesCursor(t *testing.T) {
+	state := openState(t)
+	now := time.Date(2026, 11, 28, 8, 0, 0, 0, time.UTC)
+	postsStream, _ := x.StreamByName("posts")
+	// A first run: the walk starts via UserTweetsAndReplies, then X answers 404
+	// on the second history page and the run falls back to UserTweets.
+	api := &fakeAPI{
+		remaining: -1,
+		errs:      map[string]error{"UserTweetsAndReplies|utr-c2": errors.New("UserTweetsAndReplies: HTTP 404")},
+		pages: map[string]map[string]any{
+			"UserTweetsAndReplies|":       roundTrip(t, profileTimeline(itemEntry("503", tweet("503", myID, myHandle, "newest", nil)), cursorEntry("Bottom", "utr-c1"))),
+			"UserTweetsAndReplies|utr-c1": roundTrip(t, profileTimeline(itemEntry("502", tweet("502", myID, myHandle, "older", nil)), cursorEntry("Bottom", "utr-c2"))),
+			"UserTweets|utr-c2":           roundTrip(t, profileTimeline(itemEntry("501", tweet("501", myID, myHandle, "oldest", nil)), cursorEntry("Bottom", "ut-c3"))),
+		},
+	}
+	if _, err := (&x.Runner{
+		Account: myHandle, UserID: myID, API: api, Client: &recordingUploader{}, State: state,
+		Streams: []x.Stream{postsStream}, Logger: common.NewWriterLogger(io.Discard),
+		Now: func() time.Time { return now }, Pages: 1, BackfillPages: 3,
+	}).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	bf, err := state.Backfill("posts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bf.Started || bf.Done || bf.Cursor != "utr-c2" || bf.Operation != "UserTweetsAndReplies" {
+		t.Fatalf("fallback overwrote the fresh UserTweetsAndReplies backfill: %+v", bf)
 	}
 }

@@ -383,6 +383,9 @@ func (r *Runner) syncStream(stream Stream) error {
 		if err := r.State.SetBackfill(stream.Name, next, activeOp, done, r.Now()); err != nil {
 			return err
 		}
+		// The saved row is now this walk's state, so a fallback on a later
+		// page of a fresh walk preserves it too.
+		backfill = BackfillState{Started: true, Cursor: next, Done: done, Operation: activeOp}
 		if done {
 			r.Logger.Infof("X %s: history backfill complete", stream.Name)
 			return nil
