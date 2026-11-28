@@ -2832,6 +2832,35 @@ def test_gmail_person_relays_and_specific_requests_are_attention_not_bulk(wareho
                       'z@x.test|install': 'cc', 'z@x.test|promo': 'noise'}
 
 
+def test_an_x_reread_that_only_moves_engagement_counts_does_not_bump_seq(warehouse):
+    # Every uploader run re-reads the newest page and rewrites those rows with
+    # fresh like/view counts. The counts stay in base_x.posts: were they in the
+    # timeline row's content-guarded metadata, every run would bump seq and
+    # re-chunk and re-embed the same posts.
+    _ensure_all_source_tables(warehouse)
+
+    def post(synced_at, views: int) -> dict:
+        return {
+            "account": "zachlatta", "post_id": "x1", "author_screen_name": "zachlatta",
+            "created_at": _NOW - timedelta(hours=1), "text": "Shipping a new warehouse source",
+            "conversation_id": "x1", "url": "https://x.com/zachlatta/status/x1",
+            "like_count": views // 10, "view_count": views, "synced_at": synced_at, "exported_at": synced_at,
+        }
+
+    def run_and_read_seq() -> int:
+        engine = _engine(warehouse, adapters=[adapter_by_name("x_post")])
+        try:
+            engine.run()
+        finally:
+            engine.close()
+        return warehouse._query("SELECT seq FROM @timeline_events WHERE adapter = 'x_post'")[0][0]
+
+    warehouse.insert_x_posts([post(_NOW, 100)])
+    first = run_and_read_seq()
+    warehouse.insert_x_posts([post(_NOW + timedelta(minutes=30), 5000)])
+    assert run_and_read_seq() == first
+
+
 def test_agent_harness_provenance_and_short_daily_schedules_are_background(warehouse):
     _ensure_all_source_tables(warehouse)
     rows = [

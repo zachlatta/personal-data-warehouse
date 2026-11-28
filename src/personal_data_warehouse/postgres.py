@@ -12764,6 +12764,7 @@ class PostgresWarehouse:
     def _insert_full_rows(
         self, table: str, columns: Sequence[str], rows: Sequence[Mapping[str, Any]]
     ) -> None:
+        """Upsert rows carrying every column, a missing one taking its TableSpec default."""
         if not rows:
             return
         self._insert_rows(
@@ -12840,26 +12841,12 @@ class PostgresWarehouse:
 
     def insert_android_screen_time_events(self, rows: Sequence[Mapping[str, Any]]) -> None:
         """Upsert usage events by (account, device, event_key)."""
-        self._insert_android_screen_time("android_screen_time_events", ANDROID_SCREEN_TIME_EVENT_COLUMNS, rows)
+        self._insert_full_rows("android_screen_time_events", ANDROID_SCREEN_TIME_EVENT_COLUMNS, rows)
 
     def insert_android_screen_time_daily_usage(self, rows: Sequence[Mapping[str, Any]]) -> None:
         """Upsert daily usage buckets by (account, device, usage_key)."""
-        self._insert_android_screen_time(
+        self._insert_full_rows(
             "android_screen_time_daily_usage", ANDROID_SCREEN_TIME_DAILY_USAGE_COLUMNS, rows
-        )
-
-    def _insert_android_screen_time(
-        self, table: str, columns: Sequence[str], rows: Sequence[Mapping[str, Any]]
-    ) -> None:
-        if not rows:
-            return
-        self._insert_rows(
-            table,
-            [
-                {column: row.get(column, _default_python_value(column, table=table)) for column in columns}
-                for row in rows
-            ],
-            columns,
         )
 
     def ensure_android_messages_tables(self) -> None:
