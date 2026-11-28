@@ -719,6 +719,14 @@ Pass `--wifi-only` (or `SCREEN_TIMELAPSE_WIFI_ONLY=1` in the phone's `.env`) to 
 on cellular (`dumpsys connectivity` active default network). Setup, switches and rollback:
 `pichu/2026-10-23-screen-timelapse.md` in the sysadmin repository.
 
+**The rooted Kindle (`kindle`) uploads itself with the `linux/arm` (`GOARM=7`) release binary.**
+`pdw-cli-release.yml` publishes a 32-bit `linux/arm` (`GOARM=7`) tarball alongside the 64-bit
+platforms (and `app/internal/clirelease` proxies it), so the Kindle can install and self-update
+via `pdw update` and upload frames under `device = 'kindle'`. Because the Kindle may sit unread
+for days or weeks, `kindle` is listed in `SCREEN_TIMELAPSE_INTERMITTENT_DEVICES`
+(`pipeline_health.py`) so 4+ days without frames does not turn `screen_timelapse` to
+`attention`.
+
 **A CLI login token is not an ingestion signing key.** The installer must receive
 credentials whose token is the app's `PDW_SECRET_TOKEN` (or a still-accepted
 keyring secret). A working `pdw sql` login does not establish that: API access

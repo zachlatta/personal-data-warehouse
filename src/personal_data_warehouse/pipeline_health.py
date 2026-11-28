@@ -94,6 +94,7 @@ __all__ = [
     "SCREEN_TIMELAPSE_ACTIVE_USAGE_EVENT_TYPES",
     "SCREEN_TIMELAPSE_DEVICE_ATTENTION_AFTER",
     "SCREEN_TIMELAPSE_DEVICE_SILENT_AFTER",
+    "SCREEN_TIMELAPSE_INTERMITTENT_DEVICES",
     "SCREEN_TIMELAPSE_RETIRED_DEVICES",
     "STALE_MULTIPLIER",
     "WAL_READY_ATTENTION",
@@ -572,13 +573,16 @@ UPLOADER_RUN_INTERVAL = 30 * MINUTE
 #:    within the last 6 hours must have a screen timelapse frame within 6 hours,
 #:    or screen_timelapse reads attention (e.g. frames waiting on the phone or
 #:    a stopped device uploader).
-#: 2. Any non-retired device that sent frames in the last 7 days (such as crobat
-#:    Mac) must have a frame within the last 4 days (matching the pipeline's
-#:    2-day data interval, late at 4 days, which leaves room for a weekend away).
+#: 2. Any non-retired, non-intermittent device that sent frames in the last 7 days
+#:    (such as crobat Mac) must have a frame within the last 4 days (matching the
+#:    pipeline's 2-day data interval, late at 4 days, which leaves room for a
+#:    weekend away). Intermittent devices (such as kindle, which may go unread
+#:    for days or weeks) are excluded from the 4-day silence rule.
 SCREEN_TIMELAPSE_DEVICE_ATTENTION_AFTER = 6 * HOUR
 SCREEN_TIMELAPSE_ACTIVE_DEVICE_LOOKBACK = 7 * DAY
 SCREEN_TIMELAPSE_DEVICE_SILENT_AFTER = 4 * DAY
 SCREEN_TIMELAPSE_RETIRED_DEVICES: tuple[str, ...] = ("joltik",)
+SCREEN_TIMELAPSE_INTERMITTENT_DEVICES: tuple[str, ...] = ("kindle",)
 SCREEN_TIMELAPSE_ACTIVE_USAGE_EVENT_TYPES: tuple[str, ...] = (
     "ACTIVITY_RESUMED",
     "USER_INTERACTION",
@@ -3235,16 +3239,19 @@ class PipelineHealthCollector:
         1. An Android device that recorded interactive usage events in
            base_android_screen_time.events within the last 6 hours must also have
            a screenshot within the last 6 hours.
-        2. Any non-retired device that delivered screenshots in the last 7 days
-           (such as crobat) must have a screenshot within the last 4 days (matching
-           the pipeline's 2-day data interval, late at 4 days, which leaves room
-           for a weekend away).
+        2. Any non-retired, non-intermittent device that delivered screenshots in
+           the last 7 days (such as crobat) must have a screenshot within the last
+           4 days (matching the pipeline's 2-day data interval, late at 4 days,
+           which leaves room for a weekend away). Intermittent devices (such as
+           kindle) are exempt from this silence check so going unread for 4+ days
+           does not turn screen_timelapse to attention.
         """
         now = datetime.now(tz=UTC)
         usage_cutoff = now - SCREEN_TIMELAPSE_DEVICE_ATTENTION_AFTER
         active_lookback_cutoff = now - SCREEN_TIMELAPSE_ACTIVE_DEVICE_LOOKBACK
         silent_cutoff = now - SCREEN_TIMELAPSE_DEVICE_SILENT_AFTER
         retired = set(SCREEN_TIMELAPSE_RETIRED_DEVICES)
+        intermittent = set(SCREEN_TIMELAPSE_INTERMITTENT_DEVICES)
 
         try:
             screenshot_rows = self._warehouse._query_dicts(
@@ -3305,7 +3312,7 @@ class PipelineHealthCollector:
                 )
 
         for device in sorted(latest_screenshots):
-            if device in flagged_devices or device in retired:
+            if device in flagged_devices or device in retired or device in intermittent:
                 continue
             last_captured_at = latest_screenshots[device]
             if last_captured_at is None:

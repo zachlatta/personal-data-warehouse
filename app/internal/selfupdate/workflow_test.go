@@ -24,6 +24,7 @@ const workflowRelPath = "../../../.github/workflows/pdw-cli-release.yml"
 var supportedPlatforms = []struct{ GOOS, GOARCH string }{
 	{"linux", "amd64"},
 	{"linux", "arm64"},
+	{"linux", "arm"},
 	{"darwin", "amd64"},
 	{"darwin", "arm64"},
 }
@@ -54,16 +55,14 @@ func TestWorkflowBuildsAllSupportedPlatforms(t *testing.T) {
 		// The matrix entries appear as two adjacent lines:
 		//   - goos: linux
 		//     goarch: amd64
-		// Use a single-line marker that's specific enough to catch typos:
-		// the pair must appear on adjacent lines, in order, anywhere.
-		marker := "goos: " + p.GOOS + "\n"
-		if !strings.Contains(body, marker) {
-			t.Errorf("workflow missing matrix entry for goos=%s", p.GOOS)
+		// Check the exact pair so "goarch: arm" cannot be satisfied by "goarch: arm64".
+		pair := "- goos: " + p.GOOS + "\n            goarch: " + p.GOARCH + "\n"
+		if !strings.Contains(body, pair) {
+			t.Errorf("workflow missing matrix entry for %s/%s", p.GOOS, p.GOARCH)
 		}
-		archMarker := "goarch: " + p.GOARCH
-		if !strings.Contains(body, archMarker) {
-			t.Errorf("workflow missing matrix entry for goarch=%s", p.GOARCH)
-		}
+	}
+	if !strings.Contains(body, `goarm: "7"`) || !strings.Contains(body, "GOARM: ${{ matrix.goarm }}") {
+		t.Errorf("workflow must build linux/arm with GOARM=7")
 	}
 }
 

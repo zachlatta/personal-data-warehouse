@@ -217,11 +217,14 @@ and aggregate `max(captured_at)` / `max(ingested_at)` saw only the freshest devi
 device (`SCREEN_TIMELAPSE_RETIRED_DEVICES = ('joltik',)`): an Android device with interactive
 usage events (`SCREEN_INTERACTIVE`, `KEYGUARD_HIDDEN`, `ACTIVITY_RESUMED`) in
 `base_android_screen_time.events` within the last 6 hours
-(`SCREEN_TIMELAPSE_DEVICE_ATTENTION_AFTER`) and no frames for 6 hours, or an active non-retired
-device (frames in the last 7 days, such as `crobat`) with no frames for 4 days
+(`SCREEN_TIMELAPSE_DEVICE_ATTENTION_AFTER`) and no frames for 6 hours, or an active non-retired,
+non-intermittent device (frames in the last 7 days, such as `crobat`) with no frames for 4 days
 (`SCREEN_TIMELAPSE_DEVICE_SILENT_AFTER`, matching the 2-day data interval's late-at-4-days
 threshold so a weekend away stays `ok`), increments `state_attention_rows` (`status =
 'attention'`) and names the silent device and its last frame timestamp in `last_error`.
+Intermittent devices (`SCREEN_TIMELAPSE_INTERMITTENT_DEVICES = ('kindle',)`) are exempt from
+the 4-day silence rule so going unread for days or weeks does not turn `screen_timelapse` to
+`attention`.
 
 Quick check without the UI:
 

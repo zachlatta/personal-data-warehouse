@@ -3522,6 +3522,21 @@ def test_screen_timelapse_stays_ok_for_three_day_old_retired_device_and_weekend_
     assert row["last_error"] is None
 
 
+def test_screen_timelapse_stays_ok_when_intermittent_kindle_is_unread_past_four_days(warehouse):
+    _provision_every_table(warehouse)
+    _seed_screen_timelapse_frame(warehouse, "crobat", captured_ago=timedelta(minutes=5))
+    _seed_screen_timelapse_heartbeat(warehouse, "crobat", ran_ago=timedelta(minutes=2))
+    # kindle sent a frame 5 days ago (inside 7d lookback, past 4d silence), but is intermittent.
+    _seed_screen_timelapse_frame(warehouse, "kindle", captured_ago=timedelta(days=5))
+
+    PipelineHealthCollector(warehouse).run_all()
+
+    row = _screen_timelapse_health_row(warehouse)
+    assert row["status"] == "ok"
+    assert row["state_attention_rows"] == 0
+    assert row["last_error"] is None
+
+
 def test_location_recent_upload_does_not_hide_old_measurement(warehouse):
     _provision_every_table(warehouse)
     now = datetime.now(UTC)

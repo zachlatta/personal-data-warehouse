@@ -97,6 +97,9 @@ jobs:
             goarch: amd64
           - goos: linux
             goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
           - goos: darwin
             goarch: amd64
           - goos: darwin
@@ -113,6 +116,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: "0"
           VERSION: ${{ needs.version.outputs.version }}
         run: |

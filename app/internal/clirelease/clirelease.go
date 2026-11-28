@@ -50,7 +50,7 @@ const baseURLPlaceholder = "__PDW_BASE_URL__"
 
 var (
 	tagPattern   = regexp.MustCompile(`^pdw-cli/(v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?)$`)
-	assetPattern = regexp.MustCompile(`^pdw-cli_(v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?)_(linux|darwin)_(amd64|arm64)\.tar\.gz$`)
+	assetPattern = regexp.MustCompile(`^pdw-cli_(v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?)_(?:linux_(?:amd64|arm64|arm)|darwin_(?:amd64|arm64))\.tar\.gz$`)
 )
 
 // AssetName is the release tarball for one platform.

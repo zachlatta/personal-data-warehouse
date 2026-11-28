@@ -39,7 +39,7 @@ func newFakeGitHub(t *testing.T, binary []byte) *fakeGitHub {
 	f := &fakeGitHub{assets: map[string][]byte{}}
 	version := strings.TrimPrefix(testTag, "pdw-cli/")
 	var sums strings.Builder
-	for _, p := range []string{"linux_amd64", "linux_arm64", "darwin_amd64", "darwin_arm64"} {
+	for _, p := range []string{"linux_amd64", "linux_arm64", "linux_arm", "darwin_amd64", "darwin_arm64"} {
 		name := "pdw-cli_" + version + "_" + p + ".tar.gz"
 		f.assets[name] = tarball(t, binary)
 		sum := sha256.Sum256(f.assets[name])
@@ -156,8 +156,8 @@ func TestLatestReleaseIsServedWithDownloadURLsOnThisServer(t *testing.T) {
 	if rel.TagName != testTag {
 		t.Fatalf("tag = %q", rel.TagName)
 	}
-	if len(rel.Assets) != 5 {
-		t.Fatalf("want 4 tarballs + SHA256SUMS, got %+v", rel.Assets)
+	if len(rel.Assets) != 6 {
+		t.Fatalf("want 5 tarballs + SHA256SUMS, got %+v", rel.Assets)
 	}
 	for _, a := range rel.Assets {
 		if a.Name == fx.gh.extraAsset {
@@ -228,6 +228,7 @@ func TestTheProxyIsNotOpen(t *testing.T) {
 	for _, path := range []string{
 		DownloadPrefix + testTag + "/notes.txt",
 		DownloadPrefix + testTag + "/pdw-cli_" + version + "_windows_amd64.tar.gz",
+		DownloadPrefix + testTag + "/pdw-cli_" + version + "_darwin_arm.tar.gz",
 		DownloadPrefix + testTag + "/pdw-cli_v0.0.1_linux_amd64.tar.gz", // version disagrees with tag
 		DownloadPrefix + "other/v1.0.0/SHA256SUMS",
 		DownloadPrefix + "pdw-cli/v1.0.0/../../evil/SHA256SUMS",

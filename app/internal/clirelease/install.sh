@@ -51,6 +51,7 @@ arch_raw=$(uname -m)
 case "$arch_raw" in
   x86_64|amd64) arch=amd64 ;;
   arm64|aarch64) arch=arm64 ;;
+  armv7l|armv7*) arch=arm ;;
   *) err "unsupported architecture: $arch_raw" ;;
 esac
 

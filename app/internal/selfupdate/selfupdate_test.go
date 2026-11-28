@@ -127,6 +127,7 @@ func TestReleaseAssetForPicksMatchingPlatform(t *testing.T) {
 		Assets: []selfupdate.Asset{
 			{Name: "pdw-cli_v1.0.0_linux_amd64.tar.gz", DownloadURL: "https://x/linux-amd64"},
 			{Name: "pdw-cli_v1.0.0_linux_arm64.tar.gz", DownloadURL: "https://x/linux-arm64"},
+			{Name: "pdw-cli_v1.0.0_linux_arm.tar.gz", DownloadURL: "https://x/linux-arm"},
 			{Name: "pdw-cli_v1.0.0_darwin_amd64.tar.gz", DownloadURL: "https://x/darwin-amd64"},
 			{Name: "pdw-cli_v1.0.0_darwin_arm64.tar.gz", DownloadURL: "https://x/darwin-arm64"},
 			{Name: "SHA256SUMS", DownloadURL: "https://x/sums"},
@@ -137,6 +138,7 @@ func TestReleaseAssetForPicksMatchingPlatform(t *testing.T) {
 	}{
 		{"linux", "amd64", "https://x/linux-amd64"},
 		{"linux", "arm64", "https://x/linux-arm64"},
+		{"linux", "arm", "https://x/linux-arm"},
 		{"darwin", "amd64", "https://x/darwin-amd64"},
 		{"darwin", "arm64", "https://x/darwin-arm64"},
 	}
